@@ -26,49 +26,49 @@ def _select_grouped_matmul_config(
     transpose_weight: bool = False,
     has_bias: bool = False,
     schedule_mode: str = "tuned",
+    bm_override: int = 0,
+    bn_override: int = 0,
+    bk_override: int = 0,
+    num_stages_override: int = 0,
 ) -> dict[str, object]:
     """Select tile/schedule parameters across ragged group regimes on Ascend950PR."""
     non_empty = [m for m in group_sizes if m > 0]
     max_m = max(non_empty) if non_empty else 0
     total_m = sum(non_empty)
-    num_groups = len(group_sizes)
 
     if schedule_mode != "tuned":
-        return {
-            "bm": 64,
-            "bn": 64,
-            "bk": 64,
-            "k_dim": int(k_dim),
-            "n_dim": int(n_dim),
-            "num_stages": 2,
-            "num_cores": 28,
-            "has_bias": bool(has_bias),
-            "transpose_weight": bool(transpose_weight),
-            "tl_dtype": tl_dtype,
-            "schedule_mode": schedule_mode,
-            "compile_flags": list(PURE_SIMDVF_UBUF_FLAGS),
-        }
-
-    if tl_dtype == "float32":
+        bm, bn, bk = 64, 64, 64
+    elif tl_dtype == "float32":
         bm, bn = 64, 64
-    elif max_m <= 64:
-        bm = 32
-        bn = 128 if (n_dim >= 512 and total_m >= 96) else 64
-    elif max_m <= 256 and n_dim <= 256:
-        bm = 128 if total_m >= 512 else 64
-        bn = 128 if (n_dim > 128 and total_m >= 512) else 64
-    elif max_m <= 256 and n_dim <= 512:
-        bm, bn = 64, 64
-    elif tl_dtype != "float32" and total_m >= 512 and n_dim >= 2047:
-        bm, bn = 128, 256
-    elif tl_dtype != "float32" and total_m >= 512 and n_dim >= 1023:
-        bm, bn = 128, 128
-    elif max_m <= 256 and n_dim <= 1024:
-        bm, bn = 64, 128
+        bk = 64 if k_dim >= 64 else 32
+    elif total_m >= 1024 and k_dim >= 512 and n_dim >= 256:
+        bm, bn, bk = 128, 256, 64
     else:
-        bm, bn = 128, 128
+        if max_m <= 64:
+            bm = 32
+            bn = 128 if (n_dim >= 512 and total_m >= 96) else 64
+        elif max_m <= 256 and n_dim <= 256:
+            bm = 128 if total_m >= 512 else 64
+            bn = 128 if (n_dim > 128 and total_m >= 512) else 64
+        elif max_m <= 256 and n_dim <= 512:
+            bm, bn = 64, 64
+        elif total_m >= 512 and n_dim >= 2047:
+            bm, bn = 128, 256
+        elif total_m >= 512 and n_dim >= 1023:
+            bm, bn = 128, 128
+        elif max_m <= 256 and n_dim <= 1024:
+            bm, bn = 64, 128
+        else:
+            bm, bn = 128, 128
+        bk = 128 if k_dim >= 256 else (64 if k_dim >= 64 else 32)
 
-    bk = 128 if (k_dim >= 256 and tl_dtype != "float32") else (64 if k_dim >= 64 else 32)
+    if int(bm_override) > 0:
+        bm = int(bm_override)
+    if int(bn_override) > 0:
+        bn = int(bn_override)
+    if int(bk_override) > 0:
+        bk = int(bk_override)
+    num_stages = int(num_stages_override) if int(num_stages_override) > 0 else 2
 
     return {
         "bm": bm,
@@ -76,12 +76,12 @@ def _select_grouped_matmul_config(
         "bk": bk,
         "k_dim": int(k_dim),
         "n_dim": int(n_dim),
-        "num_stages": 2,
+        "num_stages": num_stages,
         "num_cores": 28,
         "has_bias": bool(has_bias),
         "transpose_weight": bool(transpose_weight),
         "tl_dtype": tl_dtype,
-        "schedule_mode": "tuned",
+        "schedule_mode": schedule_mode,
         "compile_flags": list(PURE_SIMDVF_UBUF_FLAGS),
     }
 
@@ -91,10 +91,35 @@ _GMM_TRACKB_SRC = r"""
 #include <tl_templates/ascend/gemm.h>
 #include <tl_templates/ascend/simd_inst.h>
 
-struct GmmGroupMeta {
-  int starts[32];
-  int ends[32];
-};
+template <int BM, int BN>
+__aicore__ inline void gmm_decode_tile(
+    __gm__ int32_t* group_offsets,
+    __gm__ int32_t* group_tile_prefix,
+    int E, int N, int n_tiles, int linear_tile,
+    int& g, int& m0, int& m_cur, int& n0, int& n_cur) {
+  int lo = 0;
+  int hi = E;
+  while (lo + 1 < hi) {
+    int mid = (lo + hi) >> 1;
+    if (group_tile_prefix[mid] <= linear_tile) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  g = lo;
+  int rem = linear_tile - group_tile_prefix[g];
+  int mt = rem / n_tiles;
+  int nt = rem % n_tiles;
+  int g_start = group_offsets[g];
+  int g_end = group_offsets[g + 1];
+  m0 = g_start + mt * BM;
+  m_cur = g_end - m0;
+  if (m_cur > BM) m_cur = BM;
+  n0 = nt * BN;
+  n_cur = N - n0;
+  if (n_cur > BN) n_cur = BN;
+}
 
 template <int M, int K, int N, int TILE_K_SUB, typename InT, typename AccumT>
 __aicore__ inline void ascend_gemm_l1_nn(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
@@ -306,17 +331,18 @@ __aicore__ inline void gmm_consume_k_stage(
   asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)stg);
 }
 
-template <int BM, int BN, int BK, int TRANS_W, int HAS_BIAS, typename InT, typename BiasT>
+template <int BM, int BN, int BK, int TRANS_W, int HAS_BIAS, int NUM_STAGES, typename InT, typename BiasT>
 __global__ __mix__(1, 2) void gmm_persistent_16(
     __gm__ InT* X, __gm__ InT* W, __gm__ BiasT* Bias, __gm__ InT* Y,
-    GmmGroupMeta meta, int E, int K, int N) {
+    __gm__ int32_t* group_offsets, __gm__ int32_t* group_tile_prefix,
+    int E, int total_tiles, int K, int N) {
   asc_init();
   constexpr int ROWS = BM / 2;
   constexpr int A_STAGE = BM * BK;
   constexpr int B_STAGE = TRANS_W ? (BN * BK) : (BK * BN);
 
   __cbuf__ InT* a_l1_base = (__cbuf__ InT*)0;
-  __cbuf__ InT* b_l1_base = (__cbuf__ InT*)(2 * A_STAGE * 2);
+  __cbuf__ InT* b_l1_base = (__cbuf__ InT*)(NUM_STAGES * A_STAGE * 2);
 
   __cc__ float* c_l0c0 = (__cc__ float*)0;
   __cc__ float* c_l0c1 = (__cc__ float*)(BM * BN * 4);
@@ -333,11 +359,6 @@ __global__ __mix__(1, 2) void gmm_persistent_16(
   __ubuf__ float* bias_f32_ub1 = (__ubuf__ float*)(2 * C_UB_BYTES + 2 * OUT_UB_BYTES + 4096);
 
   int n_tiles = (N + BN - 1) / BN;
-  int total_tiles = 0;
-  for (int g = 0; g < E; ++g) {
-    int mg = meta.ends[g] - meta.starts[g];
-    if (mg > 0) total_tiles += ((mg + BM - 1) / BM) * n_tiles;
-  }
   int cid = (int)block_idx;
   int num_cores = 28;
   if (cid >= total_tiles) return;
@@ -352,47 +373,37 @@ __global__ __mix__(1, 2) void gmm_persistent_16(
     uint32_t inflight = 0;
     int tile_seq = 0;
 
-    for (int tid = cid; tid < total_tiles; tid += num_cores) {
-      int rem = tid;
-      int g = 0;
-      int mt = 0;
-      int nt = 0;
-      for (; g < E; ++g) {
-        int mg = meta.ends[g] - meta.starts[g];
-        if (mg <= 0) continue;
-        int m_blks = (mg + BM - 1) / BM;
-        int g_tiles = m_blks * n_tiles;
-        if (rem < g_tiles) {
-          mt = rem / n_tiles;
-          nt = rem % n_tiles;
-          break;
-        }
-        rem -= g_tiles;
-      }
-      int m0 = meta.starts[g] + mt * BM;
-      int m_cur = meta.ends[g] - m0;
-      if (m_cur > BM) m_cur = BM;
-      int n0 = nt * BN;
-      int n_cur = N - n0;
-      if (n_cur > BN) n_cur = BN;
+    for (int linear_tile = cid; linear_tile < total_tiles; linear_tile += num_cores) {
+      int g, m0, m_cur, n0, n_cur;
+      gmm_decode_tile<BM, BN>(group_offsets, group_tile_prefix, E, N, n_tiles, linear_tile,
+                              g, m0, m_cur, n0, n_cur);
 
       int buf = tile_seq & 1;
       __cc__ float* cur_l0c = buf ? c_l0c1 : c_l0c0;
       __ubuf__ float* cur_cub = buf ? c_ub1 : c_ub0;
       asc_sync_wait(PIPE_FIX, PIPE_M, (event_t)buf);
 
-      if (k_iters > 0) {
-        gmm_issue_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
-            a_l1_base, b_l1_base, X, W, g, m0, m_cur, n0, n_cur, K, N, 0, 0);
-      }
-      for (int ki = 0; ki < k_iters; ++ki) {
-        int stg = ki & 1;
-        if (ki + 1 < k_iters) {
+      if constexpr (NUM_STAGES > 1) {
+        if (k_iters > 0) {
           gmm_issue_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
-              a_l1_base, b_l1_base, X, W, g, m0, m_cur, n0, n_cur, K, N, ki + 1, (ki + 1) & 1);
+              a_l1_base, b_l1_base, X, W, g, m0, m_cur, n0, n_cur, K, N, 0, 0);
         }
-        gmm_consume_k_stage<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
-            cur_l0c, a_l1_base, b_l1_base, stg, (ki == 0) ? 1 : 0);
+        for (int ki = 0; ki < k_iters; ++ki) {
+          int stg = ki & 1;
+          if (ki + 1 < k_iters) {
+            gmm_issue_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
+                a_l1_base, b_l1_base, X, W, g, m0, m_cur, n0, n_cur, K, N, ki + 1, (ki + 1) & 1);
+          }
+          gmm_consume_k_stage<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
+              cur_l0c, a_l1_base, b_l1_base, stg, (ki == 0) ? 1 : 0);
+        }
+      } else {
+        for (int ki = 0; ki < k_iters; ++ki) {
+          gmm_issue_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
+              a_l1_base, b_l1_base, X, W, g, m0, m_cur, n0, n_cur, K, N, ki, 0);
+          gmm_consume_k_stage<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
+              cur_l0c, a_l1_base, b_l1_base, 0, (ki == 0) ? 1 : 0);
+        }
       }
 
       asc_sync_notify(PIPE_M, PIPE_FIX, (event_t)buf);
@@ -430,29 +441,10 @@ __global__ __mix__(1, 2) void gmm_persistent_16(
     asc_sync_notify(PIPE_V, PIPE_MTE2, (event_t)1);
     int tile_seq = 0;
 
-    for (int tid = cid; tid < total_tiles; tid += num_cores) {
-      int rem = tid;
-      int g = 0;
-      int mt = 0;
-      int nt = 0;
-      for (; g < E; ++g) {
-        int mg = meta.ends[g] - meta.starts[g];
-        if (mg <= 0) continue;
-        int m_blks = (mg + BM - 1) / BM;
-        int g_tiles = m_blks * n_tiles;
-        if (rem < g_tiles) {
-          mt = rem / n_tiles;
-          nt = rem % n_tiles;
-          break;
-        }
-        rem -= g_tiles;
-      }
-      int m0 = meta.starts[g] + mt * BM;
-      int m_cur = meta.ends[g] - m0;
-      if (m_cur > BM) m_cur = BM;
-      int n0 = nt * BN;
-      int n_cur = N - n0;
-      if (n_cur > BN) n_cur = BN;
+    for (int linear_tile = cid; linear_tile < total_tiles; linear_tile += num_cores) {
+      int g, m0, m_cur, n0, n_cur;
+      gmm_decode_tile<BM, BN>(group_offsets, group_tile_prefix, E, N, n_tiles, linear_tile,
+                              g, m0, m_cur, n0, n_cur);
 
       int my_m_start = sid * ROWS;
       int my_rows = m_cur - my_m_start;
@@ -554,21 +546,22 @@ __aicore__ inline void gmm_issue_f32_k_dma(
   asc_sync_notify(PIPE_MTE2, PIPE_MTE1, (event_t)stg_id);
 }
 
-template <int BM, int BN, int BK, int TRANS_W, int HAS_BIAS>
+template <int BM, int BN, int BK, int TRANS_W, int HAS_BIAS, int NUM_STAGES>
 __global__ __mix__(1, 2) void gmm_persistent_f32_split(
     __gm__ half* X_hi, __gm__ half* X_lo,
     __gm__ half* W_hi, __gm__ half* W_lo,
     __gm__ float* Bias, __gm__ float* Y,
-    GmmGroupMeta meta, int E, int K, int N) {
+    __gm__ int32_t* group_offsets, __gm__ int32_t* group_tile_prefix,
+    int E, int total_tiles, int K, int N) {
   asc_init();
   constexpr int ROWS = BM / 2;
   constexpr int A_STAGE = BM * BK;
   constexpr int B_STAGE = TRANS_W ? (BN * BK) : (BK * BN);
 
   __cbuf__ half* a_hi_base = (__cbuf__ half*)0;
-  __cbuf__ half* a_lo_base = (__cbuf__ half*)(2 * A_STAGE * 2);
-  __cbuf__ half* b_hi_base = (__cbuf__ half*)(4 * A_STAGE * 2);
-  __cbuf__ half* b_lo_base = (__cbuf__ half*)((4 * A_STAGE + 2 * B_STAGE) * 2);
+  __cbuf__ half* a_lo_base = (__cbuf__ half*)(NUM_STAGES * A_STAGE * 2);
+  __cbuf__ half* b_hi_base = (__cbuf__ half*)(2 * NUM_STAGES * A_STAGE * 2);
+  __cbuf__ half* b_lo_base = (__cbuf__ half*)((2 * NUM_STAGES * A_STAGE + NUM_STAGES * B_STAGE) * 2);
 
   __cc__ float* c_l0c0 = (__cc__ float*)0;
   __cc__ float* c_l0c1 = (__cc__ float*)(BM * BN * 4);
@@ -579,11 +572,6 @@ __global__ __mix__(1, 2) void gmm_persistent_f32_split(
   __ubuf__ float* bias_f32_ub = (__ubuf__ float*)(2 * C_UB_BYTES);
 
   int n_tiles = (N + BN - 1) / BN;
-  int total_tiles = 0;
-  for (int g = 0; g < E; ++g) {
-    int mg = meta.ends[g] - meta.starts[g];
-    if (mg > 0) total_tiles += ((mg + BM - 1) / BM) * n_tiles;
-  }
   int cid = (int)block_idx;
   int num_cores = 28;
   if (cid >= total_tiles) return;
@@ -598,55 +586,63 @@ __global__ __mix__(1, 2) void gmm_persistent_f32_split(
     uint32_t inflight = 0;
     int tile_seq = 0;
 
-    for (int tid = cid; tid < total_tiles; tid += num_cores) {
-      int rem = tid;
-      int g = 0, mt = 0, nt = 0;
-      for (; g < E; ++g) {
-        int mg = meta.ends[g] - meta.starts[g];
-        if (mg <= 0) continue;
-        int m_blks = (mg + BM - 1) / BM;
-        int g_tiles = m_blks * n_tiles;
-        if (rem < g_tiles) { mt = rem / n_tiles; nt = rem % n_tiles; break; }
-        rem -= g_tiles;
-      }
-      int m0 = meta.starts[g] + mt * BM;
-      int m_cur = meta.ends[g] - m0; if (m_cur > BM) m_cur = BM;
-      int n0 = nt * BN;
-      int n_cur = N - n0; if (n_cur > BN) n_cur = BN;
+    for (int linear_tile = cid; linear_tile < total_tiles; linear_tile += num_cores) {
+      int g, m0, m_cur, n0, n_cur;
+      gmm_decode_tile<BM, BN>(group_offsets, group_tile_prefix, E, N, n_tiles, linear_tile,
+                              g, m0, m_cur, n0, n_cur);
 
       int buf = tile_seq & 1;
       __cc__ float* cur_l0c = buf ? c_l0c1 : c_l0c0;
       __ubuf__ float* cur_cub = buf ? c_ub1 : c_ub0;
       asc_sync_wait(PIPE_FIX, PIPE_M, (event_t)buf);
 
-      if (k_iters > 0) {
-        gmm_issue_f32_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE>(
-            a_hi_base, a_lo_base, b_hi_base, b_lo_base,
-            X_hi, X_lo, W_hi, W_lo, g, m0, m_cur, n0, n_cur, K, N, 0, 0);
-      }
-      for (int ki = 0; ki < k_iters; ++ki) {
-        int stg = ki & 1;
-        if (ki + 1 < k_iters) {
+      if constexpr (NUM_STAGES > 1) {
+        if (k_iters > 0) {
           gmm_issue_f32_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE>(
               a_hi_base, a_lo_base, b_hi_base, b_lo_base,
-              X_hi, X_lo, W_hi, W_lo, g, m0, m_cur, n0, n_cur, K, N, ki + 1, (ki + 1) & 1);
+              X_hi, X_lo, W_hi, W_lo, g, m0, m_cur, n0, n_cur, K, N, 0, 0);
         }
-        __cbuf__ half* ah = a_hi_base + stg * A_STAGE;
-        __cbuf__ half* al = a_lo_base + stg * A_STAGE;
-        __cbuf__ half* bh = b_hi_base + stg * B_STAGE;
-        __cbuf__ half* bl = b_lo_base + stg * B_STAGE;
-        asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)stg);
+        for (int ki = 0; ki < k_iters; ++ki) {
+          int stg = ki & 1;
+          if (ki + 1 < k_iters) {
+            gmm_issue_f32_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE>(
+                a_hi_base, a_lo_base, b_hi_base, b_lo_base,
+                X_hi, X_lo, W_hi, W_lo, g, m0, m_cur, n0, n_cur, K, N, ki + 1, (ki + 1) & 1);
+          }
+          __cbuf__ half* ah = a_hi_base + stg * A_STAGE;
+          __cbuf__ half* al = a_lo_base + stg * A_STAGE;
+          __cbuf__ half* bh = b_hi_base + stg * B_STAGE;
+          __cbuf__ half* bl = b_lo_base + stg * B_STAGE;
+          asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)stg);
 
-        if constexpr (TRANS_W) {
-          ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, ah, bh, (ki == 0) ? 1 : 0, 0, 0);
-          ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, ah, bl, 0, 0, 0);
-          ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, al, bh, 0, 0, 0);
-        } else {
-          ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, ah, bh, (ki == 0) ? 1 : 0, 0);
-          ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, ah, bl, 0, 0);
-          ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, al, bh, 0, 0);
+          if constexpr (TRANS_W) {
+            ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, ah, bh, (ki == 0) ? 1 : 0, 0, 0);
+            ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, ah, bl, 0, 0, 0);
+            ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, al, bh, 0, 0, 0);
+          } else {
+            ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, ah, bh, (ki == 0) ? 1 : 0, 0);
+            ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, ah, bl, 0, 0);
+            ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, al, bh, 0, 0);
+          }
+          asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)stg);
         }
-        asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)stg);
+      } else {
+        for (int ki = 0; ki < k_iters; ++ki) {
+          gmm_issue_f32_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE>(
+              a_hi_base, a_lo_base, b_hi_base, b_lo_base,
+              X_hi, X_lo, W_hi, W_lo, g, m0, m_cur, n0, n_cur, K, N, ki, 0);
+          asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)0);
+          if constexpr (TRANS_W) {
+            ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, a_hi_base, b_hi_base, (ki == 0) ? 1 : 0, 0, 0);
+            ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, a_hi_base, b_lo_base, 0, 0, 0);
+            ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, a_lo_base, b_hi_base, 0, 0, 0);
+          } else {
+            ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, a_hi_base, b_hi_base, (ki == 0) ? 1 : 0, 0);
+            ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, a_hi_base, b_lo_base, 0, 0);
+            ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, a_lo_base, b_hi_base, 0, 0);
+          }
+          asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)0);
+        }
       }
 
       asc_sync_notify(PIPE_M, PIPE_FIX, (event_t)buf);
@@ -684,21 +680,10 @@ __global__ __mix__(1, 2) void gmm_persistent_f32_split(
     asc_sync_notify(PIPE_V, PIPE_MTE2, (event_t)1);
     int tile_seq = 0;
 
-    for (int tid = cid; tid < total_tiles; tid += num_cores) {
-      int rem = tid;
-      int g = 0, mt = 0, nt = 0;
-      for (; g < E; ++g) {
-        int mg = meta.ends[g] - meta.starts[g];
-        if (mg <= 0) continue;
-        int m_blks = (mg + BM - 1) / BM;
-        int g_tiles = m_blks * n_tiles;
-        if (rem < g_tiles) { mt = rem / n_tiles; nt = rem % n_tiles; break; }
-        rem -= g_tiles;
-      }
-      int m0 = meta.starts[g] + mt * BM;
-      int m_cur = meta.ends[g] - m0; if (m_cur > BM) m_cur = BM;
-      int n0 = nt * BN;
-      int n_cur = N - n0; if (n_cur > BN) n_cur = BN;
+    for (int linear_tile = cid; linear_tile < total_tiles; linear_tile += num_cores) {
+      int g, m0, m_cur, n0, n_cur;
+      gmm_decode_tile<BM, BN>(group_offsets, group_tile_prefix, E, N, n_tiles, linear_tile,
+                              g, m0, m_cur, n0, n_cur);
 
       int my_m_start = sid * ROWS;
       int my_rows = m_cur - my_m_start;
@@ -744,54 +729,22 @@ __global__ __mix__(1, 2) void gmm_persistent_f32_split(
   }
 }
 
-template <int BM, int BN>
-__aicore__ inline void gmm_decode_tile(
-    const GmmGroupMeta& meta, int E, int N, int n_tiles, int tid,
-    int& g, int& m0, int& m_cur, int& n0, int& n_cur) {
-  int rem = tid;
-  g = 0;
-  int mt = 0;
-  int nt = 0;
-  for (; g < E; ++g) {
-    int mg = meta.ends[g] - meta.starts[g];
-    if (mg <= 0) continue;
-    int m_blks = (mg + BM - 1) / BM;
-    int g_tiles = m_blks * n_tiles;
-    if (rem < g_tiles) {
-      mt = rem / n_tiles;
-      nt = rem % n_tiles;
-      break;
-    }
-    rem -= g_tiles;
-  }
-  m0 = meta.starts[g] + mt * BM;
-  m_cur = meta.ends[g] - m0;
-  if (m_cur > BM) m_cur = BM;
-  n0 = nt * BN;
-  n_cur = N - n0;
-  if (n_cur > BN) n_cur = BN;
-}
-
-template <int BM, int BN, int BK, int TRANS_W, int QUANT_MODE, typename InT>
+template <int BM, int BN, int BK, int TRANS_W, int QUANT_MODE, int NUM_STAGES, typename InT>
 __global__ __cube__ void gmm_persistent_16_cube(
     __gm__ InT* X, __gm__ InT* W, __gm__ InT* Y,
-    GmmGroupMeta meta, int E, int K, int N) {
+    __gm__ int32_t* group_offsets, __gm__ int32_t* group_tile_prefix,
+    int E, int total_tiles, int K, int N) {
   asc_init();
   constexpr int A_STAGE = BM * BK;
   constexpr int B_STAGE = TRANS_W ? (BN * BK) : (BK * BN);
   constexpr int SUB_K_STEP = (BK < 64) ? BK : 64;
 
   __cbuf__ InT* a_l1_base = (__cbuf__ InT*)0;
-  __cbuf__ InT* b_l1_base = (__cbuf__ InT*)(2 * A_STAGE * 2);
+  __cbuf__ InT* b_l1_base = (__cbuf__ InT*)(NUM_STAGES * A_STAGE * 2);
   __cc__ float* c_l0c0 = (__cc__ float*)0;
   __cc__ float* c_l0c1 = (__cc__ float*)(BM * BN * 4);
 
   int n_tiles = (N + BN - 1) / BN;
-  int total_tiles = 0;
-  for (int g = 0; g < E; ++g) {
-    int mg = meta.ends[g] - meta.starts[g];
-    if (mg > 0) total_tiles += ((mg + BM - 1) / BM) * n_tiles;
-  }
   int cid = (int)block_idx;
   int num_cores = 28;
   if (cid >= total_tiles) return;
@@ -803,33 +756,48 @@ __global__ __cube__ void gmm_persistent_16_cube(
   asc_sync_notify(PIPE_FIX, PIPE_M, (event_t)1);
   int tile_seq = 0;
 
-  for (int tid = cid; tid < total_tiles; tid += num_cores) {
+  for (int linear_tile = cid; linear_tile < total_tiles; linear_tile += num_cores) {
     int g, m0, m_cur, n0, n_cur;
-    gmm_decode_tile<BM, BN>(meta, E, N, n_tiles, tid, g, m0, m_cur, n0, n_cur);
+    gmm_decode_tile<BM, BN>(group_offsets, group_tile_prefix, E, N, n_tiles, linear_tile,
+                            g, m0, m_cur, n0, n_cur);
 
     int buf = tile_seq & 1;
     __cc__ float* cur_l0c = buf ? c_l0c1 : c_l0c0;
     asc_sync_wait(PIPE_FIX, PIPE_M, (event_t)buf);
 
-    if (k_iters > 0) {
-      gmm_issue_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
-          a_l1_base, b_l1_base, X, W, g, m0, m_cur, n0, n_cur, K, N, 0, 0);
-    }
-    for (int ki = 0; ki < k_iters; ++ki) {
-      int stg = ki & 1;
-      if (ki + 1 < k_iters) {
+    if constexpr (NUM_STAGES > 1) {
+      if (k_iters > 0) {
         gmm_issue_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
-            a_l1_base, b_l1_base, X, W, g, m0, m_cur, n0, n_cur, K, N, ki + 1, (ki + 1) & 1);
+            a_l1_base, b_l1_base, X, W, g, m0, m_cur, n0, n_cur, K, N, 0, 0);
       }
-      __cbuf__ InT* a_dst = a_l1_base + stg * A_STAGE;
-      __cbuf__ InT* b_dst = b_l1_base + stg * B_STAGE;
-      asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)stg);
-      if constexpr (TRANS_W) {
-        ascend_gemm_l1<BM, BK, BN, SUB_K_STEP, true, InT>(cur_l0c, a_dst, b_dst, (ki == 0) ? 1 : 0, 0, 0);
-      } else {
-        ascend_gemm_l1_nn<BM, BK, BN, SUB_K_STEP, InT, float>(cur_l0c, a_dst, b_dst, (ki == 0) ? 1 : 0, 0);
+      for (int ki = 0; ki < k_iters; ++ki) {
+        int stg = ki & 1;
+        if (ki + 1 < k_iters) {
+          gmm_issue_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
+              a_l1_base, b_l1_base, X, W, g, m0, m_cur, n0, n_cur, K, N, ki + 1, (ki + 1) & 1);
+        }
+        __cbuf__ InT* a_dst = a_l1_base + stg * A_STAGE;
+        __cbuf__ InT* b_dst = b_l1_base + stg * B_STAGE;
+        asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)stg);
+        if constexpr (TRANS_W) {
+          ascend_gemm_l1<BM, BK, BN, SUB_K_STEP, true, InT>(cur_l0c, a_dst, b_dst, (ki == 0) ? 1 : 0, 0, 0);
+        } else {
+          ascend_gemm_l1_nn<BM, BK, BN, SUB_K_STEP, InT, float>(cur_l0c, a_dst, b_dst, (ki == 0) ? 1 : 0, 0);
+        }
+        asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)stg);
       }
-      asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)stg);
+    } else {
+      for (int ki = 0; ki < k_iters; ++ki) {
+        gmm_issue_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
+            a_l1_base, b_l1_base, X, W, g, m0, m_cur, n0, n_cur, K, N, ki, 0);
+        asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)0);
+        if constexpr (TRANS_W) {
+          ascend_gemm_l1<BM, BK, BN, SUB_K_STEP, true, InT>(cur_l0c, a_l1_base, b_l1_base, (ki == 0) ? 1 : 0, 0, 0);
+        } else {
+          ascend_gemm_l1_nn<BM, BK, BN, SUB_K_STEP, InT, float>(cur_l0c, a_l1_base, b_l1_base, (ki == 0) ? 1 : 0, 0);
+        }
+        asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)0);
+      }
     }
 
     asc_sync_notify(PIPE_M, PIPE_FIX, (event_t)buf);
@@ -851,27 +819,23 @@ __global__ __cube__ void gmm_persistent_16_cube(
   asc_sync_wait(PIPE_FIX, PIPE_M, (event_t)1);
 }
 
-template <int BM, int BN, int BK, int TRANS_W>
+template <int BM, int BN, int BK, int TRANS_W, int NUM_STAGES>
 __global__ __cube__ void gmm_persistent_f32_cube(
     __gm__ half* X_hi, __gm__ half* X_lo, __gm__ half* W_hi, __gm__ half* W_lo,
-    __gm__ float* Y, GmmGroupMeta meta, int E, int K, int N) {
+    __gm__ float* Y, __gm__ int32_t* group_offsets, __gm__ int32_t* group_tile_prefix,
+    int E, int total_tiles, int K, int N) {
   asc_init();
   constexpr int A_STAGE = BM * BK;
   constexpr int B_STAGE = TRANS_W ? (BN * BK) : (BK * BN);
 
   __cbuf__ half* a_hi_base = (__cbuf__ half*)0;
-  __cbuf__ half* a_lo_base = (__cbuf__ half*)(2 * A_STAGE * 2);
-  __cbuf__ half* b_hi_base = (__cbuf__ half*)(4 * A_STAGE * 2);
-  __cbuf__ half* b_lo_base = (__cbuf__ half*)(4 * A_STAGE * 2 + 2 * B_STAGE * 2);
+  __cbuf__ half* a_lo_base = (__cbuf__ half*)(NUM_STAGES * A_STAGE * 2);
+  __cbuf__ half* b_hi_base = (__cbuf__ half*)(2 * NUM_STAGES * A_STAGE * 2);
+  __cbuf__ half* b_lo_base = (__cbuf__ half*)((2 * NUM_STAGES * A_STAGE + NUM_STAGES * B_STAGE) * 2);
   __cc__ float* c_l0c0 = (__cc__ float*)0;
   __cc__ float* c_l0c1 = (__cc__ float*)(BM * BN * 4);
 
   int n_tiles = (N + BN - 1) / BN;
-  int total_tiles = 0;
-  for (int g = 0; g < E; ++g) {
-    int mg = meta.ends[g] - meta.starts[g];
-    if (mg > 0) total_tiles += ((mg + BM - 1) / BM) * n_tiles;
-  }
   int cid = (int)block_idx;
   int num_cores = 28;
   if (cid >= total_tiles) return;
@@ -883,41 +847,61 @@ __global__ __cube__ void gmm_persistent_f32_cube(
   asc_sync_notify(PIPE_FIX, PIPE_M, (event_t)1);
   int tile_seq = 0;
 
-  for (int tid = cid; tid < total_tiles; tid += num_cores) {
+  for (int linear_tile = cid; linear_tile < total_tiles; linear_tile += num_cores) {
     int g, m0, m_cur, n0, n_cur;
-    gmm_decode_tile<BM, BN>(meta, E, N, n_tiles, tid, g, m0, m_cur, n0, n_cur);
+    gmm_decode_tile<BM, BN>(group_offsets, group_tile_prefix, E, N, n_tiles, linear_tile,
+                            g, m0, m_cur, n0, n_cur);
 
     int buf = tile_seq & 1;
     __cc__ float* cur_l0c = buf ? c_l0c1 : c_l0c0;
     asc_sync_wait(PIPE_FIX, PIPE_M, (event_t)buf);
 
-    if (k_iters > 0) {
-      gmm_issue_f32_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE>(
-          a_hi_base, a_lo_base, b_hi_base, b_lo_base,
-          X_hi, X_lo, W_hi, W_lo, g, m0, m_cur, n0, n_cur, K, N, 0, 0);
-    }
-    for (int ki = 0; ki < k_iters; ++ki) {
-      int stg = ki & 1;
-      if (ki + 1 < k_iters) {
+    if constexpr (NUM_STAGES > 1) {
+      if (k_iters > 0) {
         gmm_issue_f32_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE>(
             a_hi_base, a_lo_base, b_hi_base, b_lo_base,
-            X_hi, X_lo, W_hi, W_lo, g, m0, m_cur, n0, n_cur, K, N, ki + 1, (ki + 1) & 1);
+            X_hi, X_lo, W_hi, W_lo, g, m0, m_cur, n0, n_cur, K, N, 0, 0);
       }
-      __cbuf__ half* ah = a_hi_base + stg * A_STAGE;
-      __cbuf__ half* al = a_lo_base + stg * A_STAGE;
-      __cbuf__ half* bh = b_hi_base + stg * B_STAGE;
-      __cbuf__ half* bl = b_lo_base + stg * B_STAGE;
-      asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)stg);
-      if constexpr (TRANS_W) {
-        ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, ah, bh, (ki == 0) ? 1 : 0, 0, 0);
-        ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, ah, bl, 0, 0, 0);
-        ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, al, bh, 0, 0, 0);
-      } else {
-        ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, ah, bh, (ki == 0) ? 1 : 0, 0);
-        ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, ah, bl, 0, 0);
-        ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, al, bh, 0, 0);
+      for (int ki = 0; ki < k_iters; ++ki) {
+        int stg = ki & 1;
+        if (ki + 1 < k_iters) {
+          gmm_issue_f32_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE>(
+              a_hi_base, a_lo_base, b_hi_base, b_lo_base,
+              X_hi, X_lo, W_hi, W_lo, g, m0, m_cur, n0, n_cur, K, N, ki + 1, (ki + 1) & 1);
+        }
+        __cbuf__ half* ah = a_hi_base + stg * A_STAGE;
+        __cbuf__ half* al = a_lo_base + stg * A_STAGE;
+        __cbuf__ half* bh = b_hi_base + stg * B_STAGE;
+        __cbuf__ half* bl = b_lo_base + stg * B_STAGE;
+        asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)stg);
+        if constexpr (TRANS_W) {
+          ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, ah, bh, (ki == 0) ? 1 : 0, 0, 0);
+          ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, ah, bl, 0, 0, 0);
+          ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, al, bh, 0, 0, 0);
+        } else {
+          ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, ah, bh, (ki == 0) ? 1 : 0, 0);
+          ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, ah, bl, 0, 0);
+          ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, al, bh, 0, 0);
+        }
+        asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)stg);
       }
-      asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)stg);
+    } else {
+      for (int ki = 0; ki < k_iters; ++ki) {
+        gmm_issue_f32_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE>(
+            a_hi_base, a_lo_base, b_hi_base, b_lo_base,
+            X_hi, X_lo, W_hi, W_lo, g, m0, m_cur, n0, n_cur, K, N, ki, 0);
+        asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)0);
+        if constexpr (TRANS_W) {
+          ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, a_hi_base, b_hi_base, (ki == 0) ? 1 : 0, 0, 0);
+          ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, a_hi_base, b_lo_base, 0, 0, 0);
+          ascend_gemm_l1<BM, BK, BN, 64, true, half>(cur_l0c, a_lo_base, b_hi_base, 0, 0, 0);
+        } else {
+          ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, a_hi_base, b_hi_base, (ki == 0) ? 1 : 0, 0);
+          ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, a_hi_base, b_lo_base, 0, 0);
+          ascend_gemm_l1_nn<BM, BK, BN, 64, half, float>(cur_l0c, a_lo_base, b_hi_base, 0, 0);
+        }
+        asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)0);
+      }
     }
 
     asc_sync_notify(PIPE_M, PIPE_FIX, (event_t)buf);
@@ -941,16 +925,13 @@ __global__ __cube__ void gmm_persistent_f32_cube(
 """
 
 
-class _GmmGroupMeta(ctypes.Structure):
-    _fields_ = [("starts", ctypes.c_int * 32), ("ends", ctypes.c_int * 32)]
-
-
 def _render_gmm_trackb_launcher(
     trackb_src: str,
     *,
     bm: int,
     bn: int,
     bk: int,
+    num_stages: int = 2,
     tl_dtype: str,
     bias_dtype: str,
     transpose_weight: bool,
@@ -959,16 +940,19 @@ def _render_gmm_trackb_launcher(
     """Append concrete launch_gmm_* template instantiation to *trackb_src*."""
     trans_flag = 1 if transpose_weight else 0
     bias_flag = 1 if has_bias else 0
+    eff_stages = 1 if int(num_stages) <= 1 else 2
 
     if tl_dtype == "float32":
         kernel_call = (
-            f"gmm_persistent_f32_split<{bm}, {bn}, {bk}, {trans_flag}, {bias_flag}><<<28, nullptr, stream>>>(\n"
+            f"gmm_persistent_f32_split<{bm}, {bn}, {bk}, {trans_flag}, {bias_flag}, {eff_stages}><<<28, nullptr, stream>>>(\n"
             f"      (__gm__ half*)x_hi, (__gm__ half*)x_lo, (__gm__ half*)w_hi, (__gm__ half*)w_lo,\n"
-            f"      (__gm__ float*)bias_ptr, (__gm__ float*)y_ptr, meta, E, K, N);"
+            f"      (__gm__ float*)bias_ptr, (__gm__ float*)y_ptr,\n"
+            f"      (__gm__ int32_t*)group_offsets, (__gm__ int32_t*)group_tile_prefix, E, total_tiles, K, N);"
             if has_bias
-            else f"gmm_persistent_f32_cube<{bm}, {bn}, {bk}, {trans_flag}><<<28, nullptr, stream>>>(\n"
+            else f"gmm_persistent_f32_cube<{bm}, {bn}, {bk}, {trans_flag}, {eff_stages}><<<28, nullptr, stream>>>(\n"
             f"      (__gm__ half*)x_hi, (__gm__ half*)x_lo, (__gm__ half*)w_hi, (__gm__ half*)w_lo,\n"
-            f"      (__gm__ float*)y_ptr, meta, E, K, N);"
+            f"      (__gm__ float*)y_ptr,\n"
+            f"      (__gm__ int32_t*)group_offsets, (__gm__ int32_t*)group_tile_prefix, E, total_tiles, K, N);"
         )
         return (
             trackb_src
@@ -976,7 +960,8 @@ def _render_gmm_trackb_launcher(
 extern "C" int launch_gmm_f32(
     void* stream, void* x_ptr, void* w_ptr, void* bias_ptr, void* y_ptr,
     void* x_hi, void* x_lo, void* w_hi, void* w_lo,
-    GmmGroupMeta meta, int E, int M, int K, int N) {{
+    void* group_offsets, void* group_tile_prefix,
+    int E, int total_tiles, int M, int K, int N) {{
   int x_elems = M * K;
   int w_elems = E * K * N;
   split_f32_to_hilo_pair_kernel<<<56, nullptr, stream>>>(
@@ -996,19 +981,22 @@ extern "C" int launch_gmm_f32(
     else:
         c_bias = "half"
     kernel_call = (
-        f"gmm_persistent_16<{bm}, {bn}, {bk}, {trans_flag}, {bias_flag}, {c_in}, {c_bias}><<<28, nullptr, stream>>>(\n"
+        f"gmm_persistent_16<{bm}, {bn}, {bk}, {trans_flag}, {bias_flag}, {eff_stages}, {c_in}, {c_bias}><<<28, nullptr, stream>>>(\n"
         f"      (__gm__ {c_in}*)x_ptr, (__gm__ {c_in}*)w_ptr, (__gm__ {c_bias}*)bias_ptr,\n"
-        f"      (__gm__ {c_in}*)y_ptr, meta, E, K, N);"
+        f"      (__gm__ {c_in}*)y_ptr,\n"
+        f"      (__gm__ int32_t*)group_offsets, (__gm__ int32_t*)group_tile_prefix, E, total_tiles, K, N);"
         if has_bias
-        else f"gmm_persistent_16_cube<{bm}, {bn}, {bk}, {trans_flag}, {quant_mode}, {c_in}><<<28, nullptr, stream>>>(\n"
-        f"      (__gm__ {c_in}*)x_ptr, (__gm__ {c_in}*)w_ptr, (__gm__ {c_in}*)y_ptr, meta, E, K, N);"
+        else f"gmm_persistent_16_cube<{bm}, {bn}, {bk}, {trans_flag}, {quant_mode}, {eff_stages}, {c_in}><<<28, nullptr, stream>>>(\n"
+        f"      (__gm__ {c_in}*)x_ptr, (__gm__ {c_in}*)w_ptr, (__gm__ {c_in}*)y_ptr,\n"
+        f"      (__gm__ int32_t*)group_offsets, (__gm__ int32_t*)group_tile_prefix, E, total_tiles, K, N);"
     )
     return (
         trackb_src
         + f"""
 extern "C" int launch_gmm_16(
     void* stream, void* x_ptr, void* w_ptr, void* bias_ptr, void* y_ptr,
-    GmmGroupMeta meta, int E, int K, int N) {{
+    void* group_offsets, void* group_tile_prefix,
+    int E, int total_tiles, int K, int N) {{
   {kernel_call}
   return 0;
 }}
@@ -1040,11 +1028,13 @@ def _render_trackb_tu(**dims: object) -> str:
     bm = int(dims.get("bm", cfg["bm"]) or cfg["bm"])
     bn = int(dims.get("bn", cfg["bn"]) or cfg["bn"])
     bk = int(dims.get("bk", cfg["bk"]) or cfg["bk"])
+    num_stages = int(dims.get("num_stages", cfg["num_stages"]) or cfg["num_stages"])
     return _render_gmm_trackb_launcher(
         trackb_src,
         bm=bm,
         bn=bn,
         bk=bk,
+        num_stages=num_stages,
         tl_dtype=tl_dtype,
         bias_dtype=bias_dtype,
         transpose_weight=transpose_weight,
@@ -1061,8 +1051,10 @@ def _build_gmm_trackb_callable(
     bias_dtype: str,
     transpose_weight: bool,
     has_bias: bool,
+    num_stages: int = 2,
 ):
-    key = ("gmm_trackb", bm, bn, bk, tl_dtype, bias_dtype, bool(transpose_weight), bool(has_bias))
+    eff_stages = 1 if int(num_stages) <= 1 else 2
+    key = ("gmm_trackb", bm, bn, bk, eff_stages, tl_dtype, bias_dtype, bool(transpose_weight), bool(has_bias))
     cached = _KERNEL_CACHE.get(key)
     if cached is not None:
         return cached
@@ -1072,6 +1064,7 @@ def _build_gmm_trackb_callable(
         bm=bm,
         bn=bn,
         bk=bk,
+        num_stages=eff_stages,
         tl_dtype=tl_dtype,
         bias_dtype=bias_dtype,
         transpose_weight=transpose_weight,
@@ -1097,54 +1090,78 @@ def _build_gmm_trackb_callable(
         path_target=so_path,
     )
     lib = ctypes.CDLL(so_path)
+
+    def _build_device_meta(starts, ends, n_dim: int, device: torch.device):
+        e_dim = len(starts)
+        n_tiles = (n_dim + bn - 1) // bn
+        offsets = [0] * (e_dim + 1)
+        tile_prefix = [0] * (e_dim + 1)
+        acc_tiles = 0
+        for idx in range(e_dim):
+            s_val = int(starts[idx])
+            e_val = int(ends[idx])
+            if idx == 0:
+                offsets[0] = s_val
+            offsets[idx + 1] = e_val
+            mg = max(0, e_val - s_val)
+            g_tiles = ((mg + bm - 1) // bm) * n_tiles if mg > 0 else 0
+            acc_tiles += g_tiles
+            tile_prefix[idx + 1] = acc_tiles
+        meta_dev = torch.tensor(offsets + tile_prefix, dtype=torch.int32, device=device)
+        offsets_ptr = meta_dev.data_ptr()
+        prefix_ptr = offsets_ptr + (e_dim + 1) * 4
+        return meta_dev, offsets_ptr, prefix_ptr, acc_tiles
+
     if tl_dtype == "float32":
         fn = lib.launch_gmm_f32
         fn.argtypes = (
-            [ctypes.c_void_p] * 9
-            + [_GmmGroupMeta, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            [ctypes.c_void_p] * 11
+            + [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         )
 
         def _run(x_c, w_c, bias_c, y_c, starts, ends):
             e_dim = len(starts)
             m_dim, k_dim = int(x_c.shape[0]), int(x_c.shape[1])
             n_dim = int(y_c.shape[1])
+            meta_dev, offsets_ptr, prefix_ptr, total_tiles = _build_device_meta(
+                starts, ends, n_dim, x_c.device
+            )
+            if total_tiles <= 0:
+                return
             x_hi = torch.empty_like(x_c, dtype=torch.float16)
             x_lo = torch.empty_like(x_c, dtype=torch.float16)
             w_hi = torch.empty_like(w_c, dtype=torch.float16)
             w_lo = torch.empty_like(w_c, dtype=torch.float16)
             stream_ptr = torch.npu.current_stream().npu_stream
-            for off in range(0, e_dim, 32):
-                sub_e = min(32, e_dim - off)
-                meta = _GmmGroupMeta()
-                for idx in range(sub_e):
-                    meta.starts[idx] = int(starts[off + idx])
-                    meta.ends[idx] = int(ends[off + idx])
-                b_ptr = (
-                    bias_c[off:].data_ptr()
-                    if (has_bias and bias_c is not None)
-                    else y_c.data_ptr()
-                )
-                fn(
-                    stream_ptr,
-                    x_c.data_ptr(),
-                    w_c[off:].data_ptr(),
-                    b_ptr,
-                    y_c.data_ptr(),
-                    x_hi.data_ptr(),
-                    x_lo.data_ptr(),
-                    w_hi[off:].data_ptr(),
-                    w_lo[off:].data_ptr(),
-                    meta,
-                    sub_e,
-                    m_dim,
-                    k_dim,
-                    n_dim,
-                )
+            b_ptr = (
+                bias_c.data_ptr()
+                if (has_bias and bias_c is not None)
+                else y_c.data_ptr()
+            )
+            fn(
+                stream_ptr,
+                x_c.data_ptr(),
+                w_c.data_ptr(),
+                b_ptr,
+                y_c.data_ptr(),
+                x_hi.data_ptr(),
+                x_lo.data_ptr(),
+                w_hi.data_ptr(),
+                w_lo.data_ptr(),
+                offsets_ptr,
+                prefix_ptr,
+                e_dim,
+                total_tiles,
+                m_dim,
+                k_dim,
+                n_dim,
+            )
+            del meta_dev
 
     else:
         fn = lib.launch_gmm_16
-        fn.argtypes = [ctypes.c_void_p] * 5 + [
-            _GmmGroupMeta,
+        fn.argtypes = [ctypes.c_void_p] * 7 + [
+            ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
@@ -1154,29 +1171,31 @@ def _build_gmm_trackb_callable(
             e_dim = len(starts)
             k_dim = int(x_c.shape[1])
             n_dim = int(y_c.shape[1])
+            meta_dev, offsets_ptr, prefix_ptr, total_tiles = _build_device_meta(
+                starts, ends, n_dim, x_c.device
+            )
+            if total_tiles <= 0:
+                return
             stream_ptr = torch.npu.current_stream().npu_stream
-            for off in range(0, e_dim, 32):
-                sub_e = min(32, e_dim - off)
-                meta = _GmmGroupMeta()
-                for idx in range(sub_e):
-                    meta.starts[idx] = int(starts[off + idx])
-                    meta.ends[idx] = int(ends[off + idx])
-                b_ptr = (
-                    bias_c[off:].data_ptr()
-                    if (has_bias and bias_c is not None)
-                    else y_c.data_ptr()
-                )
-                fn(
-                    stream_ptr,
-                    x_c.data_ptr(),
-                    w_c[off:].data_ptr(),
-                    b_ptr,
-                    y_c.data_ptr(),
-                    meta,
-                    sub_e,
-                    k_dim,
-                    n_dim,
-                )
+            b_ptr = (
+                bias_c.data_ptr()
+                if (has_bias and bias_c is not None)
+                else y_c.data_ptr()
+            )
+            fn(
+                stream_ptr,
+                x_c.data_ptr(),
+                w_c.data_ptr(),
+                b_ptr,
+                y_c.data_ptr(),
+                offsets_ptr,
+                prefix_ptr,
+                e_dim,
+                total_tiles,
+                k_dim,
+                n_dim,
+            )
+            del meta_dev
 
     _run._so_lib = lib
     _KERNEL_CACHE[key] = _run
@@ -1230,27 +1249,42 @@ def grouped_matmul(
     y_full = torch.empty((m_dim, n_dim), dtype=x.dtype, device=x.device)
 
     if m_dim > 0 and n_dim > 0 and k_dim > 0 and any(sz > 0 for sz in group_sizes):
-        tl_dtype = _dtype_name(x.dtype)
-        bias_dtype = _dtype_name(bias.dtype) if bias is not None else tl_dtype
-        cfg = _select_grouped_matmul_config(
-            group_sizes=tuple(group_sizes),
-            k_dim=k_dim,
-            n_dim=n_dim,
-            tl_dtype=tl_dtype,
-            transpose_weight=bool(transpose_weight),
-            has_bias=bias is not None,
-            schedule_mode=schedule_mode,
-        )
-        runner = _build_gmm_trackb_callable(
-            bm=int(cfg["bm"]),
-            bn=int(cfg["bn"]),
-            bk=int(cfg["bk"]),
-            tl_dtype=tl_dtype,
-            bias_dtype=bias_dtype,
-            transpose_weight=bool(transpose_weight),
-            has_bias=bias is not None,
-        )
-        runner(x_c, w_c, bias_c, y_full, starts, ends)
+        if x.device.type != "npu":
+            x_f = x_c.float()
+            y_f = torch.zeros((m_dim, n_dim), dtype=torch.float32, device=x.device)
+            for g_idx in range(e_dim):
+                s_idx, e_idx = starts[g_idx], ends[g_idx]
+                if e_idx <= s_idx:
+                    continue
+                w_g = w_c[g_idx].float()
+                mm = torch.matmul(x_f[s_idx:e_idx], w_g.transpose(-2, -1) if transpose_weight else w_g)
+                if bias_c is not None:
+                    mm = mm + bias_c[g_idx].float().unsqueeze(0)
+                y_f[s_idx:e_idx] = mm
+            y_full = y_f.to(x.dtype)
+        else:
+            tl_dtype = _dtype_name(x.dtype)
+            bias_dtype = _dtype_name(bias.dtype) if bias is not None else tl_dtype
+            cfg = _select_grouped_matmul_config(
+                group_sizes=tuple(group_sizes),
+                k_dim=k_dim,
+                n_dim=n_dim,
+                tl_dtype=tl_dtype,
+                transpose_weight=bool(transpose_weight),
+                has_bias=bias is not None,
+                schedule_mode=schedule_mode,
+            )
+            runner = _build_gmm_trackb_callable(
+                bm=int(cfg["bm"]),
+                bn=int(cfg["bn"]),
+                bk=int(cfg["bk"]),
+                tl_dtype=tl_dtype,
+                bias_dtype=bias_dtype,
+                transpose_weight=bool(transpose_weight),
+                has_bias=bias is not None,
+                num_stages=int(cfg["num_stages"]),
+            )
+            runner(x_c, w_c, bias_c, y_full, starts, ends)
 
     if int(split_item) in (2, 3):
         return [y_full]
