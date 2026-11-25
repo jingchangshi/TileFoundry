@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import textwrap
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -17,6 +18,7 @@ from types import ModuleType
 
 import yaml
 
+from tilefoundry_ascend.ascend.cost_model.experience_lake import load_counterexample_boundaries
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import PyTorchSemanticAnalyzer
 from tilefoundry_ascend.ascend.sil.schema import (
     DTYPE_BYTES,
@@ -2515,6 +2517,336 @@ def append_dynamic_anchor(
     return (*anchors, new_spec)
 
 
+_NON_TAIL_DIM_KEYS = frozenset(
+    {
+        "total_elements",
+        "rank",
+        "num_inputs",
+        "dtype_bytes",
+        "case_id",
+        "case_num",
+        "group_count",
+        "b",
+        "b_dim",
+        "batch",
+        "n_q",
+        "n_kv",
+        "numheads",
+        "numkvheads",
+    }
+)
+_TOPOLOGY_AXIS_KEYS = ("compute_engine", "memory_ring", "iteration_regularity")
+
+
+def _optional_positive_float(raw: object) -> float | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        return val if val > 0.0 else None
+    if isinstance(raw, str):
+        try:
+            val = float(raw.strip())
+            return val if val > 0.0 else None
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_case_int(raw: object) -> int | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw)
+    if isinstance(raw, str):
+        try:
+            return int(raw.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _resolve_boundary_regime_tag(
+    record: Mapping[str, object],
+    *,
+    operator_name: str,
+    regime_specs: Sequence[RegimeTargetSpec],
+) -> str:
+    raw_tag = str(record.get("regime_tag", "")).strip()
+    if raw_tag:
+        return raw_tag
+    raw_dims = record.get("case_dims")
+    if isinstance(raw_dims, Mapping) and raw_dims and regime_specs:
+        return resolve_regime_for_case(operator_name, raw_dims, regime_specs).regime_tag
+    if regime_specs:
+        return regime_specs[0].regime_tag
+    return "tail_regression"
+
+
+def _append_anchor_with_fallback(
+    anchors: tuple[AnchorCaseSpec, ...],
+    *,
+    operator_name: str,
+    case_num: int,
+    regime_tag: str,
+    ref_perf_us: float | None = None,
+    t_hw_us: float | None = None,
+    cannbench_repo: str | Path | None = None,
+    env_file: str | Path | None = None,
+) -> tuple[AnchorCaseSpec, ...]:
+    cid = int(case_num)
+    if any(int(a.case_num) == cid for a in anchors):
+        return anchors
+    try:
+        return append_dynamic_anchor(
+            anchors,
+            operator_name=operator_name,
+            case_num=cid,
+            regime_tag=regime_tag,
+            ref_perf_us=ref_perf_us,
+            t_hw_us=t_hw_us,
+            cannbench_repo=cannbench_repo,
+            env_file=env_file,
+        )
+    except (FileNotFoundError, KeyError, OSError, ValueError, json.JSONDecodeError):
+        resolved_ref = 0.0 if ref_perf_us is None else float(ref_perf_us)
+        resolved_hw = 0.0 if t_hw_us is None else float(t_hw_us)
+        try:
+            return append_dynamic_anchor(
+                anchors,
+                operator_name=operator_name,
+                case_num=cid,
+                regime_tag=regime_tag,
+                ref_perf_us=resolved_ref,
+                t_hw_us=resolved_hw,
+                cannbench_repo=cannbench_repo,
+                env_file=env_file,
+            )
+        except (FileNotFoundError, KeyError, OSError, ValueError):
+            fallback_task = anchors[0].task if anchors else operator_name
+            return (
+                *anchors,
+                AnchorCaseSpec(
+                    task=fallback_task,
+                    case_num=cid,
+                    regime_tag=regime_tag,
+                    ref_perf_us=resolved_ref,
+                    t_hw_us=resolved_hw,
+                ),
+            )
+
+
+def _matches_topology_axes(
+    record: Mapping[str, object],
+    target_axes: Mapping[str, str],
+) -> bool:
+    if not target_axes:
+        return True
+    rec_axes = record.get("topology_axes")
+    if not isinstance(rec_axes, Mapping) or not rec_axes:
+        return True
+    for key, expected in target_axes.items():
+        raw_val = rec_axes.get(key)
+        if raw_val is None:
+            continue
+        val = str(raw_val).strip().lower()
+        if val and val != expected:
+            return False
+    return True
+
+
+def _record_has_unaligned_dim(record: Mapping[str, object]) -> bool:
+    if (
+        bool(record.get("has_unaligned_dim"))
+        or bool(record.get("odd_or_prime_tail"))
+        or bool(record.get("is_unaligned"))
+    ):
+        return True
+    raw_dims = record.get("case_dims")
+    if not isinstance(raw_dims, Mapping):
+        return False
+    raw_shapes = raw_dims.get("input_shape") or raw_dims.get("shapes")
+    if raw_shapes is not None:
+        for sh in _normalize_shape_list(raw_shapes):
+            if sh and sh[-1] > 1:
+                tail = sh[-1]
+                if tail % 2 == 1 or _is_prime_gt2(tail) or tail % 32 != 0:
+                    return True
+    for key, val in raw_dims.items():
+        if str(key).strip().lower() in _NON_TAIL_DIM_KEYS:
+            continue
+        if isinstance(val, int) and not isinstance(val, bool) and val > 1:
+            if val % 2 == 1 or _is_prime_gt2(val) or val % 32 != 0:
+                return True
+    return False
+
+
+def _find_unaligned_case_in_cannbench(
+    operator_name: str,
+    *,
+    existing_ids: set[int],
+    cannbench_repo: str | Path | None,
+    env_file: str | Path | None,
+) -> tuple[int, dict[str, object], float, float] | None:
+    try:
+        repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
+        task = get_operator_task(operator_name)
+        tasks_root = resolve_cannbench_tasks_root(repo)
+        cases_path = tasks_root / task / "cases.yaml"
+        if not cases_path.is_file():
+            return None
+        parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
+        cases_list = parsed.get("cases") or []
+    except (FileNotFoundError, KeyError, OSError, ValueError, yaml.YAMLError):
+        return None
+
+    meta_map: dict[int, tuple[float, float]] = {}
+    meta_path = tasks_root / "metadata" / "950pr.json"
+    if meta_path.is_file():
+        try:
+            meta_payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            level, op_key = task.split("/", 1)
+            op_meta = (meta_payload.get(level) or {}).get(op_key) or {}
+            for k_str, entry in op_meta.items():
+                if isinstance(entry, Mapping):
+                    meta_map[int(k_str)] = (
+                        float(entry.get("baseline_perf_us", 0.0) or 0.0),
+                        float(entry.get("t_hw_us", 0.0) or 0.0),
+                    )
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            pass
+
+    candidates: list[tuple[int, int, int, Mapping[str, object], float, float]] = []
+    for raw in cases_list:
+        if not isinstance(raw, Mapping):
+            continue
+        cid = _coerce_case_int(raw.get("case_id"))
+        if cid is None or cid < 0 or cid in existing_ids:
+            continue
+        ref_us, hw_us = meta_map.get(cid, (0.0, 0.0))
+        geom = _analyze_case_geometry(raw, ref_us, hw_us)
+        if not bool(geom.get("is_unaligned")):
+            continue
+        score = _coerce_case_int(geom.get("unaligned_score")) or 0
+        elems = _coerce_case_int(geom.get("total_elems")) or 1
+        candidates.append((-score, elems, cid, raw, ref_us, hw_us))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    _neg_score, _elems, best_cid, best_raw, best_ref, best_hw = candidates[0]
+    return best_cid, extract_schema_driven_case_dims(best_raw), best_ref, best_hw
+
+
+def inject_lake_counterexample_anchors(
+    initial_anchors: Sequence[AnchorCaseSpec],
+    *,
+    operator_name: str,
+    regime_specs: Sequence[RegimeTargetSpec],
+    experience_lake_dir: str | Path | None,
+    cannbench_repo: str | Path | None = None,
+    env_file: str | Path | None = None,
+    max_injected: int = 2,
+    topology_axes: Mapping[str, object] | None = None,
+) -> list[AnchorCaseSpec]:
+    """Inject high-frequency historical L3/L4 counterexamples or tail seeds into anchors."""
+    if experience_lake_dir is None or max_injected <= 0:
+        return list(initial_anchors)
+    lake_str = str(experience_lake_dir).strip()
+    if not lake_str:
+        return list(initial_anchors)
+
+    lake_path = Path(lake_str)
+    anchors_tuple = tuple(initial_anchors)
+    existing_ids = {int(a.case_num) for a in anchors_tuple}
+
+    same_op_records = load_counterexample_boundaries(lake_path, operator=operator_name)
+    if same_op_records:
+        freq: Counter[int] = Counter()
+        rep_by_case: dict[int, Mapping[str, object]] = {}
+        for rec in same_op_records:
+            cid = _coerce_case_int(rec.get("case_num"))
+            if cid is None or cid in existing_ids:
+                continue
+            freq[cid] += 1
+            prev_rep = rep_by_case.get(cid)
+            if prev_rep is None or (
+                not str(prev_rep.get("regime_tag", "")).strip()
+                and str(rec.get("regime_tag", "")).strip()
+            ):
+                rep_by_case[cid] = rec
+        ordered_cases = sorted(freq.items(), key=lambda item: (-item[1], item[0]))
+        for cid, _count in ordered_cases[:max_injected]:
+            rep = rep_by_case[cid]
+            resolved_tag = _resolve_boundary_regime_tag(
+                rep,
+                operator_name=operator_name,
+                regime_specs=regime_specs,
+            )
+            anchors_tuple = _append_anchor_with_fallback(
+                anchors_tuple,
+                operator_name=operator_name,
+                case_num=cid,
+                regime_tag=resolved_tag,
+                ref_perf_us=_optional_positive_float(rep.get("ref_perf_us")),
+                t_hw_us=_optional_positive_float(rep.get("t_hw_us")),
+                cannbench_repo=cannbench_repo,
+                env_file=env_file,
+            )
+        return list(anchors_tuple)
+
+    all_records = load_counterexample_boundaries(lake_path)
+    if not all_records:
+        return list(anchors_tuple)
+
+    target_axes = (
+        {
+            key: str(topology_axes.get(key, "")).strip().lower()
+            for key in _TOPOLOGY_AXIS_KEYS
+            if str(topology_axes.get(key, "")).strip()
+        }
+        if isinstance(topology_axes, Mapping)
+        else {}
+    )
+    filtered = [rec for rec in all_records if _matches_topology_axes(rec, target_axes)]
+    if not any(_record_has_unaligned_dim(rec) for rec in filtered):
+        return list(anchors_tuple)
+
+    found = _find_unaligned_case_in_cannbench(
+        operator_name,
+        existing_ids=existing_ids,
+        cannbench_repo=cannbench_repo,
+        env_file=env_file,
+    )
+    if found is None:
+        return list(anchors_tuple)
+
+    tail_cid, tail_dims, tail_ref, tail_hw = found
+    spec_tags = {spec.regime_tag for spec in regime_specs}
+    if "unaligned_tail" in spec_tags:
+        chosen_tag = "unaligned_tail"
+    elif "unaligned_d" in spec_tags:
+        chosen_tag = "unaligned_d"
+    elif regime_specs:
+        chosen_tag = resolve_regime_for_case(operator_name, tail_dims, regime_specs).regime_tag
+    else:
+        chosen_tag = "unaligned_tail"
+
+    anchors_tuple = _append_anchor_with_fallback(
+        anchors_tuple,
+        operator_name=operator_name,
+        case_num=tail_cid,
+        regime_tag=chosen_tag,
+        ref_perf_us=(tail_ref if tail_ref > 0.0 else None),
+        t_hw_us=(tail_hw if tail_hw > 0.0 else None),
+        cannbench_repo=cannbench_repo,
+        env_file=env_file,
+    )
+    return list(anchors_tuple)
+
+
 def compute_case_eq3_score(ref_perf_us: float, cand_us: float, t_hw_us: float) -> float:
     """Compute CANNBench Eq.3 per-case performance score in [0, +inf)."""
     if cand_us <= 0.0 or t_hw_us <= 0.0:
@@ -2713,6 +3045,7 @@ __all__ = [
     "get_operator_module_relpath",
     "get_operator_task",
     "infer_module_runtime_backend",
+    "inject_lake_counterexample_anchors",
     "load_anchor_harness_and_cases",
     "load_cannbench_contract_module",
     "lookup_case_dims",

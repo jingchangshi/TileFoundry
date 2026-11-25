@@ -117,10 +117,15 @@ class CaseObservationRecord:
     projected_gm_bytes: float = 0.0
     projected_contig_bytes: int = 32768
     timestamp: float = field(default_factory=time.time)
-    schema_version: int = 2
+    schema_version: int = 3
     min_gm_bytes: float = 0.0
     compute_floor_us: float = 0.0
     transfer_inflation_ratio: float = 0.0
+    analytical_pred_us: float = 0.0
+    ring_burst_k: int = 1
+    burst_batch_cv: float = 0.0
+    spike_retries: int = 0
+    card_ext_hbm_mb: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -155,6 +160,11 @@ class CaseObservationRecord:
             transfer_inflation_ratio=float(
                 payload.get("transfer_inflation_ratio", 0.0) or 0.0
             ),
+            analytical_pred_us=float(payload.get("analytical_pred_us", 0.0) or 0.0),
+            ring_burst_k=max(1, int(payload.get("ring_burst_k", 1) or 1)),
+            burst_batch_cv=max(0.0, float(payload.get("burst_batch_cv", 0.0) or 0.0)),
+            spike_retries=max(0, int(payload.get("spike_retries", 0) or 0)),
+            card_ext_hbm_mb=max(0, int(payload.get("card_ext_hbm_mb", 0) or 0)),
         )
 
 
@@ -595,11 +605,70 @@ class ExperienceLake:
         return pairs
 
 
+def _matches_counterexample_operator(record_op: str, target_op: str) -> bool:
+    rec_norm = str(record_op or "").strip().lower()
+    tgt_norm = str(target_op or "").strip().lower()
+    if not tgt_norm:
+        return True
+    if rec_norm == tgt_norm:
+        return True
+    if "/" not in tgt_norm or "/" not in rec_norm:
+        return rec_norm.rsplit("/", 1)[-1] == tgt_norm.rsplit("/", 1)[-1]
+    return False
+
+
+def append_counterexample_boundary(lake_dir: Path, record: Mapping[str, object]) -> Path:
+    """Append one L3/L4 counterexample boundary record to counterexample_anchors.jsonl."""
+    root = Path(lake_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    out_path = root / "counterexample_anchors.jsonl"
+    payload = {str(k): v for k, v in record.items()}
+    line = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    with out_path.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+    return out_path
+
+
+def load_counterexample_boundaries(
+    lake_dir: Path,
+    operator: str | None = None,
+) -> list[dict[str, object]]:
+    """Load persisted counterexample boundary records, optionally filtered by operator."""
+    in_path = Path(lake_dir) / "counterexample_anchors.jsonl"
+    if not in_path.is_file():
+        return []
+    records: list[dict[str, object]] = []
+    try:
+        lines = in_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for raw_line in lines:
+        raw = raw_line.strip()
+        if not raw:
+            continue
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if not isinstance(decoded, Mapping):
+            continue
+        item = {str(k): v for k, v in decoded.items()}
+        if operator is not None and not _matches_counterexample_operator(
+            str(item.get("operator", "")),
+            operator,
+        ):
+            continue
+        records.append(item)
+    return records
+
+
 __all__ = [
     "CandidateArtifactRecord",
     "CaseObservationRecord",
     "ExperienceLake",
+    "append_counterexample_boundary",
     "compute_source_sha256",
+    "load_counterexample_boundaries",
     "project_case_workload",
     "resolve_candidate_for_regime",
     "resolve_default_experience_lake_dir",
