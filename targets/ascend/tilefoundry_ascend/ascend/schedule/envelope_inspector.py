@@ -4015,6 +4015,27 @@ def _collect_divisor_vars(stmt, tirx=None) -> list[object]:
     return found
 
 
+_UNBOUND_SCALAR_EXTENT_DEFAULT = 16
+_UNBOUND_SCALAR_NAME_TOKENS: tuple[str, ...] = (
+    "block",
+    "tile",
+    "split",
+    "chunk",
+    "step",
+    "iter",
+    "topk",
+    "top_k",
+    "sparse",
+    "group",
+    "stage",
+)
+_BUFFER_FREE_AXIS_CAP = 65536
+
+
+def _same_tirx_var(lhs: object, rhs: object) -> bool:
+    return (hasattr(lhs, "same_as") and bool(lhs.same_as(rhs))) or lhs is rhs
+
+
 def _specialize_primfunc_for_anchors(
     entry_fn,
     mod_in,
@@ -4160,10 +4181,24 @@ def _specialize_primfunc_for_anchors(
                     _collect_expr_free_vars(arg)
 
     tirx.stmt_functor.post_order_visit(entry_fn.body, _visit_remaining)
+    param_var_set = [
+        p
+        for p in getattr(entry_fn, "params", ())
+        if isinstance(p, tirx.Var) and not _is_handle_or_data(p)
+    ]
+    capped_fallback_numel = min(int(fallback_numel), _BUFFER_FREE_AXIS_CAP)
     for fv in remaining_free_vars:
+        fv_name = str(getattr(fv, "name_hint", "") or str(fv)).lower()
+        in_buffer = any(_same_tirx_var(fv, bv) for bv in buffer_free_vars)
+        in_params = any(_same_tirx_var(fv, pv) for pv in param_var_set)
+        is_scalar_token = any(tok in fv_name for tok in _UNBOUND_SCALAR_NAME_TOKENS)
+        if (in_params and not in_buffer) or is_scalar_token or not in_buffer:
+            bound_extent = _UNBOUND_SCALAR_EXTENT_DEFAULT
+        else:
+            bound_extent = capped_fallback_numel
         dtype_str = str(getattr(fv, "dtype", "int32") or "int32")
         recorded_vars.append(fv)
-        spec_var_map[fv] = tirx.IntImm(dtype_str, int(fallback_numel))
+        spec_var_map[fv] = tirx.IntImm(dtype_str, int(bound_extent))
 
     params_list = list(getattr(entry_fn, "params", ()))
     denominators = _collect_div_denominators(entry_fn, tirx=tirx)
