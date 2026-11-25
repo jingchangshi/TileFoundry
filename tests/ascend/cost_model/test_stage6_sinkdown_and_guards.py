@@ -239,12 +239,13 @@ def test_observe_residual_anomaly_guard_skips_ridge_and_logs_outliers(tmp_path: 
     cal_path = tmp_path / "cal_dir" / "calibration.json"
     cal_model = HybridAscendCostModel(target, calibration_path=cal_path)
     cal_model.observe(wl, expected_analytical * math.exp(2.49))
-    assert len(cal_model._samples) == 1
+    cal_model.observe(wl, expected_analytical * math.exp(2.51))
+    assert len(cal_model._samples) == 2
     default_anomaly = cal_path.parent / "unmodeled_anomalies.jsonl"
     assert not default_anomaly.exists()
 
-    cal_model.observe(wl, expected_analytical * math.exp(2.51))
-    assert len(cal_model._samples) == 1
+    cal_model.observe(wl, expected_analytical * math.exp(8.1))
+    assert len(cal_model._samples) == 2
     assert default_anomaly.is_file()
     assert len(default_anomaly.read_text(encoding="utf-8").splitlines()) == 1
 

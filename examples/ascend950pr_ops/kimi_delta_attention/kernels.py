@@ -48,13 +48,14 @@ def _select_kimi_delta_attention_config(
     dk_alloc = ((max(1, int(dk)) + 63) // 64) * 64
     dv_alloc = ((max(1, int(dv)) + 63) // 64) * 64
     state_bytes = dk_alloc * dv_alloc * 4
-    if state_bytes <= 192 * 1024:
+    use_dv64_tile = (state_bytes > 192 * 1024) or (int(dv) > 128)
+    if not use_dv64_tile:
         regime = "persistent_ub_state_resident"
     else:
         regime = "chunked_dv_tile_state"
     default_chunk_t = min(max(1, int(t_dim)), 64 if schedule_mode == "tuned" else 16)
     chunk_t = int(chunk_t_override) if int(chunk_t_override) > 0 else default_chunk_t
-    default_dv_tile = 64 if state_bytes > 192 * 1024 else dv_alloc
+    default_dv_tile = 64 if use_dv64_tile else dv_alloc
     dv_tile = int(dv_tile_override) if int(dv_tile_override) > 0 else default_dv_tile
     return {
         "regime": regime,

@@ -1999,7 +1999,7 @@ def attention_residual(
 
     if (d_dim % 64) != 0:
         selector_fn, builder_fn = _select_ar_unaligned_config, _build_ar_unaligned_func
-    elif m_rows < 56:
+    elif m_rows < 16 or (m_rows < 56 and d_dim >= 1024):
         selector_fn, builder_fn = _select_ar_small_decode_config, _build_ar_small_decode_func
     else:
         selector_fn, builder_fn = _select_ar_aligned_config, _build_ar_aligned_func

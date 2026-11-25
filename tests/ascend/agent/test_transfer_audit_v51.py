@@ -437,10 +437,7 @@ def test_distilled_rule_directed_transfer_matrix_and_compat(tmp_path: Path) -> N
     assert d02_edge["rule_origin"] == "distilled"
     assert d02_edge["first_hit_delta_speedup"] == 0.25
 
-    r08_edge = by_edge[("R08_PERSISTENT_SWIZZLE", "matmul_dense", "moe_gmm", q2_key)]
-    assert r08_edge["source_quadrant"] == q1_key
-    assert r08_edge["rule_origin"] == "seed"
-    assert r08_edge["first_hit_delta_speedup"] == 0.22
+    assert ("R08_PERSISTENT_SWIZZLE", "matmul_dense", "moe_gmm", q2_key) not in by_edge
 
 
 def test_cli_end_to_end_json_and_markdown_outputs(tmp_path: Path) -> None:

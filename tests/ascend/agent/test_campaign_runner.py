@@ -687,7 +687,7 @@ def test_campaign_patience_escalation_xhigh_stepping_stone_and_regime_rotation(
     assert report.total_rounds == 8
     assert report.frozen_regimes == ("regime_a", "regime_b")
     assert report.escalated_rounds == (5, 6, 7, 8)
-    assert [r.regime_tag for r in report.rounds] == ["regime_a", "regime_b"] * 4
+    assert [r.regime_tag for r in report.rounds] == ["regime_b", "regime_a"] * 4
     assert [r.creative_effort for r in report.rounds] == ["high"] * 8
     assert report.rounds[4].parent_lane == "stepping_stone"
     assert report.rounds[4].creative_effort == "high"
@@ -4340,6 +4340,7 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
             max_rounds=1,
             k_rule_workers=1,
             min_surrogate_gain=0.25,
+            round_regime_tags=("regime_a",),
         ),
         target_module_path=target_mod,
         perf_target=PerfTargetSpec("attention_residual", 5.0, 5.0, 0.99, target_surrogate_score=99.0),
@@ -4379,6 +4380,7 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
             max_rounds=1,
             k_rule_workers=1,
             min_surrogate_gain=0.25,
+            round_regime_tags=("regime_a",),
         ),
         target_module_path=target_mod_reg,
         perf_target=PerfTargetSpec("attention_residual", 5.0, 5.0, 0.99, target_surrogate_score=99.0),

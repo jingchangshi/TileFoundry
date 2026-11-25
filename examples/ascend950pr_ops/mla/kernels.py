@@ -4388,8 +4388,6 @@ def mla(
         )
         _DISPATCH_CACHE[dispatch_key] = cfg
     bm = int(cfg["bm"])
-    bn = int(cfg.get("bn", 64))
-    num_stages = int(cfg.get("num_stages", 2 if schedule_mode == "tuned" else 1))
     aligned_group_q = bool(cfg["aligned_group_q"])
     num_kv_splits = (
         max(1, int(num_kv_splits_override))
@@ -4400,8 +4398,10 @@ def mla(
     compile_flags = tuple(str(f) for f in (cfg.get("compile_flags") or ()))
     raw_bk = cfg.get("builder_kwargs")
     extra_builder_kwargs = dict(raw_bk) if isinstance(raw_bk, dict) else {}
-    extra_builder_kwargs.setdefault("bn", bn)
-    extra_builder_kwargs.setdefault("num_stages", num_stages)
+    if "bn" in cfg:
+        extra_builder_kwargs.setdefault("bn", int(cfg["bn"]))
+    if "num_stages" in cfg:
+        extra_builder_kwargs.setdefault("num_stages", int(cfg["num_stages"]))
     raw_ck = cfg.get("combine_kwargs")
     extra_combine_kwargs = dict(raw_ck) if isinstance(raw_ck, dict) else None
 
@@ -4462,7 +4462,7 @@ def mla(
             num_kv_splits=1,
             pass_configs=pass_configs,
             compile_flags=compile_flags,
-            extra_builder_kwargs=extra_builder_kwargs,
+            extra_builder_kwargs=extra_builder_kwargs or None,
         )
         if use_trackb:
             q_n_in, q_r_in = q_n_flat, q_r_flat
@@ -4496,7 +4496,7 @@ def mla(
             num_kv_splits=num_kv_splits,
             pass_configs=pass_configs,
             compile_flags=compile_flags,
-            extra_builder_kwargs=extra_builder_kwargs,
+            extra_builder_kwargs=extra_builder_kwargs or None,
         )
         stage1_kernel(
             q_n_flat,

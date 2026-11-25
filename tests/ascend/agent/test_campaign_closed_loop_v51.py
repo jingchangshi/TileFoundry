@@ -898,7 +898,7 @@ def test_arc2_and_arc3_clean_gating_anomaly_log_and_lake_seed_injection(
             _make_anchor_metric(
                 case_num=2,
                 regime_tag="small_decode",
-                cand_us=5000.0,
+                cand_us=50000.0,
                 ring_burst_k=5,
                 burst_batch_cv=0.02,
                 spike_retries=0,
