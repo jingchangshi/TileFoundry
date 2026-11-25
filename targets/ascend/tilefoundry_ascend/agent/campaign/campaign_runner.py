@@ -388,7 +388,7 @@ def _resolve_l4_device_pool(config: CampaignConfig) -> tuple[str, ...]:
 
     The campaign's primary card is always first; configured extra cards follow
     in declaration order and the legacy single-retry card is appended. The pool
-    only narrows what AgentGates authorizes: every attempt is still a V2
+    only narrows what AgentGates authorizes: every attempt is still a managed
     submission on that card, so the adapter keeps ownership of the lease and
     the idle preflight.
     """
@@ -639,7 +639,7 @@ class PendingL4:
     L4 is never split across cards: a retry elsewhere is a complete run. The
     original execution/run IDs, receipt, card, and candidate digest stay attached.
     ``device_pool`` snapshots usable cards; attempted and rejected device ids keep
-    a blocked-env round and V2 refusals from repeating, while quota and occupancy
+    a blocked-env round and managed refusals from repeating, while quota and occupancy
     category fields bound backoff and prevent build-lock rotation. ``None`` quota
     means a legacy record; explicit ``0`` forbids another round.
     """
@@ -2916,7 +2916,7 @@ class PerfTargetCampaignRunner:
         key: str,
         value: Mapping[str, object] | None,
     ) -> None:
-        """Upsert a recoverable execution record before a long V2 wait starts.
+        """Upsert a recoverable execution record before a long AgentGates wait starts.
 
         The campaign checkpoint also carries round state; this read-modify-write
         adds only ``key`` so a process killed during submit/wait still leaves the
@@ -4210,7 +4210,7 @@ class PerfTargetCampaignRunner:
         candidates: Sequence[tuple[str, Path]],
         active_anchors: Sequence[AnchorCaseSpec],
     ) -> tuple[dict[str, CandidateSurrogateResult], dict[str, str]]:
-        """Evaluate one batch and return results plus each measured candidate's V2 run id.
+        """Evaluate one batch and return results plus each measured candidate's AgentGates run id.
 
         Legacy injected evaluators return a plain mapping; their results keep working and
         carry no run ids rather than borrowing an id from a different execution.
@@ -7546,7 +7546,7 @@ class PerfTargetCampaignRunner:
 
     @staticmethod
     def _is_rejected_card_l4(result: L4CannbenchResult) -> bool:
-        """Return True when V2 refused the submitted card as unauthorized.
+        """Return True when AgentGates refused the submitted card as unauthorized.
 
         Submit is the sole authorization authority. A refusal proves only that
         this card is outside the current allowlist, so the pool keeps moving;

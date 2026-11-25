@@ -305,7 +305,7 @@ class CandidateSurrogateResult:
 
 
 class L2BatchResults(dict[str, CandidateSurrogateResult]):
-    """L2 candidate results that also carry the V2 run id of their measuring execution.
+    """L2 candidate results that also carry the AgentGates run id of their measuring execution.
 
     The mapping protocol is unchanged so legacy evaluators can keep returning plain
     dictionaries; ``run_ids`` maps each candidate that was actually measured to the
@@ -3191,7 +3191,7 @@ def _agent_gates_config() -> Mapping[str, object]:
 
 
 def _agent_gates_workspace_name(source_root: Path) -> str:
-    """Resolve the configured V2 workspace whose source root is ``source_root``."""
+    """Resolve the configured AgentGates workspace whose source root is ``source_root``."""
     raw = _agent_gates_config()
     workspaces = raw.get("workspaces")
     if not isinstance(workspaces, Mapping):
@@ -3224,7 +3224,7 @@ def _sha256_file(path: Path) -> str:
 
 @dataclass(frozen=True)
 class _V2GateExecution:
-    """Outcome of one V2 submit/wait/report/verify sequence."""
+    """Outcome of one AgentGates submit/wait/report/verify sequence."""
 
     execution_id: str = ""
     run_id: str = ""
@@ -3324,7 +3324,7 @@ def _submit_device_rejected(
     proc: subprocess.CompletedProcess[str],
     parsed: Mapping[str, object],
 ) -> bool:
-    """Return True when V2 refused the named card as unauthorized.
+    """Return True when AgentGates refused the named card as unauthorized.
 
     Submit is the sole authorization authority; doctor deliberately does not
     check the allowlist. The CLI reports the refusal as a structured
@@ -3356,7 +3356,7 @@ def _run_v2_gate(
     resume_run_id: str = "",
     on_execution_started: Callable[[str, str], None] | None = None,
 ) -> _V2GateExecution:
-    """Run one V2 gate with a single monotonic deadline and one execution identity.
+    """Run one managed gate with a single monotonic deadline and one execution identity.
 
     A new submission first diagnoses the same route with the same target and
     candidate, so a blocked machine or an unusable pair is refused before an
@@ -4532,7 +4532,7 @@ def run_l3_full_contract_via_agent_gates(
     resume_run_id: str = "",
     on_execution_started: Callable[[str, str], None] | None = None,
 ) -> L3AcceptanceResult:
-    """Run the L3 promotion gate through V2 and validate its signed promotion evidence.
+    """Run the L3 promotion gate through AgentGates and validate its signed promotion evidence.
 
     The adapter owns the interpreter, CANN/TileLang setup, cache policy and device.
     TileFoundry supplies only the canonical target and the workspace-relative candidate;
@@ -5028,7 +5028,7 @@ def run_micro_probe_via_agent_gates(
 
 
 def _agent_gates_evidence_root() -> Path:
-    """Read the configured AgentGates evidence root used by the V2 worker."""
+    """Read the configured AgentGates evidence root used by the managed worker."""
     raw = _agent_gates_config()
     evidence_root = raw.get("evidence_root")
     if not isinstance(evidence_root, str) or not evidence_root.strip():
@@ -5080,7 +5080,7 @@ def _run_agent_gates_v2_cmd(
     root: Path,
     timeout_sec: float,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
-    """Run one V2 AgentGates command against the configured worker evidence."""
+    """Run one managed AgentGates command against the configured worker evidence."""
     proc = subprocess.run(
         [str(part) for part in cmd],
         text=True,
@@ -5256,9 +5256,9 @@ def run_l4_official_cannbench_via_agent_gates(
     resume_run_id: str = "",
     on_execution_started: Callable[[str, str], None] | None = None,
 ) -> L4CannbenchResult:
-    """Run official tilefoundry-npu-cannbench through V2 and verify its signed receipt.
+    """Run official tilefoundry-npu-cannbench through AgentGates and verify its signed receipt.
 
-    The campaign's actual entry always uses V2: the adapter owns environment, device
+    The campaign's actual entry always uses AgentGates: the adapter owns environment, device
     lease and cache policy, while the candidate module is bound by path and signed
     observation. The default wait budgets queueing, prep and the 3600 s official bound.
     Metrics are returned only after the official-final validation flags, case counts,

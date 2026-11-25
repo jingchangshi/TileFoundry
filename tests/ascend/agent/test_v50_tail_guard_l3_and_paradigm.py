@@ -950,6 +950,7 @@ def kernel(x):
 
     class _RecurrentSemantics:
         has_recurrent_loop = True
+        has_associative_outer_recurrence = True
 
     monkeypatch.setattr(campaign_runner, "build_prescreen_summary_from_kwargs", _spy_prescreen)
     monkeypatch.setattr(campaign_runner, "rank_symptom_families", _spy_rank_symptoms)
@@ -1157,6 +1158,7 @@ def kernel(x):
 
     class _RecurrentSemantics:
         has_recurrent_loop = True
+        has_associative_outer_recurrence = True
 
     async def _empty_filter(
         _candidates: Sequence[tuple[str, str]],
