@@ -1,6 +1,7 @@
 """TileLang Ascend950PR Pure RegBase SimdVF kernel for AddRmsNormDynamicQuant."""
 
 import contextlib
+import math
 
 import tilelang
 import tilelang.ascend.language as T
@@ -29,30 +30,61 @@ def _select_add_rms_norm_dynamic_quant_config(
     *,
     m_rows: int = 1024,
     schedule_mode: str = "tuned",
+    tile_m_override: int = 0,
+    num_stages_override: int = 0,
 ) -> dict[str, object]:
     """Select UB-resident single-pass row packing for Add+RMSNorm+DynamicQuant."""
     d_alloc = ((max(1, int(d_dim)) + 63) // 64) * 64
     ub_budget = 256 * 1024 - 4096 if schedule_mode == "tuned" else 192 * 1024
     cache_g_f32 = d_alloc <= 8192
-    use_reg_s = d_dim <= 256
     gamma_bytes = d_alloc * (6 if cache_g_f32 else 2)
-    ynorm_bytes = 0 if use_reg_s else (4 * d_alloc)
-    stages = 2 if (schedule_mode == "tuned" and m_rows >= 56 * 2 and d_alloc <= 8192 and not (m_rows <= 512 and d_dim <= 512)) else 1
-    row_bytes_s2 = d_alloc * (2 * stages + 2 * stages + 2 * stages + 1 * stages) + 64
-    if stages == 2 and (gamma_bytes + ynorm_bytes + row_bytes_s2) > ub_budget:
-        stages = 1
-    row_bytes = d_alloc * (2 * stages + 2 * stages + 2 * stages + 1 * stages) + 64
-    max_rows = max(1, min(64, (ub_budget - gamma_bytes - ynorm_bytes) // max(1, row_bytes)))
-    if (d_dim % 64) != 0:
-        max_rows = min(max_rows, 32)
-    if m_rows <= 512 and d_dim <= 512:
-        max_rows = max(1, min(max_rows, (m_rows + 55) // 56))
-    elif max_rows > 1 and m_rows >= 112 and m_rows < 56 * max_rows * 2:
-        max_rows = max(1, min(max_rows, max(1, m_rows // 112)))
-    elif max_rows > 1 and m_rows < 56 * max_rows:
-        max_rows = max(1, min(max_rows, max(1, m_rows // 56)))
-    regime = "aligned_reg_resident" if use_reg_s else (
-        "aligned_single_pass_ub" if (d_dim % 64) == 0 else "unaligned_predicated"
+    if int(num_stages_override) > 0:
+        stages = max(1, min(2, int(num_stages_override)))
+    else:
+        stages = (
+            2
+            if (
+                schedule_mode == "tuned"
+                and m_rows >= 56 * 2
+                and d_alloc <= 8192
+                and not (m_rows <= 512 and d_dim <= 512)
+            )
+            else 1
+        )
+        ynorm_min = 0 if d_dim <= 128 else (4 * d_alloc)
+        row_bytes_s2 = d_alloc * (7 * stages) + 64
+        if stages == 2 and (gamma_bytes + ynorm_min + row_bytes_s2) > ub_budget:
+            stages = 1
+
+    if int(tile_m_override) > 0:
+        max_rows = max(1, int(tile_m_override))
+    else:
+        ynorm_bytes_est = 4 * d_alloc
+        row_bytes = d_alloc * (7 * stages) + 64
+        max_rows = max(
+            1,
+            min(64, (ub_budget - gamma_bytes - ynorm_bytes_est) // max(1, row_bytes)),
+        )
+        if (d_dim % 64) != 0:
+            max_rows = min(max_rows, 32)
+        if m_rows <= 512 and d_dim <= 512:
+            max_rows = max(1, min(max_rows, (m_rows + 55) // 56))
+        elif max_rows > 1 and m_rows >= 112 and m_rows < 56 * max_rows * 2:
+            max_rows = max(1, min(max_rows, max(1, m_rows // 112)))
+        elif max_rows > 1 and m_rows < 56 * max_rows:
+            max_rows = max(1, min(max_rows, max(1, m_rows // 56)))
+        if (d_dim % 64) == 0 and d_dim < 512:
+            cacheline_rows = 512 // math.gcd(512, d_dim)
+            if max_rows >= cacheline_rows and m_rows >= 56 * cacheline_rows * 2:
+                max_rows = max(cacheline_rows, (max_rows // cacheline_rows) * cacheline_rows)
+        elif (d_dim % 64) == 0 and max_rows >= 8:
+            max_rows = max(4, (max_rows // 4) * 4)
+
+    use_reg_s = d_dim <= 128 and max_rows <= 2
+    regime = (
+        "aligned_reg_resident"
+        if use_reg_s
+        else ("aligned_single_pass_ub" if (d_dim % 64) == 0 else "unaligned_predicated")
     )
     return {
         "regime": regime,
@@ -73,6 +105,8 @@ def _build_add_rms_norm_dynamic_quant_prim_func(
     num_stages: int = 2,
     cache_g_f32: bool = True,
     schedule_mode: str = "tuned",
+    tile_m_override: int = 0,
+    num_stages_override: int = 0,
     **_extra_kwargs,
 ):
     """Build Ascend 950 Pure RegBase SimdVF @T.prim_func for AddRmsNormDynamicQuant."""
@@ -82,15 +116,17 @@ def _build_add_rms_norm_dynamic_quant_prim_func(
         raise ValueError(f"unsupported dtype {tl_dtype!r}")
 
     num_cores = 56
-    rows = max(1, int(tile_m))
+    raw_rows = int(tile_m_override) if int(tile_m_override) > 0 else int(tile_m)
+    rows = max(1, raw_rows)
     rows_alloc = max(8, ((rows + 7) // 8) * 8)
-    stages = max(1, min(2, int(num_stages)))
+    raw_stages = int(num_stages_override) if int(num_stages_override) > 0 else int(num_stages)
+    stages = max(1, min(2, raw_stages))
     full_chunks = d_dim // 64
     rem = d_dim % 64
     d_alloc = ((d_dim + 63) // 64) * 64
     inv_d = 1.0 / float(d_dim)
     inv_127 = 1.0 / 127.0
-    use_reg_s = d_dim <= 256
+    use_reg_s = d_dim <= 128 and rows <= 2
     pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
     m_rows = T.dynamic("m_rows")
 
