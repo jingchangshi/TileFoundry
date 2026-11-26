@@ -6,6 +6,7 @@ import ast
 import asyncio
 import importlib
 import json
+import subprocess
 import sys
 import time
 import types
@@ -2010,6 +2011,187 @@ def test_run_l1_hybrid_trackb_runs_trackb_fail_fast_before_tilelang(
     assert len(l1_calls) == 1
     assert len(sec_calls) == 0
     assert pass_res.elapsed_sec == pytest.approx(0.55)
+
+
+def test_run_l1_hybrid_trackb_marks_shared_sos_verified_and_skips_prewarm_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing hybrid Track-B _run_l1 populates verified SO keys so prewarm skips subprocess."""
+    unified_cache = tmp_path / "unified_tl_cache"
+    monkeypatch.setenv("TILELANG_CACHE_DIR", str(unified_cache))
+    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
+    monkeypatch.setattr(surrogate_cannbench, "_VERIFIED_HYBRID_TRACKB_SO_KEYS", set())
+
+    hyb_src = (
+        '_HYB_CPP = """\n'
+        '__global__ void hyb_tb_kernel() {}\n'
+        'extern "C" void launch_hyb() { hyb_tb_kernel<<<1, 0, 0>>>(); }\n'
+        '"""\n'
+        "def _render_trackb_tu(D=128, trackb_src='', **_kw):\n"
+        "    return f'// D={D}\\n{trackb_src}'\n"
+        "def _build_hyb_prim(tile_m=16):\n"
+        "    return int(tile_m)\n"
+    )
+    hyb_spec = RegimeTargetSpec(
+        regime_tag="decode",
+        builder_candidates=("_build_hyb_prim",),
+        sample_builder_kwargs={"tile_m": 16},
+        editable_symbols=("_build_hyb_prim", "_HYB_CPP", "_render_trackb_tu"),
+        runtime_backend="hybrid_trackb",
+        trackb_symbols=("_HYB_CPP",),
+        representative_anchor_dims={"D": 128},
+    )
+
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_regime_config",
+        lambda *_a, **_kw: types.SimpleNamespace(
+            builder_name="_build_hyb_prim",
+            builder_kwargs={"tile_m": 16},
+            pass_configs={},
+            compile_flags=(),
+            selector_name="",
+            combine_kwargs={},
+        ),
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_cannbench_repo",
+        lambda **_kw: (_ for _ in ()).throw(FileNotFoundError("isolated")),
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "lookup_case_static_spec",
+        lambda _op, cnum, **_kw: {"D": 128 if int(cnum) == 0 else 256},
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "run_l1_compile_check",
+        lambda _src, **_kw: StageBResult(passed=True, elapsed_sec=0.1),
+    )
+
+    bin_file = tmp_path / "prebuilt.o"
+    bin_file.write_bytes(b"ELF_HYB_OK")
+
+    def _fake_ascendc_compile(
+        cpp_source: str,
+        *,
+        emit_shared_so_cache_dir: Path | None = None,
+        compile_flags: Sequence[str] | str | None = None,
+        **_kw: object,
+    ) -> StageBResult:
+        if emit_shared_so_cache_dir is not None:
+            so_p = Path(emit_shared_so_cache_dir) / (
+                stage_gate_coordinator.compute_trackb_shared_so_filename(
+                    cpp_source, compile_flags
+                )
+            )
+            so_p.parent.mkdir(parents=True, exist_ok=True)
+            so_p.write_bytes(b"ELF_SO_PRI")
+        return StageBResult(passed=True, elapsed_sec=0.2, binary_paths=(str(bin_file),))
+
+    def _fake_compile_shared_so(
+        cpp_source: str,
+        *,
+        cache_dir: Path,
+        compile_flags: Sequence[str] | str | None = None,
+        **_kw: object,
+    ) -> tuple[bool, Path | None, str]:
+        so_p = Path(cache_dir) / stage_gate_coordinator.compute_trackb_shared_so_filename(
+            cpp_source, compile_flags
+        )
+        so_p.parent.mkdir(parents=True, exist_ok=True)
+        so_p.write_bytes(b"ELF_SO_SEC")
+        return True, so_p, ""
+
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "run_stage_b_ascendc_compile",
+        _fake_ascendc_compile,
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "compile_trackb_shared_so",
+        _fake_compile_shared_so,
+    )
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "get_operator_entrypoint",
+        lambda _op: "mla_kernel",
+    )
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "infer_module_runtime_backend",
+        lambda *_a, **_kw: ("hybrid_trackb", ("_HYB_CPP",)),
+    )
+
+    anchors = (
+        AnchorCaseSpec("level4/mla", 0, "decode", 20.0, 2.0),
+        AnchorCaseSpec("level4/mla", 1, "prefill", 20.0, 2.0),
+    )
+    coord = StageGateCoordinator(
+        operator_name="mla",
+        source_root=tmp_path,
+        target_module_path=tmp_path / "kernel.py",
+        regime_specs=(hyb_spec,),
+        scoreboard_anchors=anchors,
+        static_width_dims_fn=lambda _s: (),
+    )
+
+    res = coord._run_l1(hyb_src, hyb_spec)
+    assert res.passed is True
+    expected_key = surrogate_cannbench._hybrid_trackb_so_cache_key(
+        hyb_src,
+        unified_cache,
+        coord._resolve_cases_yaml_sha256(),
+        [0, 1],
+    )
+    assert expected_key in surrogate_cannbench._VERIFIED_HYBRID_TRACKB_SO_KEYS
+
+    def _forbid_subprocess_run(*_a: object, **_kw: object) -> object:
+        raise AssertionError("subprocess.run must not be spawned when SOs are verified")
+
+    monkeypatch.setattr(subprocess, "run", _forbid_subprocess_run)
+
+    cand_path = tmp_path / "cand.py"
+    cand_path.write_text(hyb_src, encoding="utf-8")
+    failed_by_cid: dict[str, str] = {}
+    surrogate_cannbench._ensure_hybrid_trackb_shared_sos_cached(
+        operator_name="mla",
+        valid_candidates=[("cand_0", str(cand_path))],
+        cand_sources={"cand_0": hyb_src},
+        anchors=(anchors[1], anchors[0]),
+        repo=tmp_path,
+        root=tmp_path,
+        resolved_tl_cache=unified_cache.resolve(),
+        resolved_ref_cache=tmp_path / "ref_cache",
+        cases_yaml_sha256="",
+        env_vals={},
+        timeout_sec=30,
+        isolate_non_incumbent=True,
+        failed_by_cid=failed_by_cid,
+    )
+    assert failed_by_cid == {}
+
+    surrogate_cannbench._VERIFIED_HYBRID_TRACKB_SO_KEYS.clear()
+    with pytest.raises(AssertionError, match="subprocess.run must not be spawned"):
+        surrogate_cannbench._ensure_hybrid_trackb_shared_sos_cached(
+            operator_name="mla",
+            valid_candidates=[("cand_0", str(cand_path))],
+            cand_sources={"cand_0": hyb_src},
+            anchors=anchors,
+            repo=tmp_path,
+            root=tmp_path,
+            resolved_tl_cache=unified_cache.resolve(),
+            resolved_ref_cache=tmp_path / "ref_cache",
+            cases_yaml_sha256="",
+            env_vals={},
+            timeout_sec=30,
+            isolate_non_incumbent=True,
+            failed_by_cid=failed_by_cid,
+        )
+
 
 
 

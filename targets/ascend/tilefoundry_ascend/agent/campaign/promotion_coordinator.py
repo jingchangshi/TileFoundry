@@ -133,10 +133,16 @@ def to_conservation_point(
 ) -> AnchorConservationPoint:
     """Convert candidate and incumbent anchor metrics into a conservation point."""
     inc_us = float(inc.cand_us) if (inc is not None and inc.cand_us > 0.0) else float(cand.cand_us)
-    mad = max(
-        float(getattr(cand, "paired_rel_mad", 0.0) or 0.0),
-        float(getattr(inc, "paired_rel_mad", 0.0) or 0.0) if inc is not None else 0.0,
-    )
+    is_paired = float(getattr(cand, "paired_speedup_vs_incumbent", 0.0) or 0.0) > 0.0
+    if is_paired:
+        mad = float(getattr(cand, "paired_rel_mad", 0.0) or 0.0)
+        ref_burst_cv = 0.0
+    else:
+        mad = max(
+            float(getattr(cand, "paired_rel_mad", 0.0) or 0.0),
+            float(getattr(inc, "paired_rel_mad", 0.0) or 0.0) if inc is not None else 0.0,
+        )
+        ref_burst_cv = float(inc.burst_batch_cv) if inc is not None else 0.0
     point_fields = {f.name for f in fields(AnchorConservationPoint)}
     if {"cand_burst_cv", "ref_burst_cv", "burst_count"} <= point_fields:
         return AnchorConservationPoint(
@@ -149,7 +155,7 @@ def to_conservation_point(
             paired_rel_mad=mad,
             accuracy_passed=bool(cand.accuracy_passed),
             cand_burst_cv=float(cand.burst_batch_cv),
-            ref_burst_cv=float(inc.burst_batch_cv) if inc is not None else 0.0,
+            ref_burst_cv=ref_burst_cv,
             burst_count=max(1, int(cand.ring_burst_k)),
         )
     return AnchorConservationPoint(

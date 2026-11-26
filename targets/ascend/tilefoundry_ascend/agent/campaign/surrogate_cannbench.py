@@ -894,7 +894,8 @@ def measure_paired_interleaved_micro_burst(
         eff_sync()
         return (float(start_ev.elapsed_time(end_ev)) * 1000.0) / float(k)
 
-    warm_iters = max(1, int(warmup))
+    is_real_npu_path = event_factory is None and synchronize_fn is None
+    warm_iters = max(6 if is_real_npu_path else 1, int(warmup))
     for _cid, fn in candidates:
         for _ in range(warm_iters):
             _invoke_callable(fn, params)
@@ -926,6 +927,16 @@ def measure_paired_interleaved_micro_burst(
             k = 1
             ring_inputs = [params]
 
+    timing_reps = k
+    if (
+        is_real_npu_path
+        and k == 1
+        and eff_probe_us is not None
+        and math.isfinite(eff_probe_us)
+        and 0.0 < eff_probe_us < 200.0
+    ):
+        timing_reps = max(1, min(8, int(200.0 // eff_probe_us)))
+
     num_rounds = max(7, int(repeat))
     num_cands = len(candidates)
     samples_by_idx: list[list[float]] = [[] for _ in range(num_cands)]
@@ -933,7 +944,7 @@ def measure_paired_interleaved_micro_burst(
         for offset in range(num_cands):
             idx = (offset + round_idx) % num_cands
             _cid, fn = candidates[idx]
-            samples_by_idx[idx].append(_time_once(fn, ring_inputs, round_idx, k))
+            samples_by_idx[idx].append(_time_once(fn, ring_inputs, round_idx, timing_reps))
 
     ref_samples = samples_by_idx[0]
     out: dict[str, tuple[float, int, float, float, float]] = {}
@@ -5135,6 +5146,35 @@ def _build_prewarm_subprocess_env(
     return run_env, _build_argv, cann_setup
 
 
+def _hybrid_trackb_so_cache_key(
+    module_source: str,
+    tl_cache_dir: str | Path,
+    cases_yaml_sha256: str,
+    anchor_case_nums: Sequence[int],
+) -> tuple[str, str, str, str]:
+    mod_sha = hashlib.sha256(module_source.encode("utf-8")).hexdigest()
+    resolved_cache = str(Path(tl_cache_dir).expanduser().resolve())
+    anchor_nums_key = ",".join(str(c) for c in sorted({int(c) for c in anchor_case_nums}))
+    return (mod_sha, resolved_cache, cases_yaml_sha256, anchor_nums_key)
+
+
+def mark_hybrid_trackb_shared_sos_verified(
+    module_source: str,
+    tl_cache_dir: str | Path,
+    cases_yaml_sha256: str,
+    anchor_case_nums: Sequence[int],
+) -> None:
+    """Record a hybrid Track-B module's anchor shared libraries as verified."""
+    cache_key = _hybrid_trackb_so_cache_key(
+        module_source,
+        tl_cache_dir,
+        cases_yaml_sha256,
+        anchor_case_nums,
+    )
+    with _VERIFIED_HYBRID_TRACKB_SO_LOCK:
+        _VERIFIED_HYBRID_TRACKB_SO_KEYS.add(cache_key)
+
+
 def _ensure_hybrid_trackb_shared_sos_cached(
     *,
     operator_name: str,
@@ -5155,7 +5195,7 @@ def _ensure_hybrid_trackb_shared_sos_cached(
         entrypoint = get_operator_entrypoint(operator_name)
     except (KeyError, FileNotFoundError, ValueError):
         entrypoint = ""
-    anchor_nums_key = ",".join(str(int(a.case_num)) for a in anchors)
+    anchor_case_nums = [int(a.case_num) for a in anchors]
     pending_cands: list[tuple[str, str, tuple[str, str, str, str]]] = []
     for cid, mod_path_str in valid_candidates:
         if cid in failed_by_cid:
@@ -5165,8 +5205,12 @@ def _ensure_hybrid_trackb_shared_sos_cached(
             continue
         if infer_module_runtime_backend(mod_src, entrypoint)[0] != "hybrid_trackb":
             continue
-        mod_sha = hashlib.sha256(mod_src.encode("utf-8")).hexdigest()
-        cache_key = (mod_sha, str(resolved_tl_cache), cases_yaml_sha256, anchor_nums_key)
+        cache_key = _hybrid_trackb_so_cache_key(
+            mod_src,
+            resolved_tl_cache,
+            cases_yaml_sha256,
+            anchor_case_nums,
+        )
         with _VERIFIED_HYBRID_TRACKB_SO_LOCK:
             if cache_key in _VERIFIED_HYBRID_TRACKB_SO_KEYS:
                 continue
@@ -9397,6 +9441,7 @@ __all__ = [
     "ensure_npu_compare_shim_dir",
     "extract_ordered_tensor_shapes",
     "lookup_case_static_spec",
+    "mark_hybrid_trackb_shared_sos_verified",
     "measure_npu_ring_burst_stats",
     "measure_paired_interleaved_micro_burst",
     "order_candidates_by_idle_preflight",

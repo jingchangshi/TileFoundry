@@ -161,7 +161,7 @@ def _measure_npu_latency_stats_us(
     """Collect NPU Event latency samples and return (median_us, batch_cv)."""
     if not hasattr(getattr(torch, "npu", None), "Event"):
         return float(_measure_npu_latency_us(fn_call, warmup=warmup, repeat=repeat)), 0.0
-    for _ in range(max(1, warmup)):
+    for _ in range(max(6, int(warmup))):
         fn_call()
     torch.npu.synchronize()
     samples_us: list[float] = []

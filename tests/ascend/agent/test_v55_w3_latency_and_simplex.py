@@ -21,6 +21,7 @@ from tilefoundry_ascend.agent.campaign.latency_algebra import (
     AnchorConservationPoint,
     calibrate_dispatch_floor_from_series,
     calibrate_dispatch_floor_us,
+    check_regime_net_improvement,
     compute_paired_sigma_us,
 )
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import to_conservation_point
@@ -426,3 +427,64 @@ def test_real_mla_case7_dispatch_floor_and_recoverable_sched() -> None:
     assert floor_with_null <= 3.04
     assert floor_with_null == pytest.approx(1.8)
     assert case7_pt.recoverable_sched_us(floor_with_null) > 18.0
+
+
+def test_to_conservation_point_isolates_paired_from_stale_unpaired_baseline() -> None:
+    """Ignore stale unpaired inc burst CV when paired_speedup_vs_incumbent > 0."""
+    inc = AnchorEvalMetrics(
+        case_num=1,
+        regime_tag="prefill_compute",
+        accuracy_passed=True,
+        cand_us=100.0,
+        ref_perf_us=120.0,
+        t_hw_us=20.0,
+        speedup=1.2,
+        roofline_eta=0.2,
+        eq3_score=1.2,
+        ring_burst_k=7,
+        burst_batch_cv=0.092,
+        paired_speedup_vs_incumbent=0.0,
+        paired_rel_mad=0.045,
+    )
+    paired_cand = AnchorEvalMetrics(
+        case_num=1,
+        regime_tag="prefill_compute",
+        accuracy_passed=True,
+        cand_us=100.0 / 1.046,
+        ref_perf_us=120.0,
+        t_hw_us=20.0,
+        speedup=1.2 * 1.046,
+        roofline_eta=0.2 * 1.046,
+        eq3_score=1.2 * 1.046,
+        ring_burst_k=7,
+        burst_batch_cv=0.008,
+        paired_speedup_vs_incumbent=1.046,
+        paired_rel_mad=0.008,
+    )
+    paired_pt = to_conservation_point(paired_cand, inc)
+    assert paired_pt.ref_burst_cv == pytest.approx(0.0)
+    assert paired_pt.cand_burst_cv == pytest.approx(0.008)
+    assert paired_pt.paired_rel_mad == pytest.approx(0.008)
+    assert paired_pt.burst_count == 7
+    ok, gain_us, thresh_us = check_regime_net_improvement([paired_pt], sigma_mult=2.0)
+    assert ok is True
+    assert gain_us > thresh_us
+
+    unpaired_cand = AnchorEvalMetrics(
+        case_num=1,
+        regime_tag="prefill_compute",
+        accuracy_passed=True,
+        cand_us=100.0 / 1.046,
+        ref_perf_us=120.0,
+        t_hw_us=20.0,
+        speedup=1.2 * 1.046,
+        roofline_eta=0.2 * 1.046,
+        eq3_score=1.2 * 1.046,
+        ring_burst_k=7,
+        burst_batch_cv=0.008,
+        paired_speedup_vs_incumbent=0.0,
+        paired_rel_mad=0.008,
+    )
+    unpaired_pt = to_conservation_point(unpaired_cand, inc)
+    assert unpaired_pt.ref_burst_cv == pytest.approx(0.092)
+    assert unpaired_pt.paired_rel_mad == pytest.approx(0.045)

@@ -75,6 +75,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     aggregate_surrogate_result,
     extract_ordered_tensor_shapes,
     lookup_case_static_spec,
+    mark_hybrid_trackb_shared_sos_verified,
     run_l0_l1_round_filter,
     run_l1_compile_check,
     run_surrogate_batch_via_agent_gates,
@@ -1953,6 +1954,13 @@ class StageGateCoordinator:
                 failed_tier="stage_b",
             )
             return tb_b, cached_tb_rec, tb_elapsed_sec, fail_res
+        if not has_tb_override and self._scoreboard_anchors:
+            mark_hybrid_trackb_shared_sos_verified(
+                module_source,
+                unified_tl_cache,
+                self._resolve_cases_yaml_sha256(),
+                [int(a.case_num) for a in self._scoreboard_anchors],
+            )
         return tb_b, cached_tb_rec, tb_elapsed_sec, None
 
     def _run_l1(
