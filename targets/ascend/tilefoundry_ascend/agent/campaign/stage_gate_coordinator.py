@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -78,6 +79,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     run_l1_compile_check,
     run_surrogate_batch_via_agent_gates,
 )
+_ORIG_RUN_L0_L1_ROUND_FILTER = run_l0_l1_round_filter
 from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor, create_cost_advisor
 from tilefoundry_ascend.agent.kb.bayesian_tracker import (
     BayesianRuleTracker,
@@ -1682,6 +1684,10 @@ class StageGateCoordinator:
             ):
                 return
             sig = _static_width_signature(cand)
+            if static_width_dims_fn is None and not any(
+                isinstance(v, int) and not isinstance(v, bool) for _, v in sig
+            ):
+                return
             if sig:
                 if sig in seen_sigs:
                     return
@@ -2818,7 +2824,7 @@ class StageGateCoordinator:
             wkind: str,
             rule: AscendCausalRule | None,
             req: GenerationRequest,
-        ) -> tuple[str, str, AscendCausalRule | None, str | None, str, str, bool]:
+        ) -> tuple[int, str, str, AscendCausalRule | None, str | None, str, str, bool]:
             assert eff_backend is not None
             if stagger_sec > 0.0 and slot_idx > 0:
                 await asyncio.sleep(float(slot_idx) * stagger_sec)
@@ -2831,12 +2837,30 @@ class StageGateCoordinator:
                 RuntimeError,
                 ConnectionError,
             ) as exc:
-                return wid, wkind, rule, None, "", f"llm_transport:{type(exc).__name__}:{exc}", True
+                return (
+                    slot_idx,
+                    wid,
+                    wkind,
+                    rule,
+                    None,
+                    "",
+                    f"llm_transport:{type(exc).__name__}:{exc}",
+                    True,
+                )
             try:
                 snippet = extract_python_dsl(raw)
-                return wid, wkind, rule, snippet, "", "", False
+                return slot_idx, wid, wkind, rule, snippet, "", "", False
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-                return wid, wkind, rule, None, "", f"llm_parse:{type(exc).__name__}:{exc}", False
+                return (
+                    slot_idx,
+                    wid,
+                    wkind,
+                    rule,
+                    None,
+                    "",
+                    f"llm_parse:{type(exc).__name__}:{exc}",
+                    False,
+                )
 
         async def _call_creative_worker(
             slot_idx: int,
@@ -2902,84 +2926,42 @@ class StageGateCoordinator:
             else:
                 exploit_specs.append((slot_idx, wid, wkind, rule, req))
 
-        llm_t0 = time.monotonic()
-        current_creative_tasks: list[
-            tuple[int, str, AscendCausalRule | None, asyncio.Task[SpeculativeCreativeResult]]
-        ] = []
-        has_pending_creative = any(not t.done() for _, _, _, t in self._pending_speculative)
-        if has_pending_creative and creative_specs:
-            pending_count = sum(1 for _, _, _, t in self._pending_speculative if not t.done())
-            logger.info(
-                "Round %d skipping %d new explore_creative worker(s): "
-                "%d speculative task(s) still pending",
-                batch.round_idx,
-                len(creative_specs),
-                pending_count,
-            )
-        else:
-            for slot_idx, wid, rule, req in creative_specs:
-                task = asyncio.create_task(
-                    _call_creative_worker(slot_idx, wid, req),
-                    name=f"speculative_creative_r{batch.round_idx}_{wid}",
-                )
-                current_creative_tasks.append((batch.round_idx, wid, rule, task))
+        run_l0_fn = self._owner_override("_run_l0") or self._run_l0
+        run_l1_fn = self._owner_override("_run_l1") or self._run_l1
+        filter_fn = self._resolve_hook(
+            "run_l0_l1_round_filter",
+            run_l0_l1_round_filter,
+        )
 
-        exploit_replies: list[
-            tuple[str, str, AscendCausalRule | None, str | None, str, str, bool]
-        ] = []
-        if exploit_specs:
-            exploit_replies = list(
-                await asyncio.gather(
-                    *(
-                        _call_exploit_worker(slot_idx, wid, wkind, rule, req)
-                        for slot_idx, wid, wkind, rule, req in exploit_specs
-                    )
-                )
-            )
-        elif current_creative_tasks:
-            await asyncio.gather(*(task for _, _, _, task in current_creative_tasks))
-        llm_gen_sec = max(0.0, time.monotonic() - llm_t0)
+        class _TimedRepairBackend:
+            def __init__(self, inner: KernelLLMBackend) -> None:
+                self._inner = inner
+                self.repair_sec = 0.0
 
-        for wid, wkind, rule, snippet, cand_hypothesis, err, is_transport_error in exploit_replies:
-            meta_by_id[wid] = (wkind, rule, cand_hypothesis)
-            if snippet is None:
-                self._record_llm_failure(
-                    wid=wid,
-                    rule=rule,
-                    err=err,
-                    is_transport_error=is_transport_error,
-                    regime_spec=batch.regime_spec,
-                    parent_sha=eff_parent_sha,
-                    parent_axes=eff_parent_axes,
-                    round_idx=batch.round_idx,
-                    failed_entries=failed_entries,
-                )
-            else:
-                raw_candidates.append((wid, snippet))
+            async def generate(
+                self,
+                request: GenerationRequest,
+                *,
+                effort_override: object = None,
+            ) -> str:
+                t0 = time.monotonic()
+                try:
+                    if effort_override is not None:
+                        return await self._inner.generate(
+                            request, effort_override=effort_override
+                        )
+                    return await self._inner.generate(request)
+                finally:
+                    self.repair_sec += max(0.0, time.monotonic() - t0)
 
-        for origin_round_idx, wid, rule, task in current_creative_tasks:
-            if task.done():
-                self._absorb_creative_task(
-                    task,
-                    origin_round_idx=origin_round_idx,
-                    wid=wid,
-                    rule_obj=rule,
-                    batch=batch,
-                    parent_sha=eff_parent_sha,
-                    parent_axes=eff_parent_axes,
-                    raw_candidates=raw_candidates,
-                    meta_by_id=meta_by_id,
-                    failed_entries=failed_entries,
-                )
-            else:
-                self._pending_speculative.append((origin_round_idx, wid, rule, task))
-
-        l0_l1_checks: list[L0L1CandidateCheck] = []
-        round_active_kernel = ""
-        l0_l1_sec = 0.0
-        syntax_repair_sec = 0.0
-
-        if raw_candidates:
+        def _build_l0_l1_inputs(
+            non_creative_count: int,
+        ) -> tuple[
+            object | None,
+            str,
+            _TimedRepairBackend | None,
+            dict[str, object],
+        ]:
             prescreen_top_k: int | None = None
             stage_a_ranker = None
             parent_analytical_us: float | None = None
@@ -2997,14 +2979,8 @@ class StageGateCoordinator:
                     and int(self._config.cost_prescreen_top_k) > 0
                 ):
                     prescreen_top_k = int(self._config.cost_prescreen_top_k)
-                elif self._config.cost_prescreen_top_k is None:
-                    non_creative_count = sum(
-                        1
-                        for cid, _ in raw_candidates
-                        if meta_by_id.get(cid, ("", None, ""))[0] != "creative_explore"
-                    )
-                    if non_creative_count >= 2:
-                        prescreen_top_k = max(1, non_creative_count - 1)
+                elif self._config.cost_prescreen_top_k is None and non_creative_count >= 2:
+                    prescreen_top_k = max(1, non_creative_count - 1)
 
                 def _rank_stage_a_passers(
                     passers: Sequence[tuple[str, str, StageAResult]],
@@ -3119,19 +3095,6 @@ class StageGateCoordinator:
 
                 score_stage_a_analytical_fn = _score_stage_a_analytical
 
-            creative_candidate_ids = {
-                cid
-                for cid, _ in raw_candidates
-                if meta_by_id.get(cid, ("", None, ""))[0] == "creative_explore"
-            } | set(batch.creative_candidate_ids)
-
-            run_l0_fn = self._owner_override("_run_l0") or self._run_l0
-            run_l1_fn = self._owner_override("_run_l1") or self._run_l1
-            filter_fn = self._resolve_hook(
-                "run_l0_l1_round_filter",
-                run_l0_l1_round_filter,
-            )
-
             def _candidate_l0_check(mod_src: str) -> StageAResult:
                 cand_sha_in = compute_source_sha256(mod_src)
                 knob_sig_in = self._extract_knob_signature(mod_src, batch.regime_spec)
@@ -3166,7 +3129,7 @@ class StageGateCoordinator:
                     anchor_dims_override=batch.bn_dims or None,
                 )
 
-            round_active_kernel = (
+            active_kernel_val = (
                 self._resolve_active_trackb_kernel(
                     batch.parent_module_source,
                     batch.regime_spec,
@@ -3180,7 +3143,7 @@ class StageGateCoordinator:
                 batch.parent_snippet,
                 batch.regime_spec,
                 incumbent_source=batch.parent_module_source,
-                active_kernel=round_active_kernel,
+                active_kernel=active_kernel_val,
                 focus_lines=parent_focus_lines,
                 diagnostic_text=parent_diag_text,
             )
@@ -3211,37 +3174,15 @@ class StageGateCoordinator:
                     snip,
                     operator_entrypoint=op_entry,
                     sibling_specs=self._regime_specs,
-                    active_kernel=round_active_kernel,
+                    active_kernel=active_kernel_val,
                 )
-
-            class _TimedRepairBackend:
-                def __init__(self, inner: KernelLLMBackend) -> None:
-                    self._inner = inner
-                    self.repair_sec = 0.0
-
-                async def generate(
-                    self,
-                    request: GenerationRequest,
-                    *,
-                    effort_override: object = None,
-                ) -> str:
-                    t0 = time.monotonic()
-                    try:
-                        if effort_override is not None:
-                            return await self._inner.generate(
-                                request, effort_override=effort_override
-                            )
-                        return await self._inner.generate(request)
-                    finally:
-                        self.repair_sec += max(0.0, time.monotonic() - t0)
 
             timed_repair_backend = (
                 _TimedRepairBackend(eff_backend)
                 if eff_backend is not None and self._config.max_syntax_repairs > 0
                 else None
             )
-            l0_l1_t0 = time.monotonic()
-            filter_kwargs: dict[str, object] = {
+            base_kwargs: dict[str, object] = {
                 "patch_fn": lambda snip: _patch_against(batch.parent_module_source, snip),
                 "repatch_from_current_fn": lambda cur_mod_src, snip: _patch_against(
                     cur_mod_src, snip
@@ -3268,7 +3209,7 @@ class StageGateCoordinator:
                     if batch.parent_ledger
                     else False
                 ),
-                "creative_candidate_ids": creative_candidate_ids,
+                "creative_candidate_ids": set(batch.creative_candidate_ids),
                 "parent_analytical_us": parent_analytical_us,
                 "stage_a_analytical_scorer": score_stage_a_analytical_fn,
                 "parent_topology_axes": eff_parent_axes,
@@ -3289,17 +3230,298 @@ class StageGateCoordinator:
                 or "skip_repair_when_survivors_exist"
                 in inspect.signature(run_l0_l1_round_filter).parameters
             ):
-                filter_kwargs["skip_repair_when_survivors_exist"] = True
-            l0_l1_checks = await self._invoke_with_optional_kwargs(
-                filter_fn,
-                raw_candidates,
-                **filter_kwargs,
-            )
-            l0_l1_total_sec = max(0.0, time.monotonic() - l0_l1_t0)
-            syntax_repair_sec = (
-                timed_repair_backend.repair_sec if timed_repair_backend is not None else 0.0
-            )
-            l0_l1_sec = max(0.0, l0_l1_total_sec - syntax_repair_sec)
+                base_kwargs["skip_repair_when_survivors_exist"] = True
+            return stage_a_ranker, active_kernel_val, timed_repair_backend, base_kwargs
+
+        def _spawn_creative_tasks() -> list[
+            tuple[int, str, AscendCausalRule | None, asyncio.Task[SpeculativeCreativeResult]]
+        ]:
+            tasks_out: list[
+                tuple[int, str, AscendCausalRule | None, asyncio.Task[SpeculativeCreativeResult]]
+            ] = []
+            has_pending_creative = any(not t.done() for _, _, _, t in self._pending_speculative)
+            if has_pending_creative and creative_specs:
+                pending_count = sum(
+                    1 for _, _, _, t in self._pending_speculative if not t.done()
+                )
+                logger.info(
+                    "Round %d skipping %d new explore_creative worker(s): "
+                    "%d speculative task(s) still pending",
+                    batch.round_idx,
+                    len(creative_specs),
+                    pending_count,
+                )
+            else:
+                for slot_idx, wid, rule, req in creative_specs:
+                    task = asyncio.create_task(
+                        _call_creative_worker(slot_idx, wid, req),
+                        name=f"speculative_creative_r{batch.round_idx}_{wid}",
+                    )
+                    tasks_out.append((batch.round_idx, wid, rule, task))
+            return tasks_out
+
+        def _record_exploit_replies(
+            replies: Sequence[
+                tuple[str, str, AscendCausalRule | None, str | None, str, str, bool]
+            ],
+        ) -> None:
+            for (
+                wid,
+                wkind,
+                rule,
+                snippet,
+                cand_hypothesis,
+                err,
+                is_transport_error,
+            ) in replies:
+                meta_by_id[wid] = (wkind, rule, cand_hypothesis)
+                if snippet is None:
+                    self._record_llm_failure(
+                        wid=wid,
+                        rule=rule,
+                        err=err,
+                        is_transport_error=is_transport_error,
+                        regime_spec=batch.regime_spec,
+                        parent_sha=eff_parent_sha,
+                        parent_axes=eff_parent_axes,
+                        round_idx=batch.round_idx,
+                        failed_entries=failed_entries,
+                    )
+                else:
+                    raw_candidates.append((wid, snippet))
+
+        def _harvest_creative_tasks(
+            tasks_in: Sequence[
+                tuple[int, str, AscendCausalRule | None, asyncio.Task[SpeculativeCreativeResult]]
+            ],
+        ) -> list[tuple[str, str]]:
+            absorbed: list[tuple[str, str]] = []
+            for origin_round_idx, wid, rule, task in tasks_in:
+                if task.done():
+                    prev_len = len(raw_candidates)
+                    self._absorb_creative_task(
+                        task,
+                        origin_round_idx=origin_round_idx,
+                        wid=wid,
+                        rule_obj=rule,
+                        batch=batch,
+                        parent_sha=eff_parent_sha,
+                        parent_axes=eff_parent_axes,
+                        raw_candidates=raw_candidates,
+                        meta_by_id=meta_by_id,
+                        failed_entries=failed_entries,
+                    )
+                    if len(raw_candidates) > prev_len:
+                        absorbed.append(raw_candidates[-1])
+                else:
+                    self._pending_speculative.append((origin_round_idx, wid, rule, task))
+            return absorbed
+
+        pre_stream_ctx: (
+            tuple[
+                object | None,
+                str,
+                _TimedRepairBackend | None,
+                dict[str, object],
+            ]
+            | None
+        ) = None
+        can_stream_l0_l1 = False
+        if filter_fn is _ORIG_RUN_L0_L1_ROUND_FILTER and bool(exploit_specs):
+            expected_non_creative = sum(
+                1
+                for cid, _ in raw_candidates
+                if meta_by_id.get(cid, ("", None, ""))[0] != "creative_explore"
+            ) + len(exploit_specs)
+            pre_stream_ctx = _build_l0_l1_inputs(expected_non_creative)
+            can_stream_l0_l1 = pre_stream_ctx[0] is None
+
+        l0_l1_checks: list[L0L1CandidateCheck] = []
+        round_active_kernel = ""
+        l0_l1_sec = 0.0
+        syntax_repair_sec = 0.0
+
+        if can_stream_l0_l1:
+            assert pre_stream_ctx is not None
+            _, active_kernel_val, timed_repair_backend, base_filter_kwargs = pre_stream_ctx
+            stream_l1_sem = threading.Semaphore(2)
+
+            def _limited_l1_compiler(mod_src: str) -> StageBResult:
+                with stream_l1_sem:
+                    return run_l1_fn(mod_src, batch.regime_spec)
+
+            async def _run_streamed_one(
+                wid: str,
+                snippet: str,
+                *,
+                is_creative: bool,
+            ) -> L0L1CandidateCheck:
+                stream_kwargs = dict(base_filter_kwargs)
+                stream_kwargs["l1_compiler"] = _limited_l1_compiler
+                stream_kwargs["repair_backend"] = None
+                stream_kwargs["max_syntax_repairs"] = 0
+                stream_kwargs["stage_a_cost_ranker"] = None
+                stream_kwargs["creative_candidate_ids"] = (
+                    {wid} if is_creative or wid in batch.creative_candidate_ids else ()
+                )
+                stream_kwargs["skip_repair_when_survivors_exist"] = True
+                res = await _ORIG_RUN_L0_L1_ROUND_FILTER(
+                    [(wid, snippet)],
+                    **stream_kwargs,
+                )
+                return res[0]
+
+            streamed_tasks: dict[str, asyncio.Task[L0L1CandidateCheck]] = {}
+            for wid, snippet in raw_candidates:
+                if wid not in streamed_tasks:
+                    streamed_tasks[wid] = asyncio.create_task(
+                        _run_streamed_one(wid, snippet, is_creative=True),
+                        name=f"stream_l0_l1_r{batch.round_idx}_{wid}",
+                    )
+
+            llm_t0 = time.monotonic()
+            current_creative_tasks = _spawn_creative_tasks()
+            exploit_tasks = [
+                asyncio.create_task(
+                    _call_exploit_worker(slot_idx, wid, wkind, rule, req),
+                    name=f"exploit_llm_r{batch.round_idx}_{wid}",
+                )
+                for slot_idx, wid, wkind, rule, req in exploit_specs
+            ]
+            exploit_replies_by_slot: dict[
+                int,
+                tuple[str, str, AscendCausalRule | None, str | None, str, str, bool],
+            ] = {}
+            for completed_fut in asyncio.as_completed(exploit_tasks):
+                slot_idx, wid, wkind, rule, snippet, cand_hyp, err, is_transport = (
+                    await completed_fut
+                )
+                exploit_replies_by_slot[slot_idx] = (
+                    wid,
+                    wkind,
+                    rule,
+                    snippet,
+                    cand_hyp,
+                    err,
+                    is_transport,
+                )
+                if snippet is not None and wid not in streamed_tasks:
+                    streamed_tasks[wid] = asyncio.create_task(
+                        _run_streamed_one(wid, snippet, is_creative=False),
+                        name=f"stream_l0_l1_r{batch.round_idx}_{wid}",
+                    )
+            llm_done_t = time.monotonic()
+            llm_gen_sec = max(0.0, llm_done_t - llm_t0)
+
+            ordered_replies = [
+                exploit_replies_by_slot[slot_idx]
+                for slot_idx, *_ in exploit_specs
+            ]
+            _record_exploit_replies(ordered_replies)
+            newly_absorbed = _harvest_creative_tasks(current_creative_tasks)
+            for wid, snippet in newly_absorbed:
+                if wid not in streamed_tasks:
+                    streamed_tasks[wid] = asyncio.create_task(
+                        _run_streamed_one(wid, snippet, is_creative=True),
+                        name=f"stream_l0_l1_r{batch.round_idx}_{wid}",
+                    )
+
+            if raw_candidates:
+                round_active_kernel = active_kernel_val
+                ordered_ids = [wid for wid, _ in raw_candidates]
+                l0_l1_checks = list(
+                    await asyncio.gather(*(streamed_tasks[wid] for wid in ordered_ids))
+                )
+                if (
+                    not any(chk.passed for chk in l0_l1_checks)
+                    and self._config.max_syntax_repairs > 0
+                    and timed_repair_backend is not None
+                ):
+                    repairable = [
+                        (wid, snip)
+                        for (wid, snip), chk in zip(raw_candidates, l0_l1_checks)
+                        if chk.failed_tier != "noop_identical"
+                    ]
+                    if repairable:
+                        creative_ids = {
+                            cid
+                            for cid, _ in raw_candidates
+                            if meta_by_id.get(cid, ("", None, ""))[0] == "creative_explore"
+                        } | set(batch.creative_candidate_ids)
+                        repair_kwargs = dict(base_filter_kwargs)
+                        repair_kwargs["creative_candidate_ids"] = creative_ids
+                        repair_kwargs["skip_repair_when_survivors_exist"] = True
+                        repaired_list = await _ORIG_RUN_L0_L1_ROUND_FILTER(
+                            repairable,
+                            **repair_kwargs,
+                        )
+                        repaired_by_id = {chk.candidate_id: chk for chk in repaired_list}
+                        l0_l1_checks = [
+                            repaired_by_id.get(chk.candidate_id, chk)
+                            for chk in l0_l1_checks
+                        ]
+                l0_l1_end_t = time.monotonic()
+                l0_l1_total_sec = max(0.0, l0_l1_end_t - llm_done_t)
+                syntax_repair_sec = (
+                    timed_repair_backend.repair_sec
+                    if timed_repair_backend is not None
+                    else 0.0
+                )
+                l0_l1_sec = max(0.0, l0_l1_total_sec - syntax_repair_sec)
+        else:
+            llm_t0 = time.monotonic()
+            current_creative_tasks = _spawn_creative_tasks()
+            exploit_replies: list[
+                tuple[str, str, AscendCausalRule | None, str | None, str, str, bool]
+            ] = []
+            if exploit_specs:
+                raw_exploit_replies = await asyncio.gather(
+                    *(
+                        _call_exploit_worker(slot_idx, wid, wkind, rule, req)
+                        for slot_idx, wid, wkind, rule, req in exploit_specs
+                    )
+                )
+                exploit_replies = [
+                    (wid, wkind, rule, snippet, cand_hyp, err, is_transport)
+                    for _slot_idx, wid, wkind, rule, snippet, cand_hyp, err, is_transport in (
+                        raw_exploit_replies
+                    )
+                ]
+            elif current_creative_tasks:
+                await asyncio.gather(*(task for _, _, _, task in current_creative_tasks))
+            llm_gen_sec = max(0.0, time.monotonic() - llm_t0)
+
+            _record_exploit_replies(exploit_replies)
+            _harvest_creative_tasks(current_creative_tasks)
+
+            if raw_candidates:
+                non_creative_count = sum(
+                    1
+                    for cid, _ in raw_candidates
+                    if meta_by_id.get(cid, ("", None, ""))[0] != "creative_explore"
+                )
+                _, round_active_kernel, timed_repair_backend, filter_kwargs = (
+                    _build_l0_l1_inputs(non_creative_count)
+                )
+                creative_candidate_ids = {
+                    cid
+                    for cid, _ in raw_candidates
+                    if meta_by_id.get(cid, ("", None, ""))[0] == "creative_explore"
+                } | set(batch.creative_candidate_ids)
+                filter_kwargs["creative_candidate_ids"] = creative_candidate_ids
+                l0_l1_t0 = time.monotonic()
+                l0_l1_checks = await self._invoke_with_optional_kwargs(
+                    filter_fn,
+                    raw_candidates,
+                    **filter_kwargs,
+                )
+                l0_l1_total_sec = max(0.0, time.monotonic() - l0_l1_t0)
+                syntax_repair_sec = (
+                    timed_repair_backend.repair_sec
+                    if timed_repair_backend is not None
+                    else 0.0
+                )
+                l0_l1_sec = max(0.0, l0_l1_total_sec - syntax_repair_sec)
 
         passed_checks = [chk for chk in l0_l1_checks if chk.passed]
         infeasible_boundaries_added = 0

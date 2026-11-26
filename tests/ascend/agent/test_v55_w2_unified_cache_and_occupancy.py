@@ -1973,4 +1973,325 @@ def test_poison_pill_skips_incumbent_slot_compare_and_worker_is_self_contained(
     assert compare_calls == ["base"]
 
 
+def _setup_cpu_batch_worker_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path]:
+    """Create minimal fake source root, cannbench repo, and CPU stubs for subprocess workers."""
+    repo_root = Path(__file__).resolve().parents[3]
+    src_root = tmp_path / "src_root"
+    (src_root / "tests" / "ascend" / "benchmarks").mkdir(parents=True, exist_ok=True)
+    (src_root / "src").symlink_to(repo_root / "src")
+    (src_root / "targets").symlink_to(repo_root / "targets")
+    (src_root / "tests" / "ascend" / "benchmarks" / "cannbench_contract.py").write_text(
+        "class ReferenceCache:\n"
+        "    def __init__(self, _harness):\n"
+        "        self._store = {}\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, *_a):\n"
+        "        return None\n"
+        "    def get(self, case, tag, builder):\n"
+        "        k = (int(case.case_num), tag)\n"
+        "        if k not in self._store:\n"
+        "            self._store[k] = builder()\n"
+        "        return self._store[k]\n"
+        "def map_tensors(obj, fn):\n"
+        "    return {k: fn(v) for k, v in obj.items()}\n",
+        encoding="utf-8",
+    )
+
+    cann_repo = tmp_path / "cann_repo"
+    (cann_repo / "tasks").mkdir(parents=True, exist_ok=True)
+
+    site_dir = tmp_path / "site_patch"
+    site_dir.mkdir(exist_ok=True)
+    (site_dir / "sitecustomize.py").write_text(
+        "from types import SimpleNamespace\n"
+        "from tilefoundry_ascend.agent.campaign import anchor_specs\n"
+        "class _T:\n"
+        "    def npu(self):\n"
+        "        return self\n"
+        "class _H:\n"
+        "    def prepare(self, _c):\n"
+        "        return {'x': _T()}\n"
+        "    def reference_output(self, _c, _t, native=False):\n"
+        "        return 'ref'\n"
+        "    def params(self, _c, ts):\n"
+        "        return {'x': ts['x']}\n"
+        "    def compare(self, _c, actual, _o, _t, _n):\n"
+        "        if actual in {'inc', 'good'}:\n"
+        "            return True, {}\n"
+        "        return False, {'mismatch': str(actual)}\n"
+        "anchor_specs.load_anchor_harness_and_cases = lambda _op, anc, **_k: (\n"
+        "    _H(),\n"
+        "    [SimpleNamespace(case_num=int(a.case_num)) for a in anc],\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        f"{site_dir}:{src_root}:{src_root / 'src'}:{src_root / 'targets' / 'ascend'}",
+    )
+
+    class _FakeHarness:
+        def prepare(self, _case: object) -> dict[str, object]:
+            return {"x": 1}
+
+        def reference_output(
+            self,
+            _case: object,
+            _ts: object,
+            native: bool = False,
+        ) -> str:
+            _ = native
+            return "ref"
+
+        def params(self, _case: object, tensors: dict[str, object]) -> dict[str, object]:
+            return {"x": tensors["x"]}
+
+        def compare(
+            self,
+            _case: object,
+            actual: object,
+            _oracle: object,
+            _tensors: object,
+            _native_fn: object,
+        ) -> tuple[bool, dict[str, object]]:
+            if actual in {"inc", "good"}:
+                return True, {}
+            return False, {"mismatch": str(actual)}
+
+    class _FakeRefCache:
+        def __init__(self, _harness: object) -> None:
+            self._store: dict[tuple[int, str], object] = {}
+
+        def __enter__(self) -> _FakeRefCache:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get(self, case: object, tag: str, builder: object) -> object:
+            key = (int(getattr(case, "case_num", 0)), tag)
+            if key not in self._store:
+                self._store[key] = builder()
+            return self._store[key]
+
+    fake_contract = SimpleNamespace(
+        ReferenceCache=_FakeRefCache,
+        map_tensors=lambda obj, _fn: dict(obj),
+    )
+    monkeypatch.setattr(
+        batch_harness,
+        "load_cannbench_contract_module",
+        lambda **_kw: fake_contract,
+    )
+    monkeypatch.setattr(
+        batch_harness,
+        "load_anchor_harness_and_cases",
+        lambda _op, anc, **_kw: (
+            _FakeHarness(),
+            [SimpleNamespace(case_num=int(a.case_num)) for a in anc],
+        ),
+    )
+
+    class _FakeEvent:
+        def __init__(self, enable_timing: bool = True) -> None:
+            _ = enable_timing
+
+        def record(self) -> None:
+            return None
+
+        def elapsed_time(self, _other: _FakeEvent) -> float:
+            return 0.01
+
+    fake_npu = SimpleNamespace(
+        Event=_FakeEvent,
+        synchronize=lambda: None,
+        empty_cache=lambda: None,
+        is_available=lambda: False,
+        set_device=lambda _idx: None,
+    )
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+    monkeypatch.setattr(
+        batch_harness,
+        "measure_paired_interleaved_micro_burst",
+        lambda named_fns, _p, **_kw: {
+            cid: (10.0, 1, 0.01, 1.0, 0.0) for cid, _fn in named_fns
+        },
+    )
+    monkeypatch.setattr(
+        batch_harness,
+        "_measure_npu_latency_stats_us",
+        lambda *_a, **_k: (10.0, 0.01),
+    )
+    monkeypatch.setattr(
+        batch_harness,
+        "measure_npu_ring_burst_stats",
+        lambda *_a, **_k: (10.0, 1, 0.01, 0),
+    )
+    return src_root, cann_repo
+
+
+def test_poison_pill_batch_worker_happy_path_single_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify batch worker is standalone and screens 2+ candidates in ONE subprocess."""
+    batch_src = batch_harness._POISON_PILL_BATCH_WORKER_SCRIPT
+    assert "from tests.ascend.agent.test_surrogate_batch_npu" not in batch_src
+    assert "tests.ascend.agent.test_surrogate_batch_npu" not in batch_src
+    assert "def _configure_tilelang_cache(" in batch_src
+    assert "def _load_candidate_entrypoint(" in batch_src
+    compile(batch_src, "poison_pill_batch_worker.py", "exec")
+
+    src_root, cann_repo = _setup_cpu_batch_worker_env(tmp_path, monkeypatch)
+
+    good_a = tmp_path / "good_a.py"
+    good_a.write_text("def run_op(x):\n    return 'good'\n", encoding="utf-8")
+    good_b = tmp_path / "good_b.py"
+    good_b.write_text("def run_op(x):\n    return 'good'\n", encoding="utf-8")
+    bad_num = tmp_path / "bad_num.py"
+    bad_num.write_text("def run_op(x):\n    return 'numeric_wrong'\n", encoding="utf-8")
+
+    real_popen = batch_harness.subprocess.Popen
+    popen_scripts: list[str] = []
+
+    def _spy_popen(cmd: list[str], *args: object, **kwargs: object) -> object:
+        popen_scripts.append(Path(cmd[1]).read_text(encoding="utf-8"))
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(batch_harness.subprocess, "Popen", _spy_popen)
+
+    anchors = [AnchorCaseSpec("level4/mla", 3, "decode", 20.0, 6.0).to_dict()]
+    both_good_res = batch_harness._evaluate_operator_batch(
+        {
+            "operator_name": "mla",
+            "entrypoint": "run_op",
+            "candidates": [
+                {"candidate_id": "c_good_a", "module_path": str(good_a)},
+                {"candidate_id": "c_good_b", "module_path": str(good_b)},
+            ],
+            "anchors": anchors,
+        },
+        source_root=src_root,
+        cannbench_repo=cann_repo,
+        warmup=1,
+        repeat=3,
+        poison_pill_isolation=True,
+        poison_pill_timeout_sec=5.0,
+    )
+    assert len(popen_scripts) == 1
+    assert popen_scripts[0] == batch_harness._POISON_PILL_BATCH_WORKER_SCRIPT
+    assert both_good_res["c_good_a"].all_passed is True
+    assert both_good_res["c_good_b"].all_passed is True
+
+    popen_scripts.clear()
+    mixed_res = batch_harness._evaluate_operator_batch(
+        {
+            "operator_name": "mla",
+            "entrypoint": "run_op",
+            "candidates": [
+                {"candidate_id": "c_good_a", "module_path": str(good_a)},
+                {"candidate_id": "c_bad_num", "module_path": str(bad_num)},
+            ],
+            "anchors": anchors,
+        },
+        source_root=src_root,
+        cannbench_repo=cann_repo,
+        warmup=1,
+        repeat=3,
+        poison_pill_isolation=True,
+        poison_pill_timeout_sec=5.0,
+    )
+    assert len(popen_scripts) == 1
+    assert popen_scripts[0] == batch_harness._POISON_PILL_BATCH_WORKER_SCRIPT
+    assert mixed_res["c_good_a"].all_passed is True
+    assert mixed_res["c_bad_num"].all_passed is False
+    assert len(mixed_res["c_bad_num"].anchors) == 1
+    assert mixed_res["c_bad_num"].anchors[0].accuracy_passed is False
+    assert "numeric_wrong" in mixed_res["c_bad_num"].anchors[0].error_message
+
+
+def test_poison_pill_batch_crash_and_timeout_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify batch worker crash or timeout falls back to per-candidate isolation."""
+    src_root, cann_repo = _setup_cpu_batch_worker_env(tmp_path, monkeypatch)
+
+    good_mod = tmp_path / "good.py"
+    good_mod.write_text("def run_op(x):\n    return 'good'\n", encoding="utf-8")
+    crash_mod = tmp_path / "crash.py"
+    crash_mod.write_text("import os\ndef run_op(x):\n    os._exit(11)\n", encoding="utf-8")
+    hang_mod = tmp_path / "hang.py"
+    hang_mod.write_text(
+        "import time\ndef run_op(x):\n    time.sleep(10)\n    return 'good'\n",
+        encoding="utf-8",
+    )
+
+    real_popen = batch_harness.subprocess.Popen
+    popen_scripts: list[str] = []
+
+    def _spy_popen(cmd: list[str], *args: object, **kwargs: object) -> object:
+        popen_scripts.append(Path(cmd[1]).read_text(encoding="utf-8"))
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(batch_harness.subprocess, "Popen", _spy_popen)
+    anchors = [AnchorCaseSpec("level4/mla", 3, "decode", 20.0, 6.0).to_dict()]
+
+    crash_res = batch_harness._evaluate_operator_batch(
+        {
+            "operator_name": "mla",
+            "entrypoint": "run_op",
+            "candidates": [
+                {"candidate_id": "c_good", "module_path": str(good_mod)},
+                {"candidate_id": "c_crash", "module_path": str(crash_mod)},
+            ],
+            "anchors": anchors,
+        },
+        source_root=src_root,
+        cannbench_repo=cann_repo,
+        warmup=1,
+        repeat=3,
+        poison_pill_isolation=True,
+        poison_pill_timeout_sec=5.0,
+    )
+    assert len(popen_scripts) == 3
+    assert popen_scripts[0] == batch_harness._POISON_PILL_BATCH_WORKER_SCRIPT
+    assert popen_scripts[1] == batch_harness._POISON_PILL_WORKER_SCRIPT
+    assert popen_scripts[2] == batch_harness._POISON_PILL_WORKER_SCRIPT
+    assert crash_res["c_good"].all_passed is True
+    assert crash_res["c_crash"].all_passed is False
+    assert "poison_pill_timeout_or_crash" in crash_res["c_crash"].anchors[0].error_message
+
+    popen_scripts.clear()
+    hang_res = batch_harness._evaluate_operator_batch(
+        {
+            "operator_name": "mla",
+            "entrypoint": "run_op",
+            "candidates": [
+                {"candidate_id": "c_good", "module_path": str(good_mod)},
+                {"candidate_id": "c_hang", "module_path": str(hang_mod)},
+            ],
+            "anchors": anchors,
+        },
+        source_root=src_root,
+        cannbench_repo=cann_repo,
+        warmup=1,
+        repeat=3,
+        poison_pill_isolation=True,
+        poison_pill_timeout_sec=2.0,
+    )
+    assert len(popen_scripts) == 3
+    assert popen_scripts[0] == batch_harness._POISON_PILL_BATCH_WORKER_SCRIPT
+    assert popen_scripts[1] == batch_harness._POISON_PILL_WORKER_SCRIPT
+    assert popen_scripts[2] == batch_harness._POISON_PILL_WORKER_SCRIPT
+    assert hang_res["c_good"].all_passed is True
+    assert hang_res["c_hang"].all_passed is False
+    assert "poison_pill_timeout_or_crash" in hang_res["c_hang"].anchors[0].error_message
+
+
+
 

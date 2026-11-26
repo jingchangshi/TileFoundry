@@ -943,6 +943,177 @@ os.replace(tmp_out, out_path)
 """
 
 
+_POISON_PILL_BATCH_WORKER_SCRIPT = """import importlib
+import importlib.util
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import torch
+
+from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    AnchorCaseSpec,
+    load_anchor_harness_and_cases,
+    load_cannbench_contract_module,
+)
+
+
+def _configure_tilelang_cache(tl_cache_dir: str) -> None:
+    resolved = Path(tl_cache_dir).resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
+    os.environ["TILELANG_CACHE_DIR"] = str(resolved)
+    os.environ["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
+    os.environ["TILELANG_DISABLE_CACHE"] = "0"
+    tl_env_mod = importlib.import_module("tilelang.env")
+    tl_env_mod.env.enable_cache()
+    kc_mod = importlib.import_module("tilelang.cache.kernel_cache")
+    kc_mod.KernelCache._get_cache_namespace.cache_clear()
+    kc_mod.KernelCache._get_tilelang_lib_stamp.cache_clear()
+    kc_mod.KernelCache._create_dirs()
+
+
+def _load_candidate_entrypoint(module_path: Path, entrypoint: str, unique_tag: str):
+    mod_name = f"_tf_surrogate_cand_{unique_tag}"
+    spec = importlib.util.spec_from_file_location(mod_name, str(module_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load candidate module {module_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, entrypoint):
+        raise AttributeError(f"{module_path} does not define {entrypoint!r}")
+    return getattr(mod, entrypoint), mod
+
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+out_path = Path(sys.argv[2])
+op_name = str(payload["operator_name"])
+entrypoint = str(payload["entrypoint"])
+candidates_raw = list(payload["candidates"])
+source_root = Path(str(payload["source_root"]))
+cannbench_repo = Path(str(payload["cannbench_repo"]))
+anchors = [AnchorCaseSpec.from_dict(item) for item in payload["anchors"]]
+
+if not hasattr(torch, "npu"):
+    try:
+        importlib.import_module("torch_npu")
+    except ImportError:
+        pass
+if hasattr(torch, "npu") and torch.npu.is_available():
+    torch.npu.set_device(0)
+
+tl_cache_env = os.environ.get("TILELANG_CACHE_DIR", "").strip()
+if tl_cache_env:
+    _configure_tilelang_cache(tl_cache_env)
+
+contract_mod = load_cannbench_contract_module(source_root=source_root)
+harness, cases = load_anchor_harness_and_cases(
+    op_name,
+    anchors,
+    cannbench_repo=cannbench_repo,
+    source_root=source_root,
+)
+case_by_num = {int(c.case_num): c for c in cases}
+
+results = {}
+loaded_cands = []
+for idx, item in enumerate(candidates_raw):
+    cid = str(item["candidate_id"])
+    mod_path = Path(str(item["module_path"]))
+    results[cid] = {"all_passed": True, "error": "", "cases": {}}
+    try:
+        fn, mod_obj = _load_candidate_entrypoint(
+            mod_path,
+            entrypoint,
+            f"bpill_{op_name}_{idx}_{int(time.monotonic_ns())}",
+        )
+        loaded_cands.append((cid, fn, mod_obj))
+    except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"[:300]
+        results[cid]["all_passed"] = False
+        results[cid]["error"] = err_msg
+        for spec in anchors:
+            results[cid]["cases"][str(int(spec.case_num))] = {
+                "passed": False,
+                "error": err_msg,
+            }
+
+try:
+    with contract_mod.ReferenceCache(harness) as cache:
+        for spec in anchors:
+            cnum = int(spec.case_num)
+            case = case_by_num[cnum]
+
+            def _prep(c=case, h=harness):
+                ts = h.prepare(c)
+                return {"inputs": ts, "oracle": h.reference_output(c, ts)}
+
+            bundle = cache.get(case, "oracle", _prep)
+            tensors = bundle["inputs"]
+            oracle = bundle["oracle"]
+
+            def _native_fn(c=case, ts=tensors, h=harness, ch=cache):
+                return ch.get(c, "native", lambda: h.reference_output(c, ts, native=True))
+
+            npu_tensors = None
+            try:
+                npu_tensors = contract_mod.map_tensors(tensors, lambda x: x.npu())
+                for cid, fn, _mod_obj in loaded_cands:
+                    params = None
+                    actual = None
+                    try:
+                        params = harness.params(case, npu_tensors)
+                        actual = fn(**params)
+                        if hasattr(torch, "npu") and hasattr(torch.npu, "synchronize"):
+                            torch.npu.synchronize()
+                        passed, details = harness.compare(
+                            case, actual, oracle, tensors, _native_fn
+                        )
+                        if passed:
+                            results[cid]["cases"][str(cnum)] = {"passed": True, "error": ""}
+                        else:
+                            err_msg = json.dumps(details)[:300]
+                            results[cid]["cases"][str(cnum)] = {
+                                "passed": False,
+                                "error": err_msg,
+                            }
+                            results[cid]["all_passed"] = False
+                            if not results[cid]["error"]:
+                                results[cid]["error"] = err_msg
+                    except Exception as exc:
+                        err_msg = f"{type(exc).__name__}: {exc}"[:300]
+                        results[cid]["cases"][str(cnum)] = {
+                            "passed": False,
+                            "error": err_msg,
+                        }
+                        results[cid]["all_passed"] = False
+                        if not results[cid]["error"]:
+                            results[cid]["error"] = err_msg
+                    finally:
+                        actual = None
+                        params = None
+                        if hasattr(torch, "npu") and hasattr(torch.npu, "empty_cache"):
+                            torch.npu.empty_cache()
+            finally:
+                npu_tensors = None
+                if hasattr(torch, "npu") and hasattr(torch.npu, "empty_cache"):
+                    torch.npu.empty_cache()
+finally:
+    for _cid, _fn, mod_obj in loaded_cands:
+        cache_obj = getattr(mod_obj, "_KERNEL_CACHE", None)
+        if isinstance(cache_obj, dict):
+            cache_obj.clear()
+    if hasattr(torch, "npu") and hasattr(torch.npu, "empty_cache"):
+        torch.npu.empty_cache()
+
+tmp_out = out_path.with_suffix(".tmp")
+tmp_out.write_text(json.dumps({"candidates": results}), encoding="utf-8")
+os.replace(tmp_out, out_path)
+"""
+
+
 def _build_poison_pill_worker_env(source_root: Path) -> dict[str, str]:
     env = dict(os.environ)
     pp_entries: list[str] = []
@@ -1036,15 +1207,104 @@ def _screen_candidate_isolated(
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             return False, f"poison_pill_timeout_or_crash: invalid worker json: {exc}"[:300], {}
 
-        per_case: dict[int, tuple[bool, str]] = {}
-        raw_cases = raw.get("cases")
-        if isinstance(raw_cases, Mapping):
-            for k, row in raw_cases.items():
-                if isinstance(row, Mapping):
-                    per_case[int(k)] = (bool(row.get("passed", False)), str(row.get("error", "")))
+        per_case = _parse_poison_pill_cases(raw.get("cases"))
         all_passed = bool(raw.get("all_passed", False))
         err_msg = str(raw.get("error", ""))
         return all_passed, err_msg[:300], per_case
+
+
+def _parse_poison_pill_cases(raw_cases: object) -> dict[int, tuple[bool, str]]:
+    per_case: dict[int, tuple[bool, str]] = {}
+    if isinstance(raw_cases, Mapping):
+        for k, row in raw_cases.items():
+            if isinstance(row, Mapping):
+                per_case[int(k)] = (bool(row.get("passed", False)), str(row.get("error", "")))
+    return per_case
+
+
+def _screen_candidates_isolated_batch(
+    *,
+    operator_name: str,
+    entrypoint: str,
+    candidates: Sequence[tuple[str, Path]],
+    anchors: Sequence[AnchorCaseSpec],
+    source_root: Path,
+    cannbench_repo: Path,
+    timeout_sec: float = 30.0,
+) -> tuple[bool, dict[str, tuple[bool, str, dict[int, tuple[bool, str]]]]]:
+    """Run one-shot accuracy verification for multiple candidates in one isolated subprocess."""
+    if not candidates:
+        return True, {}
+    eff_timeout = max(0.05, float(timeout_sec))
+    total_timeout = max(eff_timeout, min(eff_timeout * max(1, len(candidates)), 120.0))
+    worker_env = _build_poison_pill_worker_env(source_root)
+    with tempfile.TemporaryDirectory(prefix="tf_poison_pill_batch_") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        req_path = tmp_root / "req.json"
+        out_path = tmp_root / "out.json"
+        script_path = tmp_root / "worker.py"
+        req_path.write_text(
+            json.dumps(
+                {
+                    "operator_name": operator_name,
+                    "entrypoint": entrypoint,
+                    "candidates": [
+                        {"candidate_id": cid, "module_path": str(mod_path)}
+                        for cid, mod_path in candidates
+                    ],
+                    "source_root": str(source_root),
+                    "cannbench_repo": str(cannbench_repo),
+                    "anchors": [a.to_dict() for a in anchors],
+                }
+            ),
+            encoding="utf-8",
+        )
+        script_path.write_text(_POISON_PILL_BATCH_WORKER_SCRIPT, encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, str(script_path), str(req_path), str(out_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(source_root),
+            env=worker_env,
+            start_new_session=True,
+        )
+        try:
+            proc.communicate(timeout=total_timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.communicate()
+            return False, {}
+
+        if proc.returncode != 0 or not out_path.is_file():
+            return False, {}
+        try:
+            raw = json.loads(out_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return False, {}
+
+        if not isinstance(raw, Mapping):
+            return False, {}
+        raw_cands = raw.get("candidates")
+        if not isinstance(raw_cands, Mapping):
+            return False, {}
+
+        parsed_map: dict[str, tuple[bool, str, dict[int, tuple[bool, str]]]] = {}
+        for cid, _mod_path in candidates:
+            entry = raw_cands.get(cid)
+            if not isinstance(entry, Mapping):
+                return False, {}
+            try:
+                per_case = _parse_poison_pill_cases(entry.get("cases"))
+            except (TypeError, ValueError):
+                return False, {}
+            all_passed = bool(entry.get("all_passed", False))
+            err_msg = str(entry.get("error", ""))[:300]
+            parsed_map[cid] = (all_passed, err_msg, per_case)
+        return True, parsed_map
 
 
 _ORIG_LOAD_CANDIDATE_ENTRYPOINT = _load_candidate_entrypoint
@@ -1138,21 +1398,41 @@ def _evaluate_operator_batch(
 
                     warm_cache.get(case, "oracle", _warm_prep)
 
-        for cand in candidates:
-            cid = str(cand["candidate_id"])
-            mod_path = Path(str(cand["module_path"]))
-            if cid in _INCUMBENT_CANDIDATE_IDS:
-                continue
-            passed_iso, batch_err, per_case = _screen_candidate_isolated(
+        non_incumbent_pairs = [
+            (str(cand["candidate_id"]), Path(str(cand["module_path"])))
+            for cand in candidates
+            if str(cand["candidate_id"]) not in _INCUMBENT_CANDIDATE_IDS
+        ]
+        batch_ok = False
+        batch_results: dict[str, tuple[bool, str, dict[int, tuple[bool, str]]]] = {}
+        if (
+            len(non_incumbent_pairs) >= 2
+            and _screen_candidate_isolated is _ORIG_SCREEN_CANDIDATE_ISOLATED
+        ):
+            batch_ok, batch_results = _screen_candidates_isolated_batch(
                 operator_name=op_name,
                 entrypoint=entrypoint,
-                candidate_id=cid,
-                module_path=mod_path,
+                candidates=non_incumbent_pairs,
                 anchors=anchors,
                 source_root=source_root,
                 cannbench_repo=cannbench_repo,
                 timeout_sec=eff_pill_timeout,
             )
+
+        for cid, mod_path in non_incumbent_pairs:
+            if batch_ok:
+                passed_iso, batch_err, per_case = batch_results[cid]
+            else:
+                passed_iso, batch_err, per_case = _screen_candidate_isolated(
+                    operator_name=op_name,
+                    entrypoint=entrypoint,
+                    candidate_id=cid,
+                    module_path=mod_path,
+                    anchors=anchors,
+                    source_root=source_root,
+                    cannbench_repo=cannbench_repo,
+                    timeout_sec=eff_pill_timeout,
+                )
             if passed_iso:
                 phase_a_passed_ids.add(cid)
             else:

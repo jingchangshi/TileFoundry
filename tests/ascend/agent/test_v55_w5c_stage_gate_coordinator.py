@@ -7,6 +7,7 @@ import asyncio
 import importlib
 import json
 import sys
+import time
 import types
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -1521,6 +1522,339 @@ def test_width_covered_by_anchor_specs_matches_static_width_signature() -> None:
         same_compile_cfg,
         [({"tile_m": 16, "epsilon": 1e-5}, anchor_cfg)],
     )
+
+
+@pytest.mark.anyio
+async def test_streamed_l0_l1_overlaps_fast_exploit_and_drained_creative_with_slow_llm(
+    tmp_path: Path,
+) -> None:
+    """Streamed L0/L1 overlaps fast exploit and drained creative with slow LLM."""
+    loop = asyncio.get_running_loop()
+    overlap_seen = asyncio.Event()
+    creative_gate = asyncio.Event()
+    started_l1_tiles: set[str] = set()
+
+    class _OverlapBackend:
+        async def generate(
+            self,
+            req: GenerationRequest,
+            *,
+            effort_override: object = None,
+        ) -> str:
+            _ = effort_override
+            if req.role == "explore_creative":
+                await creative_gate.wait()
+                return (
+                    "# target_bottleneck: aiv_vec\n"
+                    "# structural_hypothesis: Drained creative\n"
+                    f"```python\n{_CREATIVE_SNIPPET}\n```"
+                )
+            if req.user_prompt == "slow":
+                await asyncio.wait_for(overlap_seen.wait(), timeout=2.0)
+                return _EXPLOIT_SNIPPET.replace("32", "48")
+            return _EXPLOIT_SNIPPET
+
+    def _l1_overlap(src: str, _reg: RegimeTargetSpec) -> StageBResult:
+        if "tile_m=64" in src:
+            started_l1_tiles.add("creative")
+            time.sleep(0.05)
+        elif "tile_m=32" in src:
+            started_l1_tiles.add("fast")
+            time.sleep(0.05)
+        else:
+            time.sleep(0.01)
+        if {"creative", "fast"}.issubset(started_l1_tiles):
+            loop.call_soon_threadsafe(overlap_seen.set)
+        return StageBResult(passed=True)
+
+    coord = _make_coordinator(tmp_path, backend=_OverlapBackend(), l1_compiler=_l1_overlap)
+    spec = _make_regime_spec()
+    anchors = _make_anchors()
+
+    batch_r0 = CandidateBatch(
+        round_idx=0,
+        regime_spec=spec,
+        worker_specs=[
+            ("r0_rule_0", "rule_exploit", None, _make_req("exploit_rule")),
+            ("r0_creative", "creative_explore", None, _make_req("explore_creative")),
+        ],
+        parent_module_source=_PARENT_MODULE_SRC,
+        parent_snippet=_PARENT_SNIPPET,
+        func_name="_build_main",
+    )
+    await coord.execute_round_gates(batch_r0, anchors)
+    creative_gate.set()
+    await asyncio.sleep(0.02)
+
+    started_l1_tiles.clear()
+    overlap_seen.clear()
+    slow_req = GenerationRequest(
+        system_prompt="sys",
+        user_prompt="slow",
+        role="exploit_rule",
+        effort="medium",
+    )
+    fast_req = GenerationRequest(
+        system_prompt="sys",
+        user_prompt="fast",
+        role="exploit_rule",
+        effort="medium",
+    )
+    batch_r1 = CandidateBatch(
+        round_idx=1,
+        regime_spec=spec,
+        worker_specs=[
+            ("r1_slow", "rule_exploit", None, slow_req),
+            ("r1_fast", "rule_exploit", None, fast_req),
+        ],
+        parent_module_source=_PARENT_MODULE_SRC,
+        parent_snippet=_PARENT_SNIPPET,
+        func_name="_build_main",
+    )
+    out_r1 = await coord.execute_round_gates(batch_r1, anchors)
+    assert [cid for cid, _ in out_r1.raw_candidates] == [
+        "r0_creative",
+        "r1_slow",
+        "r1_fast",
+    ]
+    assert [chk.candidate_id for chk in out_r1.l0_l1_checks] == [
+        "r0_creative",
+        "r1_slow",
+        "r1_fast",
+    ]
+    assert out_r1.l0_l1_sec < 0.05
+
+
+@pytest.mark.anyio
+async def test_streamed_l0_l1_triggers_repair_only_when_zero_survive(
+    tmp_path: Path,
+) -> None:
+    """Repair runs when 0 streamed candidates survive and skips when >=1 survives."""
+    repair_calls = 0
+
+    class _RepairBackend:
+        def __init__(self, *, first_valid: bool) -> None:
+            self._first_valid = first_valid
+
+        async def generate(
+            self,
+            req: GenerationRequest,
+            *,
+            effort_override: object = None,
+        ) -> str:
+            nonlocal repair_calls
+            _ = effort_override
+            if "repair" in req.role.lower() or "repair" in req.system_prompt.lower():
+                repair_calls += 1
+                await asyncio.sleep(0.01)
+                return _EXPLOIT_SNIPPET
+            if self._first_valid and req.user_prompt == "c0":
+                return _EXPLOIT_SNIPPET
+            return "def _build_main(tile_m=999):\n    return int(tile_m)\n"
+
+    def _l0_check(src: str, _reg: RegimeTargetSpec) -> StageAResult:
+        if "tile_m=999" in src:
+            return StageAResult(
+                passed=False,
+                prim_func=None,
+                ledger=None,
+                error_message="bad tile_m=999",
+            )
+        return _make_stage_a()
+
+    target_path = tmp_path / "kernel.py"
+    target_path.write_text(_PARENT_MODULE_SRC, encoding="utf-8")
+    spec = _make_regime_spec()
+    anchors = _make_anchors()
+
+    coord_all_fail = StageGateCoordinator(
+        operator_name="rms_norm",
+        target_module_path=target_path,
+        regime_specs=(spec,),
+        initial_anchors=anchors,
+        scoreboard_anchors=anchors,
+        backend=_RepairBackend(first_valid=False),
+        l0_checker=_l0_check,
+        l1_compiler=lambda _s, _r: StageBResult(passed=True),
+        l2_batch_evaluator=lambda cands, _a: {
+            cid: _make_surrogate_result(cid) for cid, _p in cands
+        },
+        max_syntax_repairs=1,
+    )
+    req0 = GenerationRequest(
+        role="exploit_rule",
+        system_prompt="sys",
+        user_prompt="c0",
+        effort="medium",
+    )
+    req1 = GenerationRequest(
+        role="exploit_rule",
+        system_prompt="sys",
+        user_prompt="c1",
+        effort="medium",
+    )
+    batch = CandidateBatch(
+        round_idx=0,
+        regime_spec=spec,
+        worker_specs=[
+            ("w0", "rule_exploit", None, req0),
+            ("w1", "rule_exploit", None, req1),
+        ],
+        parent_module_source=_PARENT_MODULE_SRC,
+        parent_snippet=_PARENT_SNIPPET,
+        func_name="_build_main",
+    )
+    out_repaired = await coord_all_fail.execute_round_gates(batch, anchors)
+    assert repair_calls == 2
+    assert out_repaired.syntax_repair_sec > 0.0
+    assert [c.candidate_id for c in out_repaired.passed_checks] == ["w0", "w1"]
+    assert all(c.repaired for c in out_repaired.passed_checks)
+
+    repair_calls = 0
+    coord_one_survives = StageGateCoordinator(
+        operator_name="rms_norm",
+        target_module_path=target_path,
+        regime_specs=(spec,),
+        initial_anchors=anchors,
+        scoreboard_anchors=anchors,
+        backend=_RepairBackend(first_valid=True),
+        l0_checker=_l0_check,
+        l1_compiler=lambda _s, _r: StageBResult(passed=True),
+        l2_batch_evaluator=lambda cands, _a: {
+            cid: _make_surrogate_result(cid) for cid, _p in cands
+        },
+        max_syntax_repairs=1,
+    )
+    out_skip = await coord_one_survives.execute_round_gates(batch, anchors)
+    assert repair_calls == 0
+    assert out_skip.syntax_repair_sec == 0.0
+    assert [c.candidate_id for c in out_skip.passed_checks] == ["w0"]
+    assert [c.candidate_id for c in out_skip.l0_l1_checks] == ["w0", "w1"]
+
+
+@pytest.mark.anyio
+async def test_monkeypatched_filter_stays_batched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Monkeypatched run_l0_l1_round_filter must run the single batched call."""
+
+    class _StaggeredBackend:
+        async def generate(
+            self,
+            req: GenerationRequest,
+            *,
+            effort_override: object = None,
+        ) -> str:
+            _ = effort_override
+            if req.user_prompt == "slow":
+                await asyncio.sleep(0.02)
+            return _EXPLOIT_SNIPPET
+
+    batched_calls: list[list[tuple[str, str]]] = []
+
+    async def _spy_filter(
+        candidates: Sequence[tuple[str, str]],
+        **_kw: object,
+    ) -> list[L0L1CandidateCheck]:
+        batched_calls.append(list(candidates))
+        return [
+            L0L1CandidateCheck(
+                candidate_id=cid,
+                passed=True,
+                failed_tier=None,
+                patched_module_source=_PARENT_MODULE_SRC,
+                snippet_source=snip,
+                stage_a=_make_stage_a(),
+                stage_b=StageBResult(passed=True),
+            )
+            for cid, snip in candidates
+        ]
+
+    monkeypatch.setattr(stage_gate_coordinator, "run_l0_l1_round_filter", _spy_filter)
+    coord = _make_coordinator(tmp_path, backend=_StaggeredBackend())
+    batch = CandidateBatch(
+        round_idx=0,
+        regime_spec=_make_regime_spec(),
+        worker_specs=[
+            (
+                "w0",
+                "rule_exploit",
+                None,
+                GenerationRequest(
+                    role="exploit",
+                    system_prompt="sys",
+                    user_prompt="fast",
+                    effort="medium",
+                ),
+            ),
+            (
+                "w1",
+                "rule_exploit",
+                None,
+                GenerationRequest(
+                    role="exploit",
+                    system_prompt="sys",
+                    user_prompt="slow",
+                    effort="medium",
+                ),
+            ),
+        ],
+        parent_module_source=_PARENT_MODULE_SRC,
+        parent_snippet=_PARENT_SNIPPET,
+        func_name="_build_main",
+    )
+    out = await coord.execute_round_gates(batch, _make_anchors())
+    assert len(batched_calls) == 1
+    assert [cid for cid, _ in batched_calls[0]] == ["w0", "w1"]
+    assert [chk.candidate_id for chk in out.passed_checks] == ["w0", "w1"]
+
+
+def test_collect_distinct_width_dims_skips_non_width_int_sigs_when_no_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip width candidates whose _static_width_signature has no int dimension."""
+    target_path = tmp_path / "kernel.py"
+    target_path.write_text(_PARENT_MODULE_SRC, encoding="utf-8")
+    spec = _make_regime_spec()
+    coord = StageGateCoordinator(
+        operator_name="mla",
+        source_root=tmp_path,
+        target_module_path=target_path,
+        regime_specs=(spec,),
+        scoreboard_anchors=_make_anchors(),
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "collect_distinct_static_width_dims",
+        lambda *_a, **_kw: (
+            {"tl_dtype": "float16", "B": 1, "S": 128},
+            {"tl_dtype": "bfloat16", "num_kv_splits": 4},
+            {"D": 512, "B": 1, "tl_dtype": "float16"},
+        ),
+    )
+    collected = coord._collect_distinct_width_dims(
+        spec,
+        {"D": 128, "tl_dtype": "float16"},
+        False,
+        None,
+    )
+    assert collected == [{"D": 512, "B": 1, "tl_dtype": "float16"}]
+
+    monkeypatch.setattr(
+        coord,
+        "_resolve_max_row_width_dims",
+        lambda _s: {"B": 2, "tl_dtype": "float16"},
+    )
+    collected_with_max = coord._collect_distinct_width_dims(
+        spec,
+        {"D": 128, "tl_dtype": "float16"},
+        True,
+        None,
+    )
+    assert collected_with_max == [{"D": 512, "B": 1, "tl_dtype": "float16"}]
+
 
 
 
