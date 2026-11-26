@@ -14,8 +14,10 @@ import logging
 import math
 import os
 import re
+import select
 import shlex
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -65,13 +67,14 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     extract_python_dsl,
 )
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
-    _ANY_FOLDING_MARKER_RE,
-    _compact_trackb_repair_source,
-    _detect_trackb_prologue_line_offset,
-    _resplice_trackb_omitted_spans,
     build_syntax_repair_request,
     extract_lowered_compiler_excerpt as _extract_lowered_compiler_excerpt,
     extract_lowered_compiler_excerpt_with_lang,
+)
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
+    ArtifactStore,
+    compute_artifact_id,
+    extract_reachable_closure_source,
 )
 from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (
     is_paradigm_shift_exempt,
@@ -362,6 +365,50 @@ class L0L1CandidateCheck:
     stage_a: StageAResult | None = None
     stage_b: StageBResult | None = None
     error_message: str = ""
+    fault_plane: str = ""
+    fault_code: str = ""
+    wall_repair_sec: float = 0.0
+    cum_repair_worker_sec: float = 0.0
+
+
+class L0L1RoundResults(list[L0L1CandidateCheck]):
+    """Round filter result list carrying concurrent and cumulative repair timing."""
+
+    def __init__(
+        self,
+        items: Sequence[L0L1CandidateCheck],
+        *,
+        wall_repair_sec: float = 0.0,
+        cum_repair_worker_sec: float = 0.0,
+    ) -> None:
+        super().__init__(items)
+        self.wall_repair_sec = float(wall_repair_sec)
+        self.cum_repair_worker_sec = float(cum_repair_worker_sec)
+        self.round_metadata: dict[str, float] = {
+            "wall_repair_sec": self.wall_repair_sec,
+            "cum_repair_worker_sec": self.cum_repair_worker_sec,
+        }
+
+
+class AgentGatesDeviceFaultError(RuntimeError):
+    """Structured error raised when an NPU device reports device_fault or rejection."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        fault_plane: str = "INFRA_DEVICE_FAULT",
+        fault_code: str = "NPU_DEVICE_TSD_FAULT",
+        failed_tier: str = "l2_npu",
+        device_id: str = "",
+        rejected_cards: Collection[str] = (),
+    ) -> None:
+        super().__init__(message)
+        self.fault_plane = fault_plane
+        self.fault_code = fault_code
+        self.failed_tier = failed_tier
+        self.device_id = device_id
+        self.rejected_cards = tuple(sorted(str(c) for c in rejected_cards))
 
 
 @dataclass(frozen=True)
@@ -1182,6 +1229,10 @@ def run_l1_compile_check(
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     timeout_sec: int = 120,
+    artifact_store: ArtifactStore | None = None,
+    artifact_id: str = "",
+    regime_tag: str = "",
+    spec_key: str = "",
 ) -> StageBResult:
     """Run Tier L1 TileLang + bisheng device compilation on Host CPU without NPU locks."""
     env_vals = _resolve_env_values(env_file)
@@ -1212,6 +1263,10 @@ def run_l1_compile_check(
             dims=dims,
             python_bin=python_bin,
             timeout_sec=timeout_sec,
+            artifact_store=artifact_store,
+            artifact_id=artifact_id,
+            regime_tag=regime_tag,
+            spec_key=spec_key,
         )
         if not primary_res.passed or not has_tail:
             return primary_res
@@ -1225,6 +1280,9 @@ def run_l1_compile_check(
             dims=tail_anchor_dims,
             python_bin=python_bin,
             timeout_sec=timeout_sec,
+            artifact_store=artifact_store,
+            regime_tag=regime_tag,
+            spec_key=spec_key,
         )
         if not tail_res.passed:
             return StageBResult(
@@ -1236,6 +1294,9 @@ def run_l1_compile_check(
                 compiler_summary=primary_res.compiler_summary,
                 microarch_profile=primary_res.microarch_profile,
                 full_diagnostic=tail_res.full_diagnostic,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code="STAGE_B_TAIL_ANCHOR_FAILED",
+                failed_tier="stage_b",
             )
         return StageBResult(
             passed=True,
@@ -1244,6 +1305,8 @@ def run_l1_compile_check(
             vloopv2_hit=primary_res.vloopv2_hit,
             compiler_summary=primary_res.compiler_summary,
             microarch_profile=primary_res.microarch_profile,
+            artifact_id=primary_res.artifact_id,
+            binary_paths=primary_res.binary_paths,
         )
 
     t0 = time.monotonic()
@@ -1332,6 +1395,9 @@ def run_l1_compile_check(
                 error_message=f"l1_compile_timeout:{timeout_sec}s",
                 elapsed_sec=time.monotonic() - t0,
                 full_diagnostic=captured,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code="L1_COMPILE_TIMEOUT",
+                failed_tier="stage_b",
             )
         lowered_dump = (
             kernel_dump_path.read_text(encoding="utf-8", errors="ignore")
@@ -1360,6 +1426,9 @@ def run_l1_compile_check(
             compiler_summary=summary,
             microarch_profile=ma_profile,
             full_diagnostic=raw_diagnostic,
+            fault_plane="STAGE_B_COMPILE",
+            fault_code="L1_COMPILE_FAILED",
+            failed_tier="stage_b",
         )
     return StageBResult(
         passed=True,
@@ -1480,6 +1549,37 @@ def _extract_candidate_topology_axes(
     return None
 
 
+def _is_noop_identical_failure(
+    *,
+    failed_tier: str = "",
+    error_message: str = "",
+    result: object | None = None,
+) -> bool:
+    fp = str(getattr(result, "fault_plane", "") or "").upper()
+    fc = str(getattr(result, "fault_code", "") or "").upper()
+    if fp == "NOOP_IDENTICAL" or fc == "NOOP_IDENTICAL":
+        return True
+    if str(failed_tier or "").lower() == "noop_identical":
+        return True
+    return "noop_identical" in str(error_message or "").lower()
+
+
+def _merge_interval_wall_sec(intervals: Sequence[tuple[float, float]]) -> float:
+    ordered = sorted((s, e) for s, e in intervals if e > s)
+    if not ordered:
+        return 0.0
+    total = 0.0
+    cur_s, cur_e = ordered[0]
+    for s, e in ordered[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+    total += cur_e - cur_s
+    return total
+
+
 async def run_l0_l1_round_filter(
     candidates: Sequence[tuple[str, str]],
     *,
@@ -1513,8 +1613,12 @@ async def run_l0_l1_round_filter(
     parent_workspace_stages: int | None = None,
     candidate_workspace_stages_fn: Callable[[str, StageAResult], int] | None = None,
 ) -> list[L0L1CandidateCheck]:
-    """Filter candidates via noop guard, L0 static, optional cost prescreen, and L1 compile."""
+    """Filter candidates concurrently via noop guard, L0 static, prescreen, and L1 compile."""
+    _ = trackb_prologue_line_offset
     max_attempts = max(0, max_syntax_repairs)
+    bisheng_sem = asyncio.Semaphore(min(4, os.cpu_count() or 2))
+    repair_intervals: list[tuple[float, float]] = []
+    cum_repair_worker_sec = 0.0
     baseline_compare_source = (
         parent_module_source if parent_module_source.strip() else parent_source
     )
@@ -1532,13 +1636,6 @@ async def run_l0_l1_round_filter(
             else 0
         )
     )
-    trackb_backends = (
-        "ascendc",
-        "ascendc_template",
-        "ascendc_trackb",
-        "cce_trackb",
-        "hybrid_trackb",
-    )
 
     async def _try_repair(
         cur_src: str,
@@ -1546,22 +1643,11 @@ async def run_l0_l1_round_filter(
         *,
         lowered_excerpt: str = "",
         lowered_excerpt_lang: str | None = None,
-        extra_pre_compaction_sources: Sequence[str] = (),
     ) -> tuple[str | None, str, bool]:
+        nonlocal cum_repair_worker_sec
         assert repair_backend is not None
-        is_trackb = backend_kind in trackb_backends
-        repair_src = (
-            _compact_trackb_repair_source(
-                cur_src,
-                diag,
-                parent_source=parent_source,
-                prologue_line_offset=trackb_prologue_line_offset,
-            )
-            if is_trackb
-            else cur_src
-        )
         req = build_syntax_repair_request(
-            repair_src,
+            cur_src,
             diag,
             slice_hint=slice_hint,
             sil_advisory=sil_advisory,
@@ -1574,27 +1660,21 @@ async def run_l0_l1_round_filter(
             lowered_excerpt=lowered_excerpt,
             lowered_excerpt_lang=lowered_excerpt_lang,
         )
+        t_rep0 = time.monotonic()
         try:
             raw_reply = await repair_backend.generate(req)
         except Exception as exc:
+            t_rep1 = time.monotonic()
+            repair_intervals.append((t_rep0, t_rep1))
+            cum_repair_worker_sec += max(0.0, t_rep1 - t_rep0)
             return None, f"{diag} | repair_transport: {type(exc).__name__}: {exc}", True
+        t_rep1 = time.monotonic()
+        repair_intervals.append((t_rep0, t_rep1))
+        cum_repair_worker_sec += max(0.0, t_rep1 - t_rep0)
         try:
             repaired_src = extract_python_dsl(raw_reply)
         except Exception as exc:
             return None, f"{diag} | repair_parse: {type(exc).__name__}: {exc}", False
-        if is_trackb:
-            repaired_src = _resplice_trackb_omitted_spans(
-                repaired_src,
-                pre_compaction_source=cur_src,
-                parent_source=parent_source,
-                extra_sources=extra_pre_compaction_sources,
-            )
-            if _ANY_FOLDING_MARKER_RE.search(repaired_src):
-                return (
-                    None,
-                    f"{diag} | trackb_folding_marker_rejected: unresolvable folding marker",
-                    False,
-                )
         if parent_source.strip():
             violations = check_repair_monotonicity(
                 parent_source,
@@ -1625,6 +1705,21 @@ async def run_l0_l1_round_filter(
                 patched = active_patch_fn(snippet)
             except Exception as exc:
                 err = f"ast_patch_error: {type(exc).__name__}: {exc}"
+                if _is_noop_identical_failure(error_message=err):
+                    return (
+                        L0L1CandidateCheck(
+                            candidate_id=cand_id,
+                            passed=False,
+                            failed_tier="noop_identical",
+                            patched_module_source="",
+                            snippet_source=snippet,
+                            repaired=is_repaired,
+                            error_message=err,
+                            fault_plane="NOOP_IDENTICAL",
+                            fault_code="NOOP_IDENTICAL",
+                        ),
+                        None,
+                    )
                 if repair_backend is None or attempt >= max_attempts:
                     return (
                         L0L1CandidateCheck(
@@ -1635,6 +1730,8 @@ async def run_l0_l1_round_filter(
                             snippet_source=snippet,
                             repaired=is_repaired,
                             error_message=err,
+                            fault_plane="STAGE_A_STATIC",
+                            fault_code="AST_PATCH_ERROR",
                         ),
                         None,
                     )
@@ -1649,6 +1746,8 @@ async def run_l0_l1_round_filter(
                             snippet_source=snippet,
                             repaired=is_repaired,
                             error_message=_repair_timeout_message(rep_err, is_transport),
+                            fault_plane="STAGE_A_STATIC",
+                            fault_code="SYNTAX_REPAIR_FAILED",
                         ),
                         None,
                     )
@@ -1670,12 +1769,32 @@ async def run_l0_l1_round_filter(
                             snippet_source=snippet,
                             repaired=is_repaired,
                             error_message="noop_identical_to_parent",
+                            fault_plane="NOOP_IDENTICAL",
+                            fault_code="NOOP_IDENTICAL",
                         ),
                         None,
                     )
             stage_a = await asyncio.to_thread(l0_checker, patched)
             if not stage_a.passed:
                 err = stage_a.error_message or "l0_static_failed"
+                if _is_noop_identical_failure(error_message=err, result=stage_a):
+                    return (
+                        L0L1CandidateCheck(
+                            candidate_id=cand_id,
+                            passed=False,
+                            failed_tier="noop_identical",
+                            patched_module_source=patched,
+                            snippet_source=snippet,
+                            repaired=is_repaired,
+                            stage_a=stage_a,
+                            error_message=err,
+                            fault_plane="NOOP_IDENTICAL",
+                            fault_code="NOOP_IDENTICAL",
+                        ),
+                        None,
+                    )
+                fp = str(getattr(stage_a, "fault_plane", "") or "STAGE_A_STATIC")
+                fc = str(getattr(stage_a, "fault_code", "") or "STAGE_A_FAILED")
                 if repair_backend is None or attempt >= max_attempts:
                     return (
                         L0L1CandidateCheck(
@@ -1687,14 +1806,12 @@ async def run_l0_l1_round_filter(
                             repaired=is_repaired,
                             stage_a=stage_a,
                             error_message=err,
+                            fault_plane=fp,
+                            fault_code=fc,
                         ),
                         None,
                     )
-                next_snippet, rep_err, is_transport = await _try_repair(
-                    snippet,
-                    err,
-                    extra_pre_compaction_sources=(patched,),
-                )
+                next_snippet, rep_err, is_transport = await _try_repair(snippet, err)
                 if next_snippet is None:
                     return (
                         L0L1CandidateCheck(
@@ -1706,6 +1823,8 @@ async def run_l0_l1_round_filter(
                             repaired=is_repaired,
                             stage_a=stage_a,
                             error_message=_repair_timeout_message(rep_err, is_transport),
+                            fault_plane=fp,
+                            fault_code=fc,
                         ),
                         None,
                     )
@@ -1743,7 +1862,8 @@ async def run_l0_l1_round_filter(
         cur_repaired = repaired
         cur_attempt = attempt
         while True:
-            stage_b = await asyncio.to_thread(l1_compiler, cur_patched)
+            async with bisheng_sem:
+                stage_b = await asyncio.to_thread(l1_compiler, cur_patched)
             if stage_b.passed:
                 return L0L1CandidateCheck(
                     candidate_id=cand_id,
@@ -1756,6 +1876,22 @@ async def run_l0_l1_round_filter(
                     stage_b=stage_b,
                 )
             err = stage_b.error_message or "l1_compile_failed"
+            if _is_noop_identical_failure(error_message=err, result=stage_b):
+                return L0L1CandidateCheck(
+                    candidate_id=cand_id,
+                    passed=False,
+                    failed_tier="noop_identical",
+                    patched_module_source=cur_patched,
+                    snippet_source=cur_snippet,
+                    repaired=cur_repaired,
+                    stage_a=cur_stage_a,
+                    stage_b=stage_b,
+                    error_message=err,
+                    fault_plane="NOOP_IDENTICAL",
+                    fault_code="NOOP_IDENTICAL",
+                )
+            fp = str(getattr(stage_b, "fault_plane", "") or "STAGE_B_COMPILE")
+            fc = str(getattr(stage_b, "fault_code", "") or "STAGE_B_FAILED")
             if repair_backend is None or cur_attempt >= max_attempts:
                 return L0L1CandidateCheck(
                     candidate_id=cand_id,
@@ -1767,6 +1903,8 @@ async def run_l0_l1_round_filter(
                     stage_a=cur_stage_a,
                     stage_b=stage_b,
                     error_message=err,
+                    fault_plane=fp,
+                    fault_code=fc,
                 )
             lowered_excerpt, excerpt_lang = extract_lowered_compiler_excerpt_with_lang(stage_b)
             next_snippet, rep_err, is_transport = await _try_repair(
@@ -1774,7 +1912,6 @@ async def run_l0_l1_round_filter(
                 err,
                 lowered_excerpt=lowered_excerpt,
                 lowered_excerpt_lang=excerpt_lang,
-                extra_pre_compaction_sources=(cur_patched,),
             )
             if next_snippet is None:
                 return L0L1CandidateCheck(
@@ -1787,6 +1924,8 @@ async def run_l0_l1_round_filter(
                     stage_a=cur_stage_a,
                     stage_b=stage_b,
                     error_message=_repair_timeout_message(rep_err, is_transport),
+                    fault_plane=fp,
+                    fault_code=fc,
                 )
             failed_chk, passed_state = await _run_stage_a_phase(
                 cand_id,
@@ -1810,13 +1949,27 @@ async def run_l0_l1_round_filter(
             cand_id, cur_snippet, patched, stage_a, repaired, attempt
         )
 
+    def _finalize(items: Sequence[L0L1CandidateCheck]) -> L0L1RoundResults:
+        wall_sec = _merge_interval_wall_sec(repair_intervals)
+        cum_sec = float(cum_repair_worker_sec)
+        tagged = [
+            replace(chk, wall_repair_sec=wall_sec, cum_repair_worker_sec=cum_sec)
+            for chk in items
+        ]
+        return L0L1RoundResults(
+            tagged,
+            wall_repair_sec=wall_sec,
+            cum_repair_worker_sec=cum_sec,
+        )
+
     use_prescreen = (
         stage_a_cost_ranker is not None
         and cost_prescreen_top_k is not None
         and int(cost_prescreen_top_k) > 0
     )
     if not use_prescreen:
-        return list(await asyncio.gather(*(_check_one(cid, src) for cid, src in candidates)))
+        raw_res = list(await asyncio.gather(*(_check_one(cid, src) for cid, src in candidates)))
+        return _finalize(raw_res)
 
     assert stage_a_cost_ranker is not None
     top_k = int(cost_prescreen_top_k or 0)
@@ -1836,7 +1989,7 @@ async def run_l0_l1_round_filter(
             passers.append((idx, cid, cur_snippet, patched, stage_a, repaired, attempt))
 
     if not passers:
-        return [results_by_idx[i] for i in range(len(candidates))]
+        return _finalize([results_by_idx[i] for i in range(len(candidates))])
 
     creative_id_set = {str(cid) for cid in creative_candidate_ids}
     exempt_passers: list[tuple[int, str, str, str, StageAResult, bool, int]] = []
@@ -1947,6 +2100,8 @@ async def run_l0_l1_round_filter(
                     stage_a=stage_a,
                     stage_b=None,
                     error_message=err_msg,
+                    fault_plane="COST_PRESCREEN",
+                    fault_code="COST_PRESCREEN_PRUNED",
                 )
                 continue
             chk = await _run_stage_b_and_repairs(
@@ -1956,7 +2111,7 @@ async def run_l0_l1_round_filter(
             if chk.passed:
                 passed_l1 += 1
 
-    return [results_by_idx[i] for i in range(len(candidates))]
+    return _finalize([results_by_idx[i] for i in range(len(candidates))])
 
 
 def _resolve_agent_gates_bin(source_root: Path | None = None) -> str:
@@ -2091,10 +2246,15 @@ import inspect
 import json
 import logging
 import sys
+from pathlib import Path
 
 sys.path.insert(0, {ascend_target_dir!r})
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    discover_module_trackb_symbols,
+    extract_trackb_cpp_source,
     get_default_regime_specs,
+    get_operator_entrypoint,
+    infer_module_runtime_backend,
     resolve_regime_for_case,
 )
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
@@ -2128,6 +2288,7 @@ op_name = {op_name!r}
 case_ids = {case_ids_json}
 cand_paths = {cand_paths_json}
 repo = {repo!r}
+anchor_regimes = {anchor_regimes_json}
 
 regime_specs = get_default_regime_specs(op_name)
 case_specs = []
@@ -2148,15 +2309,18 @@ for cid_num in case_ids:
 tasks = []
 errors = []
 cand_errors = []
+entrypoint = get_operator_entrypoint(op_name)
 
 for idx, (cid, mod_path) in enumerate(cand_paths):
     try:
+        mod_src = Path(mod_path).read_text(encoding="utf-8")
         mod_name = f"_tf_warm_plan_{{idx}}"
         spec = importlib.util.spec_from_file_location(mod_name, mod_path)
         if spec is None or spec.loader is None:
             raise RuntimeError(f"Failed to load module spec from {{mod_path}}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        mod_backend, mod_tb_syms = infer_module_runtime_backend(mod_src, entrypoint)
     except Exception as exc:
         msg = f"candidate={{cid}} module_load_failed: {{type(exc).__name__}}: {{exc}}"
         errors.append(msg)
@@ -2165,18 +2329,15 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
 
     get_kernel_fn = getattr(mod, "_get_kernel", None)
     combine_fn = getattr(mod, "_get_combine_kernel", None)
+    render_tb_fn = getattr(mod, "_render_trackb_tu", None)
 
     for cid_num, case_dims, regime in case_specs:
-        if getattr(regime, "runtime_backend", "") == "ascendc_trackb":
-            continue
+        rt_backend = str(getattr(regime, "runtime_backend", "") or "")
+        r_tag = str(anchor_regimes.get(str(cid_num)) or getattr(regime, "regime_tag", "") or "")
+        tb_syms = list(getattr(regime, "trackb_symbols", ()) or mod_tb_syms or ())
         try:
-            resolved = resolve_regime_config(mod_path, regime, dims=case_dims)
-            builder_fn = getattr(mod, resolved.builder_name, None)
-            if not callable(builder_fn):
-                raise ValueError(f"Builder {{resolved.builder_name!r}} not callable")
-
-            pool = dict(regime.sample_builder_kwargs)
-            for h_key, h_val in regime.representative_hir_dims.items():
+            pool = dict(getattr(regime, "sample_builder_kwargs", {{}}))
+            for h_key, h_val in getattr(regime, "representative_hir_dims", {{}}).items():
                 mapped = _HIR_DIM_ALIASES.get(str(h_key), str(h_key))
                 pool.setdefault(mapped, h_val)
             for d_key, d_val in case_dims.items():
@@ -2184,11 +2345,25 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
                 pool[mapped] = d_val
             raw_bk = {{}}
             raw_ck = {{}}
-            sel_name = regime.config_selector_fn
+            pc_safe = {{}}
+            cf_list = []
+            sel_name = getattr(regime, "config_selector_fn", None)
             if sel_name and callable(getattr(mod, sel_name, None)):
                 sel_fn = getattr(mod, sel_name)
                 sel_out = sel_fn(**_filter_callable_kwargs(sel_fn, pool))
                 if isinstance(sel_out, dict):
+                    raw_pc = sel_out.get("pass_configs")
+                    if isinstance(raw_pc, dict):
+                        for pk, pv in raw_pc.items():
+                            if pk == "tl.device_compile_flags":
+                                cf_list.extend(str(f) for f in (pv if isinstance(pv, (list, tuple)) else [pv]))
+                            else:
+                                pc_safe[str(pk)] = pv
+                    raw_cf = sel_out.get("compile_flags") or ()
+                    if isinstance(raw_cf, str):
+                        cf_list.extend(raw_cf.split())
+                    else:
+                        cf_list.extend(str(f) for f in raw_cf if str(f).strip())
                     maybe_bk = sel_out.get("builder_kwargs")
                     if isinstance(maybe_bk, dict):
                         raw_bk = dict(maybe_bk)
@@ -2203,9 +2378,55 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
                             "combine_kwargs",
                         ):
                             pool[str(sk)] = sv
-            pool.update(resolved.builder_kwargs)
-            pc_safe = dict(resolved.pass_configs) if isinstance(resolved.pass_configs, dict) else {{}}
-            cf_list = [str(f) for f in resolved.compile_flags]
+
+            is_pure_tb = rt_backend in ("ascendc_trackb", "ascendc") or mod_backend == "ascendc_trackb"
+            has_tb_cpp = bool(callable(render_tb_fn) or tb_syms or discover_module_trackb_symbols(mod_src))
+            is_hybrid_tb = (
+                rt_backend == "hybrid_trackb" or mod_backend == "hybrid_trackb"
+            ) and has_tb_cpp
+
+            resolved = None
+            builder_fn = None
+            try:
+                resolved = resolve_regime_config(mod_path, regime, dims=case_dims)
+                builder_fn = getattr(mod, resolved.builder_name, None)
+                pool.update(resolved.builder_kwargs)
+                if isinstance(resolved.pass_configs, dict):
+                    pc_safe = dict(resolved.pass_configs)
+                if resolved.compile_flags:
+                    cf_list = [str(f) for f in resolved.compile_flags]
+            except Exception:
+                if not (is_pure_tb or is_hybrid_tb):
+                    raise
+
+            tb_only_builder = bool(
+                resolved is not None
+                and resolved.builder_name == sel_name
+                and has_tb_cpp
+            )
+            if is_pure_tb or (is_hybrid_tb and (builder_fn is None or tb_only_builder)):
+                tb_builder_name = "_render_trackb_tu" if callable(render_tb_fn) else (
+                    resolved.builder_name if (resolved is not None and callable(builder_fn)) else "_trackb_tu"
+                )
+                tasks.append({{
+                    "candidate_id": cid,
+                    "case_num": int(cid_num),
+                    "mod_path": mod_path,
+                    "mode": "trackb",
+                    "builder_name": tb_builder_name,
+                    "kwargs": {{
+                        "dims": _json_safe(pool),
+                        "regime_tag": r_tag,
+                        "trackb_symbols": tb_syms,
+                    }},
+                    "pass_configs": _json_safe(pc_safe),
+                    "compile_flags": cf_list,
+                }})
+                continue
+
+            if not callable(builder_fn):
+                raise ValueError(f"Builder {{resolved.builder_name if resolved else 'missing'!r}} not callable")
+
             pool["builder_fn"] = builder_fn
             pool["pass_configs"] = pc_safe
             pool["compile_flags"] = tuple(cf_list)
@@ -2287,9 +2508,12 @@ print(json.dumps({{"tasks": tasks, "errors": errors, "cand_errors": cand_errors}
 """
 
 
-_PREWARM_TL_WORKER_TEMPLATE = """import importlib.util
+_PREWARM_TL_WORKER_TEMPLATE = """import hashlib
+import importlib.util
 import json
+import os
 import sys
+from pathlib import Path
 import tilelang
 
 task = json.loads({task_json!r})
@@ -2312,6 +2536,79 @@ elif mode == "_get_combine_kernel":
     if "compile_flags" in kwargs and isinstance(kwargs["compile_flags"], list):
         kwargs["compile_flags"] = tuple(kwargs["compile_flags"])
     fn(**kwargs)
+elif mode == "trackb":
+    from tilefoundry_ascend.agent.campaign.anchor_specs import (
+        discover_module_trackb_symbols,
+        extract_trackb_cpp_source,
+    )
+    from tilefoundry_ascend.agent.campaign.campaign_runner import _filter_callable_kwargs
+    from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+        extract_reachable_trackb_source,
+    )
+    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+        resolve_trackb_compile_flags,
+        run_stage_b_ascendc_compile,
+    )
+    from tilefoundry_ascend.ascend.compile_cache.artifact_store import ArtifactStore
+
+    cache_dir = Path(os.environ["TILELANG_CACHE_DIR"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dims_pool = dict(kwargs.get("dims") or {{}})
+    regime_tag = str(kwargs.get("regime_tag") or "")
+    tb_syms = list(kwargs.get("trackb_symbols") or [])
+    mod_src = Path(task["mod_path"]).read_text(encoding="utf-8")
+    cpp_src = ""
+    render_fn = getattr(mod, "_render_trackb_tu", None)
+    if callable(render_fn):
+        cpp_src = str(render_fn(**_filter_callable_kwargs(render_fn, dims_pool)))
+    if not cpp_src.strip():
+        builder_fn = getattr(mod, task.get("builder_name", ""), None)
+        if callable(builder_fn):
+            maybe = builder_fn(**_filter_callable_kwargs(builder_fn, dims_pool))
+            if isinstance(maybe, str) and ("__global__" in maybe or "#include" in maybe):
+                cpp_src = maybe
+    if not cpp_src.strip():
+        syms = tb_syms or list(discover_module_trackb_symbols(mod_src))
+        extracted = extract_trackb_cpp_source(mod_src, syms)
+        if extracted is not None:
+            _kname, cpp_src = extract_reachable_trackb_source(
+                extracted[1],
+                module_source=mod_src,
+                regime_tag=regime_tag,
+            )
+    if not cpp_src.strip():
+        raise RuntimeError("trackb prewarm could not extract C++ translation unit")
+    cf_list = list(resolve_trackb_compile_flags(cpp_src, task.get("compile_flags") or []))
+    task_sig = hashlib.sha256(
+        (cpp_src + "|" + " ".join(cf_list)).encode("utf-8")
+    ).hexdigest()[:16]
+    compile_ascend_fn = getattr(tilelang, "compile_ascend", None)
+    if not callable(compile_ascend_fn):
+        try:
+            from tilelang.contrib.bisheng import compile_ascend as compile_ascend_fn
+        except Exception:
+            compile_ascend_fn = None
+    if callable(compile_ascend_fn):
+        so_path = cache_dir / f"trackb_{{task_sig}}.so"
+        compile_ascend_fn(
+            cpp_src,
+            target_format="so",
+            npu_arch="dav-3510",
+            options=cf_list or None,
+            path_target=str(so_path),
+        )
+        if not so_path.is_file() or so_path.stat().st_size <= 0:
+            raise RuntimeError(f"compile_ascend produced no valid binary at {{so_path}}")
+    else:
+        sb_res = run_stage_b_ascendc_compile(
+            cpp_src,
+            compile_flags=cf_list,
+            artifact_store=ArtifactStore(cache_dir),
+            artifact_id=f"trackb_{{task_sig}}",
+            regime_tag=regime_tag,
+        )
+        if not sb_res.passed:
+            raise RuntimeError(sb_res.error_message or "trackb stage_b compile failed")
 else:
     builder_fn = getattr(mod, task["builder_name"])
     prog = builder_fn(**kwargs)
@@ -2425,24 +2722,31 @@ def _compute_tilelang_lib_stamp(env_vals: Mapping[str, str]) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
-def _tl_cache_has_artifacts(cache_dir: Path) -> bool:
-    """Return True when the TileLang cache contains compiled binary or stub artifacts."""
-    if not cache_dir.is_dir():
+_ARTIFACT_STORE_INTERNAL_FILES = frozenset(
+    {
+        "artifact_manifest_v1.json",
+        "artifact_index_v1.jsonl",
+        ".artifact_store_v1.lock",
+    }
+)
+
+
+def _is_prewarm_internal_file(item: Path) -> bool:
+    name = item.name
+    if name == _PREWARM_MANIFEST_FILENAME or name.startswith(".prewarm_manifest_v1."):
+        return True
+    return name in _ARTIFACT_STORE_INTERNAL_FILES or name.startswith(".artifact_manifest.")
+
+
+def _is_compiled_binary_file(item: Path) -> bool:
+    try:
+        return (
+            item.is_file()
+            and (item.suffix in (".so", ".o", ".bin") or ".so" in item.suffixes)
+            and item.stat().st_size > 0
+        )
+    except OSError:
         return False
-    for item in cache_dir.rglob("*"):
-        if not item.is_file():
-            continue
-        if item.name == _PREWARM_MANIFEST_FILENAME or item.name.startswith(".prewarm_manifest_v1."):
-            continue
-        if item.suffix == ".so":
-            return True
-        if item.name == "compiled_entries.jsonl":
-            try:
-                if item.stat().st_size > 0:
-                    return True
-            except OSError:
-                continue
-    return False
 
 
 def _seed_prewarm_cache_tree(src_dir: Path, dst_dir: Path) -> None:
@@ -2452,9 +2756,11 @@ def _seed_prewarm_cache_tree(src_dir: Path, dst_dir: Path) -> None:
     dst_dir.mkdir(parents=True, exist_ok=True)
     for item in sorted(src_dir.rglob("*")):
         rel = item.relative_to(src_dir)
-        if item.name == _PREWARM_MANIFEST_FILENAME or item.name.startswith(".prewarm_manifest_v1."):
+        if _is_prewarm_internal_file(item):
             continue
         if item.name == "compiled_entries.jsonl":
+            continue
+        if rel.parts and rel.parts[0] == "artifact_blobs":
             continue
         target = dst_dir / rel
         if item.is_dir():
@@ -2490,7 +2796,7 @@ def _merge_prewarm_cache_tree(src_dir: Path, dst_dir: Path) -> None:
         return
     dst_dir.mkdir(parents=True, exist_ok=True)
     for item in sorted(src_dir.rglob("*")):
-        if item.name == _PREWARM_MANIFEST_FILENAME or item.name.startswith(".prewarm_manifest_v1."):
+        if _is_prewarm_internal_file(item):
             continue
         rel = item.relative_to(src_dir)
         target = dst_dir / rel
@@ -2652,7 +2958,7 @@ def prewarm_surrogate_tilelang_cache_with_stats(
     timeout_sec: int = 300,
     isolate_non_incumbent: bool = True,
 ) -> PrewarmTileLangResult:
-    """Content-addressed TileLang prewarm with per-candidate fault isolation and stats."""
+    """Closure-addressed TileLang and Track-B prewarm with binary ArtifactStore checks."""
     t0 = time.monotonic()
     root = Path(source_root).resolve() if source_root is not None else default_source_root()
     repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
@@ -2689,17 +2995,17 @@ def prewarm_surrogate_tilelang_cache_with_stats(
     manifest = _load_prewarm_manifest(manifest_path)
     manifest_tasks: dict[str, object] = dict(manifest["tasks"])
     manifest_plan: dict[str, object] = dict(manifest["plan_index"])
-    has_artifacts = _tl_cache_has_artifacts(resolved_tl_cache)
+    artifact_store = ArtifactStore(resolved_tl_cache)
 
     failed_by_cid: dict[str, str] = {}
-    cand_shas: dict[str, str] = {}
+    cand_sources: dict[str, str] = {}
     cand_resolved_paths: dict[str, str] = {}
     valid_candidates: list[tuple[str, str]] = []
     for raw_cid, raw_path in candidates:
         cid = str(raw_cid)
         try:
             resolved_p = Path(raw_path).resolve()
-            cand_shas[cid] = _sha256_file(resolved_p)
+            cand_sources[cid] = resolved_p.read_text(encoding="utf-8")
             cand_resolved_paths[cid] = str(resolved_p)
             valid_candidates.append((cid, str(resolved_p)))
         except OSError as exc:
@@ -2709,6 +3015,25 @@ def prewarm_surrogate_tilelang_cache_with_stats(
             failed_by_cid[cid] = err
 
     case_ids = [int(a.case_num) for a in anchors]
+    anchor_regimes = {str(int(a.case_num)): str(a.regime_tag or "") for a in anchors}
+    case_closure_srcs: dict[tuple[str, int], str] = {}
+    case_closure_shas: dict[tuple[str, int], str] = {}
+    for cid, _mod_path_str in valid_candidates:
+        mod_src = cand_sources[cid]
+        for anchor in anchors:
+            cnum = int(anchor.case_num)
+            rtag = str(anchor.regime_tag or "")
+            c_src = extract_reachable_closure_source(mod_src, regime_tag=rtag)
+            c_id = compute_artifact_id(
+                closure_src=c_src,
+                arch="dav-3510",
+                cann_series="cann_9_3",
+                spec_key=f"{operator_name}:{rtag}:{cases_yaml_sha256}",
+                compiler_stamp=tl_lib_stamp,
+            )
+            case_closure_srcs[(cid, cnum)] = c_src
+            case_closure_shas[(cid, cnum)] = c_id
+
     cache_hits = 0
     compiled_tasks = 0
     failed_task_count = 0
@@ -2717,8 +3042,8 @@ def prewarm_surrogate_tilelang_cache_with_stats(
     hit_cases_by_cid: dict[str, set[int]] = {}
 
     for cid, mod_path_str in valid_candidates:
-        c_sha = cand_shas[cid]
         for cnum in case_ids:
+            c_sha = case_closure_shas[(cid, cnum)]
             p_key = _build_prewarm_plan_key(
                 operator_name=operator_name,
                 cand_sha256=c_sha,
@@ -2726,10 +3051,16 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 cases_yaml_sha256=cases_yaml_sha256,
                 tilelang_lib_stamp=tl_lib_stamp,
             )
-            entry_keys = manifest_plan.get(p_key) if has_artifacts else None
+            entry_keys = manifest_plan.get(p_key)
             if (
                 isinstance(entry_keys, list)
-                and all(isinstance(tk, str) and tk in manifest_tasks for tk in entry_keys)
+                and len(entry_keys) > 0
+                and all(
+                    isinstance(tk, str)
+                    and tk in manifest_tasks
+                    and artifact_store.has_verified_artifact(tk)
+                    for tk in entry_keys
+                )
             ):
                 cache_hits += len(entry_keys)
                 hit_cases_by_cid.setdefault(cid, set()).add(cnum)
@@ -2817,6 +3148,7 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 case_ids_json=json.dumps(missed_case_ids),
                 cand_paths_json=json.dumps(missed_cand_paths),
                 repo=str(repo),
+                anchor_regimes_json=json.dumps(anchor_regimes),
             ),
             encoding="utf-8",
         )
@@ -2885,7 +3217,7 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 separators=(",", ":"),
             )
             compile_flags = tuple(str(f) for f in (task.get("compile_flags") or ()))
-            c_sha = cand_shas.get(cid)
+            c_sha = case_closure_shas.get((cid, case_num))
             if c_sha is None:
                 if raw_cid:
                     continue
@@ -2897,9 +3229,9 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 compile_flags=compile_flags,
                 tilelang_lib_stamp=tl_lib_stamp,
             )
-            if cid in cand_shas and case_num >= 0:
+            if (cid, case_num) in case_closure_shas and case_num >= 0:
                 planned_plan_keys.setdefault((cid, case_num), []).append(t_key)
-            if has_artifacts and t_key in manifest_tasks:
+            if t_key in manifest_tasks and artifact_store.has_verified_artifact(t_key):
                 if t_key not in seen_hit_task_keys:
                     seen_hit_task_keys.add(t_key)
                     cache_hits += 1
@@ -2910,16 +3242,23 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 continue
             idx = len(unique_miss_tasks)
             seen_miss_idx[t_key] = idx
-            unique_miss_tasks.append(dict(task))
+            task_copy = dict(task)
+            task_copy["artifact_id"] = t_key
+            unique_miss_tasks.append(task_copy)
             unique_miss_keys.append(t_key)
             task_cids_by_idx[idx] = {cid} if cid else set()
 
         if unique_miss_tasks:
-            def _compile_one(idx: int, task: dict[str, object]) -> tuple[int, Path]:
+            def _compile_one(idx: int, task: dict[str, object]) -> tuple[int, Path, tuple[Path, ...]]:
                 worker_dir = tmp_root / f"worker_{idx}"
                 worker_cache = worker_dir / "tl_cache"
                 worker_cache.mkdir(parents=True, exist_ok=True)
                 _seed_prewarm_cache_tree(resolved_tl_cache, worker_cache)
+                pre_bins: dict[Path, tuple[int, int]] = {}
+                for item in worker_cache.rglob("*"):
+                    if _is_compiled_binary_file(item):
+                        st = item.stat()
+                        pre_bins[item.relative_to(worker_cache)] = (st.st_size, st.st_mtime_ns)
                 worker_script = worker_dir / "compile_task.py"
                 worker_script.write_text(
                     _PREWARM_TL_WORKER_TEMPLATE.format(task_json=json.dumps(task, sort_keys=True)),
@@ -2941,11 +3280,22 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                         f"candidate={task.get('candidate_id')} case={task.get('case_num')} "
                         f"builder={task.get('builder_name')}: {detail}"
                     )
-                return idx, worker_cache
+                post_new_rels: list[Path] = []
+                all_post_rels: list[Path] = []
+                for item in sorted(worker_cache.rglob("*")):
+                    if not _is_compiled_binary_file(item):
+                        continue
+                    rel = item.relative_to(worker_cache)
+                    all_post_rels.append(rel)
+                    st = item.stat()
+                    prev = pre_bins.get(rel)
+                    if prev is None or prev != (st.st_size, st.st_mtime_ns):
+                        post_new_rels.append(rel)
+                return idx, worker_cache, tuple(post_new_rels or all_post_rels)
 
             max_workers = min(4, len(unique_miss_tasks))
             incumbent_or_fatal_errors: list[str] = []
-            worker_caches: dict[int, Path] = {}
+            worker_caches: dict[int, tuple[Path, tuple[Path, ...]]] = {}
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = [
                     (idx, pool.submit(_compile_one, idx, task))
@@ -2953,8 +3303,8 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 ]
                 for idx, fut in futures:
                     try:
-                        res_idx, worker_cache = fut.result()
-                        worker_caches[res_idx] = worker_cache
+                        res_idx, worker_cache, bin_rels = fut.result()
+                        worker_caches[res_idx] = (worker_cache, bin_rels)
                     except Exception as exc:
                         err_text = str(exc)
                         assoc_cids = task_cids_by_idx.get(idx, set())
@@ -2980,14 +3330,40 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                     merged_tasks = dict(latest["tasks"])
                     merged_plan = dict(latest["plan_index"])
                     for idx in sorted(worker_caches):
-                        _merge_prewarm_cache_tree(worker_caches[idx], resolved_tl_cache)
+                        worker_cache, bin_rels = worker_caches[idx]
+                        _merge_prewarm_cache_tree(worker_cache, resolved_tl_cache)
                         compiled_tasks += 1
                         task = unique_miss_tasks[idx]
                         t_key = unique_miss_keys[idx]
                         cid = str(task.get("candidate_id", ""))
+                        cnum = int(task.get("case_num", -1))
+                        c_sha = case_closure_shas.get((cid, cnum), "")
+                        merged_bins = [
+                            resolved_tl_cache / rel
+                            for rel in bin_rels
+                            if _is_compiled_binary_file(resolved_tl_cache / rel)
+                        ]
+                        if not merged_bins:
+                            merged_bins = [
+                                item
+                                for item in sorted(resolved_tl_cache.rglob("*"))
+                                if _is_compiled_binary_file(item)
+                            ]
+                        if merged_bins:
+                            artifact_store.record_verified_artifact(
+                                t_key,
+                                binary_paths=merged_bins,
+                                backend_kind="ascendc_trackb"
+                                if task.get("mode") == "trackb"
+                                else "tilelang",
+                                flags=" ".join(str(f) for f in (task.get("compile_flags") or ())),
+                                spec_key=f"{operator_name}:{cnum}",
+                                compiler_stamp=tl_lib_stamp,
+                                closure_src=case_closure_srcs.get((cid, cnum), ""),
+                            )
                         merged_tasks[t_key] = {
                             "builder_name": str(task.get("builder_name", "")),
-                            "cand_sha256": cand_shas.get(cid, ""),
+                            "cand_sha256": c_sha,
                             "tilelang_lib_stamp": tl_lib_stamp,
                         }
                     for (cid, case_num), t_keys in planned_plan_keys.items():
@@ -2996,7 +3372,7 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                         if all(tk in merged_tasks for tk in t_keys):
                             p_key = _build_prewarm_plan_key(
                                 operator_name=operator_name,
-                                cand_sha256=cand_shas[cid],
+                                cand_sha256=case_closure_shas[(cid, case_num)],
                                 case_num=case_num,
                                 cases_yaml_sha256=cases_yaml_sha256,
                                 tilelang_lib_stamp=tl_lib_stamp,
@@ -3009,7 +3385,7 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                             if (cid, cnum) not in planned_plan_keys:
                                 p_key = _build_prewarm_plan_key(
                                     operator_name=operator_name,
-                                    cand_sha256=cand_shas[cid],
+                                    cand_sha256=case_closure_shas[(cid, cnum)],
                                     case_num=cnum,
                                     cases_yaml_sha256=cases_yaml_sha256,
                                     tilelang_lib_stamp=tl_lib_stamp,
@@ -3033,7 +3409,7 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                         if all(tk in merged_tasks for tk in t_keys):
                             p_key = _build_prewarm_plan_key(
                                 operator_name=operator_name,
-                                cand_sha256=cand_shas[cid],
+                                cand_sha256=case_closure_shas[(cid, case_num)],
                                 case_num=case_num,
                                 cases_yaml_sha256=cases_yaml_sha256,
                                 tilelang_lib_stamp=tl_lib_stamp,
@@ -3173,11 +3549,159 @@ def _parse_agent_gates_json(stdout: str) -> dict[str, object]:
         return {}
 
 
+def _inspect_v2_device_fault(
+    report: Mapping[str, object] | None,
+    verification: Mapping[str, object] | None = None,
+) -> tuple[bool, bool, str]:
+    """Inspect AgentGates managed receipts for device_fault or deviceRejected flags."""
+    is_device_fault = False
+    is_device_rejected = False
+    category = ""
+
+    def _scan_mapping(obj: Mapping[str, object] | None) -> None:
+        nonlocal is_device_fault, is_device_rejected, category
+        if not isinstance(obj, Mapping):
+            return
+        if obj.get("deviceRejected") is True or obj.get("device_rejected") is True:
+            is_device_rejected = True
+        for key in ("errorCategory", "failureCategory"):
+            raw_cat = str(obj.get(key) or "").strip().lower()
+            if raw_cat:
+                if not category:
+                    category = raw_cat
+                if raw_cat == "device_fault":
+                    is_device_fault = True
+
+    _scan_mapping(report)
+    _scan_mapping(verification)
+    if isinstance(report, Mapping):
+        gates = report.get("gates")
+        if isinstance(gates, Sequence) and not isinstance(gates, (str, bytes)):
+            for row in gates:
+                if not isinstance(row, Mapping):
+                    continue
+                _scan_mapping(row)
+                obs = row.get("observations")
+                if isinstance(obs, Mapping):
+                    _scan_mapping(obs)
+    return is_device_fault, is_device_rejected, category
+
+
+def compute_adaptive_poison_pill_timeout(inc_latencies_us: Sequence[float]) -> float:
+    """Compute bounded poison-pill kernel timeout in [10.0, 60.0] seconds."""
+    total_sec = sum(
+        max(max(0.0, float(inc_us)) * 1e-6, 1e-3)
+        for inc_us in inc_latencies_us
+    )
+    return min(60.0, max(10.0, 25.0 * total_sec))
+
+
+def run_poison_pill_subprocess(
+    cmd: Sequence[str],
+    *,
+    cwd: str | Path,
+    env: Mapping[str, str] | None = None,
+    inc_latencies_us: Sequence[float] = (),
+    exec_timeout_sec: float | None = None,
+    boot_timeout_sec: float = 30.0,
+) -> tuple[bool, str, int, str, str]:
+    """Run poison-pill worker with boot-ready pipe handshake before exec timeout starts."""
+    eff_exec_timeout = (
+        max(0.05, float(exec_timeout_sec))
+        if exec_timeout_sec is not None
+        else compute_adaptive_poison_pill_timeout(inc_latencies_us)
+    )
+    eff_boot_timeout = max(1.0, float(boot_timeout_sec))
+    read_fd, write_fd = os.pipe()
+    child_env = dict(os.environ if env is None else env)
+    child_env["TF_POISON_PILL_READY_FD"] = str(write_fd)
+
+    def _kill_proc(proc: subprocess.Popen[str]) -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+
+    proc = subprocess.Popen(
+        [str(part) for part in cmd],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(cwd),
+        env=child_env,
+        start_new_session=True,
+        pass_fds=(write_fd,),
+    )
+    os.close(write_fd)
+
+    boot_ready = False
+    boot_deadline = time.monotonic() + eff_boot_timeout
+    buf = b""
+    try:
+        while True:
+            rem = boot_deadline - time.monotonic()
+            if rem <= 0.0:
+                _kill_proc(proc)
+                stdout, stderr = proc.communicate()
+                return (
+                    False,
+                    f"poison_pill_timeout_or_crash: boot timeout after {eff_boot_timeout:g}s",
+                    proc.returncode if proc.returncode is not None else -9,
+                    stdout or "",
+                    stderr or "",
+                )
+            ready, _, _ = select.select([read_fd], [], [], rem)
+            if not ready:
+                continue
+            chunk = os.read(read_fd, 256)
+            if not chunk:
+                break
+            buf += chunk
+            if b"READY" in buf:
+                boot_ready = True
+                break
+    finally:
+        os.close(read_fd)
+
+    if not boot_ready and proc.poll() is not None:
+        stdout, stderr = proc.communicate()
+        detail = (stderr or stdout or "").strip()[-300:]
+        msg = f"poison_pill_timeout_or_crash: exit_code={proc.returncode}"
+        if detail:
+            msg = f"{msg} ({detail})"
+        return False, msg[:300], int(proc.returncode or 1), stdout or "", stderr or ""
+
+    try:
+        stdout, stderr = proc.communicate(timeout=eff_exec_timeout)
+    except subprocess.TimeoutExpired:
+        _kill_proc(proc)
+        stdout, stderr = proc.communicate()
+        return (
+            False,
+            f"poison_pill_timeout_or_crash: timeout after {eff_exec_timeout:g}s",
+            -9,
+            stdout or "",
+            stderr or "",
+        )
+
+    if proc.returncode != 0:
+        detail = (stderr or stdout or "").strip()[-300:]
+        msg = f"poison_pill_timeout_or_crash: exit_code={proc.returncode}"
+        if detail:
+            msg = f"{msg} ({detail})"
+        return False, msg[:300], int(proc.returncode), stdout or "", stderr or ""
+
+    return True, "", 0, stdout or "", stderr or ""
+
+
 def _is_transient_blocked_env(
     proc: subprocess.CompletedProcess[str],
     parsed: Mapping[str, object],
 ) -> bool:
     if proc.returncode == 0:
+        return False
+    is_dev_fault, is_dev_rejected, _cat = _inspect_v2_device_fault(parsed)
+    if is_dev_fault or is_dev_rejected:
         return False
     if parsed.get("status") == "BLOCKED_ENV":
         return True
@@ -3678,12 +4202,16 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
                 {"candidate_id": candidate_id, "module_path": relative, "sha256": digest}
             )
         staged[wire_op] = bindings
+        adaptive_pill_timeout = compute_adaptive_poison_pill_timeout(
+            [float(a.ref_perf_us) for a in op_anchors]
+        )
         request_batches.append(
             {
                 "operator_name": wire_op,
                 "entrypoint": get_operator_entrypoint(op_name),
                 "candidates": entries,
                 "anchors": [a.to_dict() for a in op_anchors],
+                "poison_pill_timeout_sec": adaptive_pill_timeout,
             }
         )
 
@@ -3739,6 +4267,19 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
         env_vals=env_vals,
     )
     l2_npu_sec = time.monotonic() - t_npu0
+    is_dev_fault, is_dev_rejected, _cat = _inspect_v2_device_fault(
+        execution.report, execution.verification
+    )
+    if is_dev_fault or is_dev_rejected or execution.device_rejected:
+        bad_card = execution.device_id or str(device_id)
+        raise AgentGatesDeviceFaultError(
+            f"AgentGates device-fast receipt reported device_fault on card {bad_card}",
+            fault_plane="INFRA_DEVICE_FAULT",
+            fault_code="NPU_DEVICE_TSD_FAULT",
+            failed_tier="l2_npu",
+            device_id=bad_card,
+            rejected_cards=[bad_card] if bad_card else (),
+        )
     _verify_fast_bindings(raw_resp, staged)
     _verify_fast_coverage(
         raw_resp,
@@ -4548,6 +5089,7 @@ def _run_v2_gate(
             resolved_device_id=resolved_device,
             state=last_state or "FINISHED",
         )
+    is_dev_fault, is_dev_rejected, _cat = _inspect_v2_device_fault(report, verification)
     return _V2GateExecution(
         execution_id=execution_id,
         run_id=run_id,
@@ -4558,6 +5100,7 @@ def _run_v2_gate(
         device_id=resolved_device,
         state=last_state or "FINISHED",
         execution_terminal=True,
+        device_rejected=bool(is_dev_rejected or is_dev_fault),
     )
 
 
@@ -4802,6 +5345,7 @@ def _submit_fast_gate(
     total_occupancy_sleep = 0.0
     rejected_cards: set[str] = set()
     selected_card = ""
+    saw_device_fault = False
     execution: _V2GateExecution | None = None
     for pass_idx in range(max_pool_passes):
         candidates = _call_order_candidates_by_idle_preflight(
@@ -4846,11 +5390,25 @@ def _submit_fast_gate(
                 attempt_exec.report,
                 (AGENT_GATES_DEVICE_FAST_GATE,),
             )
-            if attempt_exec.device_rejected or blocked_category == "occupancy":
+            is_dev_fault, is_dev_rejected, receipt_cat = _inspect_v2_device_fault(
+                attempt_exec.report,
+                attempt_exec.verification,
+            )
+            eff_dev_fault = bool(
+                is_dev_fault or blocked_category == "device_fault" or receipt_cat == "device_fault"
+            )
+            eff_rejected = bool(attempt_exec.device_rejected or is_dev_rejected or eff_dev_fault)
+            if eff_rejected or blocked_category == "occupancy":
                 response_path.unlink(missing_ok=True)
-                if attempt_exec.device_rejected:
+                if eff_rejected:
                     rejected_cards.add(card)
-                reason = "device_rejected" if attempt_exec.device_rejected else "occupancy"
+                if eff_dev_fault:
+                    saw_device_fault = True
+                reason = (
+                    "device_fault"
+                    if eff_dev_fault
+                    else ("device_rejected" if eff_rejected else "occupancy")
+                )
                 next_card = candidates[idx + 1] if idx + 1 < len(candidates) else "backoff"
                 logger.warning(
                     "FAST_GATE_CONTAMINATION_RETEST request=%s tainted_device=%s "
@@ -4882,6 +5440,16 @@ def _submit_fast_gate(
                     continue
         break
     assert execution is not None
+    if not selected_card and (saw_device_fault or rejected_cards):
+        raise AgentGatesDeviceFaultError(
+            "AgentGates device-fast rejected all candidate NPU cards "
+            f"(rejected={sorted(rejected_cards)}, detail={execution.transport_error or 'device_fault'})",
+            fault_plane="INFRA_DEVICE_FAULT",
+            fault_code="NPU_DEVICE_TSD_FAULT",
+            failed_tier="l2_npu",
+            device_id=execution.device_id or str(device_id or "").strip(),
+            rejected_cards=rejected_cards,
+        )
     if execution.transport_error:
         raise RuntimeError(f"AgentGates device-fast batch failed: {execution.transport_error}")
     if not execution.verified:
@@ -6386,6 +6954,7 @@ __all__ = [
     "AGENT_GATES_DEVICE_FAST_GATE",
     "AGENT_GATES_L3_PROMOTION_GATE",
     "AGENT_GATES_L4_CANNBENCH_GATE",
+    "AgentGatesDeviceFaultError",
     "AnchorEvalMetrics",
     "CandidateSurrogateResult",
     "DEFAULT_L3_PROMOTION_WAIT_SEC",
@@ -6401,6 +6970,7 @@ __all__ = [
     "FAILURE_KIND_CANDIDATE",
     "FAILURE_KIND_INFRASTRUCTURE",
     "L0L1CandidateCheck",
+    "L0L1RoundResults",
     "L2BatchResults",
     "L3AcceptanceResult",
     "L4CannbenchResult",
@@ -6410,6 +6980,7 @@ __all__ = [
     "build_anchor_metrics",
     "collect_bottleneck_msprof_via_agent_gates",
     "collect_p2_deep_dive_via_agent_gates",
+    "compute_adaptive_poison_pill_timeout",
     "ensure_npu_compare_shim_dir",
     "extract_ordered_tensor_shapes",
     "lookup_case_static_spec",
@@ -6426,6 +6997,7 @@ __all__ = [
     "run_l4_official_cannbench_via_agent_gates",
     "run_micro_probe_via_agent_gates",
     "run_multi_operator_surrogate_batch_via_agent_gates",
+    "run_poison_pill_subprocess",
     "run_surrogate_batch_via_agent_gates",
     "select_idle_campaign_device",
 ]

@@ -24,6 +24,11 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     StaticDynamicResidual,
     compute_static_dynamic_residual,
 )
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
+    ArtifactStore,
+    compute_artifact_id,
+    extract_reachable_closure_source,
+)
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     BishengResourceSummary,
     count_reachable_ub_scalar_compute_loops,
@@ -62,6 +67,9 @@ class StageAResult:
     error_message: str = ""
     elapsed_ms: float = 0.0
     backend_kind: str = "tilelang"
+    fault_plane: str = ""
+    fault_code: str = ""
+    failed_tier: str = ""
 
 
 @dataclass(frozen=True)
@@ -78,6 +86,37 @@ class StageBResult:
     full_diagnostic: str = ""
     generated_cce: str = ""
     lowered_tir: str = ""
+    fault_plane: str = ""
+    fault_code: str = ""
+    failed_tier: str = ""
+    artifact_id: str = ""
+    binary_paths: tuple[str, ...] = ()
+
+
+def _resolve_artifact_store(artifact_store: ArtifactStore | None) -> ArtifactStore | None:
+    if artifact_store is not None:
+        return artifact_store
+    raw_dir = os.environ.get("TILEFOUNDRY_NPU_ARTIFACT_STORE", "").strip()
+    if raw_dir:
+        return ArtifactStore(Path(raw_dir))
+    return None
+
+
+def _classify_ascendc_stage_a_fault(errors: Sequence[str]) -> tuple[str, str, str]:
+    joined = "; ".join(errors).lower()
+    if "cce_forbidden_tokens" in joined:
+        return "STAGE_A_STATIC", "CCE_FORBIDDEN_TOKENS", "stage_a"
+    if "max_overflow_bytes" in joined:
+        return "STAGE_A_STATIC", "UB_OVERFLOW", "stage_a"
+    if "missing_cube_engine_primitives" in joined:
+        return "STAGE_A_STATIC", "MISSING_CUBE_ENGINE", "stage_a"
+    if "missing_hardware_dma_staging" in joined:
+        return "STAGE_A_STATIC", "MISSING_HARDWARE_DMA", "stage_a"
+    if "degenerated_single_lane_simt" in joined:
+        return "STAGE_A_STATIC", "DEGENERATED_SINGLE_LANE_SIMT", "stage_a"
+    if "redline" in joined:
+        return "STAGE_A_STATIC", "CUSTOM_KERNEL_REDLINE", "stage_a"
+    return "STAGE_A_STATIC", "STAGE_A_ASCENDC_STATIC_FAILED", "stage_a"
 
 
 @dataclass(frozen=True)
@@ -2669,6 +2708,9 @@ def evaluate_ascendc_candidate(
             error_message="ascendc_empty_source",
             elapsed_ms=(time.monotonic() - t0) * 1000.0,
             backend_kind="ascendc",
+            fault_plane="STAGE_A_STATIC",
+            fault_code="ASCENDC_EMPTY_SOURCE",
+            failed_tier="stage_a",
         )
 
     from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask  # noqa: PLC0415
@@ -2788,6 +2830,7 @@ def evaluate_ascendc_candidate(
         features = dict(route.features) if route.features is not None else semantic_features
 
     if errors:
+        fault_plane, fault_code, failed_tier = _classify_ascendc_stage_a_fault(errors)
         return StageAResult(
             passed=False,
             prim_func=None,
@@ -2797,6 +2840,9 @@ def evaluate_ascendc_candidate(
             error_message="; ".join(errors),
             elapsed_ms=(time.monotonic() - t0) * 1000.0,
             backend_kind="ascendc",
+            fault_plane=fault_plane,
+            fault_code=fault_code,
+            failed_tier=failed_tier,
         )
     return StageAResult(
         passed=True,
@@ -3206,6 +3252,9 @@ def run_stage_a_static(
                     f"threads= (lines {line_list}); pass threads= only to T.SimtVF(threads=128)"
                 ),
                 elapsed_ms=(time.monotonic() - t0) * 1000.0,
+                fault_plane="STAGE_A_STATIC",
+                fault_code="FORBIDDEN_KERNEL_THREADS_KWARG",
+                failed_tier="stage_a",
             )
         parallel_math = _parallel_forbidden_math_calls(parsed_tree)
         if parallel_math:
@@ -3220,6 +3269,9 @@ def run_stage_a_static(
                     "with T.SimtVF(threads=128): with T.cast"
                 ),
                 elapsed_ms=(time.monotonic() - t0) * 1000.0,
+                fault_plane="STAGE_A_STATIC",
+                fault_code="FORBIDDEN_TRACKA_PARALLEL_SCALAR_MATH",
+                failed_tier="stage_a",
             )
         uncovered_1c2v_lines = _uncovered_1c2v_subcore_mte3_writes(parsed_tree)
         if uncovered_1c2v_lines:
@@ -3234,6 +3286,9 @@ def run_stage_a_static(
                     "partition rows as sid * half_m : (sid + 1) * half_m"
                 ),
                 elapsed_ms=(time.monotonic() - t0) * 1000.0,
+                fault_plane="STAGE_A_STATIC",
+                fault_code="UNCOVERED_1C2V_SUBCORE_MTE3_WRITE",
+                failed_tier="stage_a",
             )
         tl_ast_report = verify_tilelang_ast(dsl_source)
         if not tl_ast_report.passed:
@@ -3243,6 +3298,9 @@ def run_stage_a_static(
                 ledger=None,
                 error_message="; ".join(tl_ast_report.errors),
                 elapsed_ms=(time.monotonic() - t0) * 1000.0,
+                fault_plane="STAGE_A_STATIC",
+                fault_code="TILELANG_AST_VIOLATION",
+                failed_tier="stage_a",
             )
         entry_name = _detect_module_entrypoint(parsed_tree)
         if entry_name:
@@ -3254,6 +3312,9 @@ def run_stage_a_static(
                     ledger=None,
                     error_message="; ".join(purity_errs),
                     elapsed_ms=(time.monotonic() - t0) * 1000.0,
+                    fault_plane="STAGE_A_STATIC",
+                    fault_code="NPU_ENTRYPOINT_PURITY_VIOLATION",
+                    failed_tier="stage_a",
                 )
         with ascend_compile_session("ascend"):
             prim_func, sel_pc, sel_cf = _resolve_prim_func_and_configs_from_dsl(
@@ -3281,6 +3342,9 @@ def run_stage_a_static(
                     error_message="; ".join(err_parts),
                     elapsed_ms=(time.monotonic() - t0) * 1000.0,
                     backend_kind="python_kernel",
+                    fault_plane="STAGE_A_STATIC",
+                    fault_code="STAGE_A_NON_KERNEL_CALLABLE",
+                    failed_tier="stage_a",
                 )
             merged_pc, merged_cf = _merge_pass_configs_and_flags(
                 sel_pc,
@@ -3306,6 +3370,9 @@ def run_stage_a_static(
             route=None,
             error_message=f"stage_a_parse_or_lower_error: {type(exc).__name__}: {exc}",
             elapsed_ms=(time.monotonic() - t0) * 1000.0,
+            fault_plane="STAGE_A_STATIC",
+            fault_code="STAGE_A_PARSE_OR_LOWER_ERROR",
+            failed_tier="stage_a",
         )
 
     ledger = inspection.ledger
@@ -3339,6 +3406,11 @@ def run_stage_a_static(
             route=route,
             error_message="; ".join(reasons),
             elapsed_ms=(time.monotonic() - t0) * 1000.0,
+            fault_plane="STAGE_A_STATIC",
+            fault_code=(
+                "UB_OVERFLOW" if ledger.max_overflow_bytes > 0 else "ILLEGAL_DATAPATH_OR_CAPACITY"
+            ),
+            failed_tier="stage_a",
         )
     engine_reasons: list[str] = []
     if require_cube_engine:
@@ -3368,6 +3440,9 @@ def run_stage_a_static(
             route=route,
             error_message="; ".join(engine_reasons),
             elapsed_ms=(time.monotonic() - t0) * 1000.0,
+            fault_plane="STAGE_A_STATIC",
+            fault_code="MISSING_ENGINE_PRIMITIVES",
+            failed_tier="stage_a",
         )
     return StageAResult(
         passed=True,
@@ -3576,6 +3651,10 @@ def run_stage_b_compile(
     python_bin: str | None = None,
     timeout_sec: int = 120,
     enable_device_compile: bool = True,
+    artifact_store: ArtifactStore | None = None,
+    artifact_id: str = "",
+    regime_tag: str = "",
+    spec_key: str = "",
 ) -> StageBResult:
     """Verify full TileLang + bisheng device compilation in an isolated subprocess."""
     if not enable_device_compile:
@@ -3586,11 +3665,15 @@ def run_stage_b_compile(
     env["TILELANG_DISABLE_CACHE"] = "1"
     env.setdefault("USE_CUDA", "0")
     _inject_cann_cpath_env(env)
+    resolved_store = _resolve_artifact_store(artifact_store)
+    recorded_aid = ""
+    recorded_bins: tuple[str, ...] = ()
     with tempfile.TemporaryDirectory(prefix="tf_stage_b_") as tmp_dir:
-        cand_path = Path(tmp_dir) / "candidate_dsl.py"
+        tmp_root = Path(tmp_dir)
+        cand_path = tmp_root / "candidate_dsl.py"
         cand_path.write_text(dsl_source, encoding="utf-8")
-        kernel_dump_path = Path(tmp_dir) / "lowered_kernel.cce"
-        tir_dump_path = Path(tmp_dir) / "lowered_tir.tir"
+        kernel_dump_path = tmp_root / "lowered_kernel.cce"
+        tir_dump_path = tmp_root / "lowered_tir.tir"
         driver = build_stage_b_driver_source(
             cand_path,
             factory_name=factory_name,
@@ -3628,6 +3711,9 @@ def run_stage_b_compile(
                 elapsed_sec=time.monotonic() - t0,
                 generated_cce=lowered_dump,
                 lowered_tir=lowered_tir_dump,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code="STAGE_B_COMPILE_TIMEOUT",
+                failed_tier="stage_b",
             )
         lowered_dump = (
             kernel_dump_path.read_text(encoding="utf-8", errors="ignore")
@@ -3639,6 +3725,36 @@ def run_stage_b_compile(
             if tir_dump_path.is_file()
             else ""
         )
+        if proc.returncode == 0 and resolved_store is not None:
+            built_bins = [
+                p
+                for p in sorted(tmp_root.rglob("*"))
+                if p.is_file()
+                and (p.suffix in (".so", ".o", ".bin") or ".so" in p.suffixes)
+                and p.stat().st_size > 0
+            ]
+            if built_bins:
+                closure_src = (
+                    extract_reachable_closure_source(dsl_source, regime_tag=regime_tag)
+                    if regime_tag
+                    else dsl_source
+                )
+                flags_str = " ".join(_normalize_flag_list(compile_flags))
+                recorded_aid = artifact_id or compute_artifact_id(
+                    closure_src=closure_src,
+                    flags=flags_str,
+                    spec_key=spec_key,
+                )
+                rec = resolved_store.record_verified_artifact(
+                    recorded_aid,
+                    binary_paths=built_bins,
+                    backend_kind="tilelang",
+                    flags=flags_str,
+                    spec_key=spec_key,
+                    closure_src=closure_src,
+                    copy_binaries=True,
+                )
+                recorded_bins = rec.binary_paths
     combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
     spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
         combined_out,
@@ -3663,6 +3779,9 @@ def run_stage_b_compile(
             full_diagnostic=raw_detail,
             generated_cce=lowered_dump,
             lowered_tir=lowered_tir_dump,
+            fault_plane="STAGE_B_COMPILE",
+            fault_code="STAGE_B_COMPILE_FAILED",
+            failed_tier="stage_b",
         )
     return StageBResult(
         passed=True,
@@ -3673,6 +3792,8 @@ def run_stage_b_compile(
         microarch_profile=ma_profile,
         generated_cce=lowered_dump,
         lowered_tir=lowered_tir_dump,
+        artifact_id=recorded_aid,
+        binary_paths=recorded_bins,
     )
 
 
@@ -4123,6 +4244,10 @@ def run_stage_b_ascendc_compile(
     timeout_sec: int = 120,
     enable_device_compile: bool = True,
     verify_shared_link: bool = False,
+    artifact_store: ArtifactStore | None = None,
+    artifact_id: str = "",
+    regime_tag: str = "",
+    spec_key: str = "",
 ) -> StageBResult:
     """Verify dav-3510 C++20 translation unit compilation via bisheng in an isolated tempdir."""
     if not enable_device_compile:
@@ -4133,6 +4258,9 @@ def run_stage_b_ascendc_compile(
             passed=False,
             error_message="stage_b_ascendc_empty_source",
             elapsed_sec=time.monotonic() - t0,
+            fault_plane="STAGE_B_COMPILE",
+            fault_code="STAGE_B_ASCENDC_EMPTY_SOURCE",
+            failed_tier="stage_b",
         )
 
     resolved_bisheng = _resolve_bisheng_bin(bisheng_bin, cann_root=cann_root)
@@ -4141,6 +4269,9 @@ def run_stage_b_ascendc_compile(
             passed=False,
             error_message="stage_b_ascendc_bisheng_not_found",
             elapsed_sec=time.monotonic() - t0,
+            fault_plane="INFRA_TOOLCHAIN",
+            fault_code="BISHENG_NOT_FOUND",
+            failed_tier="stage_b",
         )
 
     extra_flags = _normalize_flag_list(compile_flags)
@@ -4180,6 +4311,9 @@ def run_stage_b_ascendc_compile(
     if cann_root_str and Path(cann_root_str).is_dir() and not env.get("ASCEND_HOME_PATH"):
         env["ASCEND_HOME_PATH"] = cann_root_str
 
+    resolved_store = _resolve_artifact_store(artifact_store)
+    recorded_aid = ""
+    recorded_bins: tuple[str, ...] = ()
     with tempfile.TemporaryDirectory(prefix="tf_stage_b_ascendc_") as tmp_dir:
         src_name = "kernel.cpp" if has_explicit_x else "kernel.asc"
         src_path = Path(tmp_dir) / src_name
@@ -4235,6 +4369,9 @@ def run_stage_b_ascendc_compile(
                 passed=False,
                 error_message=f"stage_b_ascendc_compile_timeout:{timeout_sec}s",
                 elapsed_sec=time.monotonic() - t0,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code="STAGE_B_ASCENDC_COMPILE_TIMEOUT",
+                failed_tier="stage_b",
             )
 
         combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
@@ -4262,6 +4399,9 @@ def run_stage_b_ascendc_compile(
                 compiler_summary=summary,
                 microarch_profile=ma_profile,
                 full_diagnostic=raw_detail,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code="STAGE_B_ASCENDC_COMPILE_FAILED",
+                failed_tier="stage_b",
             )
 
         inst_ok, inst_err = _verify_object_has_instantiated_kernel(
@@ -4285,8 +4425,12 @@ def run_stage_b_ascendc_compile(
                 vloopv2_hit=vloopv2_hit,
                 compiler_summary=summary,
                 microarch_profile=ma_profile,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code="STAGE_B_ASCENDC_UNINSTANTIATED_TEMPLATE",
+                failed_tier="stage_b",
             )
 
+        so_path_opt: Path | None = None
         if (
             verify_shared_link
             and 'extern "C"' in cpp_source
@@ -4329,6 +4473,9 @@ def run_stage_b_ascendc_compile(
                     vloopv2_hit=vloopv2_hit,
                     compiler_summary=summary,
                     microarch_profile=ma_profile,
+                    fault_plane="STAGE_B_COMPILE",
+                    fault_code="STAGE_B_ASCENDC_SHARED_LINK_TIMEOUT",
+                    failed_tier="stage_b",
                 )
             link_raw = (link_proc.stderr or "") + "\n" + (link_proc.stdout or "")
             if link_proc.returncode != 0 or not so_path.is_file():
@@ -4345,7 +4492,42 @@ def run_stage_b_ascendc_compile(
                     compiler_summary=summary,
                     microarch_profile=ma_profile,
                     full_diagnostic=link_raw,
+                    fault_plane="STAGE_B_COMPILE",
+                    fault_code="STAGE_B_ASCENDC_SHARED_LINK_FAILED",
+                    failed_tier="stage_b",
                 )
+            so_path_opt = so_path
+
+        if resolved_store is not None:
+            built_bins = [
+                p
+                for p in (obj_path, so_path_opt)
+                if p is not None and p.is_file() and p.stat().st_size > 0
+            ]
+            if built_bins:
+                closure_src = (
+                    extract_reachable_closure_source(cpp_source, regime_tag=regime_tag)
+                    if regime_tag
+                    else cpp_source
+                )
+                flags_str = " ".join(extra_flags)
+                recorded_aid = artifact_id or compute_artifact_id(
+                    closure_src=closure_src,
+                    flags=flags_str,
+                    arch=arch,
+                    spec_key=spec_key,
+                )
+                rec = resolved_store.record_verified_artifact(
+                    recorded_aid,
+                    binary_paths=built_bins,
+                    backend_kind="ascendc",
+                    arch=arch,
+                    flags=flags_str,
+                    spec_key=spec_key,
+                    closure_src=closure_src,
+                    copy_binaries=True,
+                )
+                recorded_bins = rec.binary_paths
 
     return StageBResult(
         passed=True,
@@ -4354,6 +4536,8 @@ def run_stage_b_ascendc_compile(
         vloopv2_hit=vloopv2_hit,
         compiler_summary=summary,
         microarch_profile=ma_profile,
+        artifact_id=recorded_aid,
+        binary_paths=recorded_bins,
     )
 
 
@@ -4630,12 +4814,14 @@ class GateFunnel:
         compile_runner: Callable[[str], StageBResult] | None = None,
         device_runner: Callable[[str, StageAResult], StageCResult] | None = None,
         enable_track_router: bool = False,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self._target = target or AscendTarget("ascend.950pr")
         self._skip_stage_b = skip_stage_b
         self._compile_runner = compile_runner
         self._device_runner = device_runner
         self._enable_track_router = enable_track_router
+        self._artifact_store = artifact_store
 
     def evaluate(
         self,
@@ -4652,6 +4838,8 @@ class GateFunnel:
         freedom_mask: object | None = None,
         roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
         ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
+        regime_tag: str = "",
+        spec_key: str = "",
     ) -> FunnelEvaluation:
         """Run Stage A, Stage B, and Stage C sequentially with early rejection."""
         if backend_kind in ("ascendc", "ascendc_template"):
@@ -4691,6 +4879,9 @@ class GateFunnel:
             stage_b = run_stage_b_ascendc_compile(
                 dsl_source,
                 compile_flags=compile_flags,
+                artifact_store=self._artifact_store,
+                regime_tag=regime_tag,
+                spec_key=spec_key,
             )
         else:
             stage_b = run_stage_b_compile(
@@ -4701,6 +4892,9 @@ class GateFunnel:
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
                 dims=dims,
+                artifact_store=self._artifact_store,
+                regime_tag=regime_tag,
+                spec_key=spec_key,
             )
         if not stage_b.passed:
             return FunnelEvaluation(
