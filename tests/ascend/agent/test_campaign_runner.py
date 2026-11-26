@@ -4138,9 +4138,12 @@ def test_wp_final1_pruned_inline_regimes_partial_override_and_mla_combine_gate(
     assert "combine_kernel(_build_mla_split_kv_combine_func)" in l0_bad.error_message
 
     l1_builders: list[str] = []
+    l1_static_specs: list[object] = []
 
-    def _fake_l1(mod_src, *, builder_name, **_kw):
+    def _fake_l1(mod_src, *, builder_name, static_spec_dims_list=None, **_kw):
         l1_builders.append(builder_name)
+        if builder_name == "_build_mla_split_kv_decode_func":
+            l1_static_specs.extend(static_spec_dims_list or ())
         if builder_name == "_build_mla_split_kv_combine_func":
             return StageBResult(passed=False, error_message="broken combine ir")
         return StageBResult(passed=True)
@@ -4148,8 +4151,9 @@ def test_wp_final1_pruned_inline_regimes_partial_override_and_mla_combine_gate(
     monkeypatch.setattr(cr_mod, "run_l1_compile_check", _fake_l1)
     l1_bad = runner._run_l1(broken_combine_mod, split_spec)
     assert not l1_bad.passed
-    assert len(l1_builders) >= 3
-    assert all(b == "_build_mla_split_kv_decode_func" for b in l1_builders[:-1])
+    assert len(l1_builders) == 2
+    assert l1_builders[0] == "_build_mla_split_kv_decode_func"
+    assert len(l1_static_specs) >= 1
     assert l1_builders[-1] == "_build_mla_split_kv_combine_func"
     assert "combine_kernel(_build_mla_split_kv_combine_func): broken combine ir" == l1_bad.error_message
 
