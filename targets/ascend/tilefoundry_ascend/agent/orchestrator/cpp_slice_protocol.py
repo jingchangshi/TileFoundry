@@ -533,7 +533,7 @@ def _truncate_kernel_body(
         encoded = kernel_text.encode("utf-8")[: max(128, max_bytes - 48)]
         return encoded.decode("utf-8", errors="ignore").rstrip() + "\n}"
     middle_marker = (
-        "\n    /* [MIDDLE BODY OMITTED TO FIT <15KB SCOPED VIEW; PATCH VISIBLE LINES] */\n"
+        "\n    /* [MIDDLE BODY OMITTED TO FIT SCOPED VIEW; PATCH VISIBLE LINES] */\n"
     )
     budget = max(256, max_bytes - len(middle_marker.encode("utf-8")))
     head_budget = budget // 2
@@ -662,6 +662,34 @@ def _truncate_kernel_body(
     return encoded.decode("utf-8", errors="ignore").rstrip() + "\n}"
 
 
+def _joined_utf8_bytes(parts: Sequence[str]) -> int:
+    text = "\n\n".join(p for p in parts if p).strip()
+    return len(text.encode("utf-8")) if text else 0
+
+
+def _pick_summary_budget_tier(
+    base_parts: Sequence[str],
+    core_parts: Sequence[str],
+    sibling_tiers: Sequence[str],
+    helper_tiers: Sequence[str],
+    max_bytes: int,
+) -> tuple[str, str]:
+    """Select the richest sibling/helper summary tier that fits *core_parts* within *max_bytes*."""
+    sib_full, sib_compact, sib_folded = sibling_tiers
+    hlp_full, hlp_folded = helper_tiers
+    candidates = (
+        (sib_full, hlp_full),
+        (sib_full, hlp_folded),
+        (sib_compact, hlp_folded),
+        (sib_folded, ""),
+        ("", ""),
+    )
+    for sib_blk, hlp_blk in candidates:
+        if _joined_utf8_bytes([*base_parts, sib_blk, *core_parts, hlp_blk]) <= max_bytes:
+            return sib_blk, hlp_blk
+    return "", ""
+
+
 def build_trackb_context_view(
     cpp_source: str,
     *,
@@ -670,12 +698,12 @@ def build_trackb_context_view(
     module_source: str = "",
     trackb_symbol: str = "",
     launcher_preview: str = "",
-    max_bytes: int = 14800,
+    max_bytes: int = 49152,
     focus_lines: Sequence[int] = (),
     focus_window: int = 25,
     diagnostic_text: str = "",
 ) -> str:
-    """Build a bounded (<15 KB) scoped C++20 context view for Track-B editing."""
+    """Build a bounded (48 KB default) scoped C++20 context view for Track-B editing."""
     diag_lines = extract_cpp_diagnostic_lines(diagnostic_text) if diagnostic_text else ()
     resolved_focus = tuple(
         sorted({int(ln) for ln in (*focus_lines, *diag_lines) if int(ln) > 0})
@@ -698,26 +726,34 @@ def build_trackb_context_view(
 
     preview = launcher_preview.strip() or extract_trackb_launcher_preview(module_source)
 
-    prefix_parts: list[str] = []
+    base_parts: list[str] = []
     if trackb_symbol:
-        prefix_parts.append(f"/* TRACK-B SCOPED SLICE: symbol={trackb_symbol} active={target_name} */")
+        base_parts.append(f"/* TRACK-B SCOPED SLICE: symbol={trackb_symbol} active={target_name} */")
     if directives:
-        prefix_parts.append("\n".join(directives))
+        base_parts.append("\n".join(directives))
     if global_decls:
-        prefix_parts.append("\n\n".join(global_decls))
+        base_parts.append("\n\n".join(global_decls))
     if preview:
-        prefix_parts.append(f"/* LAUNCHER BINDING PREVIEW */\n{preview}")
+        base_parts.append(f"/* LAUNCHER BINDING PREVIEW */\n{preview}")
 
-    sibling_summaries: list[str] = []
-    for k in kernels:
-        if target_unit is not None and k.name == target_unit.name:
-            continue
-        sibling_summaries.append(
-            f"/* [READ-ONLY SIBLING KERNEL: {k.name} ({k.line_count} lines; edits forbidden)] */\n"
-            f"{k.signature};"
-        )
-    if sibling_summaries:
-        prefix_parts.append("\n\n".join(sibling_summaries))
+    sibling_kernels = [
+        k for k in kernels if target_unit is None or k.name != target_unit.name
+    ]
+    sibling_full = "\n\n".join(
+        f"/* [READ-ONLY SIBLING KERNEL: {k.name} ({k.line_count} lines; edits forbidden)] */\n"
+        f"{k.signature};"
+        for k in sibling_kernels
+    )
+    sibling_compact = "\n".join(
+        f"/* [READ-ONLY SIBLING KERNEL: {k.name} ({k.line_count} lines; edits forbidden)] */"
+        for k in sibling_kernels
+    )
+    sibling_folded = (
+        f"/* [{len(sibling_kernels)} READ-ONLY SIBLING KERNELS OMITTED] */"
+        if sibling_kernels
+        else ""
+    )
+    sibling_tiers = (sibling_full, sibling_compact, sibling_folded)
 
     helpers_by_name = {h.name: h for h in helpers if h.name}
     helper_calls: set[str] = set()
@@ -726,34 +762,41 @@ def build_trackb_context_view(
     ref_helpers = [h for h in helpers if h.name and h.name in helper_calls]
     other_helpers = [h for h in helpers if h not in ref_helpers]
 
-    helper_summaries = [
+    helper_full = "\n\n".join(
         f"/* [READ-ONLY HELPER] */ {h.signature};" for h in other_helpers if h.signature
-    ]
+    )
+    helper_folded = (
+        f"/* [{len(other_helpers)} READ-ONLY HELPERS OMITTED] */"
+        if other_helpers
+        else ""
+    )
+    helper_tiers = (helper_full, helper_folded)
     ref_summaries = [
         f"/* [HELPER SUMMARY] */ {h.signature};" for h in ref_helpers if h.signature
     ]
 
-    static_header = "\n\n".join(p for p in prefix_parts if p)
-    footer = "\n\n".join(helper_summaries)
-    overhead_bytes = len((static_header + "\n\n" + footer).encode("utf-8")) + 64
-
     body_parts: list[tuple[str, _CppUnit | None]] = []
-    if static_header:
-        body_parts.append((static_header, None))
+    chosen_sib = sibling_full
+    chosen_hlp = helper_full
 
     if target_unit is not None:
-        ref_full_text = "\n\n".join(h.text.strip() for h in ref_helpers)
-        full_with_helpers = (
-            overhead_bytes
-            + len(ref_full_text.encode("utf-8"))
-            + len(target_unit.text.encode("utf-8"))
+        target_text = target_unit.text.strip()
+        ref_texts = [h.text.strip() for h in ref_helpers if h.text.strip()]
+        all_core = [*ref_texts, target_text]
+        sib_all, hlp_all = _pick_summary_budget_tier(
+            base_parts, all_core, sibling_tiers, helper_tiers, max_bytes
         )
-        if full_with_helpers <= max_bytes:
+        if _joined_utf8_bytes([*base_parts, sib_all, *all_core, hlp_all]) <= max_bytes:
+            chosen_sib, chosen_hlp = sib_all, hlp_all
+            for p in base_parts:
+                body_parts.append((p, None))
+            if chosen_sib:
+                body_parts.append((chosen_sib, None))
             for rh in ref_helpers:
                 rh_text = rh.text.strip()
                 if rh_text:
                     body_parts.append((rh_text, rh))
-            body_parts.append((target_unit.text.strip(), target_unit))
+            body_parts.append((target_text, target_unit))
         else:
             focused_helpers = [
                 h
@@ -761,79 +804,150 @@ def build_trackb_context_view(
                 if any(h.start_line <= fl <= h.end_line for fl in resolved_focus)
             ]
             unfocused_ref_helpers = [h for h in ref_helpers if h not in focused_helpers]
-            ref_sum_text = "\n".join(
+            focused_texts = [h.text.strip() for h in focused_helpers if h.text.strip()]
+            unfocused_sum_lines = [
                 f"/* [HELPER SUMMARY] */ {h.signature};"
                 for h in unfocused_ref_helpers
                 if h.signature
+            ]
+            unfocused_sum_text = "\n".join(unfocused_sum_lines)
+            min_core = [
+                *( [unfocused_sum_text] if unfocused_sum_text else [] ),
+                *focused_texts,
+                target_text,
+            ]
+            chosen_sib, chosen_hlp = _pick_summary_budget_tier(
+                base_parts, min_core, sibling_tiers, helper_tiers, max_bytes
             )
-            if ref_sum_text:
-                body_parts.append((ref_sum_text, None))
-
-            target_has_focus = any(
-                target_unit.start_line <= fl <= target_unit.end_line for fl in resolved_focus
-            )
-            if focused_helpers:
-                fixed_bytes = (
-                    len("\n\n".join(p for p, _ in body_parts if p).encode("utf-8"))
-                    + (len(("\n\n" + footer).encode("utf-8")) if footer else 0)
-                    + 16
-                )
-                avail_code = max(512, max_bytes - fixed_bytes)
-                helper_cap = max(
-                    256,
-                    int(avail_code * (0.45 if target_has_focus else 0.65)),
-                )
-                raw_focused = [h.text.strip() for h in focused_helpers if h.text.strip()]
-                raw_focused_bytes = sum(len(t.encode("utf-8")) for t in raw_focused)
-                if raw_focused_bytes + 4 * len(raw_focused) <= helper_cap:
-                    for fh in focused_helpers:
-                        fh_text = fh.text.strip()
-                        if fh_text:
-                            body_parts.append((fh_text, fh))
-                else:
-                    per_helper_budget = max(
-                        256,
-                        (helper_cap - 4 * len(focused_helpers)) // len(focused_helpers),
+            if _joined_utf8_bytes([*base_parts, chosen_sib, *min_core, chosen_hlp]) <= max_bytes:
+                for p in base_parts:
+                    body_parts.append((p, None))
+                if chosen_sib:
+                    body_parts.append((chosen_sib, None))
+                kept_unfocused: list[_CppUnit] = []
+                rem_unfocused: list[_CppUnit] = list(unfocused_ref_helpers)
+                for candidate_h in unfocused_ref_helpers:
+                    cand_text = candidate_h.text.strip()
+                    if not cand_text:
+                        rem_unfocused.remove(candidate_h)
+                        continue
+                    trial_kept = [*kept_unfocused, candidate_h]
+                    trial_rem = [h for h in unfocused_ref_helpers if h not in trial_kept]
+                    trial_sum = "\n".join(
+                        f"/* [HELPER SUMMARY] */ {h.signature};"
+                        for h in trial_rem
+                        if h.signature
                     )
-                    for fh in focused_helpers:
-                        fh_text = fh.text.strip()
-                        if not fh_text:
-                            continue
-                        body_parts.append(
-                            (
-                                _truncate_kernel_body(
-                                    fh_text,
-                                    per_helper_budget,
-                                    unit_start_line=fh.start_line,
-                                    focus_lines=resolved_focus,
-                                    focus_window=focus_window,
-                                ),
-                                fh,
-                            )
-                        )
-
-            used_parts = [p for p, _ in body_parts if p]
-            if footer:
-                used_parts.append(footer)
-            used_now = len("\n\n".join(used_parts).encode("utf-8")) + 4
-            remaining = max(256, max_bytes - used_now)
-            body_parts.append(
-                (
-                    _truncate_kernel_body(
-                        target_unit.text.strip(),
-                        remaining,
-                        unit_start_line=target_unit.start_line,
-                        focus_lines=resolved_focus,
-                        focus_window=focus_window,
-                    ),
-                    target_unit,
+                    trial_parts = [
+                        *base_parts,
+                        chosen_sib,
+                        *( [trial_sum] if trial_sum else [] ),
+                        *(h.text.strip() for h in trial_kept if h.text.strip()),
+                        *focused_texts,
+                        target_text,
+                        chosen_hlp,
+                    ]
+                    if _joined_utf8_bytes(trial_parts) <= max_bytes:
+                        kept_unfocused = trial_kept
+                        rem_unfocused = trial_rem
+                rem_sum = "\n".join(
+                    f"/* [HELPER SUMMARY] */ {h.signature};"
+                    for h in rem_unfocused
+                    if h.signature
                 )
-            )
-    elif ref_helpers:
-        body_parts.append(("\n".join(ref_summaries), None))
+                if rem_sum:
+                    body_parts.append((rem_sum, None))
+                for uh in kept_unfocused:
+                    body_parts.append((uh.text.strip(), uh))
+                for fh in focused_helpers:
+                    fh_text = fh.text.strip()
+                    if fh_text:
+                        body_parts.append((fh_text, fh))
+                body_parts.append((target_text, target_unit))
+            else:
+                chosen_sib, chosen_hlp = _pick_summary_budget_tier(
+                    base_parts,
+                    [*( [unfocused_sum_text] if unfocused_sum_text else [] ), *focused_texts],
+                    sibling_tiers,
+                    helper_tiers,
+                    max_bytes,
+                )
+                for p in base_parts:
+                    body_parts.append((p, None))
+                if chosen_sib:
+                    body_parts.append((chosen_sib, None))
+                if unfocused_sum_text:
+                    body_parts.append((unfocused_sum_text, None))
 
-    if footer:
-        body_parts.append((footer, None))
+                target_has_focus = any(
+                    target_unit.start_line <= fl <= target_unit.end_line for fl in resolved_focus
+                )
+                if focused_helpers:
+                    fixed_bytes = (
+                        _joined_utf8_bytes([p for p, _ in body_parts if p] + ([chosen_hlp] if chosen_hlp else []))
+                        + 8
+                    )
+                    avail_code = max(512, max_bytes - fixed_bytes)
+                    helper_cap = max(
+                        256,
+                        int(avail_code * (0.45 if target_has_focus else 0.65)),
+                    )
+                    raw_focused = [h.text.strip() for h in focused_helpers if h.text.strip()]
+                    raw_focused_bytes = sum(len(t.encode("utf-8")) for t in raw_focused)
+                    if raw_focused_bytes + 4 * len(raw_focused) <= helper_cap:
+                        for fh in focused_helpers:
+                            fh_text = fh.text.strip()
+                            if fh_text:
+                                body_parts.append((fh_text, fh))
+                    else:
+                        per_helper_budget = max(
+                            256,
+                            (helper_cap - 4 * len(focused_helpers)) // len(focused_helpers),
+                        )
+                        for fh in focused_helpers:
+                            fh_text = fh.text.strip()
+                            if not fh_text:
+                                continue
+                            body_parts.append(
+                                (
+                                    _truncate_kernel_body(
+                                        fh_text,
+                                        per_helper_budget,
+                                        unit_start_line=fh.start_line,
+                                        focus_lines=resolved_focus,
+                                        focus_window=focus_window,
+                                    ),
+                                    fh,
+                                )
+                            )
+
+                used_parts = [p for p, _ in body_parts if p]
+                if chosen_hlp:
+                    used_parts.append(chosen_hlp)
+                used_now = _joined_utf8_bytes(used_parts) + 2
+                remaining = max(256, max_bytes - used_now)
+                body_parts.append(
+                    (
+                        _truncate_kernel_body(
+                            target_text,
+                            remaining,
+                            unit_start_line=target_unit.start_line,
+                            focus_lines=resolved_focus,
+                            focus_window=focus_window,
+                        ),
+                        target_unit,
+                    )
+                )
+    else:
+        for p in base_parts:
+            body_parts.append((p, None))
+        if sibling_full:
+            body_parts.append((sibling_full, None))
+        if ref_helpers:
+            body_parts.append(("\n".join(ref_summaries), None))
+
+    if chosen_hlp:
+        body_parts.append((chosen_hlp, None))
 
     non_empty_parts = [(p, unit) for p, unit in body_parts if p]
     result = "\n\n".join(p for p, _ in non_empty_parts).strip()
