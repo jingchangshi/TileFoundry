@@ -18,13 +18,9 @@ from tilefoundry_ascend.agent.kb.schema import (
 )
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     CREATIVE_SOURCE_MAX_BYTES,
-    _ANY_FOLDING_MARKER_RE,
-    _compact_trackb_repair_source,
     _detect_trackb_prologue_line_offset,
     _find_python_cpp_literal_spans,
     _looks_like_python_primfunc_slice,
-    _resplice_trackb_omitted_spans,
-    _splice_cpp_omitted_spans,
     build_trackb_context_view,
     compact_creative_source_slice,
     extract_cpp_diagnostic_lines,
@@ -1109,8 +1105,8 @@ class PortfolioRunner:
         target_roofline_eta: float = 0.85,
         prev_local_rel_gain: float | None = None,
         mean_recoverable_excess_us: float | None = None,
-        disengage_roofline_eta: float = 0.65,
-        slow_gain_threshold: float = 0.03,
+        bucket_clean_samples: int = 0,
+        out_of_sample_spearman_rho: float | None = None,
         focus_lines: Sequence[int] = (),
     ) -> tuple[WorkerSpec, ...]:
         """Select matching causal rules and fill remaining slots with creative explorers."""
@@ -1201,35 +1197,20 @@ class PortfolioRunner:
             except ModuleNotFoundError:
                 evaluate_cost_gate_policy = None
             if evaluate_cost_gate_policy is not None:
-                eff_eta = (
-                    float(incumbent_roofline_eta)
-                    if incumbent_roofline_eta is not None
-                    else (
-                        min(1.0, float(eff_roofline) / float(parent.latency_us))
-                        if eff_roofline > 0.0 and parent.latency_us > 0.0
-                        else 0.0
-                    )
-                )
-                eff_excess_us = (
-                    float(mean_recoverable_excess_us)
-                    if mean_recoverable_excess_us is not None
-                    else (
-                        max(0.0, float(parent.latency_us) - float(eff_roofline))
-                        if eff_roofline > 0.0 and parent.latency_us > 0.0
-                        else None
-                    )
+                _ = (
+                    round_idx,
+                    stagnation_rounds,
+                    incumbent_roofline_eta,
+                    target_roofline_eta,
+                    prev_local_rel_gain,
+                    mean_recoverable_excess_us,
+                    eff_roofline,
                 )
                 cost_gate_decision = evaluate_cost_gate_policy(
                     mode=eff_mode,
                     enable_prescreen_flag=eff_prescreen,
-                    round_idx=round_idx,
-                    stagnation_rounds=stagnation_rounds,
-                    incumbent_roofline_eta=eff_eta,
-                    target_roofline_eta=target_roofline_eta,
-                    prev_local_rel_gain=prev_local_rel_gain,
-                    mean_recoverable_excess_us=eff_excess_us,
-                    disengage_roofline_eta=disengage_roofline_eta,
-                    slow_gain_threshold=slow_gain_threshold,
+                    bucket_clean_samples=bucket_clean_samples,
+                    out_of_sample_spearman_rho=out_of_sample_spearman_rho,
                 )
 
         policy_engaged = (
@@ -1365,22 +1346,7 @@ class PortfolioRunner:
                 lowered_excerpt, lowered_excerpt_lang = extract_lowered_compiler_excerpt_with_lang(
                     evaluation.stage_b
                 )
-                repair_src = (
-                    _compact_trackb_repair_source(
-                        dsl_source,
-                        evaluation.error_message,
-                        parent_source=parent_dsl,
-                    )
-                    if escalation_tier
-                    in (
-                        "ascendc",
-                        "ascendc_template",
-                        "ascendc_trackb",
-                        "cce_trackb",
-                        "hybrid_trackb",
-                    )
-                    else dsl_source
-                )
+                repair_src = dsl_source
                 repair_req = build_syntax_repair_request(
                     repair_src,
                     evaluation.error_message,
@@ -1399,7 +1365,6 @@ class PortfolioRunner:
                     repaired_raw = await self._backend.generate(repair_req)
                 except Exception as exc:
                     return None, repaired, (spec.worker_id, "llm_transport", str(exc)[-400:]), False
-                pre_repair_dsl = dsl_source
                 try:
                     dsl_source = extract_python_dsl(repaired_raw)
                 except Exception as exc:
@@ -1410,18 +1375,6 @@ class PortfolioRunner:
                             topology_axes=active_axes,
                         )
                     return None, repaired, (spec.worker_id, "llm_parse", str(exc)[-400:]), False
-                if escalation_tier in (
-                    "ascendc",
-                    "ascendc_template",
-                    "ascendc_trackb",
-                    "cce_trackb",
-                    "hybrid_trackb",
-                ):
-                    dsl_source = _resplice_trackb_omitted_spans(
-                        dsl_source,
-                        pre_compaction_source=pre_repair_dsl,
-                        parent_source=parent_dsl,
-                    )
                 if parent_dsl.strip():
                     violations = check_repair_monotonicity(
                         parent_dsl,

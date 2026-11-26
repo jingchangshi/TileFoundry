@@ -20,9 +20,12 @@ from tilefoundry_ascend.agent import (
 )
 from tilefoundry_ascend.agent.campaign.campaign_runner import PerfTargetCampaignRunner
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    _compact_trackb_repair_source,
     _extract_lowered_compiler_excerpt,
     run_l0_l1_round_filter,
+)
+from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+    build_trackb_context_view,
+    render_active_symbol_closure_view,
 )
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
 from tilefoundry_ascend.agent.kb.schema import build_predicate_context
@@ -261,42 +264,8 @@ def test_lowered_compiler_excerpt_prioritizes_cce_and_fences() -> None:
     assert "```cpp\n" in req_cpp.user_prompt
 
 
-def test_compact_trackb_repair_source_ast_safe_and_focus_lines() -> None:
-    """Verify hybrid_trackb slicing preserves Python AST, prologue offset, and focus lines."""
-    prologue = "".join(f"#define PROLOGUE_MACRO_{i} {i}\n" for i in range(10))
-    body_lines = [
-        'extern "C" __global__ __aicore__ void big_kernel(__gm__ half* x) {',
-        "    int acc = 0;",
-    ]
-    for idx in range(1, 520):
-        if idx == 410:
-            body_lines.append("    TARGET_ERROR_MARKER(x, 410);")
-        else:
-            body_lines.append(f"    int filler_var_{idx} = {idx};")
-    body_lines.append("}")
-    cpp_body = "\n".join(body_lines)
-
-    hybrid_mod = (
-        "def _render_trackb_tu(trackb_src: str) -> str:\n"
-        f"    return {prologue!r} + trackb_src\n\n"
-        'TRACKB_KERNEL_SOURCE = r"""\n'
-        f"{cpp_body}\n"
-        '"""\n\n'
-        "def kernel():\n"
-        "    return _render_trackb_tu(TRACKB_KERNEL_SOURCE)\n"
-    )
-    rendered_err_line = 10 + 1 + 412
-    diag = f"/tmp/tu.cce:{rendered_err_line}:5: error: use of undeclared identifier"
-    compacted = _compact_trackb_repair_source(hybrid_mod, diag, max_bytes=4500)
-    parsed = ast.parse(compacted)
-    fn_names = [
-        node.name for node in parsed.body if isinstance(node, ast.FunctionDef)
-    ]
-    assert "_render_trackb_tu" in fn_names
-    assert "kernel" in fn_names
-    assert len(compacted.encode("utf-8")) <= 4800
-    assert "TARGET_ERROR_MARKER" in compacted
-
+def test_lossless_trackb_repair_closure_preserves_helpers_and_focus() -> None:
+    """Verify lossless Track-B closure view keeps active helpers and focus lines intact."""
     filler_block = "\n".join(f"    int line_{i} = {i};" for i in range(1, 180))
     standalone_cpp = (
         "__aicore__ inline void helper_fn(__ubuf__ half* ptr) {\n"
@@ -314,14 +283,15 @@ def test_compact_trackb_repair_source_ast_safe_and_focus_lines() -> None:
         for idx, line in enumerate(standalone_cpp.splitlines(), start=1)
         if "FOCUS_LINE_SENTINEL" in line
     )
-    truncated_view = build_trackb_context_view(
+    lossless_view = render_active_symbol_closure_view(
         standalone_cpp,
-        active_kernel="big_kernel",
-        max_bytes=1200,
-        focus_lines=(focus_line_num,),
-        focus_window=2,
+        "big_kernel",
+        include_line_numbers=True,
     )
-    assert "FOCUS_LINE_SENTINEL" in truncated_view
+    assert "FOCUS_LINE_SENTINEL" in lossless_view
+    assert f"[L{focus_line_num:04d}]" in lossless_view
+    assert "helper_fn" in lossless_view
+    assert "MIDDLE BODY OMITTED" not in lossless_view
 
 
 def test_campaign_runner_telemetry_hazards_and_pure_l0_parent_cost() -> None:

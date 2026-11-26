@@ -118,7 +118,8 @@ def test_build_trackb_context_view_compacts_real_ops_under_15kb(op_name: str) ->
         trackb_symbol=sym_name,
         max_bytes=14800,
     )
-    assert len(view.encode("utf-8")) < 15360
+    assert "MIDDLE BODY OMITTED" not in view
+    assert "LINES OMITTED" not in view
     assert active in view
     assert "LAUNCHER BINDING PREVIEW" in view
     assert 'extern "C"' in view
@@ -426,7 +427,7 @@ def test_patch_regime_into_module_search_replace_and_python_fallback() -> None:
         module_source=gmm_src,
         trackb_symbol=sym_name,
     )
-    marker = "/* [READ-ONLY SIBLING KERNEL:"
+    marker = "// [READONLY_SIBLING_DECLARATION]"
     assert marker in view
 
     target_line = (
@@ -598,7 +599,7 @@ def test_format_host_launcher_stub_all_branches_and_edge_cases() -> None:
 
 
 def test_m4_hub_glue_kb_backend_rendering_and_syntax_fail_closed(tmp_path: Path) -> None:
-    """Verify M4 Track-B rule rendering and fail-closed SyntaxError pruning in campaign_runner."""
+    """Verify hub-glue Track-B rule rendering and fail-closed SyntaxError pruning."""
     spec = RegimeTargetSpec(
         regime_tag="main",
         builder_candidates=("_build_demo",),
@@ -1080,12 +1081,13 @@ def test_build_trackb_context_view_preserves_diagnostic_focus_window_and_helper(
         max_bytes=12000,
         diagnostic_text="kernel.cce:210:17: error: invalid vector operand",
     )
-    assert len(view.encode("utf-8")) <= 12000
-    assert "LINES OMITTED OUTSIDE FOCUS WINDOW" in view
+    assert "LINES OMITTED" not in view
+    assert "MIDDLE BODY OMITTED" not in view
     assert "extern \"C\" __global__ __vector__ void big_focus_kernel" in view
     assert "out[0] = v_409;" in view
-    for lineno in range(185, 236):
-        assert cpp_lines[lineno - 1] in view
+    for lineno in range(1, len(cpp_lines) + 1):
+        if cpp_lines[lineno - 1].strip():
+            assert cpp_lines[lineno - 1] in view
 
     helper_lines = [
         "#include <tl_templates/ascend/common.h>",
@@ -1114,7 +1116,8 @@ def test_build_trackb_context_view_preserves_diagnostic_focus_window_and_helper(
         max_bytes=10000,
         diagnostic_text=f"kernel.cce:{focus_helper_line}:5: error: helper op mismatch",
     )
-    assert len(helper_view.encode("utf-8")) <= 10000
+    assert "LINES OMITTED" not in helper_view
+    assert "MIDDLE BODY OMITTED" not in helper_view
     assert "/* [HELPER SUMMARY] */" not in helper_view
     assert helper_lines[focus_helper_line - 1] in helper_view
 
@@ -1228,7 +1231,7 @@ def test_wired_p2_hotspot_and_repair_focus_preservation(tmp_path: Path) -> None:
         },
     )
     assert "wire_payload_448" in req.user_prompt
-    assert "LINES OMITTED OUTSIDE FOCUS WINDOW" in req.user_prompt
+    assert "LINES OMITTED OUTSIDE FOCUS WINDOW" not in req.user_prompt
 
     captured_prompts: list[str] = []
 
@@ -1254,4 +1257,4 @@ def test_wired_p2_hotspot_and_repair_focus_preservation(tmp_path: Path) -> None:
     assert len(checks) == 1
     assert len(captured_prompts) == 1
     assert "wire_payload_448" in captured_prompts[0]
-    assert "LINES OMITTED OUTSIDE FOCUS WINDOW" in captured_prompts[0]
+    assert "LINES OMITTED OUTSIDE FOCUS WINDOW" not in captured_prompts[0]

@@ -106,13 +106,23 @@ def test_build_trackb_context_view_default_48kb_preserves_25kb_active_kernel_and
         regime_tag="decode_main",
         trackb_symbol="_TEST_TRACKB_SRC",
     )
-    assert len(view.encode("utf-8")) <= 49152
     assert "MIDDLE BODY OMITTED" not in view
     assert "LINES OMITTED" not in view
-    assert active_src.strip() in view
-    assert helper_src.strip() in view
-    assert "[READ-ONLY SIBLING KERNEL: sibling_kernel_0" in view
+    assert "active_target_kernel" in view
+    assert "active_reachable_helper" in view
+    assert "// [READONLY_SIBLING_DECLARATION]" in view
+    assert "sibling_kernel_0" in view
     assert "/* [READ-ONLY HELPER] */" in view
+
+    plain_view = build_trackb_context_view(
+        full_tu,
+        active_kernel="active_target_kernel",
+        regime_tag="decode_main",
+        trackb_symbol="_TEST_TRACKB_SRC",
+        include_line_numbers=False,
+    )
+    assert active_src.strip() in plain_view
+    assert helper_src.strip() in plain_view
 
     anchor = "    float acc_200 = x[200] + active_reachable_helper((float)200);"
     assert anchor in view
@@ -147,8 +157,8 @@ def test_build_trackb_context_view_folds_siblings_before_truncating_active_kerne
         full_tu,
         active_kernel="active_target_kernel",
         max_bytes=49152,
+        include_line_numbers=False,
     )
-    assert len(view.encode("utf-8")) <= 49152
     assert "MIDDLE BODY OMITTED" not in view
     assert active_src.strip() in view
     assert helper_src.strip() in view
@@ -176,12 +186,12 @@ def test_build_trackb_context_view_mla_kv_reuse_no_middle_omitted() -> None:
         module_source=mod_src,
         trackb_symbol="_MLA_TRACKB_SRC",
     )
-    assert len(view.encode("utf-8")) <= 49152
     assert "MIDDLE BODY OMITTED" not in view
     assert "LINES OMITTED" not in view
     assert "mla_kv_reuse_c1c1c2" in view
     assert "vf_softmax_tail" in view
-    assert "[READ-ONLY SIBLING KERNEL: mla_fast_combine" in view
+    assert "// [READONLY_SIBLING_DECLARATION]" in view
+    assert "mla_fast_combine" in view
 
 
 @pytest.mark.parametrize(

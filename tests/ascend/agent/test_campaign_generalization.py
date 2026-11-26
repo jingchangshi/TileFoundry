@@ -284,7 +284,6 @@ def make_kernel():
     distiller = FlywheelDistiller(
         funnel=GateFunnel(skip_stage_b=True),
         tracker=tracker,
-        min_edit_gain=0.10,
     )
     report = distiller.distill_from_pair(
         baseline_dsl=base_dsl,

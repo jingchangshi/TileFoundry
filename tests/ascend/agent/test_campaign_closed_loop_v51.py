@@ -148,7 +148,7 @@ def test_round_record_closed_loop_fields_roundtrip() -> None:
         best_round_speedup=1.5,
         best_so_far_speedup=1.5,
         promoted=True,
-        rolled_back_l3=False,
+        l3_resolution="PROMOTED",
         stagnation_rounds_after=0,
         round_spearman_rho=0.8125,
         prescreen_pruned_ids=("c2",),
@@ -781,6 +781,9 @@ def _build_op(tile_m=256):
             passed=False,
             error_message="stage_b_max_row_width_vf_stack_overflow: stack_bytes=4096 (exceeded vf stack size)",
             full_diagnostic="exceeded vf stack size",
+            fault_plane="STAGE_B_COMPILE",
+            fault_code="VF_STACK_OVERFLOW",
+            failed_tier="stage_b",
         )
 
     runner = PerfTargetCampaignRunner(
@@ -852,7 +855,7 @@ def test_arc2_and_arc3_clean_gating_anomaly_log_and_lake_seed_injection(
         config=CampaignConfig(
             operator_name="attention_residual",
             max_rounds=1,
-            cost_model_mode="auto",
+            cost_model_mode="advisory",
         ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
@@ -1089,7 +1092,7 @@ async def test_arc3_spearman_quarantine_and_round_funnel_events_emitted(
             enable_tilesize_prescreen=True,
             cost_prescreen_top_k=None,
             min_surrogate_gain=999.0,
-            cost_model_mode="auto",
+            cost_model_mode="advisory",
         ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("attention_residual", 50.0, 50.0, 0.99),
@@ -1129,7 +1132,7 @@ async def test_arc3_spearman_quarantine_and_round_funnel_events_emitted(
     assert report.rounds[1].round_spearman_rho is not None
     assert report.rounds[1].round_spearman_rho < 0.2
     assert report.rounds[2].cost_model_reason == "spearman_rank_inverted"
-    assert seen_prescreen_top_k[0] == 1
+    assert seen_prescreen_top_k[0] is None
     assert seen_prescreen_top_k[2] is None
 
     funnel_path = ckpt_path.parent / "telemetry" / "round_funnel_events.jsonl"

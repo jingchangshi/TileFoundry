@@ -7,14 +7,17 @@ import copy
 import difflib
 import hashlib
 import json
+import math
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import (
+    _RESIDUAL_DEFAULTS,
+    _TELEMETRY_CONTEXT_DEFAULTS,
     SYMPTOM_FAMILY_TO_FACETS,
     AscendCausalRule,
     SymptomFamily,
@@ -30,41 +33,151 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     extract_ordered_tensor_shapes,
     run_stage_a_static,
 )
-from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
-from tilefoundry_ascend.ascend.sil.schema import VALID_FREEDOM_FACETS
-
-_STATIC_DISALLOWED_PROVENANCE_TOKENS = frozenset(
-    {
-        "/home/",
-        "/users/",
-        "/data/",
-        "attention_residual",
-        "attn_res",
-        "mla",
-        "mla_model",
-        "grouped_matmul",
-        "softmax",
-        "deepgemm",
-        "flash_attention",
-    }
+from tilefoundry_ascend.ascend.passes.observation_space import (
+    AxisResidual5D,
+    ComputeIssueAxis,
+    GridIrregularityAxis,
+    ObservationVector5D,
+    OffChipMemoryDmaAxis,
+    OnChipSramRegAxis,
+    PipelineSyncAxis,
 )
-_SUBSTRING_PROVENANCE_TOKENS = frozenset(
-    {
-        "/home/",
-        "/users/",
-        "/data/",
-        "attention_residual",
-        "attn_res",
-        "mla_model",
-        "deepgemm",
-        "flash_attention",
-    }
+from tilefoundry_ascend.ascend.passes.physical_ledger import (
+    ObjectivePhysicalLedger,
+    ScopeWaterline,
+)
+from tilefoundry_ascend.ascend.sil.schema import (
+    VALID_FREEDOM_FACETS,
+    CasePhysicsRatios,
+    TopologyAxes,
 )
 
+_GENERIC_PATH_PATTERN = re.compile(r"(?:^|[\s'\"=(])/(?:[A-Za-z0-9._-]+/){2,}")
 
-def _build_disallowed_provenance_tokens() -> frozenset[str]:
-    """Dynamically collect all registered operator IDs to prevent operator-specific leakage."""
-    tokens = set(_STATIC_DISALLOWED_PROVENANCE_TOKENS)
+
+def _build_allowed_schema_signal_vocabulary() -> frozenset[str]:
+    """Build closed predicate identifier vocabulary from schema dataclasses and builtins."""
+    vocab: set[str] = {
+        "True",
+        "False",
+        "None",
+        "abs",
+        "min",
+        "max",
+        "prev",
+        "PIPE_M",
+        "PIPE_FIX",
+        "PIPE_V",
+        "PIPE_MTE2",
+        "PIPE_MTE3",
+        "AIC",
+        "AIV0",
+        "AIV1",
+        "UB",
+        "L1",
+        "L0A",
+        "L0B",
+        "L0C",
+        "SSBUF",
+        "any_overflow_bytes",
+        "degraded_buffer_count",
+        "implicit_bloat_bytes",
+        "max_overflow_bytes",
+        "ub_utilization_ratio",
+        "ub_occupancy_ratio",
+        "cube_to_vector_ratio",
+        "cube_cycles",
+        "vec_cycles",
+        "has_dynamic_control",
+        "has_opaque_regions",
+        "has_simtvf",
+        "dominant_axis",
+        "has_l1_compiler_summary",
+        "degraded_count",
+    }
+    schema_classes = (
+        ObservationVector5D,
+        ComputeIssueAxis,
+        OffChipMemoryDmaAxis,
+        OnChipSramRegAxis,
+        PipelineSyncAxis,
+        GridIrregularityAxis,
+        AxisResidual5D,
+        ObjectivePhysicalLedger,
+        ScopeWaterline,
+        CasePhysicsRatios,
+        TopologyAxes,
+    )
+    for cls in schema_classes:
+        for f in fields(cls):
+            vocab.add(f.name)
+    for mapping in (_RESIDUAL_DEFAULTS, _TELEMETRY_CONTEXT_DEFAULTS):
+        vocab.update(mapping.keys())
+    return frozenset(vocab)
+
+
+ALLOWED_SCHEMA_SIGNAL_VOCABULARY: frozenset[str] = _build_allowed_schema_signal_vocabulary()
+
+
+def _validate_schema_closed_identifiers(expr: str) -> list[str]:
+    """Parse predicate AST and return root identifiers absent from schema vocabulary."""
+    if not isinstance(expr, str) or not expr.strip():
+        return ["<empty>"]
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return ["<syntax_error>"]
+    unknown: list[str] = []
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id not in ALLOWED_SCHEMA_SIGNAL_VOCABULARY:
+            if node.id not in seen:
+                seen.add(node.id)
+                unknown.append(node.id)
+        elif (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "prev"
+            and node.attr not in ALLOWED_SCHEMA_SIGNAL_VOCABULARY
+            and node.attr not in seen
+        ):
+            seen.add(node.attr)
+            unknown.append(node.attr)
+    return unknown
+
+
+def _operator_name_variants(operator_name: str) -> set[str]:
+    """Generate dynamic snake, kebab, compact, and prefix variants for an operator name."""
+    raw = str(operator_name or "").strip()
+    if not raw:
+        return set()
+    low = raw.lower()
+    variants: set[str] = {low}
+    parts = [p for p in re.split(r"[^a-z0-9]+", low) if p]
+    if parts:
+        snake = "_".join(parts)
+        variants.add(snake)
+        variants.add("-".join(parts))
+        variants.add("".join(parts))
+        variants.add(f"{snake}_model")
+        if len(parts) >= 2:
+            variants.add(f"{parts[0][:4]}_{parts[1][:3]}")
+            if len(parts[0]) >= 3 and len(parts[1]) >= 3:
+                variants.add(f"{parts[0][:3]}_{parts[1][:3]}")
+        if len(parts) >= 3:
+            variants.add("".join(p[0] for p in parts))
+    camel_split = [p.lower() for p in re.findall(r"[A-Z]?[a-z0-9]+|[A-Z]+(?=[A-Z]|$)", raw)]
+    if len(camel_split) >= 2:
+        snake_c = "_".join(camel_split)
+        variants.add(snake_c)
+        variants.add("-".join(camel_split))
+        variants.add("".join(camel_split))
+    return {v for v in variants if len(v) >= 2}
+
+
+def _build_disallowed_provenance_tokens(operator_name: str = "") -> frozenset[str]:
+    """Dynamically collect operator variants and registered operator IDs without hardcoding."""
+    tokens = _operator_name_variants(operator_name)
     try:
         for op_id in CannbenchOpsRegistry.default().list_operators():
             cleaned = str(op_id).strip().lower()
@@ -73,6 +186,65 @@ def _build_disallowed_provenance_tokens() -> frozenset[str]:
     except (FileNotFoundError, OSError):
         pass
     return frozenset(tokens)
+
+
+def resolve_paired_sigma_us(
+    reference_us: float,
+    *,
+    sigma_paired_us: float | None = None,
+    paired_rel_mad: float | None = None,
+) -> float:
+    """Resolve paired measurement uncertainty (us) from sigma_paired_us or paired_rel_mad."""
+    if sigma_paired_us is not None:
+        val = float(sigma_paired_us)
+        return max(0.0, val) if math.isfinite(val) else 0.0
+    if paired_rel_mad is not None:
+        mad = float(paired_rel_mad)
+        ref = float(reference_us)
+        if math.isfinite(mad) and mad > 0.0 and math.isfinite(ref) and ref > 0.0:
+            return 1.4826 * mad * ref
+    return 0.0
+
+
+def is_paired_gain_significant(
+    delta_us: float,
+    *,
+    sigma_paired_us: float | None = None,
+    paired_rel_mad: float | None = None,
+    reference_us: float = 0.0,
+    sigma_multiplier: float = 2.0,
+) -> bool:
+    """Return True when paired latency reduction exceeds sigma_multiplier * sigma_paired_us."""
+    delta = float(delta_us)
+    if not math.isfinite(delta) or delta <= 0.0:
+        return False
+    eff_sigma = resolve_paired_sigma_us(
+        reference_us,
+        sigma_paired_us=sigma_paired_us,
+        paired_rel_mad=paired_rel_mad,
+    )
+    return delta > float(sigma_multiplier) * eff_sigma
+
+
+def should_trigger_flywheel_checkpoint(
+    baseline_latency_us: float,
+    winner_latency_us: float,
+    *,
+    sigma_paired_us: float | None = None,
+    paired_rel_mad: float | None = None,
+) -> bool:
+    """Return True when winner latency beats baseline by more than 3 * sigma_paired_us."""
+    base_lat = float(baseline_latency_us)
+    win_lat = float(winner_latency_us)
+    if not (math.isfinite(base_lat) and math.isfinite(win_lat)) or base_lat <= 0.0 or win_lat <= 0.0:
+        return False
+    return is_paired_gain_significant(
+        base_lat - win_lat,
+        sigma_paired_us=sigma_paired_us,
+        paired_rel_mad=paired_rel_mad,
+        reference_us=base_lat,
+        sigma_multiplier=3.0,
+    )
 
 
 @dataclass(frozen=True)
@@ -2295,15 +2467,36 @@ def verify_micro_probe_hardware(
     spec: MicroProbeSpec,
     *,
     probe_runner: Callable[[MicroProbeSpec], Mapping[str, float]] | None = None,
-    min_speedup: float = 1.08,
+    sigma_paired_us: float | None = None,
+    paired_rel_mad: float | None = None,
 ) -> tuple[bool, dict[str, float]]:
-    """Verify synthesized micro-probe correctness, speedup, and pipe wait ratios on NPU."""
+    """Verify micro-probe correctness, 3-sigma paired gain, and pipe wait ratios on NPU."""
     if probe_runner is not None:
         raw = dict(probe_runner(spec))
         b_us = float(raw.get("baseline_dur_us", 0.0))
         o_us = float(raw.get("optimized_dur_us", 0.0))
         speedup = float(raw.get("speedup", (b_us / o_us) if b_us > 0.0 and o_us > 0.0 else 0.0))
         raw["speedup"] = speedup
+        raw_sigma = raw.get("sigma_paired_us")
+        raw_mad = raw.get("paired_rel_mad")
+        eff_sigma = resolve_paired_sigma_us(
+            b_us,
+            sigma_paired_us=float(raw_sigma) if raw_sigma is not None else sigma_paired_us,
+            paired_rel_mad=float(raw_mad) if raw_mad is not None else paired_rel_mad,
+        )
+        delta_us = b_us - o_us
+        raw["delta_us"] = delta_us
+        raw["sigma_paired_us"] = eff_sigma
+        sig_ok = (
+            b_us > 0.0
+            and o_us > 0.0
+            and is_paired_gain_significant(
+                delta_us,
+                sigma_paired_us=eff_sigma,
+                reference_us=b_us,
+                sigma_multiplier=3.0,
+            )
+        )
         wait_ok = True
         if "baseline_mte2_wait_ratio" in raw and "optimized_mte2_wait_ratio" in raw:
             base_w = float(raw["baseline_mte2_wait_ratio"])
@@ -2320,13 +2513,7 @@ def verify_micro_probe_hardware(
                     base_abs * 1.15, base_abs + 0.05 * b_us
                 ):
                     wait_ok = False
-        passed = (
-            bool(raw.get("numerical_ok", True))
-            and b_us > 0.0
-            and o_us > 0.0
-            and speedup >= min_speedup
-            and wait_ok
-        )
+        passed = bool(raw.get("numerical_ok", True)) and sig_ok and wait_ok
         return passed, raw
 
     import importlib.util  # noqa: PLC0415
@@ -2415,9 +2602,27 @@ def verify_micro_probe_hardware(
             b_ratios["aiv_mte2"] * 1.15, b_ratios["aiv_mte2"] + 0.05
         ) and opt_abs > max(base_abs * 1.15, base_abs + 0.05 * b_us):
             wait_non_regression = False
+    eff_sigma = resolve_paired_sigma_us(
+        b_us,
+        sigma_paired_us=sigma_paired_us,
+        paired_rel_mad=paired_rel_mad,
+    )
+    delta_us = b_us - o_us
+    sig_ok = (
+        b_us > 0.0
+        and o_us > 0.0
+        and is_paired_gain_significant(
+            delta_us,
+            sigma_paired_us=eff_sigma,
+            reference_us=b_us,
+            sigma_multiplier=3.0,
+        )
+    )
     metrics = {
         "baseline_dur_us": round(b_us, 6),
         "optimized_dur_us": round(o_us, 6),
+        "delta_us": round(delta_us, 6),
+        "sigma_paired_us": round(eff_sigma, 6),
         "speedup": round(speedup, 6),
         "numerical_ok": 1.0,
         "aiv_mte2": round(o_ratios["aiv_mte2"], 6),
@@ -2426,7 +2631,7 @@ def verify_micro_probe_hardware(
         "baseline_aiv_mte2": round(b_ratios["aiv_mte2"], 6),
         "optimized_aiv_mte2": round(o_ratios["aiv_mte2"], 6),
     }
-    return (speedup >= min_speedup and wait_non_regression), metrics
+    return (sig_ok and wait_non_regression), metrics
 
 
 def _generalize_template_text(chunk: AstEditChunk) -> str:
@@ -2755,19 +2960,26 @@ def _validate_postcondition_strictness(tree: ast.AST) -> tuple[bool, str]:
     return True, ""
 
 
-def _validate_distilled_rule(rule: AscendCausalRule) -> tuple[bool, str]:
-    """Enforce provenance, freedom-facet, Track-B template, and strict convergence gates."""
-    joined = " ".join(rule.as_six_tuple()).lower()
+def _validate_distilled_rule(
+    rule: AscendCausalRule,
+    *,
+    operator_name: str = "",
+) -> tuple[bool, str]:
+    """Enforce provenance, closed AST vocabulary, Track-B template, and convergence gates."""
+    raw_fields = list(rule.as_six_tuple())
     if rule.cpp20_transform_template:
-        joined = f"{joined} {rule.cpp20_transform_template.lower()}"
-    for bad in _build_disallowed_provenance_tokens():
-        if bad in _SUBSTRING_PROVENANCE_TOKENS:
-            if bad in joined:
-                return False, f"disallowed token {bad!r} in distilled rule text"
-        elif re.search(rf"(?<![a-z0-9_]){re.escape(bad)}(?![a-z0-9_])", joined):
+        raw_fields.append(rule.cpp20_transform_template)
+    joined = " ".join(raw_fields).lower()
+    active_op = operator_name or str(getattr(rule, "origin_operator", "") or "")
+    for bad in _build_disallowed_provenance_tokens(active_op):
+        if re.search(rf"(?<![a-z0-9_]){re.escape(bad)}(?![a-z0-9_])", joined):
             return False, f"disallowed token {bad!r} in distilled rule text"
-    if re.search(r"/(home|tmp|var|usr)/", joined):
-        return False, "filesystem path leaked into rule text"
+    for bad in _operator_name_variants(active_op):
+        if len(bad) >= 4 and bad in joined:
+            return False, f"disallowed token {bad!r} in distilled rule text"
+    for field_text in raw_fields:
+        if _GENERIC_PATH_PATTERN.search(field_text):
+            return False, "filesystem path leaked into rule text"
     try:
         validate_rule_predicate(rule.regime_guard)
         pre_tree = validate_rule_predicate(rule.precondition)
@@ -2795,11 +3007,24 @@ def _validate_distilled_rule(rule: AscendCausalRule) -> tuple[bool, str]:
     post_ok, post_err = _validate_postcondition_strictness(post_tree)
     if not post_ok:
         return False, post_err
+
+    for field_name, expr in (
+        ("precondition", rule.precondition),
+        ("anti_precondition", rule.anti_precondition),
+        ("expected_postcondition", rule.expected_postcondition),
+    ):
+        unknown_ids = _validate_schema_closed_identifiers(expr)
+        if unknown_ids:
+            return False, f"unknown schema identifier(s) {unknown_ids!r} in {field_name}"
     return True, ""
 
 
-def _is_rule_text_clean(rule: AscendCausalRule) -> tuple[bool, str]:
-    return _validate_distilled_rule(rule)
+def _is_rule_text_clean(
+    rule: AscendCausalRule,
+    *,
+    operator_name: str = "",
+) -> tuple[bool, str]:
+    return _validate_distilled_rule(rule, operator_name=operator_name)
 
 
 def distill_causal_rule(
@@ -2881,14 +3106,14 @@ class FlywheelDistiller:
         funnel: GateFunnel,
         tracker: BayesianRuleTracker,
         probe_runner: Callable[[MicroProbeSpec], Mapping[str, float]] | None = None,
-        min_edit_gain: float = 0.03,
-        min_probe_speedup: float = 1.08,
+        sigma_paired_us: float | None = None,
+        paired_rel_mad: float | None = None,
     ) -> None:
         self._funnel = funnel
         self._tracker = tracker
         self._probe_runner = probe_runner
-        self._min_edit_gain = min_edit_gain
-        self._min_probe_speedup = min_probe_speedup
+        self._sigma_paired_us = sigma_paired_us
+        self._paired_rel_mad = paired_rel_mad
 
     def distill_leave_one_out(
         self,
@@ -2910,8 +3135,12 @@ class FlywheelDistiller:
         rule_scope: str = "operator_local",
         active_symptom_family: str = "",
         ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
+        sigma_paired_us: float | None = None,
+        paired_rel_mad: float | None = None,
     ) -> FlywheelDistillationReport:
         """Run Leave-One-Out AST/config ablation directly on real candidate winner_dsl."""
+        eff_sigma_arg = self._sigma_paired_us if sigma_paired_us is None else sigma_paired_us
+        eff_mad_arg = self._paired_rel_mad if paired_rel_mad is None else paired_rel_mad
         resolved_shapes = extract_ordered_tensor_shapes(
             dims=dims,
             ordered_tensor_shapes=ordered_tensor_shapes,
@@ -2992,7 +3221,14 @@ class FlywheelDistiller:
                 var_lat = float(max(eval_res.stage_a.ledger.pipe_cycles.values(), default=100)) / 20.0
 
             rel_gain = (var_lat - win_lat) / max(var_lat, 1e-6)
-            is_pos = var_lat > win_lat and rel_gain >= self._min_edit_gain
+            delta_us = var_lat - win_lat
+            is_pos = var_lat > win_lat and is_paired_gain_significant(
+                delta_us,
+                sigma_paired_us=eff_sigma_arg,
+                paired_rel_mad=eff_mad_arg,
+                reference_us=win_lat,
+                sigma_multiplier=2.0,
+            )
             meas = AblationMeasurement(
                 chunk=chunk,
                 funnel_passed=True,
@@ -3037,7 +3273,7 @@ class FlywheelDistiller:
                 origin_operator=operator_name,
                 active_symptom_family=active_symptom_family,
             )
-            clean_ok, clean_err = _validate_distilled_rule(rule)
+            clean_ok, clean_err = _validate_distilled_rule(rule, operator_name=operator_name)
             if not clean_ok:
                 outcomes.append(
                     DistilledRuleOutcome(
@@ -3104,12 +3340,31 @@ class FlywheelDistiller:
         rule_scope: str = "cross_op",
         active_symptom_family: str = "",
         ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
+        sigma_paired_us: float | None = None,
+        paired_rel_mad: float | None = None,
     ) -> FlywheelDistillationReport:
         """Run full counterfactual ablation, micro-probe or LOO check, and KB admission."""
+        eff_sigma_arg = self._sigma_paired_us if sigma_paired_us is None else sigma_paired_us
+        eff_mad_arg = self._paired_rel_mad if paired_rel_mad is None else paired_rel_mad
         resolved_shapes = extract_ordered_tensor_shapes(
             dims=dims,
             ordered_tensor_shapes=ordered_tensor_shapes,
         )
+        if not should_trigger_flywheel_checkpoint(
+            baseline_latency_us,
+            winner_latency_us,
+            sigma_paired_us=eff_sigma_arg,
+            paired_rel_mad=eff_mad_arg,
+        ):
+            return FlywheelDistillationReport(
+                baseline_latency_us=baseline_latency_us,
+                winner_latency_us=winner_latency_us,
+                total_chunks=0,
+                kept_positive_chunks=(),
+                discarded_chunks=(),
+                distilled_outcomes=(),
+                admitted_rule_ids=(),
+            )
         if verify_on_candidate:
             return self.distill_leave_one_out(
                 baseline_dsl=baseline_dsl,
@@ -3129,6 +3384,8 @@ class FlywheelDistiller:
                 rule_scope=rule_scope,
                 active_symptom_family=active_symptom_family,
                 ordered_tensor_shapes=resolved_shapes,
+                sigma_paired_us=eff_sigma_arg,
+                paired_rel_mad=eff_mad_arg,
             )
         chunks = decompose_ast_ablations(baseline_dsl, winner_dsl)
         kept: list[AblationMeasurement] = []
@@ -3216,7 +3473,14 @@ class FlywheelDistiller:
             else:
                 var_lat = float(max(eval_res.stage_a.ledger.pipe_cycles.values(), default=100)) / 20.0
             rel_gain = (base_lat - var_lat) / base_lat
-            is_pos = rel_gain >= self._min_edit_gain
+            delta_us = base_lat - var_lat
+            is_pos = is_paired_gain_significant(
+                delta_us,
+                sigma_paired_us=eff_sigma_arg,
+                paired_rel_mad=eff_mad_arg,
+                reference_us=base_lat,
+                sigma_multiplier=2.0,
+            )
             meas = AblationMeasurement(
                 chunk=chunk,
                 funnel_passed=True,
@@ -3254,7 +3518,8 @@ class FlywheelDistiller:
             ok, metrics = verify_micro_probe_hardware(
                 probe,
                 probe_runner=self._probe_runner,
-                min_speedup=self._min_probe_speedup,
+                sigma_paired_us=eff_sigma_arg,
+                paired_rel_mad=eff_mad_arg,
             )
             if not ok:
                 outcomes.append(
@@ -3286,7 +3551,7 @@ class FlywheelDistiller:
                 origin_operator=operator_name,
                 active_symptom_family=active_symptom_family,
             )
-            clean_ok, clean_err = _validate_distilled_rule(rule)
+            clean_ok, clean_err = _validate_distilled_rule(rule, operator_name=operator_name)
             if not clean_ok:
                 outcomes.append(
                     DistilledRuleOutcome(
@@ -3365,6 +3630,7 @@ class FlywheelDistiller:
 
 
 __all__ = [
+    "ALLOWED_SCHEMA_SIGNAL_VOCABULARY",
     "AblationMeasurement",
     "AstEditChunk",
     "DistilledRuleOutcome",
@@ -3372,11 +3638,16 @@ __all__ = [
     "FlywheelDistiller",
     "MicroProbeSpec",
     "_build_disallowed_provenance_tokens",
+    "_operator_name_variants",
     "_validate_distilled_rule",
+    "_validate_schema_closed_identifiers",
     "decompose_ast_ablations",
     "decompose_cpp_string_leave_one_out",
     "decompose_leave_one_out_ablations",
     "distill_causal_rule",
+    "is_paired_gain_significant",
+    "resolve_paired_sigma_us",
+    "should_trigger_flywheel_checkpoint",
     "synthesize_micro_probe",
     "verify_micro_probe_hardware",
 ]

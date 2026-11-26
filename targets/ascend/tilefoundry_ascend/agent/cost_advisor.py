@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -12,7 +11,6 @@ from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (
     CostGateDecision,
     CostModelMode,
     evaluate_cost_gate_policy,
-    is_paradigm_shift_exempt,
 )
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendTarget
@@ -36,19 +34,6 @@ def _coerce_axes(raw: object | None) -> TopologyAxes | None:
     ):
         return TopologyAxes.from_dict(raw)
     return None
-
-
-def _extract_candidate_id(cand: object) -> str:
-    if isinstance(cand, str):
-        return cand
-    if isinstance(cand, Mapping):
-        return str(cand.get("candidate_id") or cand.get("id") or "")
-    if isinstance(cand, (tuple, list)) and cand:
-        return str(cand[0])
-    cid = getattr(cand, "candidate_id", None)
-    if cid is not None:
-        return str(cid)
-    return str(cand)
 
 
 def _has_measured_pmu(residual: object | None) -> bool:
@@ -158,16 +143,9 @@ class CostModelAdvisor(Protocol):
     def evaluate_round_policy(
         self,
         *,
-        enable_prescreen_flag: bool,
-        round_idx: int,
-        stagnation_rounds: int,
-        incumbent_roofline_eta: float,
-        target_roofline_eta: float,
-        prev_local_rel_gain: float | None,
-        mean_recoverable_excess_us: float | None,
-        coarse_reject_ratio: float = 3.0,
-        disengage_roofline_eta: float = 0.65,
-        slow_gain_threshold: float = 0.03,
+        enable_prescreen_flag: bool = True,
+        bucket_clean_samples: int = 0,
+        out_of_sample_spearman_rho: float | None = None,
     ) -> CostGateDecision:
         """Evaluate round-level engagement decision."""
         ...
@@ -287,37 +265,15 @@ class NullCostModelAdvisor:
     def evaluate_round_policy(
         self,
         *,
-        enable_prescreen_flag: bool,
-        round_idx: int,
-        stagnation_rounds: int,
-        incumbent_roofline_eta: float,
-        target_roofline_eta: float,
-        prev_local_rel_gain: float | None,
-        mean_recoverable_excess_us: float | None,
-        coarse_reject_ratio: float = 3.0,
-        disengage_roofline_eta: float = 0.65,
-        slow_gain_threshold: float = 0.03,
+        enable_prescreen_flag: bool = True,
+        bucket_clean_samples: int = 0,
+        out_of_sample_spearman_rho: float | None = None,
     ) -> CostGateDecision:
         """Return disabled CostGateDecision for mode=off."""
-        _ = (
-            enable_prescreen_flag,
-            round_idx,
-            stagnation_rounds,
-            incumbent_roofline_eta,
-            target_roofline_eta,
-            prev_local_rel_gain,
-            mean_recoverable_excess_us,
-            coarse_reject_ratio,
-            disengage_roofline_eta,
-            slow_gain_threshold,
-        )
-        return CostGateDecision(
+        _ = (bucket_clean_samples, out_of_sample_spearman_rho)
+        return evaluate_cost_gate_policy(
             mode=CostModelMode.OFF,
-            engaged=False,
-            reason="disabled_by_config",
-            coarse_reject_ratio=float("inf"),
-            allow_prompt_guidance=False,
-            allow_candidate_pruning=False,
+            enable_prescreen_flag=enable_prescreen_flag,
         )
 
     def predict_candidate_us(
@@ -408,11 +364,11 @@ class NullCostModelAdvisor:
 
 
 class PluginCostModelAdvisor:
-    """Plugin advisor wrapping HybridAscendCostModel for shadow, auto, and coarse_only."""
+    """Plugin advisor wrapping HybridAscendCostModel for shadow and advisory modes."""
 
     def __init__(
         self,
-        mode: CostModelMode | str = CostModelMode.AUTO,
+        mode: CostModelMode | str = CostModelMode.ADVISORY,
         *,
         target: AscendTarget | None = None,
         operator_name: str = "",
@@ -485,30 +441,16 @@ class PluginCostModelAdvisor:
     def evaluate_round_policy(
         self,
         *,
-        enable_prescreen_flag: bool,
-        round_idx: int,
-        stagnation_rounds: int,
-        incumbent_roofline_eta: float,
-        target_roofline_eta: float,
-        prev_local_rel_gain: float | None,
-        mean_recoverable_excess_us: float | None,
-        coarse_reject_ratio: float = 3.0,
-        disengage_roofline_eta: float = 0.65,
-        slow_gain_threshold: float = 0.03,
+        enable_prescreen_flag: bool = True,
+        bucket_clean_samples: int = 0,
+        out_of_sample_spearman_rho: float | None = None,
     ) -> CostGateDecision:
         """Evaluate round policy via evaluate_cost_gate_policy."""
         return evaluate_cost_gate_policy(
             mode=self._mode,
             enable_prescreen_flag=enable_prescreen_flag,
-            round_idx=round_idx,
-            stagnation_rounds=stagnation_rounds,
-            incumbent_roofline_eta=incumbent_roofline_eta,
-            target_roofline_eta=target_roofline_eta,
-            prev_local_rel_gain=prev_local_rel_gain,
-            mean_recoverable_excess_us=mean_recoverable_excess_us,
-            disengage_roofline_eta=disengage_roofline_eta,
-            slow_gain_threshold=slow_gain_threshold,
-            coarse_reject_ratio=coarse_reject_ratio,
+            bucket_clean_samples=bucket_clean_samples,
+            out_of_sample_spearman_rho=out_of_sample_spearman_rho,
         )
 
     def predict_candidate_us(
@@ -518,6 +460,8 @@ class PluginCostModelAdvisor:
         bisheng_res: object | None = None,
     ) -> object | None:
         """Run HybridAscendCostModel.predict and increment predictions_invoked."""
+        if self._mode == CostModelMode.OFF:
+            return None
         pred = self._cost_model.predict(workload, bisheng_res=bisheng_res)
         self._predictions_invoked += 1
         return pred
@@ -534,6 +478,8 @@ class PluginCostModelAdvisor:
         bisheng_res: object | None = None,
     ) -> float:
         """Project and average predicted latency across anchors."""
+        if self._mode == CostModelMode.OFF:
+            return 0.0
         from tilefoundry_ascend.ascend.cost_model.experience_lake import (  # noqa: PLC0415
             project_case_workload,
         )
@@ -609,7 +555,7 @@ class PluginCostModelAdvisor:
     ) -> str:
         """Build tile-size prescreen prompt guidance when decision allows it."""
         _ = dims
-        if self._mode == CostModelMode.SHADOW:
+        if self._mode != CostModelMode.ADVISORY:
             return ""
         if not decision.engaged or not decision.allow_prompt_guidance or not base_cfg:
             return ""
@@ -685,46 +631,18 @@ class PluginCostModelAdvisor:
         candidate_workspace_stages_by_id: Mapping[str, int],
         creative_ids: Collection[str],
     ) -> tuple[list[object], list[tuple[object, str]]]:
-        """Coarse-filter Stage-A passers with paradigm-shift exemption."""
-        if (
-            self._mode == CostModelMode.SHADOW
-            or not decision.engaged
-            or not decision.allow_candidate_pruning
-        ):
-            return list(candidates), []
-
-        eff_parent_axes = _coerce_axes(parent_axes)
-        creative_set = frozenset(str(cid) for cid in creative_ids)
-        kept: list[object] = []
-        rejected: list[tuple[object, str]] = []
-        cap = float(decision.coarse_reject_ratio)
-
-        for cand in candidates:
-            cid = _extract_candidate_id(cand)
-            cand_axes = _coerce_axes(candidate_axes_by_id.get(cid))
-            cand_ws_stages = int(candidate_workspace_stages_by_id.get(cid, parent_workspace_stages))
-            exempt = is_paradigm_shift_exempt(
-                cand_axes,
-                eff_parent_axes,
-                cand_workspace_stages=cand_ws_stages,
-                parent_workspace_stages=int(parent_workspace_stages),
-                is_creative=(cid in creative_set),
-            )
-            cand_us = candidate_pred_us_by_id.get(cid)
-            if (
-                not exempt
-                and parent_pred_us > 0.0
-                and cand_us is not None
-                and float(cand_us) > 0.0
-                and math.isfinite(cap)
-                and cap > 0.0
-            ):
-                ratio = float(cand_us) / float(parent_pred_us)
-                if ratio > cap:
-                    rejected.append((cand, f"coarse_reject_ratio:{ratio:.2f}>{cap:.2f}"))
-                    continue
-            kept.append(cand)
-        return kept, rejected
+        """Return all Stage-A passers unchanged; advisory mode never prunes candidates."""
+        _ = (
+            decision,
+            parent_pred_us,
+            parent_axes,
+            parent_workspace_stages,
+            candidate_pred_us_by_id,
+            candidate_axes_by_id,
+            candidate_workspace_stages_by_id,
+            creative_ids,
+        )
+        return list(candidates), []
 
     def observe_surrogate_batch(
         self,
@@ -823,8 +741,8 @@ class PluginCostModelAdvisor:
         *,
         fallback_cost_pred: object | None = None,
     ) -> str:
-        """Resolve dominant bound via PMU+ledger (shadow) or fallback cost prediction."""
-        if self._mode != CostModelMode.SHADOW and not _has_measured_pmu(residual):
+        """Resolve dominant bound via PMU+ledger or advisory fallback prediction."""
+        if self._mode == CostModelMode.ADVISORY and not _has_measured_pmu(residual):
             pred_bound = str(_read_field(fallback_cost_pred, "dominant_bound", "") or "").strip()
             if pred_bound:
                 return pred_bound

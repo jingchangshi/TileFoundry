@@ -256,15 +256,12 @@ def test_cli_and_marathon_cost_mode_validation_and_forwarding(
             "--operator",
             "rms_norm",
             "--marathon",
-            "--cost-disengage-eta",
-            "0.12",
-            "--cost-slow-gain-threshold",
-            "0.02",
+            "--cost-model-mode",
+            "advisory",
         ]
     )
     assert rc_cli == 0
-    assert captured_marathon_cfgs[0].cost_disengage_eta == pytest.approx(0.12)
-    assert captured_marathon_cfgs[0].cost_slow_gain_threshold == pytest.approx(0.02)
+    assert captured_marathon_cfgs[0].cost_model_mode == "advisory"
 
     captured_direct: list[marathon.MarathonConfig] = []
     monkeypatch.setattr(
@@ -277,16 +274,13 @@ def test_cli_and_marathon_cost_mode_validation_and_forwarding(
             "run",
             "--operator",
             "rms_norm",
-            "--cost-disengage-eta",
-            "0.12",
-            "--cost-slow-gain-threshold",
-            "0.02",
+            "--cost-model-mode",
+            "shadow",
             "--allow-unreviewed-distilled-rules",
         ]
     )
     assert rc_m == 0
-    assert captured_direct[0].cost_disengage_eta == pytest.approx(0.12)
-    assert captured_direct[0].cost_slow_gain_threshold == pytest.approx(0.02)
+    assert captured_direct[0].cost_model_mode == "shadow"
     assert captured_direct[0].allow_unreviewed_distilled_rules is True
 
     monkeypatch.undo()
@@ -351,18 +345,14 @@ def test_cli_and_marathon_cost_mode_validation_and_forwarding(
             env_file=env_sh,
             auto_bootstrap_seed=False,
             salvage_beam_candidates=False,
-            cost_model_mode="coarse_only",
-            cost_disengage_eta=0.12,
-            cost_slow_gain_threshold=0.02,
+            cost_model_mode="advisory",
             allow_unreviewed_distilled_rules=True,
         )
     )
     assert rc_run == 0
     assert seen_tracker_flags == [True]
     assert len(seen_campaign_cfgs) == 1
-    assert seen_campaign_cfgs[0].cost_model_mode == "coarse_only"
-    assert seen_campaign_cfgs[0].cost_disengage_eta == pytest.approx(0.12)
-    assert seen_campaign_cfgs[0].cost_slow_gain_threshold == pytest.approx(0.02)
+    assert seen_campaign_cfgs[0].cost_model_mode == "advisory"
     assert seen_campaign_cfgs[0].allow_unreviewed_distilled_rules is True
 
 
@@ -471,7 +461,9 @@ def test_measure_npu_ring_burst_stats_and_anchor_metrics_roundtrip() -> None:
     assert restored.card_ext_hbm_mb == 2048
 
 
-def test_portfolio_runner_default_disengage_roofline_eta() -> None:
-    """PortfolioRunner.plan_workers defaults disengage_roofline_eta to 0.65."""
+def test_portfolio_runner_zero_magic_cost_gate_signature() -> None:
+    """PortfolioRunner.plan_workers exposes cost_model_mode without magic eta thresholds."""
     sig = inspect.signature(PortfolioRunner.plan_workers)
-    assert sig.parameters["disengage_roofline_eta"].default == pytest.approx(0.65)
+    assert "cost_model_mode" in sig.parameters
+    assert "disengage_roofline_eta" not in sig.parameters
+    assert "slow_gain_threshold" not in sig.parameters

@@ -3099,11 +3099,11 @@ def inject_lake_counterexample_anchors(
     experience_lake_dir: str | Path | None,
     cannbench_repo: str | Path | None = None,
     env_file: str | Path | None = None,
-    max_injected: int = 2,
+    max_injected: int | None = None,
     topology_axes: Mapping[str, object] | None = None,
 ) -> list[AnchorCaseSpec]:
     """Inject high-frequency historical L3/L4 counterexamples or tail seeds into anchors."""
-    if experience_lake_dir is None or max_injected <= 0:
+    if experience_lake_dir is None or (max_injected is not None and max_injected <= 0):
         return list(initial_anchors)
     lake_str = str(experience_lake_dir).strip()
     if not lake_str:
@@ -3129,7 +3129,8 @@ def inject_lake_counterexample_anchors(
             ):
                 rep_by_case[cid] = rec
         ordered_cases = sorted(freq.items(), key=lambda item: (-item[1], item[0]))
-        for cid, _count in ordered_cases[:max_injected]:
+        selected_cases = ordered_cases if max_injected is None else ordered_cases[:max_injected]
+        for cid, _count in selected_cases:
             rep = rep_by_case[cid]
             resolved_tag = _resolve_boundary_regime_tag(
                 rep,

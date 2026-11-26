@@ -647,12 +647,12 @@ def kernel(x):
     )
 
     assert [a.case_num for a in anchors] == [2]
-    assert [g.case_num for g in runner._guardrail_cases] == [14, 15]
+    assert [g.case_num for g in runner._guardrail_cases] == [14, 15, 16]
     assert promoted is False
     assert rolled_back is True
     assert stag_after == 2
     assert rec.promoted is False
-    assert rec.rolled_back_l3 is True
+    assert rec.l3_resolution == "CANDIDATE_REJECTED"
     assert new_inc == incumbent_src
     assert target_path.read_text(encoding="utf-8") == incumbent_src
 

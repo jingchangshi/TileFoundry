@@ -1835,7 +1835,7 @@ def test_trackb_round_evidence_persists_blueprint_observation_and_provenance(
         best_round_speedup=1.0,
         best_so_far_speedup=1.0,
         promoted=False,
-        rolled_back_l3=False,
+        l3_resolution="NOT_RUN",
         stagnation_rounds_after=0,
         trackb_evidence=evidence,
     )

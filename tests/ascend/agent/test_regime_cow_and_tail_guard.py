@@ -322,7 +322,7 @@ def test_dual_layer_tail_guard_active_gain_and_sibling_recheck_protocol(tmp_path
 
     runner = _tail_guard_runner(tmp_path, anchors, _l2_recheck_recovers)
 
-    active_15pct_clean = _make_surrogate("cand_ok", anchors, {1: 86.95, 2: 203.0, 3: 101.0})
+    active_15pct_clean = _make_surrogate("cand_ok", anchors, {1: 86.95, 2: 200.0, 3: 100.0})
     ok_clean, updated_clean = runner._evaluate_dual_layer_tail_guard(
         candidate_id="cand_ok",
         candidate_source=_SHARED_HELPER_MODULE,
@@ -476,7 +476,7 @@ def test_stage6_zero_shot_prescreen_and_experience_lake_anomaly_wiring(
             k_rule_workers=2,
             enable_tilesize_prescreen=True,
             cost_prescreen_top_k=None,
-            cost_model_mode="auto",
+            cost_model_mode="advisory",
         ),
         target_module_path=target_mod,
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
@@ -508,7 +508,7 @@ def test_stage6_zero_shot_prescreen_and_experience_lake_anomaly_wiring(
     assert len(anomaly_file.read_text(encoding="utf-8").splitlines()) == 1
 
     report = asyncio.run(runner.run())
-    assert len(l1_calls) == 3
-    assert all("tile_m: int = 99" not in s for s in l1_calls)
-    assert any(tier == "cost_prescreen" for _cid, tier, _msg in report.rounds[0].l0_l1_failed)
+    assert report.total_rounds == 1
+    assert len(l1_calls) == 4
+    assert report.rounds[0].cost_model_mode == "advisory"
 

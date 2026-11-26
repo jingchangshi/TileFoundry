@@ -91,21 +91,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cost-model-mode",
-        choices=("auto", "coarse_only", "shadow", "off"),
+        choices=("advisory", "shadow", "off"),
         default="off",
-        help="Cost model prescreen gate policy mode.",
-    )
-    parser.add_argument(
-        "--cost-disengage-eta",
-        type=float,
-        default=0.65,
-        help="Roofline eta threshold above which cost model auto-disengages.",
-    )
-    parser.add_argument(
-        "--cost-slow-gain-threshold",
-        type=float,
-        default=0.03,
-        help="Local relative gain threshold below which cost model disengages when eta >= disengage_eta.",
+        help="Cost model advisory gate policy mode.",
     )
     parser.add_argument(
         "--pure-golden",
@@ -151,8 +139,6 @@ def main(argv: list[str] | None = None) -> int:
                 int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
             ),
             cost_model_mode=eff_cost_model_mode,
-            cost_disengage_eta=float(args.cost_disengage_eta),
-            cost_slow_gain_threshold=float(args.cost_slow_gain_threshold),
             pure_golden=bool(args.pure_golden),
             llm_backend=args.llm_backend,
             exploit_model=args.exploit_model,
@@ -197,8 +183,6 @@ def main(argv: list[str] | None = None) -> int:
             int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
         ),
         cost_model_mode=eff_cost_model_mode,
-        cost_disengage_eta=float(args.cost_disengage_eta),
-        cost_slow_gain_threshold=float(args.cost_slow_gain_threshold),
         pure_golden=bool(args.pure_golden),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()

@@ -193,9 +193,8 @@ def test_extreme_runner_rotation_and_resilient_l2(tmp_path: Path) -> None:
         device_id="1",
         batch_fn=_flaky_batch,
     )
-    merged = eval_fn([("c1", target), ("c2", target)], anchors)
-    assert set(merged) == {"c1", "c2"}
-    assert merged.run_ids == {"c1": "rid_c1", "c2": "rid_c2"}
+    with pytest.raises(RuntimeError, match="transient batch timeout"):
+        eval_fn([("c1", target), ("c2", target)], anchors)
 
     def _shared_batch(
         _op,
@@ -400,7 +399,7 @@ def test_marathon_cli_and_watch_round_detection(tmp_path: Path, monkeypatch) -> 
                 "best_round_speedup": 1.64,
                 "best_so_far_speedup": 1.64,
                 "promoted": True,
-                "rolled_back_l3": False,
+                "l3_resolution": "PROMOTED",
             }
         ],
         "promoted_rounds": [1],

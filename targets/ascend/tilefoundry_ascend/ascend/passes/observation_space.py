@@ -26,6 +26,87 @@ _L2_FIELD_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("l2_pseudo_double_buffer", ("pseudo_double_buffer_serialized",)),
 )
 
+_PMU_L2_FIELDS: frozenset[str] = frozenset(
+    {
+        "l2_aic_mac_ratio",
+        "l2_aiv_vec_ratio",
+        "l2_mte2_wait_ratio",
+        "l2_fixpipe_ratio",
+        "l2_cache_hit_rate",
+        "l2_bank_conflict_ratio",
+        "l2_sync_stall_ratio",
+        "l2_pseudo_double_buffer",
+    }
+)
+
+_VALID_COMPUTE_ENGINES: frozenset[str] = frozenset({"aiv_only", "aic_only", "coupled_1c2v"})
+
+
+def _normalize_compute_engine(raw: object) -> str:
+    """Normalize a compute engine label to a canonical 3D topology tag or empty string."""
+    if raw is None:
+        return ""
+    cleaned = str(raw).strip()
+    return cleaned if cleaned in _VALID_COMPUTE_ENGINES else ""
+
+
+def _resolve_compute_engine(
+    *,
+    topology_axes: object | None,
+    telemetry: Mapping[str, object],
+    ledger: PhysicalLedgerLike,
+    cube_cycles: int,
+    vec_cycles: int,
+    l2_aic_mac: float,
+    l2_aiv_vec: float,
+) -> str:
+    """Resolve compute_engine from topology_axes, telemetry, ledger profile, or cycle counts."""
+    for source in (topology_axes, telemetry.get("topology_axes")):
+        if isinstance(source, Mapping):
+            candidate = _normalize_compute_engine(source.get("compute_engine"))
+            if candidate:
+                return candidate
+        elif source is not None:
+            candidate = _normalize_compute_engine(getattr(source, "compute_engine", ""))
+            if candidate:
+                return candidate
+    for raw in (
+        telemetry.get("compute_engine"),
+        ledger.microarch_profile.get("compute_engine"),
+        getattr(ledger, "compute_engine", ""),
+    ):
+        candidate = _normalize_compute_engine(raw)
+        if candidate:
+            return candidate
+    has_cube = cube_cycles > 0 or l2_aic_mac > 0.0
+    has_vec = vec_cycles > 0 or l2_aiv_vec > 0.0
+    if has_cube and has_vec:
+        return "coupled_1c2v"
+    if has_cube:
+        return "aic_only"
+    if has_vec:
+        return "aiv_only"
+    return ""
+
+
+def _resolve_num_stages(
+    telemetry: Mapping[str, object],
+    ledger: PhysicalLedgerLike,
+) -> int:
+    """Resolve pipeline stage count from telemetry, ledger profile, or default 1."""
+    for raw in (
+        telemetry.get("num_stages"),
+        telemetry.get("pipeline_depth"),
+        ledger.microarch_profile.get("num_stages"),
+        ledger.microarch_profile.get("pipeline_depth"),
+        getattr(ledger, "num_stages", None),
+        getattr(ledger, "pipeline_depth", None),
+    ):
+        val = _as_int(raw, 0)
+        if val > 0:
+            return val
+    return 1
+
 
 class RooflineSummaryLike(Protocol):
     """Structural view of analytical HIR Roofline bounds consumed by from_tiers."""
@@ -488,6 +569,29 @@ class ObservationVector5D:
     has_l2_telemetry: bool = False
     has_l1_compiler_summary: bool = False
     measured_l2_fields: tuple[str, ...] = ()
+    compute_engine: str = ""
+    num_stages: int = 1
+    has_l2_pmu: bool = False
+
+    def __post_init__(self) -> None:
+        normalized_engine = _normalize_compute_engine(self.compute_engine)
+        if normalized_engine != self.compute_engine:
+            object.__setattr__(self, "compute_engine", normalized_engine)
+        normalized_stages = max(1, int(self.num_stages))
+        if normalized_stages != self.num_stages:
+            object.__setattr__(self, "num_stages", normalized_stages)
+        if not self.has_l2_pmu and self.has_l2_telemetry:
+            derived_pmu = any(f in _PMU_L2_FIELDS for f in self.measured_l2_fields) or (
+                not self.measured_l2_fields
+                and (
+                    self.compute_issue.l2_aiv_vec_ratio > 0.0
+                    or self.compute_issue.l2_aic_mac_ratio > 0.0
+                    or self.offchip_dma.l2_mte2_wait_ratio > 0.0
+                    or self.pipeline_sync.l2_sync_stall_ratio > 0.0
+                )
+            )
+            if derived_pmu:
+                object.__setattr__(self, "has_l2_pmu", True)
 
     @property
     def transfer_inflation_ratio(self) -> float:
@@ -507,6 +611,7 @@ class ObservationVector5D:
         compiler_summary: CompilerSummaryLike | None = None,
         telemetry: Mapping[str, object] | None = None,
         roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
+        topology_axes: object | None = None,
     ) -> ObservationVector5D:
         """Assemble the 5-axis vector from L0 ledger, L1 summary, L2 telemetry, and Roofline."""
         tel = telemetry if telemetry is not None else {}
@@ -582,6 +687,22 @@ class ObservationVector5D:
             (32.0 / float(min_dma)) if 0 < min_dma < 32 else 0.0,
         )
 
+        l2_aic_mac = _telemetry_float(tel, "aic_mac_ratio", "aic_mad")
+        l2_aiv_vec = _telemetry_float(tel, "aiv_vec_ratio", "aiv_vec")
+        compute_engine = _resolve_compute_engine(
+            topology_axes=topology_axes,
+            telemetry=tel,
+            ledger=ledger,
+            cube_cycles=cube_cycles,
+            vec_cycles=vec_cycles,
+            l2_aic_mac=l2_aic_mac,
+            l2_aiv_vec=l2_aiv_vec,
+        )
+        num_stages = _resolve_num_stages(tel, ledger)
+        has_l2_pmu = bool(has_l2_telemetry) and any(
+            field_name in _PMU_L2_FIELDS for field_name in measured_l2_fields
+        )
+
         return cls(
             compute_issue=ComputeIssueAxis(
                 l0_cube_cycles=cube_cycles,
@@ -591,8 +712,8 @@ class ObservationVector5D:
                 l1_software_loops=software_loops,
                 l1_vf_fusion_breaks=vf_fusion_breaks,
                 l1_dual_issue_collapse=dual_issue_collapse,
-                l2_aic_mac_ratio=_telemetry_float(tel, "aic_mac_ratio", "aic_mad"),
-                l2_aiv_vec_ratio=_telemetry_float(tel, "aiv_vec_ratio", "aiv_vec"),
+                l2_aic_mac_ratio=l2_aic_mac,
+                l2_aiv_vec_ratio=l2_aiv_vec,
                 l2_roofline_eta=_telemetry_float(tel, "roofline_eta"),
                 effective_compute_eta=effective_compute_eta,
                 l0_aiv_subcore_imbalance=(aiv0_v > 0 and aiv1_v == 0),
@@ -660,6 +781,9 @@ class ObservationVector5D:
             has_l2_telemetry=has_l2_telemetry,
             has_l1_compiler_summary=compiler is not None,
             measured_l2_fields=measured_l2_fields,
+            compute_engine=compute_engine,
+            num_stages=num_stages,
+            has_l2_pmu=has_l2_pmu,
         )
 
     def compute_axis_residuals(self) -> AxisResidual5D:
@@ -779,6 +903,9 @@ class ObservationVector5D:
             "has_l2_telemetry": self.has_l2_telemetry,
             "has_l1_compiler_summary": self.has_l1_compiler_summary,
             "measured_l2_fields": list(self.measured_l2_fields),
+            "compute_engine": self.compute_engine,
+            "num_stages": self.num_stages,
+            "has_l2_pmu": self.has_l2_pmu,
             "residuals": asdict(self.compute_axis_residuals()),
         }
 
@@ -881,6 +1008,9 @@ class ObservationVector5D:
             has_l2_telemetry=_as_bool(payload.get("has_l2_telemetry")),
             has_l1_compiler_summary=_as_bool(payload.get("has_l1_compiler_summary")),
             measured_l2_fields=_as_str_tuple(payload.get("measured_l2_fields")),
+            compute_engine=_normalize_compute_engine(payload.get("compute_engine")),
+            num_stages=max(1, _as_int(payload.get("num_stages"), 1)),
+            has_l2_pmu=_as_bool(payload.get("has_l2_pmu")),
         )
 
 

@@ -438,7 +438,7 @@ def test_campaign_runner_live_sil_7facet_cost_calibration_and_shared_stone_pruni
             k_rule_workers=1,
             stagnation_escalate_rounds=1,
             exploit_effort="high",
-            cost_model_mode="auto",
+            cost_model_mode="advisory",
         ),
         target_module_path=mod_file,
         perf_target=PerfTargetSpec("demo_op", 4.0, 3.5, 0.95),
@@ -595,7 +595,7 @@ def test_agy_effort_defaults_and_campaign_defaults(tmp_path: Path) -> None:
     m_cfg = MarathonConfig(operator_name="rms_norm")
     assert m_cfg.llm_backend is None
     assert m_cfg.escalate_model is None
-    assert m_cfg.exploit_effort == "high"
+    assert m_cfg.exploit_effort == "medium"
     assert m_cfg.auto_bootstrap_seed is True
 
     c_cfg = CampaignConfig(operator_name="rms_norm")

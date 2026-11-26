@@ -94,7 +94,7 @@ def test_attention_residual_routes_to_aiv_only_and_gemm_einsum_keeps_cube() -> N
 
 
 def test_marathon_dead_prewarm_removed_and_cost_model_mode_added() -> None:
-    """Confirm prewarm_l3/build_prewarmed_l3_runner are gone and cost_model_mode defaults auto."""
+    """Confirm prewarm_l3/build_prewarmed_l3_runner are gone and cost_model_mode defaults off."""
     assert not hasattr(marathon, "build_prewarmed_l3_runner")
     assert "build_prewarmed_l3_runner" not in marathon.__all__
     field_names = {f.name for f in fields(MarathonConfig)}
@@ -104,9 +104,9 @@ def test_marathon_dead_prewarm_removed_and_cost_model_mode_added() -> None:
     cfg = MarathonConfig(operator_name="mla")
     assert cfg.cost_model_mode == "off"
     parsed = build_marathon_arg_parser().parse_args(
-        ["run", "--operator", "mla", "--cost-model-mode", "auto"]
+        ["run", "--operator", "mla", "--cost-model-mode", "advisory"]
     )
-    assert parsed.cost_model_mode == "auto"
+    assert parsed.cost_model_mode == "advisory"
 
 
 def test_sil_verifier_tilelang_ast_stage_and_parallel_redlines() -> None:

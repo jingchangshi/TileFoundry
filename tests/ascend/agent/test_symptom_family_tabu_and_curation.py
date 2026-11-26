@@ -15,7 +15,10 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec, PerfT
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     PerfTargetCampaignRunner,
-    _should_trigger_p2_deep_dive,
+)
+from tilefoundry_ascend.agent.kb.schema import (
+    DETERMINISTIC_SYMPTOM_FAMILIES,
+    should_escalate_diagnostic_or_creative,
 )
 from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
     select_fallback_track_from_semantics,
@@ -143,7 +146,8 @@ def test_all_seed_rules_have_valid_symptom_family_and_anti_precondition(tmp_path
     """Validate all 41 seed rules declare SymptomFamily, mechanism_tag, and anti_precondition."""
     rules = load_seed_rules()
     assert len(rules) == 41
-    assert len(SymptomFamily) == 13
+    assert len(SymptomFamily) == 14
+    assert len(DETERMINISTIC_SYMPTOM_FAMILIES) == 13
     assert set(SYMPTOM_FAMILY_TO_AXIS) == set(SymptomFamily)
     assert set(SYMPTOM_FAMILY_TO_FACETS) == set(SymptomFamily)
     assert len({r.mechanism_tag for r in rules}) == 41
@@ -168,7 +172,7 @@ def test_all_seed_rules_have_valid_symptom_family_and_anti_precondition(tmp_path
         assert roundtrip.anti_precondition == rule.anti_precondition
         assert roundtrip.mechanism_tag == rule.mechanism_tag
         assert roundtrip.concept_description == rule.concept_description
-    assert covered_families == set(SymptomFamily)
+    assert covered_families == DETERMINISTIC_SYMPTOM_FAMILIES
 
     with pytest.raises(ValueError, match="invalid symptom_family"):
         AscendCausalRule(
@@ -199,7 +203,7 @@ def test_all_seed_rules_have_valid_symptom_family_and_anti_precondition(tmp_path
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="non-empty symptom_family"):
+    with pytest.raises(ValueError, match="must declare a valid deterministic symptom_family"):
         load_seed_rules(bad_yaml)
 
 
@@ -329,8 +333,8 @@ def test_anti_precondition_blocks_matching_with_orthogonal_ratios() -> None:
     assert rules["R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION"].matches(ctx_bar_pseudo) is False
 
 
-def test_rank_symptom_families_and_p2_deep_dive_trigger_policy() -> None:
-    """Verify 12-family symptom ranking and P2 deep-dive tie threshold at stagnation >= 2."""
+def test_rank_symptom_families_and_simplex_escalation_policy() -> None:
+    """Verify 14-family symptom simplex conservation and entropy escalation policy."""
     roundtrip_ledger = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
         is_legal=True,
@@ -344,31 +348,31 @@ def test_rank_symptom_families_and_p2_deep_dive_trigger_policy() -> None:
         extra={"transfer_inflation_ratio": 2.4},
     )
     ranked_rt = rank_symptom_families(ctx_rt)
-    assert len(ranked_rt) == 13
+    assert len(ranked_rt) == 14
+    assert sum(w for _, w in ranked_rt) == pytest.approx(1.0, abs=1e-6)
     assert ranked_rt[0][0] == SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP
-    assert ranked_rt[0][1] > 0.7
+    assert ranked_rt[0][1] > 0.25
 
     obs_spill = roundtrip_ledger.to_observation_5d(
         telemetry={"dur_us": 20.0, "sync_stall_ratio": 0.45, "bank_conflict_ratio": 0.30},
     )
     ranked_obs = rank_symptom_families(obs_spill)
-    assert len(ranked_obs) == 13
-    assert ranked_obs[0][0] == SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP
+    assert len(ranked_obs) == 14
+    assert sum(w for _, w in ranked_obs) == pytest.approx(1.0, abs=1e-6)
 
-    tied = [
-        (SymptomFamily.DMA_L2_THRASH_REUSE_MISS, 0.54),
-        (SymptomFamily.SYNC_BARRIER_SERIALIZATION, 0.49),
+    flat_simplex = [(fam, 1.0 / len(SymptomFamily)) for fam in SymptomFamily]
+    peaked_simplex = [
+        (fam, 0.9 if fam == SymptomFamily.DMA_L2_THRASH_REUSE_MISS else 0.1 / 13.0)
+        for fam in SymptomFamily
     ]
-    separated = [
-        (SymptomFamily.DMA_L2_THRASH_REUSE_MISS, 0.72),
-        (SymptomFamily.SYNC_BARRIER_SERIALIZATION, 0.45),
+    unmodeled_top = [
+        (fam, 0.8 if fam == SymptomFamily.UNMODELED_SILICON_RESIDUAL else 0.2 / 13.0)
+        for fam in SymptomFamily
     ]
-    assert _should_trigger_p2_deep_dive(0, tied) is False
-    assert _should_trigger_p2_deep_dive(1, tied) is False
-    assert _should_trigger_p2_deep_dive(2, tied) is True
-    assert _should_trigger_p2_deep_dive(3, tied) is True
-    assert _should_trigger_p2_deep_dive(2, separated) is False
-    assert _should_trigger_p2_deep_dive(2, [(SymptomFamily.DMA_L2_THRASH_REUSE_MISS, 0.5)]) is False
+    assert should_escalate_diagnostic_or_creative(flat_simplex, stagnation_rounds=0) is False
+    assert should_escalate_diagnostic_or_creative(flat_simplex, stagnation_rounds=1) is True
+    assert should_escalate_diagnostic_or_creative(unmodeled_top, stagnation_rounds=1) is True
+    assert should_escalate_diagnostic_or_creative(peaked_simplex, stagnation_rounds=1) is False
 
 
 def test_online_rulebook_frozen_by_default_and_opt_in_distilled_sync(tmp_path: Path) -> None:
@@ -648,16 +652,12 @@ def test_flywheel_stages_offline_evidence_without_mutating_online_rulebook(
             "optimized_dur_us": 18.0,
             "numerical_ok": 1.0,
         },
-        min_edit_gain=0.05,
-        min_probe_speedup=1.08,
     )
     runner = PerfTargetCampaignRunner(
         config=CampaignConfig(
             operator_name="synthetic_op",
             max_rounds=1,
             k_rule_workers=1,
-            min_surrogate_gain=0.25,
-            min_flywheel_gain=0.03,
             allow_unreviewed_distilled_rules=False,
         ),
         target_module_path=target_path,

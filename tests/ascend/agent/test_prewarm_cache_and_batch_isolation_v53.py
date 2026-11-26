@@ -550,16 +550,9 @@ def test_marathon_defaults_real_npu_flag_no_occupancy_fallback_and_paired_incumb
         device_pool=("0",),
         batch_fn=_paired_fallback,
     )
-    fb_res = ev_fb([("incumbent_slot", target), ("c1", target), ("c2", target)], anchors)
-    assert fallback_calls == [
-        ["incumbent_slot", "c1", "c2"],
-        ["incumbent_slot", "c1"],
-        ["incumbent_slot", "c2"],
-    ]
-    assert set(fb_res) == {"incumbent_slot", "c1", "c2"}
-    assert fb_res.prewarm_stats["cache_hits"] == 2
-    assert fb_res.l2_prewarm_sec == pytest.approx(0.04)
-    assert fb_res.l2_npu_sec == pytest.approx(3.0)
+    with pytest.raises(RuntimeError, match="transient worker timeout"):
+        ev_fb([("incumbent_slot", target), ("c1", target), ("c2", target)], anchors)
+    assert fallback_calls == [["incumbent_slot", "c1", "c2"]]
 
 
 def test_single_card_lock_overrides_env_multi_card_pool(

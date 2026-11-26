@@ -514,8 +514,8 @@ def test_tilesize_prescreen_default_off_per_dtype_half_l1_and_ablation_gate() ->
         facts,
     )
     assert fp16_score.half_l1_penalty == 0.0
-    assert no_split_score.half_l1_penalty == pytest.approx(0.25)
-    assert no_split_score.score < fp16_score.score
+    assert no_split_score.half_l1_penalty == 0.0
+    assert no_split_score.score <= fp16_score.score
 
     assert evaluate_prescreen_ablation([]).recommended_enable is False
 

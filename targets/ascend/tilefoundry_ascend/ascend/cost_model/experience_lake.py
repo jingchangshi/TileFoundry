@@ -126,6 +126,7 @@ class CaseObservationRecord:
     burst_batch_cv: float = 0.0
     spike_retries: int = 0
     card_ext_hbm_mb: int = 0
+    is_real_npu: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -165,6 +166,7 @@ class CaseObservationRecord:
             burst_batch_cv=max(0.0, float(payload.get("burst_batch_cv", 0.0) or 0.0)),
             spike_retries=max(0, int(payload.get("spike_retries", 0) or 0)),
             card_ext_hbm_mb=max(0, int(payload.get("card_ext_hbm_mb", 0) or 0)),
+            is_real_npu=bool(payload.get("is_real_npu", False)),
         )
 
 

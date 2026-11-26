@@ -808,7 +808,13 @@ def test_l2_fast_contract_is_workspace_relative_and_sha_bound(
     assert set(batch_entries) == {"attention_residual", "mla"}
     candidate_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
     for operator_name, entry in batch_entries.items():
-        assert set(entry) == {"operator_name", "entrypoint", "candidates", "anchors"}
+        assert set(entry) == {
+            "operator_name",
+            "entrypoint",
+            "candidates",
+            "anchors",
+            "poison_pill_timeout_sec",
+        }
         for anchor in entry["anchors"]:
             assert set(anchor) == {
                 "task",

@@ -1,7 +1,7 @@
 """Tests for v50 adaptive cost gate, cold-L2 denoising, L3 taxonomy, and KDA springboard."""
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 import importlib.util
 import json
@@ -57,62 +57,16 @@ def _ensure_cost_gate_policy_stub() -> None:
 
     def evaluate_cost_gate_policy(
         *,
-        mode: CostModelMode | str = CostModelMode.AUTO,
+        mode: CostModelMode | str = CostModelMode.OFF,
         enable_prescreen_flag: bool = True,
-        round_idx: int = 1,
-        stagnation_rounds: int = 0,
-        incumbent_roofline_eta: float = 0.0,
-        target_roofline_eta: float = 0.85,
-        prev_local_rel_gain: float | None = None,
-        mean_recoverable_excess_us: float | None = None,
-        disengage_roofline_eta: float = 0.65,
-        slow_gain_threshold: float = 0.03,
-        min_recoverable_excess_us: float = 1.0,
-        coarse_reject_ratio: float = 3.0,
+        bucket_clean_samples: int = 0,
+        out_of_sample_spearman_rho: float | None = None,
     ) -> CostGateDecision:
-        _ = (round_idx, stagnation_rounds, target_roofline_eta)
-        resolved_mode = CostModelMode(str(mode))
-        if not enable_prescreen_flag or resolved_mode == CostModelMode.OFF:
-            return CostGateDecision(
-                mode=resolved_mode,
-                engaged=False,
-                reason="disabled_by_flag_or_off_mode",
-                coarse_reject_ratio=coarse_reject_ratio,
-                allow_prompt_guidance=False,
-                allow_candidate_pruning=False,
-            )
-        if resolved_mode == CostModelMode.COARSE_ONLY:
-            return CostGateDecision(
-                mode=resolved_mode,
-                engaged=True,
-                reason="coarse_only_mode",
-                coarse_reject_ratio=coarse_reject_ratio,
-                allow_prompt_guidance=False,
-                allow_candidate_pruning=True,
-            )
-        if (
-            incumbent_roofline_eta >= disengage_roofline_eta
-            and prev_local_rel_gain is not None
-            and prev_local_rel_gain < slow_gain_threshold
-        ) or (
-            mean_recoverable_excess_us is not None
-            and mean_recoverable_excess_us < min_recoverable_excess_us
-        ):
-            return CostGateDecision(
-                mode=resolved_mode,
-                engaged=False,
-                reason="auto_disengaged_high_eta_low_gain",
-                coarse_reject_ratio=coarse_reject_ratio,
-                allow_prompt_guidance=False,
-                allow_candidate_pruning=False,
-            )
-        return CostGateDecision(
-            mode=resolved_mode,
-            engaged=True,
-            reason="auto_engaged",
-            coarse_reject_ratio=coarse_reject_ratio,
-            allow_prompt_guidance=True,
-            allow_candidate_pruning=True,
+        return evaluate_cost_gate_policy(
+            mode=mode,
+            enable_prescreen_flag=enable_prescreen_flag,
+            bucket_clean_samples=bucket_clean_samples,
+            out_of_sample_spearman_rho=out_of_sample_spearman_rho,
         )
 
     stub = types.ModuleType(mod_name)
@@ -219,16 +173,10 @@ def test_cli_and_round_record_cost_gate_telemetry_roundtrip() -> None:
                 "--operator",
                 "kda_chunk",
                 "--cost-model-mode",
-                "coarse_only",
-                "--cost-disengage-eta",
-                "0.72",
-                "--cost-slow-gain-threshold",
-                "0.045",
+                "advisory",
             ]
         )
-        assert args.cost_model_mode == "coarse_only"
-        assert args.cost_disengage_eta == pytest.approx(0.72)
-        assert args.cost_slow_gain_threshold == pytest.approx(0.045)
+        assert args.cost_model_mode == "advisory"
 
     rec = campaign_runner.CampaignRoundRecord(
         round_idx=3,
@@ -241,25 +189,25 @@ def test_cli_and_round_record_cost_gate_telemetry_roundtrip() -> None:
         best_round_speedup=1.2,
         best_so_far_speedup=1.3,
         promoted=False,
-        rolled_back_l3=False,
+        l3_resolution="NOT_RUN",
         stagnation_rounds_after=1,
-        cost_model_mode="auto",
+        cost_model_mode="advisory",
         cost_model_engaged=False,
-        cost_model_reason="auto_disengaged_high_eta_low_gain",
+        cost_model_reason="insufficient_bucket_samples",
         local_rel_gain=0.018,
         tail_guard_reject_reason="multi_sibling_regression",
     )
     payload = rec.to_dict()
-    assert payload["cost_model_mode"] == "auto"
+    assert payload["cost_model_mode"] == "advisory"
     assert payload["cost_model_engaged"] is False
-    assert payload["cost_model_reason"] == "auto_disengaged_high_eta_low_gain"
+    assert payload["cost_model_reason"] == "insufficient_bucket_samples"
     assert payload["local_rel_gain"] == pytest.approx(0.018)
     assert payload["tail_guard_reject_reason"] == "multi_sibling_regression"
 
     restored = campaign_runner.CampaignRoundRecord.from_dict(payload)
-    assert restored.cost_model_mode == "auto"
+    assert restored.cost_model_mode == "advisory"
     assert restored.cost_model_engaged is False
-    assert restored.cost_model_reason == "auto_disengaged_high_eta_low_gain"
+    assert restored.cost_model_reason == "insufficient_bucket_samples"
     assert restored.local_rel_gain == pytest.approx(0.018)
     assert restored.tail_guard_reject_reason == "multi_sibling_regression"
 
@@ -321,7 +269,6 @@ async def test_run_l0_l1_round_filter_exempts_creative_and_paradigm_shift() -> N
         l1_compiler=_l1,
         stage_a_cost_ranker=_ranker,
         cost_prescreen_top_k=1,
-        cost_coarse_reject_ratio=3.0,
         creative_candidate_ids={"cand_creative"},
         parent_analytical_us=10.0,
         stage_a_analytical_scorer=_scorer,
@@ -477,7 +424,7 @@ def _build_small():
 def _build_large():
     return _shared_helper(99)
 '''
-    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="advisory")
     small_spec = runner._regime_specs[0]
     assert "large" in runner._unchanged_sibling_regimes(
         incumbent_src, cand_unchanged_sibling, small_spec
@@ -552,6 +499,8 @@ def _build_large():
     assert ok_exempt is True
 
     best_l_j, cand_l_j = _pair(1, "large", 10.0, 5.0, 5.20)
+    best_l_j = replace(best_l_j, paired_rel_mad=0.05)
+    cand_l_j = replace(cand_l_j, paired_rel_mad=0.05)
     cand_res_floor = surrogate_cannbench.CandidateSurrogateResult(
         candidate_id="cand_floor",
         operator_name="rms_norm",
@@ -656,7 +605,7 @@ def test_l3_failure_kind_candidate_and_infra_distinction() -> None:
 
 def test_vf_stack_overflow_and_max_row_width_helpers(tmp_path: Path) -> None:
     """Verify VF stack overflow detection and max-row-width resolution."""
-    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="advisory")
     spec = runner._regime_specs[0]
     overflow_res = StageBResult(
         passed=False,
@@ -725,7 +674,7 @@ def _build_small(tile_n=64):
     )
     assert "MUST NOT" not in instr_tilelang
 
-    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="advisory")
     kda_spec = RegimeTargetSpec(
         regime_tag="small",
         builder_candidates=("_build_small",),
@@ -825,7 +774,7 @@ def test_prewarm_dedup_and_strict_error(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
 def test_recoverable_excess_launch_floors(tmp_path: Path) -> None:
     """Verify per-backend launch floor constants used in _regime_mean_recoverable_excess_us."""
-    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="advisory")
     tl_spec = runner._regime_specs[0]
     tb_spec = RegimeTargetSpec(
         regime_tag="small",
@@ -855,8 +804,9 @@ def test_recoverable_excess_launch_floors(tmp_path: Path) -> None:
             ),
         ),
     )
-    assert runner._regime_mean_recoverable_excess_us(res, tl_spec) == pytest.approx(0.8)
-    assert runner._regime_mean_recoverable_excess_us(res, tb_spec) == pytest.approx(1.6)
+    assert runner._regime_mean_recoverable_excess_us(res, tl_spec) == pytest.approx(2.2)
+    runner._calibrated_dispatch_floor_us = 1.6
+    assert runner._regime_mean_recoverable_excess_us(res, tb_spec) == pytest.approx(0.6)
 
 
 @pytest.mark.anyio
@@ -879,7 +829,7 @@ def _build_large():
 def kernel(x):
     return x
 '''
-    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="advisory")
     runner._target_module_path.write_text(mod_src, encoding="utf-8")
 
     class _FakeLLM:
@@ -1006,8 +956,11 @@ def kernel(x):
         admitted_rule_ids=[],
     )
     assert rec.cost_model_engaged is False
-    assert rec.cost_model_mode == "auto"
-    assert rec.cost_model_reason == "near_theoretical_limit"
+    assert rec.cost_model_mode == "advisory"
+    assert rec.cost_model_reason in (
+        "insufficient_bucket_samples",
+        "missing_spearman_rho",
+    )
     assert prescreen_calls == 0
     assert seen_contexts and seen_contexts[0].get("use_uncalibrated_analytical") is False
     assert seen_filter_kwargs
@@ -1075,7 +1028,7 @@ def _build_large():
 def kernel(x):
     return x
 '''
-    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="advisory")
     runner._target_module_path.write_text(mod_src, encoding="utf-8")
 
     captured_requests: list[GenerationRequest] = []
@@ -1251,7 +1204,7 @@ def test_campaign_round_record_paradigm_shift_roundtrip() -> None:
         best_round_speedup=0.04,
         best_so_far_speedup=0.04,
         promoted=False,
-        rolled_back_l3=False,
+        l3_resolution="NOT_RUN",
         stagnation_rounds_after=3,
         paradigm_shift_active=True,
         paradigm_shift_rule_ids=("R01", "R03"),

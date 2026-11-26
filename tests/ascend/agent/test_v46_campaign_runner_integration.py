@@ -135,7 +135,7 @@ def test_arch3_non_sticky_headroom_regime_rotation(tmp_path: Path) -> None:
         last_round_promoted=True,
     )
     assert picked_tie is not None
-    assert picked_tie.regime_tag == "reduce_tail_subatom"
+    assert picked_tie.regime_tag == "reduce_tail"
 
     res_round2 = _make_result(tail_eta=0.14, subatom_eta=0.28)
     picked_r2 = runner._select_active_regime(
@@ -191,6 +191,7 @@ def test_impl4_flywheel_winning_edge_records_rule_id_and_symptom_family(
             return _FakeReport()
 
     runner._flywheel = _FakeFlywheel()
+    runner._flywheel_coordinator._flywheel = runner._flywheel
     runner._run_flywheel_distillation(
         baseline_source="def f(): return 1\n",
         winner_source="def f(): return 2\n",

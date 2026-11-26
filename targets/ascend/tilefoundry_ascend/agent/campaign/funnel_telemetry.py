@@ -4,73 +4,20 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+
+from tilefoundry_ascend.agent.campaign.fault_types import (
+    FaultPlane,
+    L3Resolution,
+    TypedFault,
+)
 
 MAX_CLEAN_CALIBRATION_BURST_CV: float = 0.08
 SPEARMAN_QUARANTINE_FLOOR: float = 0.20
 ANOMALY_LOG_ERROR_THRESHOLD: float = 1.20
-
-_ERROR_CODE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("NOOP_IDENTICAL", re.compile(r"noop_identical|identical_to_parent", re.IGNORECASE)),
-    (
-        "PATCH_ANCHOR_MISS",
-        re.compile(
-            r"patch_anchor_miss|patchanchormiss|search block did not match|"
-            r"identical to parent track-b|zero effective change|"
-            r"valid search/replace block|empty search block",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "VF_STACK_OVERFLOW",
-        re.compile(
-            r"exceeded vf stack size|vf_stack|stack frame size|stack overflow",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "UB_SRAM_OVERFLOW",
-        re.compile(r"ub[_\s-]*overflow|ubuf.*exceed|ub_bytes", re.IGNORECASE),
-    ),
-    ("L1_SRAM_OVERFLOW", re.compile(r"l1[_\s-]*overflow|cbuf.*exceed", re.IGNORECASE)),
-    ("T_STAGE_NESTING_ILLEGAL", re.compile(r"t\.stage|stage.*nest", re.IGNORECASE)),
-    ("G5_MONOTONICITY_LOCK", re.compile(r"g5|monotonicity|forbidden_regression", re.IGNORECASE)),
-    ("FREEDOM_MASK_VIOLATION", re.compile(r"freedom_mask|locked_facet", re.IGNORECASE)),
-    (
-        "TRACKB_SLICE_SPLICE_ERR",
-        re.compile(
-            r"omitted_span|dead_code.*trackb|trackb.*dead_code|splice",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "SIGNATURE_CONTRACT_MISMATCH",
-        re.compile(
-            r"signature.*mismatch|missing regime symbols|entrypoint.*not define|"
-            r"arity|unexpected keyword",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "DYNAMIC_STRIDE_CONTRACT_ERR",
-        re.compile(
-            r"stride.*contract|non[-_\s]?contiguous|buffer_map.*shape",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "CCE_UNDECLARED_INTRINSIC",
-        re.compile(
-            r"undeclared identifier|no matching function|implicit declaration|unknown type name",
-            re.IGNORECASE,
-        ),
-    ),
-    ("COST_COARSE_REJECT", re.compile(r"cost_prescreen|coarse_reject", re.IGNORECASE)),
-)
 
 
 def _coerce_int(raw: object, default: int = 0) -> int:
@@ -97,22 +44,6 @@ def _coerce_float(raw: object, default: float = 0.0) -> float:
         except ValueError:
             return default
     return default
-
-
-def normalize_compile_error_code(
-    failed_tier: str | None,
-    error_message: str,
-    full_diagnostic: str = "",
-) -> str:
-    """Classify Stage-A/Stage-B/prescreen rejections into canonical telemetry codes."""
-    joined = f"{failed_tier or ''} {error_message or ''} {full_diagnostic or ''}".strip()
-    if not joined:
-        return "OK"
-    for code, pattern in _ERROR_CODE_RULES:
-        if pattern.search(joined):
-            return code
-    tier_slug = re.sub(r"[^A-Za-z0-9_]+", "_", (failed_tier or "UNKNOWN").upper()).strip("_")
-    return f"{tier_slug}_OTHER"
 
 
 def is_clean_calibration_sample(
@@ -199,11 +130,118 @@ class RoundFunnelEvent:
     stage_timings_sec: dict[str, float] = field(default_factory=dict)
     prewarm_stats: dict[str, int] = field(default_factory=dict)
     cost_advisor_predictions: int = 0
+    fault_plane: str = FaultPlane.NONE.value
+    l3_resolution: str = L3Resolution.NOT_RUN.value
+    is_real_npu: bool = False
     timestamp: float = field(default_factory=time.time)
+
+    def apply_typed_fault(self, fault: TypedFault | None) -> RoundFunnelEvent:
+        """Return an updated event populated from a structured TypedFault."""
+        if fault is None:
+            return replace(
+                self,
+                fault_plane=FaultPlane.NONE.value,
+                error_code_norm="OK",
+                failed_tier="",
+                noop_identical=False,
+            )
+        return replace(
+            self,
+            fault_plane=fault.plane.value,
+            error_code_norm=fault.code or self.error_code_norm,
+            failed_tier=fault.failed_tier or self.failed_tier,
+            noop_identical=bool(
+                self.noop_identical or fault.plane == FaultPlane.NOOP_IDENTICAL
+            ),
+        )
+
+    @classmethod
+    def from_typed_fault(
+        cls,
+        *,
+        run_id: str,
+        operator: str,
+        round_idx: int,
+        regime_tag: str,
+        topology_axes: dict[str, str],
+        candidate_id: str,
+        cand_sha: str,
+        worker_kind: str,
+        fault: TypedFault | None,
+        rule_id: str | None = None,
+        l3_resolution: str = L3Resolution.NOT_RUN.value,
+        is_real_npu: bool = False,
+        wall_sec: float = 0.0,
+    ) -> RoundFunnelEvent:
+        """Construct a RoundFunnelEvent directly from a TypedFault payload."""
+        if fault is None:
+            return cls(
+                run_id=run_id,
+                operator=operator,
+                round_idx=round_idx,
+                regime_tag=regime_tag,
+                topology_axes=topology_axes,
+                candidate_id=candidate_id,
+                cand_sha=cand_sha,
+                worker_kind=worker_kind,
+                rule_id=rule_id,
+                passed_l0_l1=True,
+                failed_tier="",
+                error_code_norm="OK",
+                fault_plane=FaultPlane.NONE.value,
+                l3_resolution=l3_resolution,
+                is_real_npu=is_real_npu,
+                wall_sec=wall_sec,
+            )
+        return cls(
+            run_id=run_id,
+            operator=operator,
+            round_idx=round_idx,
+            regime_tag=regime_tag,
+            topology_axes=topology_axes,
+            candidate_id=candidate_id,
+            cand_sha=cand_sha,
+            worker_kind=worker_kind,
+            rule_id=rule_id,
+            passed_l0_l1=(fault.plane == FaultPlane.NONE),
+            failed_tier=fault.failed_tier,
+            error_code_norm=fault.code or (
+                "OK" if fault.plane == FaultPlane.NONE else fault.plane.value
+            ),
+            noop_identical=(fault.plane == FaultPlane.NOOP_IDENTICAL),
+            fault_plane=fault.plane.value,
+            l3_resolution=l3_resolution,
+            is_real_npu=is_real_npu,
+            wall_sec=wall_sec,
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Serialize funnel event to a JSON-compatible dictionary."""
         return asdict(self)
+
+
+def assert_unmodeled_fault_share_bounded(
+    events: Sequence[RoundFunnelEvent],
+    *,
+    max_share: float = 0.10,
+) -> float:
+    """Assert unmodeled faults stay strictly below max_share of faulted events."""
+    fault_events = [
+        evt for evt in events if str(evt.fault_plane) != FaultPlane.NONE.value
+    ]
+    if not fault_events:
+        return 0.0
+    unmodeled_count = sum(
+        1
+        for evt in fault_events
+        if str(evt.fault_plane) == FaultPlane.UNMODELED_FAULT.value
+    )
+    share = unmodeled_count / len(fault_events)
+    if share >= float(max_share):
+        raise AssertionError(
+            f"unmodeled fault share {share:.3f} >= {float(max_share):.3f}"
+        )
+    return share
 
 
 def append_round_funnel_event(telemetry_dir: Path, event: RoundFunnelEvent) -> Path:
@@ -391,7 +429,7 @@ __all__ = [
     "RoundFunnelEvent",
     "SPEARMAN_QUARANTINE_FLOOR",
     "append_round_funnel_event",
+    "assert_unmodeled_fault_share_bounded",
     "compute_spearman_rho",
     "is_clean_calibration_sample",
-    "normalize_compile_error_code",
 ]
