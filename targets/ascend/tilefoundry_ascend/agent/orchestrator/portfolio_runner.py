@@ -738,9 +738,18 @@ _TIR_SCOPE_CONTRACT = (
 
 
 def _unified_reply_contract(fence_lang: str) -> str:
+    delta_rule = ""
+    if fence_lang == "python":
+        delta_rule = (
+            " For focused edits inside an existing function, prefer minimal "
+            "`<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` hunks containing exact "
+            "verbatim lines from `CURRENT KERNEL SOURCE` (never touching "
+            "`<read_only_host_tail>` or sibling regimes), OR output ONLY the modified "
+            "top-level `def ...` functions (omitting unchanged functions/helpers)."
+        )
     return (
         "Output ONLY up to 2 leading metadata comment lines followed immediately by one fenced "
-        f"```{fence_lang} code block (no JSON wrapper, no extra prose):\n"
+        f"```{fence_lang} code block (no JSON wrapper, no extra prose):{delta_rule}\n"
         "# target_bottleneck: <BOTTLENECK_NAME>\n"
         "# structural_hypothesis: <concise hypothesis>"
     )
@@ -998,7 +1007,10 @@ def build_syntax_repair_request(
         sys_prompt = (
             "You are a TileLang Ascend compiler repair engineer. Fix the syntax, API, or "
             "memory-capacity failure reported below without altering tensor semantics. "
-            "Output ONLY corrected Python code. You may output the fixed subset of "
+            "Output ONLY corrected Python code. For focused fixes inside an existing function, "
+            "prefer minimal `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` hunks containing "
+            "exact verbatim lines from `BROKEN KERNEL SOURCE` (never touching "
+            "`<read_only_host_tail>` or sibling regimes), OR output ONLY the fixed subset of "
             "authorized slice functions or prefixed macros shown in BROKEN KERNEL SOURCE "
             "(omitted sibling functions automatically inherit their parent implementation); "
             "any new top-level helper MUST reuse the exact regime prefix shown in "

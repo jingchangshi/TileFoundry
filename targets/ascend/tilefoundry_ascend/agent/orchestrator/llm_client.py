@@ -398,7 +398,7 @@ def _has_code_or_patch_structure(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
-    if "<<<<<<< SEARCH" in stripped or "<<< SEARCH" in stripped:
+    if re.search(r"<{3,7}\s*SEARCH\b", stripped):
         return True
     if any(marker in stripped for marker in _CPP_CODE_MARKERS):
         return True
@@ -707,6 +707,7 @@ class AgyCliLLMBackend:
         raw_conc = os.environ.get("TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY", "").strip()
         conc = max_concurrency or (int(raw_conc) if raw_conc else 3)
         self._sem = asyncio.Semaphore(max(1, conc))
+        self._creative_sem = asyncio.Semaphore(1)
         self._consecutive_active_ceiling_timeouts: dict[tuple[str, str], int] = {}
         self._active_ceiling_cooldown: set[tuple[str, str]] = set()
 
@@ -1306,8 +1307,9 @@ class AgyCliLLMBackend:
             self._consecutive_active_ceiling_timeouts[scope_key] = 0
             return result
 
+        sem = self._creative_sem if req.role in _REASONING_ROLES else self._sem
         return await _run_with_503_retry(
-            sem=self._sem,
+            sem=sem,
             cfg=cfg,
             fallback_model=self._fallback_model,
             attempt_fn=_attempt,

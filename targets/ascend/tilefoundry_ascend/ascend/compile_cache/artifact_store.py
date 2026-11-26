@@ -64,7 +64,7 @@ _CACHE_INTERNAL_FILES: frozenset[str] = frozenset(
 
 def _is_cache_internal_file(item: Path) -> bool:
     name = item.name
-    if name in _CACHE_INTERNAL_FILES:
+    if name in _CACHE_INTERNAL_FILES or name.endswith(".lock"):
         return True
     return name.startswith(".prewarm_manifest_v1.") or name.startswith(".artifact_manifest.")
 
@@ -127,6 +127,8 @@ def merge_tl_cache_tree(src_dir: Path, dst_dir: Path) -> None:
         if item.name == "compiled_entries.jsonl" and target.is_file():
             existing = target.read_text(encoding="utf-8")
             addition = item.read_text(encoding="utf-8")
+            if not addition or addition == existing:
+                continue
             if existing and not existing.endswith("\n"):
                 existing += "\n"
             fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".compiled_entries.")
@@ -142,6 +144,12 @@ def merge_tl_cache_tree(src_dir: Path, dst_dir: Path) -> None:
                     tmp_path.unlink(missing_ok=True)
         elif not target.exists():
             _atomic_copy_into_cache(item, target)
+        elif target.is_file():
+            if (
+                target.stat().st_size == item.stat().st_size
+                and target.read_bytes() == item.read_bytes()
+            ):
+                continue
 
 
 def snapshot_tl_cache_binaries(cache_dir: Path) -> dict[Path, tuple[int, int]]:
@@ -162,19 +170,17 @@ def collect_new_tl_cache_binaries(
 ) -> tuple[Path, ...]:
     """Return relative paths of new or updated binaries in *cache_dir*."""
     post_new: list[Path] = []
-    all_post: list[Path] = []
     if not cache_dir.is_dir():
         return ()
     for item in sorted(cache_dir.rglob("*")):
         if not is_verified_binary_file(item):
             continue
         rel = item.relative_to(cache_dir)
-        all_post.append(rel)
         st = item.stat()
         prev = pre_snapshot.get(rel)
         if prev is None or prev != (st.st_size, st.st_mtime_ns):
             post_new.append(rel)
-    return tuple(post_new or all_post)
+    return tuple(post_new)
 
 
 def _extract_cpp_string_literal(node: ast.AST | None) -> str | None:

@@ -2230,14 +2230,15 @@ class PerfTargetCampaignRunner:
         l2_results = dict(outcome.l2_results)
         meta_by_id = dict(outcome.meta_by_id)
 
-        is_occupancy_fault = (
+        if (
             outcome.l2_infra_fault is not None
             and outcome.l2_infra_fault.plane
             in (FaultPlane.INFRA_OCCUPANCY, FaultPlane.INFRA_DEVICE_FAULT)
-        )
-        if is_occupancy_fault:
+        ):
             l3_resolution = L3Resolution.INFRA_DEFERRED.value
-            promotion_blocked = True
+            promotion_blocked = (
+                outcome.l2_infra_fault.plane == FaultPlane.INFRA_DEVICE_FAULT
+            )
             stagnation_after = stagnation_rounds
         else:
             ranked_candidates: list[RankedL2Candidate] = []
@@ -2702,9 +2703,7 @@ class PerfTargetCampaignRunner:
         if promoted and top_chk is not None:
             self._prune_stale_sibling_stepping_stones(regime_spec, top_chk.snippet_source)
 
-        flywheel_sec = 0.0
         if promoted and top_chk is not None and top_res is not None:
-            t_fw0 = time.monotonic()
             win_local = new_best.for_regime(regime_spec.regime_tag)
             best_local = best_result.for_regime(regime_spec.regime_tag)
             fly_base_lat = (
@@ -2724,7 +2723,11 @@ class PerfTargetCampaignRunner:
                 if fly_pts else 0.0
             )
             eff_gain = max(rel_gain, local_rel_gain)
-            if self._flywheel_coordinator.should_trigger(
+            if winner_wkind in ("rule_exploit", "exploit_rule") and winner_rule_id:
+                self._flywheel_coordinator.seed_baseline(
+                    regime_spec.regime_tag, new_incumbent, win_lat, fly_sigma
+                )
+            elif self._flywheel_coordinator.should_trigger(
                 regime_spec.regime_tag, win_lat, fly_sigma
             ):
                 distilled = self._run_flywheel_distillation(
@@ -2764,7 +2767,6 @@ class PerfTargetCampaignRunner:
                     )
                 except (OSError, ValueError) as exc:
                     logger.debug("Appending explore winning edge skipped: %s", exc)
-            flywheel_sec = max(0.0, time.monotonic() - t_fw0)
 
         trackb_evidence = self._collect_trackb_round_evidence(
             round_idx=round_idx, regime_spec=regime_spec, blueprint=bundle.blueprint,

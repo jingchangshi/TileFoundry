@@ -14,11 +14,14 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol, TypeVar
 
 import yaml
+
+from tilefoundry_ascend.agent.campaign import surrogate_cannbench as _surrogate_cannbench
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
@@ -69,6 +72,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     OccupancyExhaustedError,
     aggregate_surrogate_result,
     extract_ordered_tensor_shapes,
+    lookup_case_static_spec,
     run_l0_l1_round_filter,
     run_l1_compile_check,
     run_surrogate_batch_via_agent_gates,
@@ -83,6 +87,7 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import select_acti
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
+    _normalize_trackb_unit_source,
     evaluate_ascendc_candidate,
     resolve_trackb_compile_flags,
     run_stage_a_static,
@@ -101,7 +106,10 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     rank_stage_a_candidates_with_cost_model,
 )
-from tilefoundry_ascend.ascend.compile_cache.artifact_store import resolve_unified_tl_cache_dir
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
+    ArtifactStore,
+    resolve_unified_tl_cache_dir,
+)
 from tilefoundry_ascend.ascend.cost_model import (
     BishengResourceSummary,
     CostFeatures,
@@ -123,6 +131,7 @@ from tilefoundry_ascend.ascend.target import AscendTarget
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
+_MAX_L1_COMPILE_WORKERS = 4
 
 _SHAPE_DIM_KEYS: frozenset[str] = frozenset(
     {
@@ -154,6 +163,7 @@ _SHAPE_DIM_KEYS: frozenset[str] = frozenset(
 _ORIG_CAMPAIGN_HOOKS: dict[str, object] = {
     "evaluate_ascendc_candidate": evaluate_ascendc_candidate,
     "lookup_case_dims": lookup_case_dims,
+    "lookup_case_static_spec": lookup_case_static_spec,
     "rank_stage_a_candidates_with_cost_model": rank_stage_a_candidates_with_cost_model,
     "resolve_cannbench_repo": resolve_cannbench_repo,
     "resolve_regime_config": resolve_regime_config,
@@ -365,6 +375,8 @@ class StageGateCoordinator:
         self._active_kernel_cache: dict[tuple[str, str], str | None] = {}
         self._l1_summary_cache: dict[tuple[str, str], BishengResourceSummary | None] = {}
         self._case_dims_cache: dict[int, dict[str, object]] = {}
+        self._case_static_spec_cache: dict[int, dict[str, object]] = {}
+        self._cases_yaml_sha256_cache: str | None = None
         self._operator_semantics_cache: PyTorchOpSemantics | None = None
         self._operator_proto_cache: Mapping[str, object] | None = None
         self._operator_semantics_loaded: bool = False
@@ -620,6 +632,91 @@ class StageGateCoordinator:
                 dims = dict(first.representative_anchor_dims or first.representative_hir_dims)
         self._case_dims_cache[cnum] = dict(dims)
         return dims
+
+    def _resolve_cases_yaml_sha256(self) -> str:
+        """Compute and cache SHA256 of the active operator cases.yaml file if present."""
+        cached = getattr(self, "_cases_yaml_sha256_cache", None)
+        if cached is not None:
+            return cached
+        digest = ""
+        if self._config.operator_name:
+            tasks_root = self._resolve_cannbench_tasks_root()
+            if tasks_root is not None:
+                try:
+                    task = get_operator_task(self._config.operator_name)
+                    cases_path = tasks_root / task / "cases.yaml"
+                    if cases_path.is_file():
+                        digest = hashlib.sha256(cases_path.read_bytes()).hexdigest()
+                except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError):
+                    digest = ""
+        self._cases_yaml_sha256_cache = digest
+        return digest
+
+    def _lookup_case_static_spec_safe(self, case_num: int) -> dict[str, object] | None:
+        """Read static case spec safely, returning None when cases.yaml is unavailable."""
+        if not self._config.operator_name:
+            return None
+        cnum = int(case_num)
+        cache = getattr(self, "_case_static_spec_cache", None)
+        if isinstance(cache, dict) and cnum in cache:
+            return dict(cache[cnum])
+        lookup_static_fn = self._resolve_hook(
+            "lookup_case_static_spec",
+            lookup_case_static_spec,
+        )
+        try:
+            spec = dict(
+                lookup_static_fn(
+                    self._config.operator_name,
+                    cnum,
+                    cannbench_repo=self._cannbench_repo,
+                    env_file=self._env_file,
+                )
+            )
+        except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if isinstance(cache, dict):
+            cache[cnum] = dict(spec)
+        return spec
+
+    def _resolve_stage_b_anchor_case_specs(
+        self,
+    ) -> list[tuple[int, str, dict[str, object]]]:
+        """Collect active scoreboard and guardrail static specs deduplicated by case_num."""
+        if not self._config.operator_name:
+            return []
+        specs: list[tuple[int, str, dict[str, object]]] = []
+        seen_cases: set[int] = set()
+        for item in (*self._scoreboard_anchors, *self._guardrail_cases):
+            cnum = int(item.case_num)
+            if cnum in seen_cases:
+                continue
+            seen_cases.add(cnum)
+            static_spec = self._lookup_case_static_spec_safe(cnum)
+            if static_spec is not None:
+                specs.append((cnum, str(item.regime_tag or ""), static_spec))
+        return specs
+
+    @staticmethod
+    def _width_covered_by_anchor_specs(
+        w_dims: Mapping[str, object],
+        w_resolved: _ResolvedConfigLike,
+        regime_anchor_specs: Sequence[tuple[dict[str, object], _ResolvedConfigLike | None]],
+    ) -> bool:
+        if not w_dims or not regime_anchor_specs:
+            return False
+        for a_spec, a_resolved in regime_anchor_specs:
+            if dict(w_dims) == dict(a_spec):
+                if a_resolved is None or w_resolved == a_resolved:
+                    return True
+                continue
+            if (
+                a_resolved is not None
+                and w_resolved == a_resolved
+                and all(a_spec.get(k) == v for k, v in w_dims.items())
+            ):
+                return True
+        return False
 
     def _belongs_to_regime(
         self,
@@ -1011,6 +1108,9 @@ class StageGateCoordinator:
         self,
         cpp_source: str,
         selector_flags: Sequence[str] | str | None = None,
+        *,
+        artifact_store: ArtifactStore | None = None,
+        regime_tag: str = "",
     ) -> StageBResult:
         override = self._owner_override("_compile_trackb_stage_b")
         if override is not None:
@@ -1018,7 +1118,15 @@ class StageGateCoordinator:
                 override,
                 cpp_source,
                 selector_flags=selector_flags,
+                artifact_store=artifact_store,
+                regime_tag=regime_tag,
             )
+        env_vals = parse_simple_env_file(self._env_file) if self._env_file else None
+        unified_tl_cache = resolve_unified_tl_cache_dir(
+            env_vals=env_vals,
+            source_root=self._source_root,
+        )
+        eff_store = artifact_store or ArtifactStore(unified_tl_cache)
         cann_root = self._resolve_cann_root_from_env_file(self._env_file)
         bisheng_bin: str | None = None
         flags = list(resolve_trackb_compile_flags(cpp_source, selector_flags))
@@ -1032,11 +1140,14 @@ class StageGateCoordinator:
             "run_stage_b_ascendc_compile",
             run_stage_b_ascendc_compile,
         )
-        return compile_fn(
+        return self._invoke_with_optional_kwargs(
+            compile_fn,
             cpp_source,
             compile_flags=flags,
             bisheng_bin=bisheng_bin,
             cann_root=cann_root,
+            artifact_store=eff_store,
+            regime_tag=regime_tag,
         )
 
     def _resolve_trackb_selector_flags(
@@ -1564,19 +1675,23 @@ class StageGateCoordinator:
             else None
         )
         if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
+            env_vals = parse_simple_env_file(self._env_file) if self._env_file else None
+            unified_tl_cache = resolve_unified_tl_cache_dir(
+                env_vals=env_vals,
+                source_root=self._source_root,
+            )
+            eff_store = ArtifactStore(unified_tl_cache)
             instantiated_tu = self._instantiate_trackb_tu(
                 module_source, tb_extracted[1], regime_spec
             )
             sel_flags = self._resolve_trackb_selector_flags(module_source, regime_spec)
-            effective_flags = resolve_trackb_compile_flags(instantiated_tu, sel_flags)
-            tb_res = (
-                self._invoke_with_optional_kwargs(
-                    self._compile_trackb_stage_b,
-                    instantiated_tu,
-                    selector_flags=sel_flags,
-                )
-                if sel_flags
-                else self._compile_trackb_stage_b(instantiated_tu)
+            effective_flags = tuple(resolve_trackb_compile_flags(instantiated_tu, sel_flags))
+            tb_res = self._invoke_with_optional_kwargs(
+                self._compile_trackb_stage_b,
+                instantiated_tu,
+                selector_flags=sel_flags or None,
+                artifact_store=eff_store,
+                regime_tag=regime_spec.regime_tag,
             )
             if not tb_res.passed:
                 return self._normalize_primary_vf_overflow(tb_res)
@@ -1585,27 +1700,114 @@ class StageGateCoordinator:
             )
             if uses_unreserved_ubuf and self._has_vf_stack_overflow(tb_res):
                 return self._build_width_failure_result(tb_res, tb_res.elapsed_sec)
-            total_elapsed = tb_res.elapsed_sec
+
+            compiled_by_key: dict[tuple[str, tuple[str, ...]], StageBResult] = {
+                (instantiated_tu, effective_flags): tb_res
+            }
+            pending_compiles: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+            pending_keys: set[tuple[str, tuple[str, ...]]] = set()
+            anchor_tu_specs: list[tuple[int, str, str, tuple[str, ...]]] = []
+
+            for anc in self._scoreboard_anchors:
+                if len(self._regime_specs) > 1 and anc.regime_tag != regime_spec.regime_tag:
+                    continue
+                cnum = int(anc.case_num)
+                anc_rtag = str(anc.regime_tag or regime_spec.regime_tag)
+                anc_dims = self._lookup_case_static_spec_safe(cnum)
+                if anc_dims is None:
+                    anc_dims = self._lookup_case_dims_safe(cnum, anc_rtag)
+                if not anc_dims:
+                    continue
+                anc_spec = replace(regime_spec, representative_anchor_dims=dict(anc_dims))
+                a_tu = self._invoke_with_optional_kwargs(
+                    self._instantiate_trackb_tu,
+                    module_source,
+                    tb_extracted[1],
+                    anc_spec,
+                    anchor_dims_override=dict(anc_dims),
+                )
+                a_flags = self._resolve_trackb_selector_flags(module_source, anc_spec)
+                a_eff_flags = tuple(resolve_trackb_compile_flags(a_tu, a_flags))
+                anchor_tu_specs.append((cnum, anc_rtag, a_tu, a_eff_flags))
+                key = (a_tu, a_eff_flags)
+                if key not in compiled_by_key and key not in pending_keys:
+                    pending_keys.add(key)
+                    pending_compiles.append((a_tu, a_flags, a_eff_flags))
+
             for w_dims in self._collect_distinct_width_dims(
                 regime_spec, anchor_dims, uses_unreserved_ubuf, eff_width_fn
             ):
                 w_spec = replace(regime_spec, representative_anchor_dims=dict(w_dims))
-                w_tu = self._instantiate_trackb_tu(module_source, tb_extracted[1], w_spec)
+                w_tu = self._invoke_with_optional_kwargs(
+                    self._instantiate_trackb_tu,
+                    module_source,
+                    tb_extracted[1],
+                    w_spec,
+                    anchor_dims_override=dict(w_dims),
+                )
                 w_flags = self._resolve_trackb_selector_flags(module_source, w_spec)
-                w_eff_flags = resolve_trackb_compile_flags(w_tu, w_flags)
-                if w_tu != instantiated_tu or w_eff_flags != effective_flags:
-                    w_b = (
-                        self._invoke_with_optional_kwargs(
-                            self._compile_trackb_stage_b,
-                            w_tu,
-                            selector_flags=w_flags,
-                        )
-                        if w_flags
-                        else self._compile_trackb_stage_b(w_tu)
+                w_eff_flags = tuple(resolve_trackb_compile_flags(w_tu, w_flags))
+                key = (w_tu, w_eff_flags)
+                if key not in compiled_by_key and key not in pending_keys:
+                    pending_keys.add(key)
+                    pending_compiles.append((w_tu, w_flags, w_eff_flags))
+
+            def _compile_extra_tb(
+                item: tuple[str, tuple[str, ...], tuple[str, ...]],
+            ) -> tuple[tuple[str, tuple[str, ...]], StageBResult]:
+                tu_src, sel_fl, eff_fl = item
+                res = self._invoke_with_optional_kwargs(
+                    self._compile_trackb_stage_b,
+                    tu_src,
+                    selector_flags=sel_fl or None,
+                    artifact_store=eff_store,
+                    regime_tag=regime_spec.regime_tag,
+                )
+                return (tu_src, eff_fl), res
+
+            total_elapsed = tb_res.elapsed_sec
+            has_owner_tb_override = self._owner_override("_compile_trackb_stage_b") is not None
+            if len(pending_compiles) > 1 and not has_owner_tb_override:
+                workers = min(_MAX_L1_COMPILE_WORKERS, len(pending_compiles))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    extra_tb_results = list(pool.map(_compile_extra_tb, pending_compiles))
+            else:
+                extra_tb_results = [_compile_extra_tb(item) for item in pending_compiles]
+
+            for key, w_b in extra_tb_results:
+                compiled_by_key[key] = w_b
+                total_elapsed += w_b.elapsed_sec
+            for _key, w_b in extra_tb_results:
+                if not w_b.passed or self._has_vf_stack_overflow(w_b):
+                    return self._build_width_failure_result(w_b, total_elapsed)
+
+            record_fn = getattr(
+                _surrogate_cannbench,
+                "record_trackb_stage_b_artifacts_and_plan",
+                None,
+            )
+            if callable(record_fn) and self._config.operator_name and anchor_tu_specs:
+                anchor_entries: list[
+                    tuple[int, str, str, Sequence[str], Sequence[Path]]
+                ] = []
+                for cnum, anc_rtag, a_tu, a_eff_flags in anchor_tu_specs:
+                    a_res = compiled_by_key.get((a_tu, a_eff_flags))
+                    if a_res is None or not a_res.passed or not a_res.binary_paths:
+                        continue
+                    bin_paths = [Path(p) for p in a_res.binary_paths if Path(p).is_file()]
+                    if not bin_paths:
+                        continue
+                    norm_tu = _normalize_trackb_unit_source(a_tu, regime_tag=anc_rtag)
+                    anchor_entries.append((cnum, anc_rtag, norm_tu, a_eff_flags, bin_paths))
+                if anchor_entries:
+                    record_fn(
+                        module_source=module_source,
+                        operator_name=self._config.operator_name,
+                        anchor_entries=anchor_entries,
+                        tl_cache_dir=unified_tl_cache,
+                        cases_yaml_sha256=self._resolve_cases_yaml_sha256(),
+                        env_vals=env_vals,
                     )
-                    total_elapsed += w_b.elapsed_sec
-                    if not w_b.passed or self._has_vf_stack_overflow(w_b):
-                        return self._build_width_failure_result(w_b, total_elapsed)
             if total_elapsed != tb_res.elapsed_sec:
                 return replace(tb_res, elapsed_sec=total_elapsed)
             return tb_res
@@ -1631,6 +1833,33 @@ class StageGateCoordinator:
         uses_unreserved_ubuf = any(
             "--cce-disable-vf-stack-reserved-ubuf" in str(fl) for fl in resolved.compile_flags
         )
+        anchor_case_specs = self._resolve_stage_b_anchor_case_specs()
+        cases_yaml_sha256 = self._resolve_cases_yaml_sha256()
+        regime_anchor_specs: list[
+            tuple[dict[str, object], _ResolvedConfigLike | None]
+        ] = []
+        for _cnum, a_rtag, a_spec in anchor_case_specs:
+            if (
+                len(self._regime_specs) > 1
+                and a_rtag
+                and regime_spec.regime_tag
+                and a_rtag != regime_spec.regime_tag
+            ):
+                continue
+            try:
+                a_resolved = resolve_cfg_fn(module_source, regime_spec, dims=a_spec)
+            except (
+                SyntaxError,
+                AttributeError,
+                ImportError,
+                KeyError,
+                NameError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ):
+                a_resolved = None
+            regime_anchor_specs.append((a_spec, a_resolved))
         width_dims = self._collect_distinct_width_dims(
             regime_spec,
             anchor_dims,
@@ -1653,6 +1882,8 @@ class StageGateCoordinator:
                 ValueError,
             ):
                 w_resolved = resolved
+            if self._width_covered_by_anchor_specs(w_dims, w_resolved, regime_anchor_specs):
+                continue
             if w_resolved == resolved and eff_width_fn is None:
                 same_cfg_widths.append(w_dims)
             else:
@@ -1662,6 +1893,7 @@ class StageGateCoordinator:
             env_vals=env_vals,
             source_root=self._source_root,
         )
+        eff_store = ArtifactStore(unified_tl_cache)
         primary_b = self._invoke_with_optional_kwargs(
             l1_check_fn,
             module_source,
@@ -1672,6 +1904,9 @@ class StageGateCoordinator:
             compile_flags=resolved.compile_flags or None,
             dims=dict(anchor_dims) if anchor_dims else None,
             static_spec_dims_list=same_cfg_widths or None,
+            anchor_case_specs=anchor_case_specs or None,
+            operator_name=self._config.operator_name,
+            cases_yaml_sha256=cases_yaml_sha256,
             source_root=self._source_root,
             env_file=self._env_file,
             tail_anchor_dims=tail_anchor_dims,
@@ -1687,14 +1922,12 @@ class StageGateCoordinator:
                 instantiated_tu = self._instantiate_trackb_tu(
                     module_source, tb_extracted[1], regime_spec
                 )
-                tb_fb = (
-                    self._invoke_with_optional_kwargs(
-                        self._compile_trackb_stage_b,
-                        instantiated_tu,
-                        selector_flags=resolved.compile_flags,
-                    )
-                    if resolved.compile_flags
-                    else self._compile_trackb_stage_b(instantiated_tu)
+                tb_fb = self._invoke_with_optional_kwargs(
+                    self._compile_trackb_stage_b,
+                    instantiated_tu,
+                    selector_flags=resolved.compile_flags or None,
+                    artifact_store=eff_store,
+                    regime_tag=regime_spec.regime_tag,
                 )
                 return self._normalize_primary_vf_overflow(tb_fb)
             return self._normalize_primary_vf_overflow(primary_b)
@@ -1703,8 +1936,12 @@ class StageGateCoordinator:
         if uses_unreserved_ubuf and self._has_vf_stack_overflow(final_b):
             return self._build_width_failure_result(final_b, final_b.elapsed_sec)
         total_elapsed = final_b.elapsed_sec
-        for w_dims, w_resolved in extra_width_checks:
-            w_b = self._invoke_with_optional_kwargs(
+
+        def _run_extra_width(
+            item: tuple[dict[str, object], _ResolvedConfigLike],
+        ) -> StageBResult:
+            w_dims, w_resolved = item
+            return self._invoke_with_optional_kwargs(
                 l1_check_fn,
                 module_source,
                 builder_name=w_resolved.builder_name,
@@ -1713,12 +1950,25 @@ class StageGateCoordinator:
                 pass_configs=w_resolved.pass_configs or None,
                 compile_flags=w_resolved.compile_flags or None,
                 dims=w_dims,
+                operator_name=self._config.operator_name,
+                cases_yaml_sha256=cases_yaml_sha256,
                 source_root=self._source_root,
                 env_file=self._env_file,
                 regime_tag=regime_spec.regime_tag,
                 tl_cache_dir=unified_tl_cache,
             )
+
+        if len(extra_width_checks) > 1:
+            workers = min(_MAX_L1_COMPILE_WORKERS, len(extra_width_checks))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                extra_width_results = list(pool.map(_run_extra_width, extra_width_checks))
+        elif len(extra_width_checks) == 1:
+            extra_width_results = [_run_extra_width(extra_width_checks[0])]
+        else:
+            extra_width_results = []
+        for w_b in extra_width_results:
             total_elapsed += w_b.elapsed_sec
+        for w_b in extra_width_results:
             if not w_b.passed or self._has_vf_stack_overflow(w_b):
                 return self._build_width_failure_result(w_b, total_elapsed)
 
@@ -1750,14 +2000,12 @@ class StageGateCoordinator:
         if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
             tb_sym, tb_cpp = tb_extracted
             instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
-            tb_b = (
-                self._invoke_with_optional_kwargs(
-                    self._compile_trackb_stage_b,
-                    instantiated_tu,
-                    selector_flags=resolved.compile_flags,
-                )
-                if resolved.compile_flags
-                else self._compile_trackb_stage_b(instantiated_tu)
+            tb_b = self._invoke_with_optional_kwargs(
+                self._compile_trackb_stage_b,
+                instantiated_tu,
+                selector_flags=resolved.compile_flags or None,
+                artifact_store=eff_store,
+                regime_tag=regime_spec.regime_tag,
             )
             agg_elapsed_sec = total_elapsed + combine_elapsed_sec + tb_b.elapsed_sec
             if not tb_b.passed:
@@ -1861,6 +2109,7 @@ class StageGateCoordinator:
         include_guardrails: bool = True,
     ) -> tuple[dict[str, CandidateSurrogateResult], dict[str, str]]:
         """Evaluate one batch and return results plus each measured candidate's run id."""
+        self._last_l2_timing_meta = {}
         eff_inc_src = self._active_incumbent_source
         if (
             not eff_inc_src
@@ -2491,12 +2740,23 @@ class StageGateCoordinator:
         current_creative_tasks: list[
             tuple[int, str, AscendCausalRule | None, asyncio.Task[SpeculativeCreativeResult]]
         ] = []
-        for slot_idx, wid, rule, req in creative_specs:
-            task = asyncio.create_task(
-                _call_creative_worker(slot_idx, wid, req),
-                name=f"speculative_creative_r{batch.round_idx}_{wid}",
+        has_pending_creative = any(not t.done() for _, _, _, t in self._pending_speculative)
+        if has_pending_creative and creative_specs:
+            pending_count = sum(1 for _, _, _, t in self._pending_speculative if not t.done())
+            logger.info(
+                "Round %d skipping %d new explore_creative worker(s): "
+                "%d speculative task(s) still pending",
+                batch.round_idx,
+                len(creative_specs),
+                pending_count,
             )
-            current_creative_tasks.append((batch.round_idx, wid, rule, task))
+        else:
+            for slot_idx, wid, rule, req in creative_specs:
+                task = asyncio.create_task(
+                    _call_creative_worker(slot_idx, wid, req),
+                    name=f"speculative_creative_r{batch.round_idx}_{wid}",
+                )
+                current_creative_tasks.append((batch.round_idx, wid, rule, task))
 
         exploit_replies: list[
             tuple[str, str, AscendCausalRule | None, str | None, str, str, bool]
@@ -2815,45 +3075,59 @@ class StageGateCoordinator:
                 else None
             )
             l0_l1_t0 = time.monotonic()
-            l0_l1_checks = await filter_fn(
-                raw_candidates,
-                patch_fn=lambda snip: _patch_against(batch.parent_module_source, snip),
-                repatch_from_current_fn=lambda cur_mod_src, snip: _patch_against(
+            filter_kwargs: dict[str, object] = {
+                "patch_fn": lambda snip: _patch_against(batch.parent_module_source, snip),
+                "repatch_from_current_fn": lambda cur_mod_src, snip: _patch_against(
                     cur_mod_src, snip
                 ),
-                l0_checker=_candidate_l0_check,
-                l1_compiler=lambda mod_src: run_l1_fn(mod_src, batch.regime_spec),
-                repair_backend=timed_repair_backend,
-                max_syntax_repairs=self._config.max_syntax_repairs,
-                slice_hint=self._slice_contract_instruction(
+                "l0_checker": _candidate_l0_check,
+                "l1_compiler": lambda mod_src: run_l1_fn(mod_src, batch.regime_spec),
+                "repair_backend": timed_repair_backend,
+                "max_syntax_repairs": self._config.max_syntax_repairs,
+                "slice_hint": self._slice_contract_instruction(
                     batch.func_name,
                     batch.regime_spec,
                     operator_entrypoint=op_entry,
                 ),
-                backend_kind=batch.regime_spec.runtime_backend,
-                parent_source=repair_parent_source,
-                parent_module_source=batch.parent_module_source,
-                trackb_prologue_line_offset=trackb_prologue_line_offset,
-                stage_a_cost_ranker=stage_a_ranker,
-                cost_prescreen_top_k=prescreen_top_k,
-                sil_advisory=self._sil_advisory,
-                freedom_mask=eff_active_mask,
-                ub_256kb_unlock=(
+                "backend_kind": batch.regime_spec.runtime_backend,
+                "parent_source": repair_parent_source,
+                "parent_module_source": batch.parent_module_source,
+                "trackb_prologue_line_offset": trackb_prologue_line_offset,
+                "stage_a_cost_ranker": stage_a_ranker,
+                "cost_prescreen_top_k": prescreen_top_k,
+                "sil_advisory": self._sil_advisory,
+                "freedom_mask": eff_active_mask,
+                "ub_256kb_unlock": (
                     bool(batch.parent_ledger.uses_unreserved_ubuf)
                     if batch.parent_ledger
                     else False
                 ),
-                creative_candidate_ids=creative_candidate_ids,
-                parent_analytical_us=parent_analytical_us,
-                stage_a_analytical_scorer=score_stage_a_analytical_fn,
-                parent_topology_axes=eff_parent_axes,
-                candidate_topology_axes_fn=lambda _mod_src, sa: self._derive_topology_axes(
+                "creative_candidate_ids": creative_candidate_ids,
+                "parent_analytical_us": parent_analytical_us,
+                "stage_a_analytical_scorer": score_stage_a_analytical_fn,
+                "parent_topology_axes": eff_parent_axes,
+                "candidate_topology_axes_fn": lambda _mod_src, sa: self._derive_topology_axes(
                     sa.ledger,
                     features=sa.features,
                     route=sa.route,
                 )
                 if sa.ledger is not None
                 else None,
+            }
+            try:
+                filter_params = inspect.signature(filter_fn).parameters
+            except (TypeError, ValueError):
+                filter_params = {}
+            if (
+                "skip_repair_when_survivors_exist" in filter_params
+                or "skip_repair_when_survivors_exist"
+                in inspect.signature(run_l0_l1_round_filter).parameters
+            ):
+                filter_kwargs["skip_repair_when_survivors_exist"] = True
+            l0_l1_checks = await self._invoke_with_optional_kwargs(
+                filter_fn,
+                raw_candidates,
+                **filter_kwargs,
             )
             l0_l1_total_sec = max(0.0, time.monotonic() - l0_l1_t0)
             syntax_repair_sec = (
@@ -3014,6 +3288,8 @@ class StageGateCoordinator:
                     cand_file.write_text(chk.patched_module_source, encoding="utf-8")
                     cand_paths.append((chk.candidate_id, cand_file))
                 l2_t0 = time.monotonic()
+                self._last_l2_timing_meta = {}
+                l2_batch_failed = False
                 try:
                     l2_results, l2_run_ids = self._run_l2_batch(
                         cand_paths,
@@ -3021,6 +3297,7 @@ class StageGateCoordinator:
                         include_guardrails=True,
                     )
                 except Exception as exc:
+                    l2_batch_failed = True
                     classified = self._classify_l2_exception(exc)
                     if classified is None and not isinstance(
                         exc,
@@ -3048,23 +3325,27 @@ class StageGateCoordinator:
                     for chk in passed_checks:
                         failed_entries.append((chk.candidate_id, fail_tier_l2, str(exc)[:1500]))
                 l2_wall_sec = max(0.0, time.monotonic() - l2_t0)
-                raw_pw_stats = self._last_l2_timing_meta.get("prewarm_stats")
-                if isinstance(raw_pw_stats, Mapping):
-                    for pw_key in (
-                        "total_tasks",
-                        "cache_hits",
-                        "compiled_tasks",
-                        "failed_candidates",
-                    ):
-                        if pw_key in raw_pw_stats:
-                            round_prewarm_stats[pw_key] = int(raw_pw_stats[pw_key])
-                l2_prewarm_sec = float(self._last_l2_timing_meta.get("l2_prewarm_sec") or 0.0)
-                raw_npu_sec = self._last_l2_timing_meta.get("l2_npu_sec")
-                l2_npu_sec = (
-                    float(raw_npu_sec)
-                    if isinstance(raw_npu_sec, (int, float)) and not isinstance(raw_npu_sec, bool)
-                    else max(0.0, l2_wall_sec - l2_prewarm_sec)
-                )
+                if not l2_batch_failed:
+                    raw_pw_stats = self._last_l2_timing_meta.get("prewarm_stats")
+                    if isinstance(raw_pw_stats, Mapping):
+                        for pw_key in (
+                            "total_tasks",
+                            "cache_hits",
+                            "compiled_tasks",
+                            "failed_candidates",
+                        ):
+                            if pw_key in raw_pw_stats:
+                                round_prewarm_stats[pw_key] = int(raw_pw_stats[pw_key])
+                    l2_prewarm_sec = float(
+                        self._last_l2_timing_meta.get("l2_prewarm_sec") or 0.0
+                    )
+                    raw_npu_sec = self._last_l2_timing_meta.get("l2_npu_sec")
+                    l2_npu_sec = (
+                        float(raw_npu_sec)
+                        if isinstance(raw_npu_sec, (int, float))
+                        and not isinstance(raw_npu_sec, bool)
+                        else max(0.0, l2_wall_sec - l2_prewarm_sec)
+                    )
 
         return StageGateOutcome(
             raw_candidates=raw_candidates,

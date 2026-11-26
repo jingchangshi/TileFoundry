@@ -18,6 +18,7 @@ from tilefoundry_ascend.agent.campaign.regime_slice_patcher import (
     DEFAULT_READONLY_HOST_EXPORTS,
     _compact_trackb_snippet_source,
     extract_regime_snippet,
+    patch_regime_into_module,
     split_readonly_host_tail,
 )
 from tilefoundry_ascend.agent.campaign.round_context_builder import (
@@ -481,3 +482,160 @@ def _make_builder(
             iteration_regularity="affine_simd",
         ),
     )
+
+
+def test_tracka_patch_regime_search_replace_hunks_and_guards() -> None:
+    """Apply Track-A SEARCH/REPLACE hunks safely and preserve full-function fallback."""
+    module_src = (
+        "import tilelang.ascend.language as T\n\n"
+        "def _select_main_config(d_dim: int = 128) -> dict[str, object]:\n"
+        '    return {"bm": 32, "d_dim": d_dim}\n\n'
+        "def _build_main_func(bm: int = 32) -> object:\n"
+        "    tile = bm\n"
+        "    scale = tile * 2\n"
+        "    return scale\n\n"
+        "def _select_sibling_config(d_dim: int = 64) -> dict[str, object]:\n"
+        '    return {"bm": 16, "d_dim": d_dim}\n\n'
+        "def _build_sibling_func(bm: int = 16) -> object:\n"
+        "    tile = bm\n"
+        "    return tile + 1\n\n"
+        "_ENTRY_CACHE: dict[object, object] = {}\n\n"
+        "def build_kernel(bm: int) -> object:\n"
+        "    return _build_main_func(bm)\n\n"
+        "def ref_kernel(x: object) -> object:\n"
+        "    return x\n\n"
+        "def kernel(x: object) -> object:\n"
+        "    return _build_main_func(32)\n\n"
+        "def my_op(x: object) -> object:\n"
+        "    return kernel(x)\n"
+    )
+    main_spec = RegimeTargetSpec(
+        regime_tag="main",
+        builder_candidates=("_build_main_func",),
+        sample_builder_kwargs={"bm": 32},
+        config_selector_fn="_select_main_config",
+        editable_symbols=("_select_main_config", "_build_main_func"),
+        runtime_backend="tilelang_dsl",
+    )
+    sib_spec = RegimeTargetSpec(
+        regime_tag="sibling",
+        builder_candidates=("_build_sibling_func",),
+        sample_builder_kwargs={"bm": 16},
+        config_selector_fn="_select_sibling_config",
+        editable_symbols=("_select_sibling_config", "_build_sibling_func"),
+        runtime_backend="tilelang_dsl",
+    )
+
+    hunk_reply = (
+        "# target_bottleneck: AIV_VEC\n"
+        "# structural_hypothesis: Scale tile by 4 and update selector bm\n"
+        "```python\n"
+        "<<<<<<< SEARCH\n"
+        '    return {"bm": 32, "d_dim": d_dim}\n'
+        "=======\n"
+        '    return {"bm": 64, "d_dim": d_dim}\n'
+        ">>>>>>> REPLACE\n"
+        "<<<<<<< SEARCH [L6-L9]\n"
+        "    tile = bm\n"
+        "    scale = tile * 2\n"
+        "=======\n"
+        "    tile = bm\n"
+        "    scale = tile * 4\n"
+        ">>>>>>> REPLACE\n"
+        "```\n"
+    )
+    patched = patch_regime_into_module(
+        module_src,
+        main_spec,
+        hunk_reply,
+        operator_entrypoint="my_op",
+        sibling_specs=(main_spec, sib_spec),
+    )
+    assert 'return {"bm": 64, "d_dim": d_dim}' in patched
+    assert "scale = tile * 4" in patched
+    assert (
+        "def _build_sibling_func(bm: int = 16) -> object:\n"
+        "    tile = bm\n    return tile + 1"
+    ) in patched
+    assert "def kernel(x: object) -> object:\n    return _build_main_func(32)" in patched
+    assert "def my_op(x: object) -> object:\n    return kernel(x)" in patched
+
+    rstrip_source = module_src.replace("scale = tile * 2", "scale = tile * 2   ")
+    rstrip_hunk = (
+        "```python\n"
+        "<<<<<<< SEARCH\n"
+        "    scale = tile * 2\n"
+        "=======\n"
+        "    scale = tile * 8\n"
+        ">>>>>>> REPLACE\n"
+        "```\n"
+    )
+    rstrip_patched = patch_regime_into_module(
+        rstrip_source,
+        main_spec,
+        rstrip_hunk,
+        operator_entrypoint="my_op",
+        sibling_specs=(main_spec, sib_spec),
+    )
+    assert "scale = tile * 8" in rstrip_patched
+
+    for bad_target in (
+        (
+            "<<<<<<< SEARCH\n    return _build_main_func(32)\n"
+            "=======\n    return _build_main_func(64)\n>>>>>>> REPLACE"
+        ),
+        (
+            "<<<<<<< SEARCH\n    return kernel(x)\n"
+            "=======\n    return kernel(x)\n>>>>>>> REPLACE"
+        ),
+        (
+            "<<<<<<< SEARCH\n    return _build_main_func(bm)\n"
+            "=======\n    return _build_main_func(64)\n>>>>>>> REPLACE"
+        ),
+        (
+            "<<<<<<< SEARCH\n    return tile + 1\n"
+            "=======\n    return tile + 9\n>>>>>>> REPLACE"
+        ),
+    ):
+        with pytest.raises(ValueError):
+            patch_regime_into_module(
+                module_src,
+                main_spec,
+                f"```python\n{bad_target}\n```\n",
+                operator_entrypoint="my_op",
+                sibling_specs=(main_spec, sib_spec),
+            )
+
+    for bad_hunk in (
+        "<<<<<<< SEARCH\n    scale = tile * 2\n=======\n",
+        "<<<<<<< SEARCH\n\n=======\n    pass\n>>>>>>> REPLACE",
+        "<<<<<<< SEARCH\n    nonexistent_line = 999\n=======\n    pass\n>>>>>>> REPLACE",
+        "<<<<<<< SEARCH\n    tile = bm\n=======\n    tile = bm + 1\n>>>>>>> REPLACE",
+        "<<<<<<< SEARCH\n    scale = tile * 2\n=======\n    scale = tile * 2\n>>>>>>> REPLACE",
+    ):
+        with pytest.raises(ValueError):
+            patch_regime_into_module(
+                module_src,
+                main_spec,
+                f"```python\n{bad_hunk}\n```\n",
+                operator_entrypoint="my_op",
+                sibling_specs=(main_spec, sib_spec),
+            )
+
+    full_fn_reply = (
+        "```python\n"
+        "def _build_main_func(bm: int = 32) -> object:\n"
+        "    return bm * 16\n"
+        "```\n"
+    )
+    ast_patched = patch_regime_into_module(
+        module_src,
+        main_spec,
+        full_fn_reply,
+        operator_entrypoint="my_op",
+        sibling_specs=(main_spec, sib_spec),
+    )
+    assert "return bm * 16" in ast_patched
+    assert 'return {"bm": 32, "d_dim": d_dim}' in ast_patched
+    assert "def kernel(x: object) -> object:" in ast_patched
+

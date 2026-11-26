@@ -19,14 +19,18 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
     _resolve_artifact_store,
+    build_stage_b_driver_source,
     run_stage_b_ascendc_compile,
     run_stage_b_compile,
 )
 from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
     ArtifactStore,
+    collect_new_tl_cache_binaries,
     compute_artifact_id,
     compute_compile_task_key,
+    merge_tl_cache_tree,
     resolve_unified_tl_cache_dir,
+    snapshot_tl_cache_binaries,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
 
@@ -722,3 +726,411 @@ def test_occupancy_exhausted_error_and_null_launch_us(
     op_res = by_op["mla"]
     assert isinstance(op_res, surrogate_cannbench.L2BatchResults)
     assert op_res.null_launch_us == pytest.approx(2.35)
+
+
+def test_collect_new_tl_cache_binaries_and_merge_skip_internal_files(tmp_path: Path) -> None:
+    """Verify collect_new_tl_cache_binaries returns empty on cache hit and merge skips locks."""
+    cache_dir = tmp_path / "tl_cache"
+    cache_dir.mkdir()
+    existing_so = cache_dir / "existing_0.so"
+    existing_so.write_bytes(b"ELF_EXISTING_0")
+    (cache_dir / "existing_1.so").write_bytes(b"ELF_EXISTING_1")
+
+    snap = snapshot_tl_cache_binaries(cache_dir)
+    assert collect_new_tl_cache_binaries(cache_dir, snap) == ()
+
+    added_so = cache_dir / "new_2.so"
+    added_so.write_bytes(b"ELF_NEW_2")
+    assert collect_new_tl_cache_binaries(cache_dir, snap) == (Path("new_2.so"),)
+
+    src_dir = tmp_path / "worker_cache"
+    dst_dir = tmp_path / "shared_cache"
+    src_dir.mkdir()
+    dst_dir.mkdir()
+    for fname in (
+        "artifact_manifest_v1.json",
+        "artifact_index_v1.jsonl",
+        "prewarm_manifest_v1.json",
+        "custom.lock",
+    ):
+        (src_dir / fname).write_text("worker_internal", encoding="utf-8")
+    (src_dir / "shared.so").write_bytes(b"SAME_BYTES")
+    (dst_dir / "shared.so").write_bytes(b"SAME_BYTES")
+    (src_dir / "fresh.so").write_bytes(b"FRESH_BYTES")
+
+    merge_tl_cache_tree(src_dir, dst_dir)
+    assert not (dst_dir / "artifact_manifest_v1.json").exists()
+    assert not (dst_dir / "artifact_index_v1.jsonl").exists()
+    assert not (dst_dir / "prewarm_manifest_v1.json").exists()
+    assert not (dst_dir / "custom.lock").exists()
+    assert (dst_dir / "fresh.so").read_bytes() == b"FRESH_BYTES"
+    assert (dst_dir / "shared.so").read_bytes() == b"SAME_BYTES"
+
+
+def test_record_trackb_stage_b_artifacts_and_plan_zero_subprocesses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify record_trackb_stage_b_artifacts_and_plan yields zero-subprocess prewarm hits."""
+    repo_root = Path(__file__).resolve().parents[3]
+    cann_repo = tmp_path / "cann_repo"
+    mla_dir = cann_repo / "tasks" / "level4" / "mla"
+    mla_dir.mkdir(parents=True, exist_ok=True)
+    cases_path = mla_dir / "cases.yaml"
+    cases_payload = {
+        "cases": [
+            {
+                "case_id": 3,
+                "input_shape": [
+                    [1, 1, 128, 512],
+                    [1, 1, 128, 64],
+                    [1, 1024, 1, 512],
+                    [1, 1024, 1, 64],
+                ],
+                "dtype": "float16",
+                "attrs": {"is_causal": False},
+            }
+        ]
+    }
+    cases_path.write_text(yaml.safe_dump(cases_payload), encoding="utf-8")
+    cases_sha = hashlib.sha256(cases_path.read_bytes()).hexdigest()
+
+    fake_root = tmp_path / "fake_root"
+    fake_root.mkdir(parents=True, exist_ok=True)
+    (fake_root / "src").symlink_to(repo_root / "src")
+    (fake_root / "targets").symlink_to(repo_root / "targets")
+    (fake_root / "tests" / "ascend" / "benchmarks").mkdir(parents=True, exist_ok=True)
+    (fake_root / "tests" / "ascend" / "benchmarks" / "cannbench_contract.py").write_text(
+        "class Harness:\n    pass\n",
+        encoding="utf-8",
+    )
+
+    tl_cache = tmp_path / "work" / "surrogate" / "tilelang"
+    tl_cache.mkdir(parents=True, exist_ok=True)
+    so_bin = tmp_path / "trackb_mla.so"
+    so_bin.write_bytes(b"ELF_TRACKB_PLAN")
+
+    mla_src = (
+        '_MLA_TRACKB_SRC = r"""\n'
+        "#include <tl_templates/ascend/common.h>\n"
+        'extern "C" __global__ __vector__ void mla_kv_reuse(__gm__ float* q) {\n'
+        "    q[0] = 1.0f;\n"
+        "}\n"
+        '"""\n'
+    )
+    mla_path = tmp_path / "mla_trackb.py"
+    mla_path.write_text(mla_src, encoding="utf-8")
+    norm_unit = (
+        "#include <tl_templates/ascend/common.h>\n"
+        'extern "C" __global__ __vector__ void mla_kv_reuse(__gm__ float* q) {\n'
+        "    q[0] = 1.0f;\n"
+        "}\n"
+    )
+    env_file = tmp_path / "env.sh"
+    env_file.write_text(
+        f"TILEFOUNDRY_NPU_CANNBENCH_REPO={cann_repo}\n"
+        f"TILEFOUNDRY_NPU_PYTHON={sys.executable}\n",
+        encoding="utf-8",
+    )
+    recorded = surrogate_cannbench.record_trackb_stage_b_artifacts_and_plan(
+        module_source=mla_src,
+        operator_name="mla",
+        anchor_entries=[(3, "split_kv_decode", norm_unit, ["-O2"], [so_bin])],
+        tl_cache_dir=tl_cache,
+        cases_yaml_sha256=cases_sha,
+        env_vals={"TILEFOUNDRY_NPU_PYTHON": sys.executable},
+    )
+    assert recorded == 1
+
+    def _fail_subprocess(*_a: object, **_kw: object) -> object:
+        raise AssertionError("prewarm should hit plan_index with zero subprocesses")
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fail_subprocess)
+    anchors = (AnchorCaseSpec("level4/mla", 3, "split_kv_decode", 10.0, 2.0),)
+    pw_res = surrogate_cannbench.prewarm_surrogate_tilelang_cache_with_stats(
+        "mla",
+        [("c_tb", mla_path)],
+        anchors,
+        cannbench_repo=cann_repo,
+        env_file=env_file,
+        cache_dir=tmp_path / "work" / "surrogate" / "reference",
+        tl_cache_dir=tl_cache,
+        source_root=fake_root,
+    )
+    assert pw_res.prewarm_stats["compiled_tasks"] == 0
+    assert pw_res.prewarm_stats["cache_hits"] == 1
+
+
+def test_tracka_anchor_case_specs_and_compile_for_cache_driver_prewarm_agreement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify anchor_case_specs and compile_for_cache align keys for zero-subprocess prewarm."""
+    repo_root = Path(__file__).resolve().parents[3]
+    cann_repo = tmp_path / "cann_repo"
+    task_dir = cann_repo / "tasks" / "level3" / "add_rms_norm_dynamic_quant"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    cases_path = task_dir / "cases.yaml"
+    cases_payload = {
+        "cases": [
+            {
+                "case_id": 1,
+                "input_shape": [[8, 128], [8, 128], [128]],
+                "dtype": "float16",
+                "attrs": {"epsilon": 1e-6},
+            },
+            {
+                "case_id": 2,
+                "input_shape": [[32, 128], [32, 128], [128]],
+                "dtype": "float16",
+                "attrs": {"epsilon": 1e-6},
+            },
+        ]
+    }
+    cases_path.write_text(yaml.safe_dump(cases_payload), encoding="utf-8")
+    cases_sha = hashlib.sha256(cases_path.read_bytes()).hexdigest()
+
+    fake_root = tmp_path / "fake_root"
+    fake_root.mkdir(parents=True, exist_ok=True)
+    (fake_root / "src").symlink_to(repo_root / "src")
+    (fake_root / "targets").symlink_to(repo_root / "targets")
+    (fake_root / "tests" / "ascend" / "benchmarks").mkdir(parents=True, exist_ok=True)
+    (fake_root / "tests" / "ascend" / "benchmarks" / "cannbench_contract.py").write_text(
+        "class Harness:\n    pass\n",
+        encoding="utf-8",
+    )
+
+    tl_stub = tmp_path / "tl_stub"
+    tl_pkg_backend = tl_stub / "tilelang" / "backend"
+    tl_pkg_backend.mkdir(parents=True)
+    (tl_pkg_backend / "__init__.py").write_text("", encoding="utf-8")
+    (tl_pkg_backend / "module.py").write_text(
+        "from types import SimpleNamespace\n"
+        "import contextlib\n"
+        "def create_backend_context(_t):\n"
+        "    return SimpleNamespace(target=contextlib.nullcontext())\n",
+        encoding="utf-8",
+    )
+    (tl_stub / "tvm.py").write_text(
+        "import contextlib\n"
+        "class _Target:\n"
+        "    @staticmethod\n"
+        "    def current(allow_none=True):\n"
+        "        return 'ascend'\n"
+        "class target:\n"
+        "    Target = _Target\n"
+        "class transform:\n"
+        "    @staticmethod\n"
+        "    def PassContext(config=None):\n"
+        "        return contextlib.nullcontext()\n"
+        "class tirx:\n"
+        "    PrimFunc = dict\n"
+        "class IRModule:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (tl_stub / "tilelang" / "__init__.py").write_text(
+        "import os, tvm\n"
+        "from pathlib import Path\n"
+        "class _Kernel:\n"
+        "    def __init__(self, kp, cce):\n"
+        "        self.kernel_path = str(kp)\n"
+        "        self._cce = cce\n"
+        "    def get_kernel_source(self):\n"
+        "        return self._cce\n"
+        "def lower(fn, target='ascend', enable_device_compile=True):\n"
+        "    cache_dir = Path(os.environ['TILELANG_CACHE_DIR'])\n"
+        "    cache_dir.mkdir(parents=True, exist_ok=True)\n"
+        "    so_p = cache_dir / f\"k_{fn['d']}_{fn['m']}.so\"\n"
+        "    so_p.write_bytes(b'ELF_LOWER_SO')\n"
+        "    return SimpleArt(so_p, '// diag cce')\n"
+        "class SimpleArt:\n"
+        "    def __init__(self, kp, cce):\n"
+        "        self.kernel_path = str(kp)\n"
+        "        self.kernel_source = cce\n"
+        "        self.device_mod = cce\n"
+        "def compile(prog, target='ascend', out_idx=None, pass_configs=None, compile_flags=None):\n"
+        "    flags = list(compile_flags or [])\n"
+        "    assert '--cce-res-usage' not in flags\n"
+        "    cache_dir = Path(os.environ['TILELANG_CACHE_DIR'])\n"
+        "    cache_dir.mkdir(parents=True, exist_ok=True)\n"
+        "    so_p = cache_dir / f\"k_{prog['d']}_{prog['m']}.so\"\n"
+        "    if not so_p.exists():\n"
+        "        so_p.write_bytes(b'ELF_COMPILE_SO')\n"
+        "    return _Kernel(so_p, '// compiled cce')\n",
+        encoding="utf-8",
+    )
+
+    mod_src = (
+        "import tilelang\n"
+        "def _select_add_rms_norm_dynamic_quant_config("
+        "d_dim=128, tl_dtype='float16', m_rows=8, schedule_mode='tuned'):\n"
+        "    return {'tile_m': 8, 'pass_configs': {}, 'compile_flags': ['-O2']}\n"
+        "def _build_add_rms_norm_dynamic_quant_prim_func("
+        "d_dim=128, tl_dtype='float16', tile_m=8, schedule_mode='tuned'):\n"
+        "    return {'d': int(d_dim), 'm': int(tile_m)}\n"
+        "def _get_kernel(d_dim, tl_dtype, m_rows, schedule_mode, *, "
+        "builder_fn=None, pass_configs=None, compile_flags=None):\n"
+        "    prog = builder_fn(d_dim, tl_dtype, 8, schedule_mode)\n"
+        "    return tilelang.compile(prog, target='ascend', out_idx=[3], "
+        "pass_configs=pass_configs, compile_flags=compile_flags)\n"
+    )
+    cand_path = tmp_path / "cand_arndq.py"
+    cand_path.write_text(mod_src, encoding="utf-8")
+    emit_json = tmp_path / "emit_bins.json"
+    drv_src = build_stage_b_driver_source(
+        cand_path,
+        factory_name="_build_add_rms_norm_dynamic_quant_prim_func",
+        factory_kwargs={"d_dim": 128, "tl_dtype": "float16", "schedule_mode": "tuned"},
+        config_selector_name="_select_add_rms_norm_dynamic_quant_config",
+        dims={"d_dim": 128, "tl_dtype": "float16", "m_rows": 8},
+        compile_for_cache=True,
+        emit_cache_bins_path=emit_json,
+    )
+    drv_env = {
+        **dict(surrogate_cannbench.os.environ),
+        "PYTHONPATH": str(tl_stub),
+        "TILELANG_CACHE_DIR": str(tmp_path / "drv_cache"),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", drv_src],
+        text=True,
+        capture_output=True,
+        env=drv_env,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    emitted = json.loads(emit_json.read_text(encoding="utf-8"))
+    assert len(emitted) == 1 and emitted[0].endswith("k_128_8.so")
+
+    work_root = tmp_path / "work_root"
+    tl_cache = work_root / "surrogate" / "tilelang"
+    env_file = tmp_path / "env.sh"
+    env_file.write_text(
+        f"TILEFOUNDRY_NPU_WORK_ROOT={work_root}\n"
+        f"TILEFOUNDRY_NPU_CANNBENCH_REPO={cann_repo}\n"
+        f"TILEFOUNDRY_NPU_TILELANG_SOURCE={tl_stub}\n"
+        f"TILEFOUNDRY_NPU_PYTHON={sys.executable}\n",
+        encoding="utf-8",
+    )
+    anchor_case_specs = [
+        (1, "default", {"d_dim": 128, "tl_dtype": "float16", "m_rows": 8}),
+        (2, "default", {"d_dim": 128, "tl_dtype": "float16", "m_rows": 32}),
+    ]
+    res = surrogate_cannbench.run_l1_compile_check(
+        mod_src,
+        builder_name="_build_add_rms_norm_dynamic_quant_prim_func",
+        builder_kwargs={"d_dim": 128, "tl_dtype": "float16", "schedule_mode": "tuned"},
+        config_selector_name="_select_add_rms_norm_dynamic_quant_config",
+        pass_configs={},
+        compile_flags=["-O2"],
+        dims={"d_dim": 128, "tl_dtype": "float16", "m_rows": 8},
+        source_root=fake_root,
+        env_file=env_file,
+        tl_cache_dir=tl_cache,
+        anchor_case_specs=anchor_case_specs,
+        operator_name="add_rms_norm_dynamic_quant",
+        cases_yaml_sha256=cases_sha,
+    )
+    assert res.passed is True
+    assert (tl_cache / "prewarm_manifest_v1.json").is_file()
+
+    def _fail_subprocess(*_a: object, **_kw: object) -> object:
+        raise AssertionError("prewarm should hit plan_index with zero subprocesses")
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fail_subprocess)
+    anchors = (
+        AnchorCaseSpec("level3/add_rms_norm_dynamic_quant", 1, "default", 5.0, 2.0),
+        AnchorCaseSpec("level3/add_rms_norm_dynamic_quant", 2, "default", 9.0, 4.0),
+    )
+    pw_res = surrogate_cannbench.prewarm_surrogate_tilelang_cache_with_stats(
+        "add_rms_norm_dynamic_quant",
+        [("c_cand", cand_path)],
+        anchors,
+        cannbench_repo=cann_repo,
+        env_file=env_file,
+        cache_dir=work_root / "surrogate" / "reference",
+        tl_cache_dir=tl_cache,
+        source_root=fake_root,
+    )
+    assert pw_res.prewarm_stats["compiled_tasks"] == 0
+    assert pw_res.prewarm_stats["cache_hits"] == 2
+
+
+def test_round_filter_skip_repair_when_survivors_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify skip_repair_when_survivors_exist skips repair when a survivor exists."""
+    ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=4,
+        pipe_cycles={"AIV0.PIPE_V": 16},
+        waterlines={},
+    )
+    repair_calls: list[str] = []
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "build_syntax_repair_request",
+        lambda cur_src, diag, **_kw: SimpleNamespace(
+            role="syntax_repair",
+            user_prompt=f"{cur_src}\n{diag}",
+        ),
+    )
+
+    class _RepairBackend:
+        async def generate(self, req: object) -> str:
+            repair_calls.append(str(getattr(req, "user_prompt", "")))
+            return "def repaired_ok():\n    return 'repaired'\n"
+
+    def _l0(_src: str) -> StageAResult:
+        return StageAResult(passed=True, prim_func=None, ledger=ledger)
+
+    def _l1(src: str) -> StageBResult:
+        if "clean_ok" in src or "repaired" in src:
+            return StageBResult(passed=True)
+        return StageBResult(
+            passed=False,
+            error_message="undeclared identifier",
+            fault_plane="STAGE_B_COMPILE",
+            fault_code="STAGE_B_COMPILE_FAILED",
+            failed_tier="stage_b",
+        )
+
+    res_with_survivor = asyncio.run(
+        surrogate_cannbench.run_l0_l1_round_filter(
+            [
+                ("c_ok", "def f_ok():\n    return 'clean_ok'\n"),
+                ("c_bad", "def f_bad():\n    return 'broken'\n"),
+            ],
+            patch_fn=lambda snip: snip,
+            l0_checker=_l0,
+            l1_compiler=_l1,
+            repair_backend=_RepairBackend(),
+            max_syntax_repairs=1,
+            parent_source="def parent():\n    return 'parent'\n",
+            skip_repair_when_survivors_exist=True,
+        )
+    )
+    assert len(repair_calls) == 0
+    assert res_with_survivor.wall_repair_sec == 0.0
+    assert res_with_survivor[0].passed is True
+    assert res_with_survivor[1].passed is False
+
+    res_no_survivor = asyncio.run(
+        surrogate_cannbench.run_l0_l1_round_filter(
+            [
+                ("c_bad1", "def f_b1():\n    return 'broken1'\n"),
+                ("c_bad2", "def f_b2():\n    return 'broken2'\n"),
+            ],
+            patch_fn=lambda snip: snip,
+            l0_checker=_l0,
+            l1_compiler=_l1,
+            repair_backend=_RepairBackend(),
+            max_syntax_repairs=1,
+            parent_source="def parent():\n    return 'parent'\n",
+            skip_repair_when_survivors_exist=True,
+        )
+    )
+    assert len(repair_calls) == 2
+    assert all(item.passed and item.repaired for item in res_no_survivor)

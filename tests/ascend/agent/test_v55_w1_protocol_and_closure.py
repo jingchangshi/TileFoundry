@@ -635,3 +635,102 @@ def test_portfolio_prompts_skip_repair_and_speculative_creative_lane() -> None:
         assert spec_runner._pending_speculative_creative is None
 
     asyncio.run(_run_speculative_rounds())
+
+
+def test_tracka_search_replace_extraction_prompt_and_creative_semaphore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify SEARCH/REPLACE extraction, Track-A delta contract, and _creative_sem isolation."""
+    reply_with_hunk = (
+        "# target_bottleneck: PIPE_V_STALL\n"
+        "# structural_hypothesis: Double vector tile size via minimal hunk\n"
+        "```python\n"
+        "<<<<<<< SEARCH [L12-L15]\n"
+        "    tile = 32\n"
+        "=======\n"
+        "    tile = 64\n"
+        ">>>>>>> REPLACE\n"
+        "```\n"
+    )
+    payload = extract_creative_payload(reply_with_hunk)
+    assert payload["target_local_metric"] == "PIPE_V_STALL"
+    assert payload["physical_hypothesis"] == "Double vector tile size via minimal hunk"
+    assert "<<<<<<< SEARCH [L12-L15]" in payload["dsl_source"]
+    assert ">>>>>>> REPLACE" in payload["dsl_source"]
+    assert extract_python_dsl(reply_with_hunk) == payload["dsl_source"]
+
+    parent = _make_parent_candidate(
+        f"{_SEED_DSL.strip()}\n\nkernel = make_kernel\n__all__ = ['kernel']\n"
+    )
+    rule = BayesianRuleTracker.from_seed_yaml().active_rules()[0]
+    exploit_req = build_exploit_request(parent, rule)
+    assert "# target_bottleneck:" in exploit_req.system_prompt
+    assert "# structural_hypothesis:" in exploit_req.system_prompt
+    assert "<<<<<<< SEARCH" in exploit_req.system_prompt
+    assert ">>>>>>> REPLACE" in exploit_req.system_prompt
+    assert "<read_only_host_tail>" in exploit_req.system_prompt
+
+    creative_req = build_creative_request(parent)
+    assert "# target_bottleneck:" in creative_req.system_prompt
+    assert "# structural_hypothesis:" in creative_req.system_prompt
+    assert "<<<<<<< SEARCH" in creative_req.system_prompt
+
+    repair_req = build_syntax_repair_request(_SEED_DSL, "syntax error")
+    assert "<<<<<<< SEARCH" in repair_req.system_prompt
+
+    bin_path, state_dir = _write_fake_sandbox_agy(tmp_path)
+    monkeypatch.setenv("TF_W1_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("TF_W1_SCENARIO", "ok")
+    backend = AgyCliLLMBackend(
+        bin_path=str(bin_path),
+        max_concurrency=1,
+        watchdog=StreamWatchdogConfig(
+            startup_timeout_sec=5.0,
+            idle_stall_timeout_sec=2.0,
+            active_ceiling_timeout_sec=5.0,
+            max_retries=0,
+        ),
+    )
+
+    async def _verify_semaphore_isolation() -> None:
+        creative_entered = asyncio.Event()
+        release_creative = asyncio.Event()
+        seen_order: list[str] = []
+
+        async def _fake_attempt(
+            req: GenerationRequest,
+            _full_prompt: str,
+            *,
+            effort_override: str | None = None,
+            model_override: str | None = None,
+        ) -> str:
+            _ = (effort_override, model_override)
+            seen_order.append(f"start:{req.role}")
+            if req.role == "explore_creative":
+                creative_entered.set()
+                await release_creative.wait()
+            seen_order.append(f"end:{req.role}")
+            return "```python\nx = 1\n```"
+
+        monkeypatch.setattr(backend, "_run_single_attempt", _fake_attempt)
+        creative_task = asyncio.create_task(
+            backend.generate(GenerationRequest("explore_creative", "s", "u"))
+        )
+        await creative_entered.wait()
+        assert backend._creative_sem.locked()
+        assert not backend._sem.locked()
+
+        exploit_res = await asyncio.wait_for(
+            backend.generate(GenerationRequest("exploit_rule", "s", "u")),
+            timeout=1.0,
+        )
+        assert "x = 1" in exploit_res
+        assert "end:exploit_rule" in seen_order
+        assert "end:explore_creative" not in seen_order
+
+        release_creative.set()
+        await creative_task
+
+    asyncio.run(_verify_semaphore_isolation())
+

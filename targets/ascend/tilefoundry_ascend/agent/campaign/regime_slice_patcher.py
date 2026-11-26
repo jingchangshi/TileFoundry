@@ -25,8 +25,13 @@ from tilefoundry_ascend.agent.orchestrator import (
     cpp_slice_protocol as _cpp_slice_protocol_mod,
 )
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+    DEFAULT_PROTECTED_EXPORTS,
     _LAUNCH_CONFIG_RE,
     _SEARCH_REPLACE_PATTERNS,
+    _char_span_to_line_span,
+    _disambiguate_matches_by_line_window,
+    _find_all_substring_spans,
+    _parse_scoped_search_replace_hunks,
     _scoped_editable_units,
     _split_cpp_units,
     apply_scoped_trackb_patch,
@@ -36,6 +41,7 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     resolve_instantiated_trackb_kernel,
     select_active_trackb_kernel,
     splice_cpp_units_into_tu,
+    split_tracka_editable_and_readonly_tail,
     strip_cpp_comments_and_strings,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import extract_python_dsl
@@ -1618,6 +1624,213 @@ def _collect_shared_non_active_symbols(
     return shared_reachable
 
 
+def _rstrip_normalized_line_matches(text: str, search_block: str) -> list[tuple[int, int]]:
+    """Locate *search_block* line windows matching after stripping trailing line whitespace."""
+    text_lines = text.splitlines(keepends=True)
+    search_lines = search_block.splitlines()
+    if not search_lines or not any(line.strip() for line in search_lines):
+        return []
+    normalized_search = [line.rstrip() for line in search_lines]
+    offsets: list[int] = []
+    pos = 0
+    for line in text_lines:
+        offsets.append(pos)
+        pos += len(line)
+    window = len(search_lines)
+    matches: list[tuple[int, int]] = []
+    for idx in range(len(text_lines) - window + 1):
+        window_lines = text_lines[idx : idx + window]
+        if [line.rstrip() for line in window_lines] != normalized_search:
+            continue
+        start = offsets[idx]
+        last_line = window_lines[-1]
+        end = offsets[idx + window - 1] + len(last_line.rstrip("\r\n"))
+        matches.append((start, end))
+    return matches
+
+
+def _resolve_tracka_editable_set(
+    tree: ast.Module,
+    regime_spec: RegimeTargetSpec,
+) -> set[str]:
+    """Return authorized editable symbol names for *regime_spec* within *tree*."""
+    top_names = {sym.name for sym in _collect_top_level_symbols(tree)}
+    if regime_spec.editable_symbols and any(
+        sym in top_names for sym in regime_spec.editable_symbols
+    ):
+        editable = set(regime_spec.editable_symbols)
+    else:
+        orig_node = _find_top_level_func(tree, regime_spec.builder_candidates)
+        if orig_node is None:
+            raise ValueError(
+                f"Original module missing regime symbols or builder "
+                f"{regime_spec.builder_candidates}."
+            )
+        editable = {orig_node.name}
+    if regime_spec.config_selector_fn and regime_spec.config_selector_fn in top_names:
+        editable.add(regime_spec.config_selector_fn)
+    return editable
+
+
+def _protected_python_spans(
+    source: str,
+    regime_spec: RegimeTargetSpec,
+    *,
+    editable_set: set[str],
+    operator_entrypoint: str,
+    sibling_specs: Sequence[RegimeTargetSpec],
+) -> tuple[int | None, dict[str, tuple[int, int]], set[str], str]:
+    """Return readonly-tail start line, protected symbol spans, protected names, and tail text."""
+    tail_exports = set(DEFAULT_PROTECTED_EXPORTS)
+    if operator_entrypoint:
+        tail_exports.add(operator_entrypoint)
+    tail_exports.difference_update(editable_set)
+    _, readonly_tail = split_tracka_editable_and_readonly_tail(
+        source,
+        protected_exports=frozenset(tail_exports),
+    )
+    tail_start_line: int | None = None
+    if readonly_tail:
+        tail_char = source.rfind(readonly_tail)
+        if tail_char >= 0:
+            tail_start_line = source.count("\n", 0, tail_char) + 1
+
+    sibling_selectors = {
+        spec.config_selector_fn
+        for spec in sibling_specs
+        if spec.regime_tag != regime_spec.regime_tag and spec.config_selector_fn
+    }
+    allowed_own = set(editable_set) - sibling_selectors
+    allowed_own.update(
+        {
+            "_plan_workspace_bytes",
+            f"_{regime_spec.regime_tag}_plan_workspace_bytes",
+        }
+    )
+
+    forbidden = _other_regime_forbidden_symbols(
+        regime_spec,
+        operator_entrypoint=operator_entrypoint,
+        sibling_specs=sibling_specs,
+        module_source=source,
+    )
+    forbidden.update(tail_exports)
+    forbidden.difference_update(allowed_own)
+
+    protected_spans: dict[str, tuple[int, int]] = {}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        for sym in _collect_top_level_symbols(tree):
+            if sym.name in forbidden:
+                protected_spans[sym.name] = (sym.start, sym.end)
+    return tail_start_line, protected_spans, forbidden, readonly_tail
+
+
+def _apply_scoped_python_search_replace_to_module(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+    candidate_dsl: str,
+    *,
+    operator_entrypoint: str = "",
+    sibling_specs: Sequence[RegimeTargetSpec] = (),
+) -> str:
+    """Apply scoped SEARCH/REPLACE hunks to Track-A Python without touching protected spans."""
+    hunks = _parse_scoped_search_replace_hunks(candidate_dsl)
+    if not hunks:
+        raise ValueError("Track-A Python candidate contains no valid SEARCH/REPLACE hunks")
+
+    orig_tree = ast.parse(module_source)
+    editable_set = _resolve_tracka_editable_set(orig_tree, regime_spec)
+    tail_exports = set(DEFAULT_PROTECTED_EXPORTS)
+    if operator_entrypoint:
+        tail_exports.add(operator_entrypoint)
+    tail_exports.difference_update(editable_set)
+    _, orig_spans, protected_names, orig_readonly_tail = _protected_python_spans(
+        module_source,
+        regime_spec,
+        editable_set=editable_set,
+        operator_entrypoint=operator_entrypoint,
+        sibling_specs=sibling_specs,
+    )
+    orig_ast_by_name = _collect_top_level_ast_nodes(orig_tree)
+
+    cur_source = module_source
+    for hunk in hunks:
+        if not hunk.search_block.strip():
+            raise ValueError("Empty SEARCH block is forbidden in Track-A Python patch")
+
+        tail_start_line, protected_spans, _, _ = _protected_python_spans(
+            cur_source,
+            regime_spec,
+            editable_set=editable_set,
+            operator_entrypoint=operator_entrypoint,
+            sibling_specs=sibling_specs,
+        )
+        if not protected_spans and orig_spans:
+            protected_spans = orig_spans
+
+        spans = _find_all_substring_spans(cur_source, hunk.search_block)
+        if not spans:
+            spans = _rstrip_normalized_line_matches(cur_source, hunk.search_block)
+        if not spans:
+            raise ValueError("SEARCH block did not match target Track-A Python source")
+
+        if len(spans) > 1:
+            picked_idx = _disambiguate_matches_by_line_window(
+                cur_source,
+                spans,
+                hunk.line_window,
+            )
+        else:
+            picked_idx = 0
+
+        match_start, match_end = spans[picked_idx]
+        m_start_line, m_end_line = _char_span_to_line_span(cur_source, match_start, match_end)
+        if tail_start_line is not None and m_end_line >= tail_start_line:
+            raise ValueError(
+                f"Track-A SEARCH/REPLACE hunk at lines {m_start_line}-{m_end_line} "
+                f"targets read-only host tail (starts at line {tail_start_line})"
+            )
+        for sym_name, (sym_start, sym_end) in protected_spans.items():
+            if m_start_line <= sym_end and m_end_line >= sym_start:
+                raise ValueError(
+                    f"Track-A SEARCH/REPLACE hunk at lines {m_start_line}-{m_end_line} "
+                    f"targets protected symbol {sym_name!r} (lines {sym_start}-{sym_end})"
+                )
+
+        cur_source = cur_source[:match_start] + hunk.replace_block + cur_source[match_end:]
+
+    patched_tree = ast.parse(cur_source)
+    patched_ast_by_name = _collect_top_level_ast_nodes(patched_tree)
+    for name in sorted(protected_names):
+        orig_node = orig_ast_by_name.get(name)
+        new_node = patched_ast_by_name.get(name)
+        if orig_node is None and new_node is not None:
+            raise ValueError(
+                f"Track-A SEARCH/REPLACE cannot define protected symbol {name!r}."
+            )
+        if orig_node is not None and (
+            new_node is None or ast.dump(orig_node) != ast.dump(new_node)
+        ):
+            raise ValueError(
+                f"Track-A SEARCH/REPLACE cannot modify protected symbol {name!r}."
+            )
+    if orig_readonly_tail:
+        _, new_readonly_tail = split_tracka_editable_and_readonly_tail(
+            cur_source,
+            protected_exports=frozenset(tail_exports),
+        )
+        if new_readonly_tail != orig_readonly_tail:
+            raise ValueError("Track-A SEARCH/REPLACE modified read-only host tail.")
+
+    if cur_source == module_source or cur_source.strip() == module_source.strip():
+        raise ValueError("Track-A SEARCH/REPLACE produced identical Python source")
+    return cur_source
+
+
 def patch_regime_into_module(
     module_source: str,
     regime_or_func: RegimeTargetSpec | str,
@@ -1669,6 +1882,24 @@ def patch_regime_into_module(
                 regime_spec,
                 candidate_dsl,
                 active_kernel=active_kernel,
+            )
+    else:
+        has_sr_markers = (
+            "<<<<<<<" in candidate_dsl
+            or ">>>>>>>" in candidate_dsl
+            or "<<< SEARCH" in candidate_dsl
+            or ">>> REPLACE" in candidate_dsl
+        )
+        search_replace_hunks = _parse_scoped_search_replace_hunks(candidate_dsl)
+        if has_sr_markers and not search_replace_hunks:
+            raise ValueError("Malformed SEARCH/REPLACE block markers in Track-A Python candidate")
+        if search_replace_hunks:
+            return _apply_scoped_python_search_replace_to_module(
+                module_source,
+                regime_spec,
+                candidate_dsl,
+                operator_entrypoint=operator_entrypoint,
+                sibling_specs=sibling_specs,
             )
     orig_tree = ast.parse(module_source)
     orig_symbols = _collect_top_level_symbols(orig_tree)
@@ -2041,6 +2272,7 @@ __all__ = [
     "_HIR_DIM_ALIASES",
     "_TopLevelSymbol",
     "_active_trackb_kernel",
+    "_apply_scoped_python_search_replace_to_module",
     "_apply_scoped_trackb_patch_to_module",
     "_apply_spliced_trackb_units_to_module",
     "_assert_trackb_replacement_scoped",

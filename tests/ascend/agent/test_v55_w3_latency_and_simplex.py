@@ -23,6 +23,8 @@ from tilefoundry_ascend.agent.campaign.latency_algebra import (
     calibrate_dispatch_floor_us,
     compute_paired_sigma_us,
 )
+from tilefoundry_ascend.agent.campaign.promotion_coordinator import to_conservation_point
+from tilefoundry_ascend.agent.campaign.surrogate_cannbench import AnchorEvalMetrics
 from tilefoundry_ascend.agent.kb.schema import (
     DETERMINISTIC_SYMPTOM_FAMILIES,
     AscendCausalRule,
@@ -340,3 +342,40 @@ def test_normalize_symptom_simplex_and_backend_isolation() -> None:
     assert cpp_only.supports_backend("cce_trackb") is True
     assert cpp_only.supports_backend("tilelang_dsl") is False
     assert cpp_only.supports_backend("hybrid_trackb") is False
+
+
+def test_real_mla_case7_dispatch_floor_and_recoverable_sched() -> None:
+    """Verify real MLA sibling latencies keep Case 7 dispatch floor <= 3.04us."""
+    mla_specs = (
+        (1, "prefill_compute", 34.8532, 34.8532, 11.6177),
+        (6, "prefill_compute", 30.7423, 30.7423, 10.2474),
+        (7, "split_kv_decode", 23.68, 4.56, 1.52),
+        (11, "split_kv_decode", 68.6341, 68.6341, 22.8780),
+        (13, "bnsd_gather", 34.8532, 34.8532, 11.6177),
+    )
+    metrics = [
+        AnchorEvalMetrics(
+            case_num=cnum,
+            regime_tag=rtag,
+            accuracy_passed=True,
+            cand_us=cand_us,
+            ref_perf_us=ref_us,
+            t_hw_us=roof_us,
+            speedup=ref_us / cand_us,
+            roofline_eta=roof_us / cand_us,
+            eq3_score=ref_us / cand_us,
+        )
+        for cnum, rtag, cand_us, ref_us, roof_us in mla_specs
+    ]
+    points = [to_conservation_point(m, m) for m in metrics]
+    case7_pt = next(p for p in points if p.case_num == 7)
+
+    floor_no_null = calibrate_dispatch_floor_us(points, null_launch_us=None)
+    assert floor_no_null <= 3.04 + 1e-9
+    assert floor_no_null == pytest.approx(3.04)
+    assert case7_pt.recoverable_sched_us(floor_no_null) > 18.0
+
+    floor_with_null = calibrate_dispatch_floor_us(points, null_launch_us=1.8)
+    assert floor_with_null <= 3.04
+    assert floor_with_null == pytest.approx(1.8)
+    assert case7_pt.recoverable_sched_us(floor_with_null) > 18.0

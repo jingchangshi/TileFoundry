@@ -46,6 +46,10 @@ def _bootstrap_isolated_worktree() -> None:
 
 _bootstrap_isolated_worktree()
 
+from tilefoundry_ascend.agent.campaign import (  # noqa: E402
+    stage_gate_coordinator,
+    surrogate_cannbench,
+)
 from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: E402
     AnchorCaseSpec,
     GuardrailCaseSpec,
@@ -62,12 +66,15 @@ from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import (  # noqa: 
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: E402
     AnchorEvalMetrics,
     CandidateSurrogateResult,
+    L0L1CandidateCheck,
+    L2BatchResults,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (  # noqa: E402
     StageAResult,
     StageBResult,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest  # noqa: E402
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import ArtifactStore  # noqa: E402
 from tilefoundry_ascend.ascend.cost_model import BishengResourceSummary  # noqa: E402
 from tilefoundry_ascend.ascend.passes import (  # noqa: E402
     build_objective_physical_ledger,
@@ -563,4 +570,465 @@ def test_tail_guard_recheck_and_combine_gate_helpers(tmp_path: Path) -> None:
     assert ok is True
     assert updated.all_passed is True
     assert coord._resolve_max_row_width_dims(spec) is not None
+
+
+@pytest.mark.anyio
+async def test_occupancy_error_clears_stale_l2_timing_meta(tmp_path: Path) -> None:
+    """Failed L2 batches must not inherit timing or prewarm stats from prior rounds."""
+
+    class _SingleBackend:
+        async def generate(
+            self,
+            req: GenerationRequest,
+            *,
+            effort_override: object = None,
+        ) -> str:
+            _ = (req, effort_override)
+            return _EXPLOIT_SNIPPET
+
+    round_state = {"fail": False}
+
+    def _l2_eval(
+        cands: Sequence[tuple[str, Path]],
+        _ancs: Sequence[AnchorCaseSpec],
+    ) -> Mapping[str, CandidateSurrogateResult]:
+        if round_state["fail"]:
+            raise OccupancyExhaustedError(3, ("all NPU cards busy",))
+        raw = {cid: _make_surrogate_result(cid) for cid, _path in cands}
+        return L2BatchResults(
+            raw,
+            {cid: "run-0" for cid, _path in cands},
+            prewarm_stats={
+                "total_tasks": 3,
+                "cache_hits": 1,
+                "compiled_tasks": 2,
+                "failed_candidates": 0,
+            },
+            l2_prewarm_sec=4.5,
+            l2_npu_sec=2.5,
+        )
+
+    coord = _make_coordinator(
+        tmp_path,
+        backend=_SingleBackend(),
+        l2_batch_evaluator=_l2_eval,
+    )
+    spec = _make_regime_spec()
+    anchors = _make_anchors()
+    batch_r0 = CandidateBatch(
+        round_idx=0,
+        regime_spec=spec,
+        worker_specs=[("r0_rule_0", "rule_exploit", None, _make_req("exploit_rule"))],
+        parent_module_source=_PARENT_MODULE_SRC,
+        parent_snippet=_PARENT_SNIPPET,
+        func_name="_build_main",
+    )
+    out_r0 = await coord.execute_round_gates(batch_r0, anchors)
+    assert out_r0.l2_prewarm_sec == pytest.approx(4.5)
+    assert out_r0.l2_npu_sec == pytest.approx(2.5)
+    assert out_r0.round_prewarm_stats["compiled_tasks"] == 2
+    assert coord._last_l2_timing_meta
+
+    round_state["fail"] = True
+    batch_r1 = CandidateBatch(
+        round_idx=1,
+        regime_spec=spec,
+        worker_specs=[("r1_rule_0", "rule_exploit", None, _make_req("exploit_rule"))],
+        parent_module_source=_PARENT_MODULE_SRC,
+        parent_snippet=_PARENT_SNIPPET,
+        func_name="_build_main",
+    )
+    out_r1 = await coord.execute_round_gates(batch_r1, anchors)
+    assert coord._last_l2_timing_meta == {}
+    assert out_r1.l2_infra_fault is not None
+    assert out_r1.l2_infra_fault.plane == FaultPlane.INFRA_OCCUPANCY
+    assert out_r1.l2_prewarm_sec == 0.0
+    assert out_r1.l2_npu_sec == 0.0
+    assert out_r1.round_prewarm_stats["compiled_tasks"] == 0
+
+
+def test_compile_trackb_stage_b_forwards_unified_artifact_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_compile_trackb_stage_b forwards an ArtifactStore rooted at unified_tl_cache."""
+    unified_cache = tmp_path / "unified_tl_cache"
+    monkeypatch.setenv("TILELANG_CACHE_DIR", str(unified_cache))
+    captured: dict[str, object] = {}
+
+    def _fake_compile(
+        cpp_source: str,
+        *,
+        compile_flags: Sequence[str] | str | None = None,
+        bisheng_bin: str | Path | None = None,
+        cann_root: str | Path | None = None,
+        artifact_store: ArtifactStore | None = None,
+        regime_tag: str = "",
+    ) -> StageBResult:
+        captured["cpp_source"] = cpp_source
+        captured["compile_flags"] = compile_flags
+        captured["bisheng_bin"] = bisheng_bin
+        captured["cann_root"] = cann_root
+        captured["artifact_store"] = artifact_store
+        captured["regime_tag"] = regime_tag
+        return StageBResult(passed=True)
+
+    monkeypatch.setattr(stage_gate_coordinator, "run_stage_b_ascendc_compile", _fake_compile)
+    coord = _make_coordinator(tmp_path)
+    res = coord._compile_trackb_stage_b(
+        'extern "C" __global__ void k() {}',
+        regime_tag="decode",
+    )
+    assert res.passed is True
+    assert isinstance(captured["artifact_store"], ArtifactStore)
+    assert captured["artifact_store"].root == unified_cache.resolve()
+    assert captured["regime_tag"] == "decode"
+
+
+@pytest.mark.anyio
+async def test_speculative_creative_does_not_pile_up_when_pending(tmp_path: Path) -> None:
+    """Do not launch an overlapping explore_creative task when one is still in flight."""
+    creative_gate = asyncio.Event()
+    creative_calls = 0
+
+    class _Backend:
+        async def generate(
+            self,
+            req: GenerationRequest,
+            *,
+            effort_override: object = None,
+        ) -> str:
+            nonlocal creative_calls
+            _ = effort_override
+            if req.role == "explore_creative":
+                creative_calls += 1
+                if creative_calls == 1:
+                    await creative_gate.wait()
+                return (
+                    "# target_bottleneck: aiv_vec\n"
+                    "# structural_hypothesis: Widen tile\n"
+                    f"```python\n{_CREATIVE_SNIPPET}\n```"
+                )
+            return _EXPLOIT_SNIPPET
+
+    coord = _make_coordinator(tmp_path, backend=_Backend())
+    spec = _make_regime_spec()
+    anchors = _make_anchors()
+
+    batch_r0 = CandidateBatch(
+        round_idx=0,
+        regime_spec=spec,
+        worker_specs=[
+            ("r0_rule_0", "rule_exploit", None, _make_req("exploit_rule")),
+            ("r0_creative", "creative_explore", None, _make_req("explore_creative")),
+        ],
+        parent_module_source=_PARENT_MODULE_SRC,
+        parent_snippet=_PARENT_SNIPPET,
+        func_name="_build_main",
+    )
+    await coord.execute_round_gates(batch_r0, anchors)
+    assert creative_calls == 1
+    assert len(coord._pending_speculative) == 1
+    assert coord._pending_speculative[0][1] == "r0_creative"
+
+    batch_r1 = CandidateBatch(
+        round_idx=1,
+        regime_spec=spec,
+        worker_specs=[
+            ("r1_rule_0", "rule_exploit", None, _make_req("exploit_rule")),
+            ("r1_creative", "creative_explore", None, _make_req("explore_creative")),
+        ],
+        parent_module_source=_PARENT_MODULE_SRC,
+        parent_snippet=_PARENT_SNIPPET,
+        func_name="_build_main",
+    )
+    await coord.execute_round_gates(batch_r1, anchors)
+    assert creative_calls == 1
+    assert len(coord._pending_speculative) == 1
+    assert coord._pending_speculative[0][1] == "r0_creative"
+
+    creative_gate.set()
+    await asyncio.sleep(0)
+
+    batch_r2 = CandidateBatch(
+        round_idx=2,
+        regime_spec=spec,
+        worker_specs=[
+            ("r2_rule_0", "rule_exploit", None, _make_req("exploit_rule")),
+            ("r2_creative", "creative_explore", None, _make_req("explore_creative")),
+        ],
+        parent_module_source=_PARENT_MODULE_SRC,
+        parent_snippet=_PARENT_SNIPPET,
+        func_name="_build_main",
+    )
+    out_r2 = await coord.execute_round_gates(batch_r2, anchors)
+    assert creative_calls == 2
+    r2_cids = [cid for cid, _ in out_r2.raw_candidates]
+    assert "r0_creative" in r2_cids
+    assert "r2_creative" in r2_cids
+
+
+@pytest.mark.anyio
+async def test_skip_repair_when_survivors_exist_forwarded_when_supported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forward skip_repair_when_survivors_exist=True when supported and skip otherwise."""
+
+    class _SingleBackend:
+        async def generate(
+            self,
+            req: GenerationRequest,
+            *,
+            effort_override: object = None,
+        ) -> str:
+            _ = (req, effort_override)
+            return _EXPLOIT_SNIPPET
+
+    captured_flags: list[bool] = []
+
+    async def _accepting_filter(
+        candidates: Sequence[tuple[str, str]],
+        *,
+        patch_fn: object,
+        l0_checker: object,
+        l1_compiler: object,
+        skip_repair_when_survivors_exist: bool = False,
+        **_extra: object,
+    ) -> list[L0L1CandidateCheck]:
+        _ = (patch_fn, l0_checker, l1_compiler, _extra)
+        captured_flags.append(skip_repair_when_survivors_exist)
+        return [
+            L0L1CandidateCheck(
+                candidate_id=cid,
+                passed=True,
+                failed_tier=None,
+                patched_module_source=_PARENT_MODULE_SRC,
+                snippet_source=snip,
+                stage_a=_make_stage_a(),
+                stage_b=StageBResult(passed=True),
+            )
+            for cid, snip in candidates
+        ]
+
+    monkeypatch.setattr(stage_gate_coordinator, "run_l0_l1_round_filter", _accepting_filter)
+    coord = _make_coordinator(tmp_path, backend=_SingleBackend())
+    batch = CandidateBatch(
+        round_idx=0,
+        regime_spec=_make_regime_spec(),
+        worker_specs=[("r0_rule_0", "rule_exploit", None, _make_req("exploit_rule"))],
+        parent_module_source=_PARENT_MODULE_SRC,
+        parent_snippet=_PARENT_SNIPPET,
+        func_name="_build_main",
+    )
+    out = await coord.execute_round_gates(batch, _make_anchors())
+    assert captured_flags == [True]
+    assert "r0_rule_0" in out.l2_results
+
+    legacy_called: list[str] = []
+
+    async def _legacy_filter(
+        candidates: Sequence[tuple[str, str]],
+        *,
+        patch_fn: object,
+        l0_checker: object,
+        l1_compiler: object,
+    ) -> list[L0L1CandidateCheck]:
+        _ = (patch_fn, l0_checker, l1_compiler)
+        legacy_called.extend(cid for cid, _ in candidates)
+        return []
+
+    monkeypatch.setattr(stage_gate_coordinator, "run_l0_l1_round_filter", _legacy_filter)
+    out_legacy = await coord.execute_round_gates(batch, _make_anchors())
+    assert legacy_called == ["r0_rule_0"]
+    assert out_legacy.passed_checks == []
+
+
+def test_run_l1_tracka_forwards_anchor_specs_and_parallelizes_extra_widths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Track-A _run_l1 forwards anchor_case_specs and runs extra widths cleanly."""
+    cases_dir = tmp_path / "tasks" / "level2" / "rms_norm"
+    cases_dir.mkdir(parents=True)
+    cases_file = cases_dir / "cases.yaml"
+    cases_file.write_text("cases:\n  - case_id: 0\n  - case_id: 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_cannbench_repo",
+        lambda **_kw: tmp_path,
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_cannbench_tasks_root",
+        lambda _repo: tmp_path / "tasks",
+    )
+
+    spec_by_case = {
+        0: {"D": 128, "tl_dtype": "bfloat16"},
+        1: {"D": 256, "tl_dtype": "bfloat16"},
+    }
+
+    def _fake_lookup_static(
+        _op: str,
+        case_num: int,
+        **_kw: object,
+    ) -> dict[str, object]:
+        if int(case_num) not in spec_by_case:
+            raise FileNotFoundError("missing case")
+        return dict(spec_by_case[int(case_num)])
+
+    monkeypatch.setattr(stage_gate_coordinator, "lookup_case_static_spec", _fake_lookup_static)
+
+    captured_calls: list[dict[str, object]] = []
+
+    def _fake_l1_check(
+        _src: str,
+        *,
+        dims: Mapping[str, object] | None = None,
+        static_spec_dims_list: Sequence[Mapping[str, object]] | None = None,
+        anchor_case_specs: Sequence[tuple[int, str, Mapping[str, object]]] | None = None,
+        operator_name: str = "",
+        cases_yaml_sha256: str = "",
+        **_kw: object,
+    ) -> StageBResult:
+        captured_calls.append(
+            {
+                "dims": dict(dims) if dims else {},
+                "static_spec_dims_list": list(static_spec_dims_list or ()),
+                "anchor_case_specs": list(anchor_case_specs or ()),
+                "operator_name": operator_name,
+                "cases_yaml_sha256": cases_yaml_sha256,
+            }
+        )
+        return StageBResult(passed=True, elapsed_sec=0.25)
+
+    monkeypatch.setattr(stage_gate_coordinator, "run_l1_compile_check", _fake_l1_check)
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_regime_config",
+        lambda _src, _reg, dims=None: types.SimpleNamespace(
+            builder_name="_build_main",
+            builder_kwargs={"tile_m": int((dims or {}).get("D", 128))},
+            pass_configs={},
+            compile_flags=(),
+            selector_name="",
+            combine_kwargs={},
+        ),
+    )
+
+    coord = StageGateCoordinator(
+        operator_name="rms_norm",
+        source_root=tmp_path,
+        target_module_path=tmp_path / "kernel.py",
+        regime_specs=(_make_regime_spec(),),
+        scoreboard_anchors=(
+            AnchorCaseSpec("level2/rms_norm", 0, "decode", 20.0, 2.0),
+        ),
+        guardrail_cases=(
+            GuardrailCaseSpec("level2/rms_norm", 0, "decode", 20.0, 2.0),
+            GuardrailCaseSpec("level2/rms_norm", 1, "decode", 25.0, 2.5),
+            GuardrailCaseSpec("level2/rms_norm", 99, "decode", 30.0, 3.0),
+        ),
+        static_width_dims_fn=lambda _spec: (
+            {"D": 128, "tl_dtype": "bfloat16"},
+            {"D": 512, "tl_dtype": "bfloat16"},
+            {"D": 1024, "tl_dtype": "bfloat16"},
+        ),
+    )
+    resolved_specs = coord._resolve_stage_b_anchor_case_specs()
+    assert [c for c, _r, _s in resolved_specs] == [0, 1]
+
+    res = coord._run_l1(_PARENT_MODULE_SRC, _make_regime_spec())
+    assert res.passed is True
+    assert len(captured_calls) == 3
+    primary = captured_calls[0]
+    assert primary["operator_name"] == "rms_norm"
+    assert len(str(primary["cases_yaml_sha256"])) == 64
+    assert [c for c, _r, _s in primary["anchor_case_specs"]] == [0, 1]
+    extra_dims = [call["dims"]["D"] for call in captured_calls[1:]]
+    assert extra_dims == [512, 1024]
+    assert res.elapsed_sec == pytest.approx(0.75)
+
+
+def test_run_l1_trackb_dedups_and_records_anchor_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Track-B _run_l1 deduplicates identical TUs and records anchor plan entries."""
+    bin_file = tmp_path / "kernel.o"
+    bin_file.write_bytes(b"ELF_TEST")
+    tb_module = (
+        '_TRACKB_CPP = """\n'
+        'extern "C" __global__ void tb_kernel() {}\n'
+        '"""\n'
+        "def _render_trackb_tu(D=128, trackb_src='', **_kw):\n"
+        "    return f'// D={D}\\n{trackb_src}'\n"
+    )
+    tb_spec = RegimeTargetSpec(
+        regime_tag="decode",
+        builder_candidates=(),
+        sample_builder_kwargs={},
+        editable_symbols=("_TRACKB_CPP", "_render_trackb_tu"),
+        runtime_backend="ascendc_trackb",
+        trackb_symbols=("_TRACKB_CPP",),
+        representative_anchor_dims={"D": 128},
+    )
+    compile_tus: list[str] = []
+
+    def _fake_ascendc_compile(
+        cpp_source: str,
+        **_kw: object,
+    ) -> StageBResult:
+        compile_tus.append(cpp_source)
+        return StageBResult(
+            passed=True,
+            elapsed_sec=0.5,
+            binary_paths=(str(bin_file),),
+        )
+
+    recorded_payloads: list[dict[str, object]] = []
+
+    def _fake_record(**kwargs: object) -> int:
+        recorded_payloads.append(dict(kwargs))
+        return len(list(kwargs["anchor_entries"]))
+
+    monkeypatch.setattr(stage_gate_coordinator, "run_stage_b_ascendc_compile", _fake_ascendc_compile)
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_cannbench_repo",
+        lambda **_kw: (_ for _ in ()).throw(FileNotFoundError("isolated")),
+    )
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "record_trackb_stage_b_artifacts_and_plan",
+        _fake_record,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "lookup_case_static_spec",
+        lambda _op, cnum, **_kw: {"D": 128 if int(cnum) in (0, 1) else 256},
+    )
+    coord = StageGateCoordinator(
+        operator_name="rms_norm",
+        source_root=tmp_path,
+        target_module_path=tmp_path / "kernel.py",
+        regime_specs=(tb_spec,),
+        scoreboard_anchors=(
+            AnchorCaseSpec("level2/rms_norm", 0, "decode", 20.0, 2.0),
+            AnchorCaseSpec("level2/rms_norm", 1, "decode", 21.0, 2.1),
+            AnchorCaseSpec("level2/rms_norm", 2, "decode", 22.0, 2.2),
+        ),
+        static_width_dims_fn=lambda _s: (),
+    )
+    res = coord._run_l1(tb_module, tb_spec)
+    assert res.passed is True
+    assert len(compile_tus) == 2
+    assert res.elapsed_sec == pytest.approx(1.0)
+    assert len(recorded_payloads) == 1
+    entries = recorded_payloads[0]["anchor_entries"]
+    assert [e[0] for e in entries] == [0, 1, 2]
+
 

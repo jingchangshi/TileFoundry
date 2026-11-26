@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,15 +18,19 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     RegimeTargetSpec,
 )
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
+    CampaignConfig,
     CampaignRoundRecord,
     PendingL4,
+    PerfTargetCampaignRunner,
 )
 from tilefoundry_ascend.agent.campaign.fault_types import FaultPlane, L3Resolution, TypedFault
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import PendingPromotion
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+    AgentGatesDeviceFaultError,
     AnchorEvalMetrics,
     CandidateSurrogateResult,
     L0L1CandidateCheck,
+    L3AcceptanceResult,
     L4CannbenchResult,
 )
 from tilefoundry_ascend.agent.campaign.telemetry_ledger_writer import (
@@ -32,9 +39,11 @@ from tilefoundry_ascend.agent.campaign.telemetry_ledger_writer import (
     source_sha256,
 )
 from tilefoundry_ascend.agent.cost_advisor import create_cost_advisor
+from tilefoundry_ascend.agent.flywheel import FlywheelDistiller
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult, StageBResult
+from tilefoundry_ascend.agent.orchestrator import MockLLMBackend
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import GateFunnel, StageAResult, StageBResult
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     TwoLaneBeamSearch,
     compute_static_dynamic_residual,
@@ -704,3 +713,193 @@ def test_record_kb_event_and_observations_and_rule_eval(tmp_path: Path) -> None:
         active_anchors=anchors,
         topology_axes=axes,
     ) == []
+
+
+def test_rule_exploit_skips_flywheel_ablation_and_advances_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Known-rule promotion skips LOO ablation and advances flywheel checkpoint."""
+    base_src = "def _build_main(tile_m=16):\n    return int(tile_m)\n"
+    r1_rule_src = "def _build_main(tile_m=32):\n    return int(tile_m)\n"
+    r1_explore_src = "def _build_main(tile_m=24):\n    return int(tile_m)\n"
+    r2_explore_src = "def _build_main(tile_m=64):\n    return int(tile_m)\n"
+
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(base_src, encoding="utf-8")
+    anchors = (AnchorCaseSpec("op/synthetic", 1, "main", 200.0, 10.0),)
+    regime = RegimeTargetSpec("main", ("_build_main",), {})
+
+    rules = [
+        AscendCausalRule(
+            rule_id="R_KNOWN_01",
+            regime_guard="is_legal",
+            precondition="PIPE_V > 0",
+            transform_template="Double tile_m to 32",
+            expected_postcondition="measured_latency_us < prev.measured_latency_us",
+            source_provenance="seed",
+        ),
+        AscendCausalRule(
+            rule_id="R_KNOWN_02",
+            regime_guard="is_legal",
+            precondition="PIPE_V > 0",
+            transform_template="Keep tile_m at 32",
+            expected_postcondition="measured_latency_us < prev.measured_latency_us",
+            source_provenance="seed",
+        ),
+    ]
+    tracker = BayesianRuleTracker.from_rules(rules)
+    flywheel = FlywheelDistiller(funnel=GateFunnel(skip_stage_b=True), tracker=tracker)
+    distill_calls: list[dict[str, object]] = []
+
+    def _spy_distill(**kwargs: object) -> object:
+        distill_calls.append(dict(kwargs))
+        return SimpleNamespace(
+            admitted_rule_ids=("R_FLYWHEEL_NEW",),
+            distilled_outcomes=(),
+            kept_positive_chunks=(),
+            to_dict=lambda: {"admitted_rule_ids": ["R_FLYWHEEL_NEW"]},
+        )
+
+    monkeypatch.setattr(flywheel, "distill_from_pair", _spy_distill)
+
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [r1_rule_src, r1_rule_src],
+            "explore_creative": [
+                "# target_bottleneck: aiv_vec\n# structural_hypothesis: Try 24\n"
+                f"```python\n{r1_explore_src}```",
+                "# target_bottleneck: aiv_vec\n# structural_hypothesis: Try 64\n"
+                f"```python\n{r2_explore_src}```",
+            ],
+        }
+    )
+
+    def _l2_eval(
+        cands: Sequence[tuple[str, Path]],
+        _active: Sequence[AnchorCaseSpec],
+    ) -> dict[str, CandidateSurrogateResult]:
+        out: dict[str, CandidateSurrogateResult] = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            if "tile_m=64" in src:
+                lat = 30.0
+            elif "tile_m=32" in src:
+                lat = 60.0
+            elif "tile_m=24" in src:
+                lat = 95.0
+            else:
+                lat = 100.0
+            metric = AnchorEvalMetrics(
+                case_num=1,
+                regime_tag="main",
+                accuracy_passed=True,
+                cand_us=lat,
+                ref_perf_us=200.0,
+                t_hw_us=10.0,
+                speedup=200.0 / lat,
+                roofline_eta=10.0 / lat,
+                eq3_score=200.0 / lat,
+                burst_batch_cv=0.05,
+                ring_burst_k=4,
+            )
+            out[cid] = _surrogate_result(cid, (metric,))
+        return out
+
+    ledger = _make_ledger()
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="synthetic_op",
+            max_rounds=2,
+            k_rule_workers=1,
+            enable_tilesize_prescreen=False,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("synthetic_op", 10.0, 8.0, 0.9),
+        anchors=anchors,
+        regime_specs=(regime,),
+        llm_backend=backend,
+        tracker=tracker,
+        flywheel_distiller=flywheel,
+        l0_checker=lambda _s, _r: StageAResult(passed=True, prim_func=None, ledger=ledger),
+        l1_compiler=lambda _s, _r: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=tmp_path / "ckpt.json",
+        experience_lake_dir=tmp_path / "lake",
+    )
+    report = asyncio.run(runner.run())
+
+    assert report.promoted_rounds == (1, 2)
+    assert len(distill_calls) == 1
+    assert distill_calls[0]["baseline_latency_us"] == pytest.approx(60.0)
+    assert distill_calls[0]["winner_latency_us"] == pytest.approx(30.0)
+    assert "tile_m=32" in str(distill_calls[0]["baseline_dsl"])
+    assert "tile_m=64" in str(distill_calls[0]["winner_dsl"])
+    assert runner._flywheel_coordinator.should_trigger("main", 59.0, 1.5) is False
+
+
+def test_l2_transient_occupancy_defers_without_blocking_campaign(tmp_path: Path) -> None:
+    """Transient L2 INFRA_OCCUPANCY defers round without setting promotion_blocked."""
+    base_src = "def _build_main(tile_m=16):\n    return int(tile_m)\n"
+    cand_src = "def _build_main(tile_m=32):\n    return int(tile_m)\n"
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(base_src, encoding="utf-8")
+    anchors = (AnchorCaseSpec("op/synthetic", 1, "main", 40.0, 4.0),)
+    regime = RegimeTargetSpec("main", ("_build_main",), {})
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [cand_src, cand_src],
+            "explore_creative": [
+                "# target_bottleneck: aiv_vec\n# structural_hypothesis: Double tile_m\n"
+                f"```python\n{cand_src}```"
+            ]
+            * 2,
+        }
+    )
+    cand_eval_calls = {"n": 0}
+
+    def _l2_eval(
+        cands: Sequence[tuple[str, Path]],
+        _active: Sequence[AnchorCaseSpec],
+    ) -> dict[str, CandidateSurrogateResult]:
+        if all(cid in {"baseline", "incumbent_baseline"} for cid, _p in cands):
+            return {cands[0][0]: _surrogate_result(cands[0][0], (_metric(1, "main", 20.0),))}
+        cand_eval_calls["n"] += 1
+        if cand_eval_calls["n"] == 1:
+            raise AgentGatesDeviceFaultError(
+                "BLOCKED_ENV: device occupied",
+                fault_plane="INFRA_OCCUPANCY",
+                fault_code="NPU_OCCUPANCY_BUSY",
+                failed_tier="l2_npu",
+                device_id="0",
+            )
+        out: dict[str, CandidateSurrogateResult] = {}
+        for cid, mod_path in cands:
+            lat = 10.0 if "tile_m=32" in mod_path.read_text(encoding="utf-8") else 20.0
+            out[cid] = _surrogate_result(cid, (_metric(1, "main", lat),))
+        return out
+
+    ledger = _make_ledger()
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="synthetic_op", max_rounds=2),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("synthetic_op", 3.0, 2.0, 0.85),
+        anchors=anchors,
+        regime_specs=(regime,),
+        llm_backend=backend,
+        tracker=BayesianRuleTracker.from_seed_yaml(),
+        l0_checker=lambda _s, _r: StageAResult(passed=True, prim_func=None, ledger=ledger),
+        l1_compiler=lambda _s, _r: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=tmp_path / "ckpt.json",
+    )
+    report = asyncio.run(runner.run())
+
+    assert report.total_rounds == 2
+    assert report.promotion_blocked is False
+    assert report.rounds[0].l3_resolution == L3Resolution.INFRA_DEFERRED.value
+    assert report.rounds[0].stagnation_rounds_after == 0
+    assert report.promoted_rounds == (2,)
+    assert "tile_m=32" in target_path.read_text(encoding="utf-8")
