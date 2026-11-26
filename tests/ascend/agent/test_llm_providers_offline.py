@@ -99,7 +99,6 @@ def test_http_factory_uses_role_models_timeouts_and_xhigh(monkeypatch: pytest.Mo
     )
     backend = create_llm_backend_from_env(settings)
     assert isinstance(backend, OpenAICompatHTTPBackend)
-    schema = {"type": "object"}
     roles = {
         "exploit_rule": ("fast-high", 17),
         "explore_creative": ("explore-xhigh", 55),
@@ -107,7 +106,7 @@ def test_http_factory_uses_role_models_timeouts_and_xhigh(monkeypatch: pytest.Mo
         "syntax_repair": ("repair", 17),
     }
     for role in roles:
-        request = GenerationRequest(role, "system", "user", schema, "xhigh")
+        request = GenerationRequest(role, "system", "user", effort="xhigh")
         assert request.effort == "xhigh"
         assert asyncio.run(backend.generate(request)) == "generation"
 
@@ -119,7 +118,6 @@ def test_http_factory_uses_role_models_timeouts_and_xhigh(monkeypatch: pytest.Mo
         assert body["model"] == model
         assert body["reasoning_effort"] == "xhigh"
         assert body["messages"][1] == {"role": "user", "content": "user"}
-        assert json.dumps(schema) in body["messages"][0]["content"]
         assert "tools" not in body
         assert "stream" not in body
         assert request.get_header("Accept") == "application/json"
@@ -567,8 +565,13 @@ def test_cli_backends_run_in_empty_isolated_temp_dir(
     observed = json.loads(raw)
     worker_cwd = Path(observed["cwd"]).resolve()
     assert observed["pwd"] == observed["cwd"]
-    assert observed["entries"] == []
-    assert observed["md_files"] == []
+    if backend_kind == "agy_cli":
+        assert observed["entries"] == [".agents"]
+        assert len(observed["md_files"]) == 1
+        assert observed["md_files"][0].endswith(".agents/rules/no_tools.md")
+    else:
+        assert observed["entries"] == []
+        assert observed["md_files"] == []
     assert observed["has_agents_md"] is False
     assert observed["has_claude_md"] is False
     assert worker_cwd != repo_root.resolve()

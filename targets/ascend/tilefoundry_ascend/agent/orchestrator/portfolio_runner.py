@@ -17,14 +17,16 @@ from tilefoundry_ascend.agent.kb.schema import (
     rank_symptom_families,
 )
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
-    CREATIVE_SOURCE_MAX_BYTES,
     _detect_trackb_prologue_line_offset,
     _find_python_cpp_literal_spans,
     _looks_like_python_primfunc_slice,
     build_trackb_context_view,
+    classify_stage_failure_for_repair,
     compact_creative_source_slice,
     extract_cpp_diagnostic_lines,
+    extract_repair_closure_slice,
     parse_scoped_search_replace_blocks,
+    split_tracka_editable_and_readonly_tail,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     FunnelEvaluation,
@@ -33,7 +35,6 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     extract_ordered_tensor_shapes,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
-    CREATIVE_RESPONSE_SCHEMA,
     AgyCliLLMBackend,
     GenerationRequest,
     KernelLLMBackend,
@@ -727,6 +728,40 @@ def _resolve_constraint_section(
     return f"{rendered}\n\n" if rendered else ""
 
 
+_TIR_SCOPE_CONTRACT = (
+    "### TIR SCOPE CONTRACT\n"
+    "- Never nest `def` (or `async def`) inside `@T.prim_func` — define any helper "
+    "function at outer module or builder scope with explicit parameters.\n"
+    "- Do NOT redefine read-only host tail bindings (`kernel`, `ref_kernel`, "
+    "`build_kernel`, `_ENTRY_CACHE`); the host splicer preserves `<read_only_host_tail>` verbatim.\n\n"
+)
+
+
+def _unified_reply_contract(fence_lang: str) -> str:
+    return (
+        "Output ONLY up to 2 leading metadata comment lines followed immediately by one fenced "
+        f"```{fence_lang} code block (no JSON wrapper, no extra prose):\n"
+        "# target_bottleneck: <BOTTLENECK_NAME>\n"
+        "# structural_hypothesis: <concise hypothesis>"
+    )
+
+
+def _format_source_and_readonly_tail(
+    source: str,
+    *,
+    fence_lang: str,
+    section_title: str = "### CURRENT KERNEL SOURCE",
+) -> str:
+    if fence_lang == "python":
+        editable, readonly_tail = split_tracka_editable_and_readonly_tail(source)
+        if editable.strip() and readonly_tail:
+            return (
+                f"{section_title}\n```python\n{editable.strip()}\n```\n\n"
+                f"<read_only_host_tail>\n{readonly_tail}\n</read_only_host_tail>\n"
+            )
+    return f"{section_title}\n```{fence_lang}\n{source.strip()}\n```\n"
+
+
 def build_exploit_request(
     parent: BeamCandidate,
     rule: AscendCausalRule,
@@ -740,10 +775,13 @@ def build_exploit_request(
     freedom_mask: ConstraintRelaxationMask | None = None,
 ) -> GenerationRequest:
     """Build causal-rule worker request under the 3-layer progressive constraint stack."""
+    fence_lang = (
+        "cpp" if get_dialect_surface(escalation_tier).dialect_id == "cce_cpp20" else "python"
+    )
     sys_prompt = (
         "You are an Ascend 950PR kernel optimization engineer. Apply the given causal rule "
         "faithfully to eliminate the bottleneck identified in the physical ledger while "
-        "preserving exact numerical equivalence. Output ONLY valid code."
+        f"preserving exact numerical equivalence. {_unified_reply_contract(fence_lang)}"
     )
     constraint_section = _resolve_constraint_section(
         parent,
@@ -760,11 +798,11 @@ def build_exploit_request(
             else str(rule.symptom_family)
         ),
     )
-    fence_lang = (
-        "cpp" if get_dialect_surface(escalation_tier).dialect_id == "cce_cpp20" else "python"
-    )
+    tir_scope_section = _TIR_SCOPE_CONTRACT if fence_lang == "python" else ""
+    source_section = _format_source_and_readonly_tail(parent.dsl_source, fence_lang=fence_lang)
     user_prompt = (
         f"{constraint_section}"
+        f"{tir_scope_section}"
         f"### SELECTED CAUSAL RULE\n"
         f"Rule ID: {rule.rule_id}\n"
         f"Precondition: {rule.precondition}\n"
@@ -772,13 +810,12 @@ def build_exploit_request(
         f"Expected Postcondition: {rule.expected_postcondition}\n\n"
         f"### OBJECTIVE PHYSICAL LEDGER\n{parent.ledger.to_json()}\n\n"
         f"### STATIC-DYNAMIC RESIDUAL\n{json.dumps(parent.residual.to_dict(), indent=2)}\n\n"
-        f"### CURRENT KERNEL SOURCE\n```{fence_lang}\n{parent.dsl_source}\n```\n"
+        f"{source_section}"
     )
     return GenerationRequest(
         role="exploit_rule",
         system_prompt=sys_prompt,
         user_prompt=user_prompt,
-        json_schema=None,
     )
 
 
@@ -797,14 +834,16 @@ def build_creative_request(
     sil_verification: object | None = None,
     freedom_mask: ConstraintRelaxationMask | None = None,
     focus_lines: Sequence[int] = (),
-    max_source_bytes: int = CREATIVE_SOURCE_MAX_BYTES,
 ) -> GenerationRequest:
     """Build rule-blind creative exploration request under 3-layer constraints."""
+    is_trackb = get_dialect_surface(escalation_tier).dialect_id == "cce_cpp20"
+    fence_lang = "cpp" if is_trackb else "python"
     sys_prompt = (
         "You are a first-principles Ascend 950PR (dav-3510) systems architect. Propose an "
         "architectural kernel optimization directly from hardware limits (1 AIC + 2 AIV coupled "
         "block, 3 KiB SSBUF, L0C->UB direct path, UB->L1 direct path, 16-entry MTE2 queue, "
-        "128 B/cycle FixPipe) and the physical telemetry below. Return JSON matching the schema."
+        "128 B/cycle FixPipe) and the physical telemetry below. "
+        f"{_unified_reply_contract(fence_lang)}"
     )
     constraint_section = _resolve_constraint_section(
         parent,
@@ -823,25 +862,25 @@ def build_creative_request(
         if prescreen_summary
         else ""
     )
-    bounded_source = compact_creative_source_slice(
+    scoped_source = compact_creative_source_slice(
         parent.dsl_source,
-        max_bytes=max_source_bytes,
         focus_lines=focus_lines,
     )
+    tir_scope_section = _TIR_SCOPE_CONTRACT if fence_lang == "python" else ""
+    source_section = _format_source_and_readonly_tail(scoped_source, fence_lang=fence_lang)
     user_prompt = (
         f"{constraint_section}"
+        f"{tir_scope_section}"
         f"{focus_section}"
         f"{prescreen_section}"
         f"### OBJECTIVE PHYSICAL LEDGER\n{parent.ledger.to_json()}\n\n"
         f"### STATIC-DYNAMIC RESIDUAL\n{json.dumps(parent.residual.to_dict(), indent=2)}\n\n"
-        f"### CURRENT KERNEL SOURCE\n```python\n{bounded_source}\n```\n"
+        f"{source_section}"
     )
-    is_trackb = get_dialect_surface(escalation_tier).dialect_id == "cce_cpp20"
     return GenerationRequest(
         role="escalate_trackb" if is_trackb else "explore_creative",
         system_prompt=sys_prompt,
         user_prompt=user_prompt,
-        json_schema=CREATIVE_RESPONSE_SCHEMA,
         effort=effort or "high",
     )
 
@@ -985,59 +1024,91 @@ def build_syntax_repair_request(
         sil_verification=sil_verification,
     )
     sil_block = f"{sil_text}\n\n" if sil_text else ""
+    closure = extract_repair_closure_slice(
+        dsl_source,
+        backend_kind=effective_tier,
+        diagnostic_text=error_message,
+    )
+    broken_src = closure.editable_device_source or dsl_source.strip()
     parent_block = ""
     stripped_parent = parent_source.strip()
     if stripped_parent:
-        if len(stripped_parent) > 16000:
-            trunc_marker = "\n/* ... parent source truncated ... */" if is_cpp else "\n..."
-            keep_len = max(0, 16000 - len(trunc_marker))
-            bounded_parent = stripped_parent[:keep_len].rstrip() + trunc_marker
-        else:
-            bounded_parent = stripped_parent
-        parent_block = (
-            f"### PARENT AUTHORIZED SOURCE\n```{fence_lang}\n{bounded_parent}\n```\n\n"
+        parent_closure = extract_repair_closure_slice(
+            stripped_parent,
+            backend_kind=effective_tier,
+            diagnostic_text=error_message,
         )
+        parent_src = parent_closure.editable_device_source or stripped_parent
+        parent_block = (
+            f"### PARENT AUTHORIZED SOURCE\n```{fence_lang}\n{parent_src}\n```\n\n"
+        )
+    sibling_block = ""
+    if closure.sibling_prototypes:
+        proto_lines = "\n".join(closure.sibling_prototypes)
+        sibling_block = f"### READ-ONLY SIBLING PROTOTYPES\n{proto_lines}\n\n"
+    abi_tail_block = ""
+    if closure.readonly_host_abi_tail:
+        if is_cpp:
+            abi_lang = "python" if "def " in closure.readonly_host_abi_tail else "cpp"
+            abi_tail_block = (
+                f"### HOST-DEVICE ABI SLICE (READ-ONLY)\n"
+                f"```{abi_lang}\n{closure.readonly_host_abi_tail}\n```\n\n"
+            )
+        else:
+            abi_tail_block = (
+                f"<read_only_host_tail>\n{closure.readonly_host_abi_tail}\n"
+                "</read_only_host_tail>\n\n"
+            )
     lowered_block = ""
     stripped_lowered = lowered_excerpt.strip()
     stripped_broken = dsl_source.strip()
-    if stripped_lowered and stripped_lowered not in stripped_broken:
-        if len(stripped_lowered) > 2400:
-            trunc_marker = "\n/* ... lowered excerpt truncated ... */"
-            keep_len = max(0, 2400 - len(trunc_marker))
-            bounded_excerpt = stripped_lowered[:keep_len].rstrip() + trunc_marker
-        else:
-            bounded_excerpt = stripped_lowered
+    if stripped_lowered and stripped_lowered not in stripped_broken and stripped_lowered not in broken_src:
         if lowered_excerpt_lang in ("cpp", "python"):
             excerpt_fence = str(lowered_excerpt_lang)
         elif (
-            "@T.prim_func" in bounded_excerpt
-            or "I.ir_module" in bounded_excerpt
-            or ("def " in bounded_excerpt and "#include" not in bounded_excerpt)
+            "@T.prim_func" in stripped_lowered
+            or "I.ir_module" in stripped_lowered
+            or ("def " in stripped_lowered and "#include" not in stripped_lowered)
         ):
             excerpt_fence = "python"
         else:
             excerpt_fence = "cpp"
         lowered_block = (
             f"### COMPILER LOWERED EXCERPT (READ-ONLY CONTEXT)\n"
-            f"```{excerpt_fence}\n{bounded_excerpt}\n```\n\n"
+            f"```{excerpt_fence}\n{stripped_lowered}\n```\n\n"
         )
+    tir_scope_section = _TIR_SCOPE_CONTRACT if not is_cpp else ""
     user_prompt = (
         f"{layer1_text}\n\n"
         f"### VALID TARGET DIALECT PRIMITIVES ({effective_surface.dialect_id})\n"
         f"{layer2_text}\n\n"
+        f"{tir_scope_section}"
         f"{g5_lock_text}\n\n"
         f"{sil_block}"
         f"{parent_block}"
         f"### COMPILER / GATE DIAGNOSTIC\n{error_message}\n\n"
         f"{lowered_block}"
-        f"### BROKEN KERNEL SOURCE\n```{fence_lang}\n{dsl_source}\n```\n"
+        f"{sibling_block}"
+        f"{abi_tail_block}"
+        f"### BROKEN KERNEL SOURCE\n```{fence_lang}\n{broken_src}\n```\n"
     )
     return GenerationRequest(
         role="syntax_repair",
         system_prompt=sys_prompt,
         user_prompt=user_prompt,
-        json_schema=None,
     )
+
+
+def _resolve_evaluation_failure_code(evaluation: FunnelEvaluation) -> str:
+    direct = str(getattr(evaluation, "fault_code", "") or "").strip()
+    if direct:
+        return direct
+    if evaluation.failed_stage == "stage_b" and evaluation.stage_b is not None:
+        sb_code = str(getattr(evaluation.stage_b, "fault_code", "") or "").strip()
+        if sb_code:
+            return sb_code
+    sa_code = str(getattr(evaluation.stage_a, "fault_code", "") or "").strip()
+    return sa_code
 
 
 class PortfolioRunner:
@@ -1067,6 +1138,17 @@ class PortfolioRunner:
         self._enable_tilesize_prescreen = bool(enable_tilesize_prescreen)
         self._cost_model = cost_model
         self._cost_model_mode = str(cost_model_mode).strip().lower() or "off"
+        self._pending_speculative_creative: (
+            asyncio.Task[tuple[BeamCandidate | None, bool, tuple[str, str, str] | None, bool]]
+            | None
+        ) = None
+
+    def cancel_pending_speculative(self) -> None:
+        """Cancel any in-flight speculative creative task and clear the pending slot."""
+        pending = self._pending_speculative_creative
+        self._pending_speculative_creative = None
+        if pending is not None and not pending.done():
+            pending.cancel()
 
     @property
     def beam(self) -> TwoLaneBeamSearch:
@@ -1149,6 +1231,7 @@ class PortfolioRunner:
                 ctx,
                 top_k=self._k_rules,
                 topology_axes=active_axes,
+                runtime_backend=escalation_tier,
                 symptom_ranking=symptom_ranking,
             )
         )
@@ -1342,75 +1425,80 @@ class PortfolioRunner:
         )
         if not evaluation.passed and evaluation.failed_stage in ("stage_a", "stage_b"):
             parent_dsl = spec.parent_candidate.dsl_source
-            for _ in range(self._max_repairs):
-                lowered_excerpt, lowered_excerpt_lang = extract_lowered_compiler_excerpt_with_lang(
-                    evaluation.stage_b
-                )
-                repair_src = dsl_source
-                repair_req = build_syntax_repair_request(
-                    repair_src,
-                    evaluation.error_message,
-                    sil_advisory=sil_advisory,
-                    sil_verification=sil_verification,
-                    backend_kind=escalation_tier,
-                    parent_source=parent_dsl,
-                    freedom_mask=freedom_mask,
-                    ub_256kb_unlock=bool(spec.parent_candidate.ledger.uses_unreserved_ubuf),
-                    topology_axes=active_axes,
-                    case_ratios=case_ratios,
-                    lowered_excerpt=lowered_excerpt,
-                    lowered_excerpt_lang=lowered_excerpt_lang,
-                )
-                try:
-                    repaired_raw = await self._backend.generate(repair_req)
-                except Exception as exc:
-                    return None, repaired, (spec.worker_id, "llm_transport", str(exc)[-400:]), False
-                try:
-                    dsl_source = extract_python_dsl(repaired_raw)
-                except Exception as exc:
-                    if spec.rule is not None:
-                        self._tracker.record_outcome(
-                            spec.rule.rule_id,
-                            postcondition_realized=False,
-                            topology_axes=active_axes,
-                        )
-                    return None, repaired, (spec.worker_id, "llm_parse", str(exc)[-400:]), False
-                if parent_dsl.strip():
-                    violations = check_repair_monotonicity(
-                        parent_dsl,
-                        dsl_source,
-                        backend_kind=escalation_tier,
+            failure_code = _resolve_evaluation_failure_code(evaluation)
+            if classify_stage_failure_for_repair(failure_code):
+                for _ in range(self._max_repairs):
+                    lowered_excerpt, lowered_excerpt_lang = (
+                        extract_lowered_compiler_excerpt_with_lang(evaluation.stage_b)
                     )
-                    if violations:
+                    repair_src = dsl_source
+                    repair_req = build_syntax_repair_request(
+                        repair_src,
+                        evaluation.error_message,
+                        sil_advisory=sil_advisory,
+                        sil_verification=sil_verification,
+                        backend_kind=escalation_tier,
+                        parent_source=parent_dsl,
+                        freedom_mask=freedom_mask,
+                        ub_256kb_unlock=bool(spec.parent_candidate.ledger.uses_unreserved_ubuf),
+                        topology_axes=active_axes,
+                        case_ratios=case_ratios,
+                        lowered_excerpt=lowered_excerpt,
+                        lowered_excerpt_lang=lowered_excerpt_lang,
+                    )
+                    try:
+                        repaired_raw = await self._backend.generate(repair_req)
+                    except Exception as exc:
+                        return None, repaired, (spec.worker_id, "llm_transport", str(exc)[-400:]), False
+                    try:
+                        dsl_source = extract_python_dsl(repaired_raw)
+                    except Exception as exc:
                         if spec.rule is not None:
                             self._tracker.record_outcome(
                                 spec.rule.rule_id,
                                 postcondition_realized=False,
                                 topology_axes=active_axes,
                             )
-                        return (
-                            None,
-                            repaired,
-                            (
-                                spec.worker_id,
-                                "repair_monotonicity_violation",
-                                "; ".join(violations),
-                            ),
-                            False,
+                        return None, repaired, (spec.worker_id, "llm_parse", str(exc)[-400:]), False
+                    if parent_dsl.strip():
+                        violations = check_repair_monotonicity(
+                            parent_dsl,
+                            dsl_source,
+                            backend_kind=escalation_tier,
                         )
-                repaired = True
-                evaluation = self._funnel.evaluate(
-                    dsl_source,
-                    factory_name=factory_name,
-                    factory_kwargs=factory_kwargs,
-                    config_selector_name=config_selector_name,
-                    dims=dims,
-                    var_bindings=var_bindings,
-                    roofline=spec.roofline,
-                    ordered_tensor_shapes=resolved_shapes,
-                )
-                if evaluation.passed:
-                    break
+                        if violations:
+                            if spec.rule is not None:
+                                self._tracker.record_outcome(
+                                    spec.rule.rule_id,
+                                    postcondition_realized=False,
+                                    topology_axes=active_axes,
+                                )
+                            return (
+                                None,
+                                repaired,
+                                (
+                                    spec.worker_id,
+                                    "repair_monotonicity_violation",
+                                    "; ".join(violations),
+                                ),
+                                False,
+                            )
+                    repaired = True
+                    evaluation = self._funnel.evaluate(
+                        dsl_source,
+                        factory_name=factory_name,
+                        factory_kwargs=factory_kwargs,
+                        config_selector_name=config_selector_name,
+                        dims=dims,
+                        var_bindings=var_bindings,
+                        roofline=spec.roofline,
+                        ordered_tensor_shapes=resolved_shapes,
+                    )
+                    if evaluation.passed:
+                        break
+                    next_code = _resolve_evaluation_failure_code(evaluation)
+                    if not classify_stage_failure_for_repair(next_code):
+                        break
 
         if not evaluation.passed or evaluation.stage_a.ledger is None:
             if spec.rule is not None:
@@ -1629,9 +1717,55 @@ class PortfolioRunner:
                 ordered_tensor_shapes=resolved_shapes,
             )
 
-        outcomes = await asyncio.gather(
-            *(_staggered_worker(idx, spec) for idx, spec in enumerate(specs))
-        )
+        outcomes: list[tuple[BeamCandidate | None, bool, tuple[str, str, str] | None, bool]] = []
+        if self._pending_speculative_creative is not None and self._pending_speculative_creative.done():
+            done_task = self._pending_speculative_creative
+            self._pending_speculative_creative = None
+            if not done_task.cancelled():
+                outcomes.append(await done_task)
+
+        exploit_specs = [s for s in specs if s.worker_kind != "creative_explore"]
+        creative_specs = [s for s in specs if s.worker_kind == "creative_explore"]
+        if not exploit_specs:
+            pending_tasks: list[
+                asyncio.Task[tuple[BeamCandidate | None, bool, tuple[str, str, str] | None, bool]]
+            ] = []
+            if self._pending_speculative_creative is not None:
+                pending_tasks.append(self._pending_speculative_creative)
+                self._pending_speculative_creative = None
+            sync_results = await asyncio.gather(
+                *pending_tasks,
+                *(_staggered_worker(idx, spec) for idx, spec in enumerate(creative_specs)),
+            )
+            outcomes.extend(sync_results)
+        else:
+            sync_specs: list[tuple[int, WorkerSpec]] = [
+                (idx, spec) for idx, spec in enumerate(exploit_specs)
+            ]
+            if creative_specs:
+                if self._pending_speculative_creative is None:
+                    self._pending_speculative_creative = asyncio.create_task(
+                        _staggered_worker(len(exploit_specs), creative_specs[0])
+                    )
+                for extra_idx, extra_spec in enumerate(creative_specs[1:], start=1):
+                    sync_specs.append((len(exploit_specs) + extra_idx, extra_spec))
+            sync_outcomes = await asyncio.gather(
+                *(_staggered_worker(slot_idx, spec) for slot_idx, spec in sync_specs)
+            )
+            outcomes.extend(sync_outcomes)
+            if (
+                self._pending_speculative_creative is not None
+                and not self._pending_speculative_creative.done()
+            ):
+                await asyncio.sleep(0)
+            if (
+                self._pending_speculative_creative is not None
+                and self._pending_speculative_creative.done()
+            ):
+                done_task = self._pending_speculative_creative
+                self._pending_speculative_creative = None
+                if not done_task.cancelled():
+                    outcomes.append(await done_task)
 
         report = PortfolioRoundReport(round_idx=round_idx, spawned_workers=specs)
         saw_proxy = False

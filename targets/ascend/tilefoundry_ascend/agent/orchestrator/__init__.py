@@ -24,7 +24,6 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     synthesize_pybind_extension_wrapper,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
-    CREATIVE_RESPONSE_SCHEMA,
     RE_503_CAPACITY,
     RE_STREAM_IDLE_LOG,
     AgyCliLLMBackend,
@@ -77,7 +76,6 @@ from tilefoundry_ascend.agent.orchestrator.twin_bridge import (
 __all__ = [
     "AgyCliLLMBackend",
     "BeamCandidate",
-    "CREATIVE_RESPONSE_SCHEMA",
     "EvolutionRoundRecord",
     "EvolutionTrajectory",
     "FunnelEvaluation",

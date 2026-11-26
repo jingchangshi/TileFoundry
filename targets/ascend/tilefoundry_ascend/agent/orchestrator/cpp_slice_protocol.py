@@ -113,18 +113,123 @@ def extract_cpp_diagnostic_lines(diagnostic_text: str) -> tuple[int, ...]:
     return tuple(sorted(lines))
 
 
-def extract_trackb_launcher_preview(module_source: str, *, max_bytes: int = 1600) -> str:
-    """Extract compact C++ extern-C launcher stubs and host binding lines from *module_source*."""
+DEFAULT_PROTECTED_EXPORTS: frozenset[str] = frozenset(
+    {"kernel", "ref_kernel", "build_kernel", "_ENTRY_CACHE", "__all__"}
+)
+
+_NON_REPAIRABLE_FAILURE_CODES: frozenset[str] = frozenset(
+    {
+        "NOOP_IDENTICAL",
+        "UB_SRAM_OVERFLOW",
+        "UB_OVERFLOW",
+        "L1_SRAM_OVERFLOW",
+        "L0C_SRAM_OVERFLOW",
+        "VF_STACK_OVERFLOW",
+    }
+)
+
+
+@dataclass(frozen=True)
+class RepairClosureSlice:
+    """Self-contained repair context spanning active device call-graph and host ABI."""
+
+    editable_device_source: str
+    sibling_prototypes: tuple[str, ...]
+    readonly_host_abi_tail: str
+    diagnostic_excerpt: str
+
+
+def classify_stage_failure_for_repair(failure_code: str) -> bool:
+    """Return True only when syntactic or API repair can resolve the failure."""
+    return str(failure_code or "").strip().upper() not in _NON_REPAIRABLE_FAILURE_CODES
+
+
+def _extract_top_level_bound_names(node: ast.stmt) -> set[str]:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return {node.name}
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return {node.target.id}
+    if isinstance(node, ast.Assign):
+        return {t.id for t in node.targets if isinstance(t, ast.Name)}
+    return set()
+
+
+def split_tracka_editable_and_readonly_tail(
+    module_source: str,
+    protected_exports: frozenset[str] = DEFAULT_PROTECTED_EXPORTS,
+) -> tuple[str, str]:
+    """Separate editable kernel builders from protected module-tail bindings."""
+    if not module_source.strip():
+        return "", ""
+    lines = module_source.splitlines(keepends=True)
+    split_lineno = len(lines) + 1
+    try:
+        tree = ast.parse(module_source)
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.FunctionDef, ast.AsyncFunctionDef)):
+                names = _extract_top_level_bound_names(node)
+                if names & protected_exports:
+                    decs = getattr(node, "decorator_list", ())
+                    node_start = min((d.lineno for d in decs), default=node.lineno)
+                    split_lineno = min(split_lineno, node_start)
+                    break
+    except SyntaxError:
+        escaped = "|".join(re.escape(name) for name in sorted(protected_exports))
+        if escaped:
+            tail_re = re.compile(
+                rf"^(?:(?:async\s+)?def\s+(?:{escaped})\b|(?:{escaped})\s*[:=])"
+            )
+            for idx, raw_line in enumerate(lines, start=1):
+                if tail_re.match(raw_line):
+                    split_lineno = idx
+                    break
+    if split_lineno > len(lines):
+        return module_source.rstrip() + "\n", ""
+    editable = "".join(lines[: split_lineno - 1]).rstrip()
+    editable_out = f"{editable}\n" if editable else ""
+    readonly_tail = "".join(lines[split_lineno - 1 :]).strip()
+    return editable_out, readonly_tail
+
+
+def extract_trackb_launcher_preview(
+    module_source: str,
+    *,
+    max_bytes: int | None = None,
+) -> str:
+    """Extract C++ extern-C launcher stubs and host binding lines without byte truncation."""
+    _ = max_bytes
     if not module_source.strip():
         return ""
     previews: list[str] = []
-    for match in re.finditer(
-        r'extern\s+"C"\s+[\s\S]{0,1200}?\n\}',
-        module_source,
-    ):
-        snippet = match.group(0).strip()
-        if snippet and snippet not in previews:
-            previews.append(snippet)
+    if any(tok in module_source for tok in _TRACKB_CPP_QUALIFIERS) or 'extern "C"' in module_source:
+        _, units = _split_cpp_units(module_source)
+        host_units, _ = _host_launcher_units(units)
+        for unit in host_units:
+            snippet = unit.text.strip()
+            if snippet and snippet not in previews:
+                previews.append(snippet)
+
+    if not previews:
+        for match in re.finditer(r'extern\s+"C"\s+', module_source):
+            start = match.start()
+            brace_open = module_source.find("{", start)
+            if brace_open < 0:
+                continue
+            depth = 0
+            end = -1
+            for idx in range(brace_open, len(module_source)):
+                ch = module_source[idx]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = idx + 1
+                        break
+            if end > start:
+                snippet = module_source[start:end].strip()
+                if snippet and snippet not in previews:
+                    previews.append(snippet)
 
     if not previews:
         try:
@@ -141,11 +246,7 @@ def extract_trackb_launcher_preview(module_source: str, *, max_bytes: int = 1600
         except SyntaxError:
             pass
 
-    joined = "\n\n".join(previews).strip()
-    if len(joined.encode("utf-8")) > max_bytes:
-        joined = joined.encode("utf-8")[: max_bytes - 32].decode("utf-8", errors="ignore")
-        joined = joined.rstrip() + "\n/* ... launcher preview truncated ... */"
-    return joined
+    return "\n\n".join(previews).strip()
 
 
 def resolve_instantiated_trackb_kernel(
@@ -812,8 +913,6 @@ def escalate_primfunc_to_trackb_tu(prim_func: object) -> str:
     return kernel_src
 
 
-CREATIVE_SOURCE_MAX_BYTES = 14_336
-
 _TRACKB_CPP_QUALIFIERS: tuple[str, ...] = (
     'extern "C" __global__',
     "__global__",
@@ -1012,176 +1111,18 @@ def _looks_like_python_primfunc_slice(source: str) -> bool:
     )
 
 
-def _is_active_python_fn(
-    node: ast.FunctionDef | ast.AsyncFunctionDef,
-    *,
-    source: str,
-    focus_lines: Sequence[int],
-    active_kernel: str | None,
-) -> bool:
-    if active_kernel and node.name == active_kernel:
-        return True
-    end_ln = node.end_lineno or node.lineno
-    if any(node.lineno <= fl <= end_ln for fl in focus_lines):
-        return True
-    if node.name in ("main", "kernel", "make_kernel") or node.name.startswith("_select_"):
-        return True
-    seg = ast.get_source_segment(source, node) or ""
-    return any(
-        tok in seg
-        for tok in ("@T.prim_func", "T.Kernel(", "T.MixedKernel(", "T.Persistent(")
-    )
-
-
-def _fold_cold_stmt_spans(
-    stmts: Sequence[ast.stmt],
-    *,
-    focus_lines: Sequence[int],
-    window: int,
-    replacements: list[tuple[int, int, str]],
-    lines: Sequence[str],
-) -> None:
-    if len(stmts) <= 4:
-        return
-    cold_run: list[ast.stmt] = []
-
-    def _flush() -> None:
-        if len(cold_run) < 2:
-            cold_run.clear()
-            return
-        first = cold_run[0]
-        last = cold_run[-1]
-        start_ln = first.lineno
-        end_ln = last.end_lineno or last.lineno
-        indent = " " * first.col_offset
-        marker = (
-            f"{indent}# [READ-ONLY COLD BLOCK FOLDED ({len(cold_run)} statements)]\n"
-            f"{indent}...\n"
-        )
-        replacements.append((start_ln, end_ln, marker))
-        cold_run.clear()
-
-    for idx, stmt in enumerate(stmts):
-        s_ln = stmt.lineno
-        e_ln = stmt.end_lineno or s_ln
-        is_edge = idx == 0 or idx == len(stmts) - 1
-        near_focus = any(s_ln - window <= fl <= e_ln + window for fl in focus_lines)
-        is_structural = isinstance(
-            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Return, ast.With, ast.AsyncWith)
-        )
-        if is_edge or near_focus or is_structural:
-            _flush()
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.With, ast.AsyncWith)):
-                _fold_cold_stmt_spans(
-                    stmt.body,
-                    focus_lines=focus_lines,
-                    window=window,
-                    replacements=replacements,
-                    lines=lines,
-                )
-            elif isinstance(stmt, ast.For):
-                _fold_cold_stmt_spans(
-                    stmt.body,
-                    focus_lines=focus_lines,
-                    window=window,
-                    replacements=replacements,
-                    lines=lines,
-                )
-        else:
-            cold_run.append(stmt)
-    _flush()
-
-
-def _compact_python_source_slice(
-    source: str,
-    *,
-    max_bytes: int,
-    focus_lines: Sequence[int] = (),
-    active_kernel: str | None = None,
-) -> str:
-    if len(source.encode("utf-8")) <= max_bytes:
-        return source
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        encoded = source.encode("utf-8")[: max(128, max_bytes - 32)]
-        return encoded.decode("utf-8", errors="ignore").rstrip() + "\n# ...\n"
-
-    lines = source.splitlines(keepends=True)
-    inactive_repls: list[tuple[int, int, str]] = []
-    active_fns: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if _is_active_python_fn(
-                node,
-                source=source,
-                focus_lines=focus_lines,
-                active_kernel=active_kernel,
-            ):
-                active_fns.append(node)
-            elif node.body:
-                b_start = node.body[0].lineno
-                b_end = node.end_lineno or node.body[-1].end_lineno or b_start
-                indent = " " * max(4, node.body[0].col_offset)
-                stub = (
-                    f"{indent}# [READ-ONLY HELPER FOLDED TO FIT <=14KB BUDGET]\n"
-                    f"{indent}...\n"
-                )
-                inactive_repls.append((b_start, b_end, stub))
-
-    def _apply_line_replacements(repls: Sequence[tuple[int, int, str]]) -> str:
-        if not repls:
-            return source
-        buf = list(lines)
-        for s_ln, e_ln, text in sorted(repls, key=lambda item: item[0], reverse=True):
-            buf[s_ln - 1 : e_ln] = [text]
-        return "".join(buf)
-
-    updated = _apply_line_replacements(inactive_repls)
-    if len(updated.encode("utf-8")) <= max_bytes:
-        ast.parse(updated)
-        return updated
-
-    for window in (15, 6, 1, 0):
-        stmt_repls = list(inactive_repls)
-        for fn in active_fns:
-            _fold_cold_stmt_spans(
-                fn.body,
-                focus_lines=focus_lines,
-                window=window,
-                replacements=stmt_repls,
-                lines=lines,
-            )
-        cand = _apply_line_replacements(stmt_repls)
-        if len(cand.encode("utf-8")) <= max_bytes:
-            ast.parse(cand)
-            return cand
-        updated = cand
-
-    lines_out = updated.splitlines(keepends=True)
-    while len("".join(lines_out).encode("utf-8")) > max_bytes and len(lines_out) > 2:
-        lines_out.pop()
-    trimmed = "".join(lines_out)
-    try:
-        ast.parse(trimmed)
-        return trimmed
-    except SyntaxError:
-        return trimmed
-
-
 def compact_creative_source_slice(
     source: str,
     *,
-    max_bytes: int = CREATIVE_SOURCE_MAX_BYTES,
+    max_bytes: int | None = None,
     focus_lines: Sequence[int] = (),
     diagnostic_text: str = "",
     active_kernel: str | None = None,
     parent_source: str = "",
     prologue_line_offset: int = 0,
 ) -> str:
-    """Scope Track-B C++ sources losslessly or fold oversized pure-Python parent sources."""
-    if len(source.encode("utf-8")) <= max_bytes:
-        return source
+    """Scope Track-B C++ sources losslessly without hardcoded byte truncation."""
+    _ = max_bytes
     if any(tok in source for tok in _TRACKB_CPP_QUALIFIERS):
         return _scope_trackb_python_or_cpp(
             source,
@@ -1191,19 +1132,570 @@ def compact_creative_source_slice(
             focus_lines=focus_lines,
             active_kernel=active_kernel,
         )
-    return _compact_python_source_slice(
-        source,
-        max_bytes=max_bytes,
-        focus_lines=focus_lines,
-        active_kernel=active_kernel,
+    return source
+
+
+def _score_name_for_regime(name: str, regime_tag: str) -> int:
+    tag = regime_tag.strip().lower()
+    if not tag:
+        return 0
+    low = name.lower()
+    if tag in low:
+        return 100 + len(tag)
+    long_tokens = [tok for tok in re.split(r"[^a-z0-9]+", tag) if len(tok) >= 3]
+    word_tokens = [tok for tok in re.split(r"[^a-z0-9]+", tag) if len(tok) >= 2]
+    name_words = set(re.split(r"[^a-z0-9]+", low))
+    score = sum(10 + len(tok) for tok in long_tokens if tok in low)
+    score += sum(3 for tok in word_tokens if tok in name_words)
+    return score
+
+
+def _py_node_source_slice(lines: Sequence[str], node: ast.stmt) -> str:
+    decs = getattr(node, "decorator_list", ())
+    start = min((d.lineno for d in decs), default=node.lineno)
+    end = node.end_lineno or node.lineno
+    return "".join(lines[start - 1 : end]).rstrip()
+
+
+def _format_python_prototype(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+    args_src = ast.unparse(node.args)
+    ret_src = f" -> {ast.unparse(node.returns)}" if node.returns is not None else ""
+    return f"{prefix} {node.name}({args_src}){ret_src}: ..."
+
+
+def _extract_python_diag_lines(diagnostic_text: str) -> tuple[int, ...]:
+    lines = set(extract_cpp_diagnostic_lines(diagnostic_text))
+    if diagnostic_text:
+        for match in re.finditer(r":(\d+)(?::\d+)?\b", diagnostic_text):
+            ln = int(match.group(1))
+            if ln > 0:
+                lines.add(ln)
+    return tuple(sorted(lines))
+
+
+def _resolve_active_kernel_from_diagnostics(
+    units: Sequence[_CppUnit],
+    diag_lines: Sequence[int],
+    helpers_by_name: Mapping[str, _CppUnit],
+) -> str | None:
+    if not diag_lines:
+        return None
+    kernels = [u for u in units if u.kind == "kernel" and u.name]
+    for ln in diag_lines:
+        for kernel in kernels:
+            if kernel.start_line <= ln <= kernel.end_line:
+                return kernel.name
+    for ln in diag_lines:
+        for helper in helpers_by_name.values():
+            if helper.start_line <= ln <= helper.end_line and helper.name:
+                for kernel in kernels:
+                    if helper.name in _helper_call_closure(kernel, helpers_by_name):
+                        return kernel.name
+    return None
+
+
+def _extract_cpp_closure_parts(
+    cpp_source: str,
+    *,
+    active_kernel: str | None = None,
+    regime_tag: str = "",
+    module_source: str = "",
+    diagnostic_lines: Sequence[int] = (),
+) -> tuple[str, tuple[str, ...], str]:
+    clean_cpp = strip_markdown_fence_lines(cpp_source)
+    _, units = _split_cpp_units(clean_cpp)
+    kernels = [u for u in units if u.kind == "kernel" and u.name]
+    helpers = [u for u in units if u.kind == "helper"]
+    helpers_by_name = {h.name: h for h in helpers if h.name}
+    host_launchers, _ = _host_launcher_units(units)
+    host_launcher_starts = {u.start_char for u in host_launchers}
+
+    target_name = active_kernel
+    if target_name is None:
+        target_name = _resolve_active_kernel_from_diagnostics(
+            units, diagnostic_lines, helpers_by_name
+        )
+    if target_name is None:
+        target_name = select_active_trackb_kernel(
+            clean_cpp,
+            regime_tag=regime_tag,
+            module_source=module_source,
+        )
+    if target_name is None and kernels:
+        target_name = kernels[0].name
+
+    target_unit = next((u for u in kernels if u.name == target_name), None)
+    if target_unit is None and target_name is not None:
+        target_unit = next((u for u in units if u.name == target_name), None)
+
+    directives = _extract_directive_lines(clean_cpp, units)
+    if target_unit is None:
+        device_parts = ["\n".join(text for _, text in directives)] if directives else []
+        for unit in units:
+            if unit.start_char in host_launcher_starts:
+                continue
+            txt = unit.text.strip()
+            if txt:
+                device_parts.append(txt)
+        host_tail = "\n\n".join(u.text.strip() for u in host_launchers if u.text.strip())
+        return "\n\n".join(p for p in device_parts if p).strip(), (), host_tail
+
+    reached_names = _helper_call_closure(target_unit, helpers_by_name)
+    entries: list[tuple[int, str, object]] = []
+    for d_lineno, d_text in directives:
+        entries.append((d_lineno, "directive", d_text))
+    sibling_protos: list[str] = []
+    for unit in units:
+        if unit.start_char in host_launcher_starts:
+            continue
+        if unit.kind == "global_decl":
+            entries.append((unit.start_line, "unit", unit))
+        elif unit.kind == "helper":
+            if unit.start_char == target_unit.start_char or (
+                unit.name and unit.name in reached_names
+            ):
+                entries.append((unit.start_line, "unit", unit))
+            else:
+                sig = unit.signature.rstrip(";").strip()
+                if sig:
+                    sibling_protos.append(f"{sig};")
+        elif unit.kind == "kernel":
+            if unit.start_char == target_unit.start_char:
+                entries.append((unit.start_line, "unit", unit))
+            else:
+                sig = unit.signature.rstrip(";").strip()
+                decl = f"{sig};" if sig else f"void {unit.name}();"
+                sibling_protos.append(decl)
+
+    entries.sort(key=lambda item: item[0])
+    device_lines: list[str] = []
+    prev_kind = ""
+    for _, kind, payload in entries:
+        if kind == "directive":
+            if device_lines and prev_kind != "directive":
+                device_lines.append("")
+            assert isinstance(payload, str)
+            device_lines.append(payload)
+        else:
+            assert isinstance(payload, _CppUnit)
+            if device_lines:
+                device_lines.append("")
+            device_lines.append(payload.text.strip())
+        prev_kind = kind
+
+    host_tail = "\n\n".join(u.text.strip() for u in host_launchers if u.text.strip())
+    return "\n".join(device_lines).strip(), tuple(sibling_protos), host_tail
+
+
+def _is_dead_tracka_builder(name: str, seg: str) -> bool:
+    if "@T.prim_func" in seg:
+        return True
+    if name.startswith("_build_") and "trackb" not in name.lower():
+        if not any(
+            tok in seg
+            for tok in ("compile_ascend", "_render_", 'extern "C"', "ctypes", "<<<", "TilingData")
+        ):
+            return True
+    return False
+
+
+def _is_host_abi_seed(name: str, seg: str) -> bool:
+    if name == "_render_trackb_tu" or name.startswith("_render_"):
+        return True
+    if "trackb" in name.lower() or "workspace" in name.lower():
+        return True
+    if name.startswith(("_select_", "select_")):
+        return True
+    return any(
+        tok in seg
+        for tok in ('extern "C"', "<<<", "TilingData", "block_dim", "compile_ascend", "ctypes")
+    )
+
+
+def _extract_hybrid_trackb_repair_closure(
+    module_source: str,
+    tree: ast.Module,
+    cpp_spans: Sequence[tuple[str, str, int, int]],
+    *,
+    active_symbols: Sequence[str],
+    regime_tag: str,
+    diagnostic_text: str,
+    protected_exports: frozenset[str],
+) -> RepairClosureSlice:
+    lines = module_source.splitlines(keepends=True)
+    funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    assigns: dict[str, ast.stmt] = {}
+    ordered_defs: list[tuple[str, str]] = []
+    cpp_names = {name for name, _, _, _ in cpp_spans}
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs[node.name] = node
+            ordered_defs.append(("func", node.name))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for bname in _extract_top_level_bound_names(node):
+                assigns[bname] = node
+                ordered_defs.append(("assign", bname))
+
+    active_sym_set = set(active_symbols)
+    picked_span = next((s for s in cpp_spans if s[0] in active_sym_set), None)
+    if picked_span is None and regime_tag:
+        picked_span = max(
+            cpp_spans,
+            key=lambda s: _score_name_for_regime(s[0], regime_tag),
+        )
+    if picked_span is None:
+        picked_span = cpp_spans[0]
+    active_cpp_name, active_cpp_text, _, _ = picked_span
+
+    prologue_offset = _detect_trackb_prologue_line_offset(module_source)
+    raw_diag_lines = extract_cpp_diagnostic_lines(diagnostic_text)
+    adj_diag_lines = (
+        tuple(ln - prologue_offset for ln in raw_diag_lines if ln > prologue_offset)
+        if prologue_offset > 0
+        else raw_diag_lines
+    )
+    explicit_kernel = next(
+        (sym for sym in active_symbols if sym not in cpp_names and sym not in funcs),
+        None,
+    )
+    editable_cpp, cpp_protos, cpp_host_tail = _extract_cpp_closure_parts(
+        active_cpp_text,
+        active_kernel=explicit_kernel,
+        regime_tag=regime_tag,
+        module_source=module_source,
+        diagnostic_lines=adj_diag_lines,
+    )
+
+    fn_segments = {name: _py_node_source_slice(lines, node) for name, node in funcs.items()}
+    dead_tracka = {
+        name for name, seg in fn_segments.items() if _is_dead_tracka_builder(name, seg)
+    }
+
+    abi_seeds: list[str] = []
+    selector_names: list[str] = [
+        name for name in funcs if name.startswith(("_select_", "select_")) and name not in dead_tracka
+    ]
+    matched_selectors = (
+        [name for name in selector_names if _score_name_for_regime(name, regime_tag) > 0]
+        if regime_tag
+        else []
+    )
+    kept_selectors = set(matched_selectors or selector_names)
+
+    for name, seg in fn_segments.items():
+        if name in dead_tracka:
+            continue
+        if name.startswith(("_select_", "select_")) and name not in kept_selectors:
+            continue
+        if name in active_sym_set or _is_host_abi_seed(name, seg):
+            abi_seeds.append(name)
+
+    abi_visited: set[str] = set()
+    queue = list(abi_seeds)
+    while queue:
+        sym = queue.pop(0)
+        if sym in abi_visited or sym in dead_tracka or sym in cpp_names:
+            continue
+        node = funcs.get(sym) or assigns.get(sym)
+        if node is None:
+            continue
+        abi_visited.add(sym)
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name):
+                ref = sub.id
+                if (
+                    ref not in abi_visited
+                    and ref not in dead_tracka
+                    and ref not in cpp_names
+                    and (ref in funcs or ref in assigns)
+                ):
+                    if ref.startswith(("_select_", "select_")) and ref not in kept_selectors:
+                        continue
+                    queue.append(ref)
+
+    for kind, name in ordered_defs:
+        if kind == "assign" and name in protected_exports and name not in abi_visited:
+            abi_visited.add(name)
+
+    abi_parts: list[str] = []
+    seen_assign_nodes: set[int] = set()
+    for kind, name in ordered_defs:
+        if name not in abi_visited:
+            continue
+        if kind == "func":
+            abi_parts.append(fn_segments[name])
+        else:
+            stmt = assigns[name]
+            if id(stmt) not in seen_assign_nodes:
+                seen_assign_nodes.add(id(stmt))
+                abi_parts.append(_py_node_source_slice(lines, stmt))
+
+    if cpp_host_tail:
+        abi_parts.append(cpp_host_tail)
+
+    extra_protos: list[str] = list(cpp_protos)
+    for cname, ctext, _, _ in cpp_spans:
+        if cname == active_cpp_name:
+            continue
+        _, c_units = _split_cpp_units(ctext)
+        for unit in c_units:
+            if unit.kind == "kernel" and unit.name:
+                sig = unit.signature.rstrip(";").strip()
+                decl = f"{sig};" if sig else f"void {unit.name}();"
+                if decl not in extra_protos:
+                    extra_protos.append(decl)
+
+    return RepairClosureSlice(
+        editable_device_source=editable_cpp,
+        sibling_prototypes=tuple(extra_protos),
+        readonly_host_abi_tail="\n\n".join(p for p in abi_parts if p).strip(),
+        diagnostic_excerpt=diagnostic_text.strip(),
+    )
+
+
+def _extract_tracka_repair_closure(
+    module_source: str,
+    *,
+    active_symbols: Sequence[str],
+    regime_tag: str,
+    diagnostic_text: str,
+    protected_exports: frozenset[str],
+) -> RepairClosureSlice:
+    editable_raw, readonly_tail = split_tracka_editable_and_readonly_tail(
+        module_source, protected_exports
+    )
+    if not editable_raw.strip():
+        return RepairClosureSlice(
+            editable_device_source="",
+            sibling_prototypes=(),
+            readonly_host_abi_tail=readonly_tail,
+            diagnostic_excerpt=diagnostic_text.strip(),
+        )
+    try:
+        tree = ast.parse(editable_raw)
+    except SyntaxError:
+        return RepairClosureSlice(
+            editable_device_source=editable_raw.strip(),
+            sibling_prototypes=(),
+            readonly_host_abi_tail=readonly_tail,
+            diagnostic_excerpt=diagnostic_text.strip(),
+        )
+
+    lines = editable_raw.splitlines(keepends=True)
+    imports: list[tuple[set[str], str]] = []
+    funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    classes: dict[str, ast.ClassDef] = {}
+    assigns: dict[str, ast.stmt] = {}
+    ordered_defs: list[tuple[str, str]] = []
+
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            bound = {alias.asname or alias.name.split(".")[0] for alias in node.names}
+            imports.append((bound, _py_node_source_slice(lines, node)))
+        elif isinstance(node, ast.ImportFrom):
+            bound = {alias.asname or alias.name for alias in node.names}
+            imports.append((bound, _py_node_source_slice(lines, node)))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs[node.name] = node
+            ordered_defs.append(("func", node.name))
+        elif isinstance(node, ast.ClassDef):
+            classes[node.name] = node
+            ordered_defs.append(("class", node.name))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for bname in _extract_top_level_bound_names(node):
+                assigns[bname] = node
+                ordered_defs.append(("assign", bname))
+
+    all_defs: dict[str, ast.stmt] = {**assigns, **classes, **funcs}
+    fn_segments = {name: _py_node_source_slice(lines, node) for name, node in funcs.items()}
+    builder_fns = {
+        name
+        for name, seg in fn_segments.items()
+        if "@T.prim_func" in seg or name.startswith("_build_") or name in ("make_kernel", "main")
+    }
+    selector_fns = {name for name in funcs if name.startswith(("_select_", "select_"))}
+
+    seeds: list[str] = [s for s in active_symbols if s in all_defs]
+    diag_lines = _extract_python_diag_lines(diagnostic_text)
+    if diag_lines:
+        for name, fnode in funcs.items():
+            end_ln = fnode.end_lineno or fnode.lineno
+            if any(fnode.lineno <= ln <= end_ln for ln in diag_lines):
+                if name not in seeds:
+                    seeds.append(name)
+
+    if not seeds and regime_tag:
+        scored_selectors = [
+            (_score_name_for_regime(n, regime_tag), n)
+            for n in selector_fns
+            if _score_name_for_regime(n, regime_tag) > 0
+        ]
+        scored_builders = [
+            (_score_name_for_regime(n, regime_tag), n)
+            for n in builder_fns
+            if _score_name_for_regime(n, regime_tag) > 0
+        ]
+        if scored_selectors:
+            top_s = max(sc for sc, _ in scored_selectors)
+            seeds.extend(n for sc, n in scored_selectors if sc == top_s and n not in seeds)
+        if scored_builders:
+            top_b = max(sc for sc, _ in scored_builders)
+            seeds.extend(n for sc, n in scored_builders if sc == top_b and n not in seeds)
+
+    if seeds and not any(s in selector_fns for s in seeds):
+        if len(selector_fns) == 1:
+            seeds.extend(selector_fns)
+        elif regime_tag:
+            for sname in selector_fns:
+                if _score_name_for_regime(sname, regime_tag) > 0 and sname not in seeds:
+                    seeds.append(sname)
+
+    if not seeds:
+        if builder_fns or selector_fns:
+            seeds.extend(sorted(selector_fns | builder_fns))
+        else:
+            seeds.extend(ordered_name for _, ordered_name in ordered_defs)
+
+    sibling_exclusions = (builder_fns | selector_fns) - set(seeds)
+    visited: set[str] = set()
+    queue = list(seeds)
+    while queue:
+        sym = queue.pop(0)
+        if sym in visited or sym not in all_defs:
+            continue
+        visited.add(sym)
+        for sub in ast.walk(all_defs[sym]):
+            if isinstance(sub, ast.Name):
+                ref = sub.id
+                if (
+                    ref in all_defs
+                    and ref not in visited
+                    and ref not in sibling_exclusions
+                ):
+                    queue.append(ref)
+
+    used_names: set[str] = set(visited)
+    for sym in visited:
+        used_names.update(sub.id for sub in ast.walk(all_defs[sym]) if isinstance(sub, ast.Name))
+
+    parts: list[str] = []
+    for bound, imp_src in imports:
+        if bound & used_names or "*" in bound:
+            parts.append(imp_src)
+
+    seen_assigns: set[int] = set()
+    for kind, name in ordered_defs:
+        if name not in visited:
+            continue
+        if kind == "assign":
+            stmt = assigns[name]
+            if id(stmt) not in seen_assigns:
+                seen_assigns.add(id(stmt))
+                parts.append(_py_node_source_slice(lines, stmt))
+        else:
+            parts.append(_py_node_source_slice(lines, all_defs[name]))
+
+    sibling_protos = tuple(
+        _format_python_prototype(funcs[name])
+        for kind, name in ordered_defs
+        if kind == "func" and name not in visited
+    )
+
+    return RepairClosureSlice(
+        editable_device_source="\n\n".join(p for p in parts if p.strip()).strip(),
+        sibling_prototypes=sibling_protos,
+        readonly_host_abi_tail=readonly_tail,
+        diagnostic_excerpt=diagnostic_text.strip(),
+    )
+
+
+def extract_repair_closure_slice(
+    module_source: str,
+    *,
+    active_symbols: Sequence[str] = (),
+    regime_tag: str = "",
+    backend_kind: str = "tilelang_dsl",
+    diagnostic_text: str = "",
+    protected_exports: frozenset[str] | None = None,
+) -> RepairClosureSlice:
+    """Extract lossless reachable call-graph closure and host ABI slice without byte caps."""
+    if not module_source.strip():
+        return RepairClosureSlice(
+            editable_device_source="",
+            sibling_prototypes=(),
+            readonly_host_abi_tail="",
+            diagnostic_excerpt=diagnostic_text.strip(),
+        )
+    eff_protected = DEFAULT_PROTECTED_EXPORTS if protected_exports is None else protected_exports
+    is_trackb_tier = str(backend_kind or "").strip().lower() in (
+        "ascendc_trackb",
+        "hybrid_trackb",
+        "ascendc_template",
+        "cce_cpp20",
+        "cce_trackb",
+    )
+    parsed_tree: ast.Module | None = None
+    try:
+        parsed_tree = ast.parse(module_source)
+    except SyntaxError:
+        parsed_tree = None
+
+    if parsed_tree is not None:
+        cpp_spans = _find_python_cpp_literal_spans(module_source, require_cpp_tokens=True)
+        if cpp_spans and (is_trackb_tier or not _looks_like_python_primfunc_slice(module_source)):
+            return _extract_hybrid_trackb_repair_closure(
+                module_source,
+                parsed_tree,
+                cpp_spans,
+                active_symbols=active_symbols,
+                regime_tag=regime_tag,
+                diagnostic_text=diagnostic_text,
+                protected_exports=eff_protected,
+            )
+        return _extract_tracka_repair_closure(
+            module_source,
+            active_symbols=active_symbols,
+            regime_tag=regime_tag,
+            diagnostic_text=diagnostic_text,
+            protected_exports=eff_protected,
+        )
+
+    if any(tok in module_source for tok in _TRACKB_CPP_QUALIFIERS) and (
+        is_trackb_tier or not _looks_like_python_primfunc_slice(module_source)
+    ):
+        diag_lines = extract_cpp_diagnostic_lines(diagnostic_text)
+        explicit_kernel = next((sym for sym in active_symbols if sym), None)
+        editable_cpp, sibling_protos, host_tail = _extract_cpp_closure_parts(
+            module_source,
+            active_kernel=explicit_kernel,
+            regime_tag=regime_tag,
+            module_source=module_source,
+            diagnostic_lines=diag_lines,
+        )
+        return RepairClosureSlice(
+            editable_device_source=editable_cpp,
+            sibling_prototypes=sibling_protos,
+            readonly_host_abi_tail=host_tail,
+            diagnostic_excerpt=diagnostic_text.strip(),
+        )
+
+    return _extract_tracka_repair_closure(
+        module_source,
+        active_symbols=active_symbols,
+        regime_tag=regime_tag,
+        diagnostic_text=diagnostic_text,
+        protected_exports=eff_protected,
     )
 
 
 __all__ = [
     "AmbiguousPatchAnchorError",
-    "CREATIVE_SOURCE_MAX_BYTES",
+    "DEFAULT_PROTECTED_EXPORTS",
     "NoopIdenticalPatchError",
     "PatchAnchorMissError",
+    "RepairClosureSlice",
     "TRACKB_REPLY_CONTRACT_PROMPT",
     "_TRACKB_CPP_QUALIFIERS",
     "_detect_trackb_prologue_line_offset",
@@ -1211,10 +1703,12 @@ __all__ = [
     "_looks_like_python_primfunc_slice",
     "apply_scoped_trackb_patch",
     "build_trackb_context_view",
+    "classify_stage_failure_for_repair",
     "compact_creative_source_slice",
     "escalate_primfunc_to_trackb_tu",
     "extract_cpp_diagnostic_lines",
     "extract_reachable_trackb_source",
+    "extract_repair_closure_slice",
     "extract_scoped_trackb_kernel_view",
     "extract_trackb_launcher_preview",
     "format_trackb_reply_contract",
@@ -1225,6 +1719,7 @@ __all__ = [
     "select_active_trackb_kernel",
     "splice_cpp_units_by_symbol",
     "splice_cpp_units_into_tu",
+    "split_tracka_editable_and_readonly_tail",
     "strip_cpp_comments_and_strings",
     "strip_markdown_fence_lines",
 ]
