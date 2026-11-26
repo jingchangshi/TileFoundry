@@ -394,23 +394,44 @@ rules:
   - rule_id: R19_STATIC_PINGPONG_UNROLL_NO_ALIAS
     symptom_family: SYNC_PSEUDO_DOUBLE_BUFFER
     mechanism_tag: static_pingpong_unroll_no_alias
-    concept_description: "Static 2x ping-pong buffer unrolling and prefetch to avoid dynamic-offset aliasing"
+    concept_description: "CCE C++20 static 2x ping-pong buffer unrolling with explicit asc_sync_notify/wait"
     regime_guard: "is_legal and (uses_dynamic_offset_pipelining or pseudo_double_buffer_serialized or in_loop_pipe_all_barriers > 0)"
     precondition: "pseudo_double_buffer_serialized or in_loop_pipe_all_barriers > 0 or (l2_pmu_available == 1 and (measured_mte2_wait_ratio >= 0.32 or measured_sync_stall_ratio >= 0.20))"
     anti_precondition: "any_overflow_bytes > 0 or (pipeline_depth >= 2 and in_loop_pipe_all_barriers == 0 and not pseudo_double_buffer_serialized and measured_mte2_wait_ratio >= 0.40)"
     transform_template: |
-      Replace T.Pipelined(..., annotations={"enable_offset": True}) dynamic modulo buffer
-      indexing with explicit static ping-pong double buffers (buf_a, buf_b) inside a 2x-unrolled
-      T.serial loop, issue next-tile prologue DMA prefetch across block boundaries before tail
-      writeback completes, and prune redundant end-of-tile PIPE_ALL barriers so backend codegen
-      avoids pointer-alias serialization.
+      Use static CCE C++20 ping-pong double buffers (ub_a, ub_b) inside a 2x-unrolled loop with
+      explicit paired asc_sync_notify(PIPE_MTE2, PIPE_V, EVENT_ID0/1) and
+      asc_sync_wait(PIPE_MTE2, PIPE_V, EVENT_ID0/1) (plus reverse PIPE_V->PIPE_MTE2 release)
+      so next-tile GM->UB prefetch overlaps with current-tile vector compute without pointer
+      aliasing or redundant PIPE_ALL barriers.
     expected_postcondition: "(not uses_dynamic_offset_pipelining) or alias_serialized_buffers < prev.alias_serialized_buffers or (not pseudo_double_buffer_serialized and prev.pseudo_double_buffer_serialized) or in_loop_pipe_all_barriers < prev.in_loop_pipe_all_barriers or measured_mte2_wait_ratio < prev.measured_mte2_wait_ratio"
     source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 15
+    compatible_backends: ["cce_trackb", "hybrid_trackb"]
+    rationale: "Explicit CCE C++20 static ping-pong buffers with paired asc_sync_notify/wait eliminate pointer-alias serialization and PIPE_ALL stalls."
+
+  - rule_id: R19A_CONSTRAINED_STAGE_OFFSET_PIPELINE
+    symptom_family: SYNC_PSEUDO_DOUBLE_BUFFER
+    mechanism_tag: constrained_stage_offset_pipeline
+    concept_description: "Constrained T.Stage + enable_offset=True pipelining with T.annotate_buffer_versions"
+    regime_guard: "is_legal and (uses_dynamic_offset_pipelining or pseudo_double_buffer_serialized or in_loop_pipe_all_barriers > 0)"
+    precondition: "pseudo_double_buffer_serialized or in_loop_pipe_all_barriers > 0 or (l2_pmu_available == 1 and (measured_mte2_wait_ratio >= 0.32 or measured_sync_stall_ratio >= 0.20))"
+    anti_precondition: "any_overflow_bytes > 0 or spill_bytes > 0"
+    transform_template: |
+      Use compiler-managed pipelining via T.Pipelined(extent, num_stages>=2,
+      annotations={"enable_offset": True}) with outer T.Stage(0) / T.Stage(1) task scopes
+      (never nesting T.Stage inside T.Task, T.SimdVF, T.SimtVF, or T.Parallel) and
+      T.annotate_buffer_versions({buf: (2, "counter") | "auto"}) instead of hand-rolled
+      manual multi-buffers or inner PIPE_ALL barriers.
+    expected_postcondition: "degraded_buffer_count == 0 and in_loop_pipe_all_barriers <= prev.in_loop_pipe_all_barriers and is_legal"
+    source_provenance: "ref:tilelang"
+    alpha_prior: 2.8
+    beta_prior: 1.0
+    priority: 15
     compatible_backends: ["tilelang_dsl"]
-    rationale: "Explicit static ping-pong unrolling removes dynamic-offset pointer aliasing and serial DMA waits."
+    rationale: "Constrained T.Stage with enable_offset=True and T.annotate_buffer_versions delivers compiler-verified cross-iteration overlap without manual multi-buffer sync hazards."
 
   - rule_id: R20_LOOP_FISSION_REDUCE_SFU_HIDING
     symptom_family: COMPUTE_INEFFECTIVE_THROUGHPUT
@@ -783,6 +804,26 @@ rules:
       Split pure-vector tile work across paired AIV sub-cores using get_subblockid() == 0 vs 1
       and half_rows = row_tile / 2 in __vector__ kernels so both AIV0 and AIV1 run concurrently.
     rationale: "Pure-vector kernels using only AIV0 leave the paired AIV1 sub-core idle and halve effective vector and DMA throughput."
+
+  - rule_id: R35_Z3_TASK_CYCLE_LATENCY_OVERRIDE
+    symptom_family: SYNC_BARRIER_SERIALIZATION
+    mechanism_tag: z3_task_cycle_latency_override
+    concept_description: "Override Z3 task and VF cycle models via T.Task(latency, ii), T.SimdVF(latency), and T.SimtVF(threads, latency)"
+    regime_guard: "is_legal and (PIPE_M > 0 or PIPE_V > 0 or PIPE_MTE2 > 0)"
+    precondition: "(steady_state_ii > 1 or (l2_pmu_available == 1 and measured_sync_stall_ratio > 0.12)) and not pseudo_double_buffer_serialized"
+    anti_precondition: "any_overflow_bytes > 0 or spill_bytes > 0"
+    transform_template: |
+      Override Z3 scheduler cycle estimates with measured task and VF latencies by grouping
+      single-PIPE serial statements in with T.Task(latency=..., ii=...): (latency >= ii > 0)
+      or annotating with T.SimdVF(latency=...): / with T.SimtVF(threads=..., latency=...):
+      to eliminate mis-estimated critical-path serialization across independent hardware pipes.
+    expected_postcondition: "(steady_state_ii <= prev.steady_state_ii or measured_sync_stall_ratio <= prev.measured_sync_stall_ratio) and is_legal"
+    source_provenance: "ref:tilelang"
+    alpha_prior: 2.6
+    beta_prior: 1.0
+    priority: 19
+    compatible_backends: ["tilelang_dsl"]
+    rationale: "Measured T.Task, T.SimdVF, and T.SimtVF cycle overrides align the Z3 scheduler with hardware pipe timings."
 
   - rule_id: R36_SUBATOM_CONTIGUOUS_ALIGNED_CORE_SLICE
     symptom_family: DMA_UNALIGNED_SHORT_BURST

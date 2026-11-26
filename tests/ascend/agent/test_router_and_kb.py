@@ -144,12 +144,12 @@ def test_seed_rules_yaml_completeness_and_sanitization() -> None:
     assert not re.search(r"\bmla\b", yaml_text.lower())
 
     rules = load_seed_rules()
-    assert len(rules) == 41
+    assert len(rules) == 43
     ids = {rule.rule_id for rule in rules}
     for idx in range(1, 42):
         prefix = f"R{idx:02d}_"
         assert any(rid.startswith(prefix) for rid in ids)
-    assert len({rule.mechanism_tag for rule in rules}) == 41
+    assert len({rule.mechanism_tag for rule in rules}) == 43
     assert all(rule.concept_description.strip() for rule in rules)
     for rule in rules:
         validate_rule_predicate(rule.regime_guard)
@@ -1442,7 +1442,8 @@ def test_dual_track_kb_backend_filtering_and_cpp20_rendering(tmp_path: Path) -> 
     tilelang_ids = {
         r.rule_id for r in tracker.rank_applicable_rules(ctx, runtime_backend="tilelang_dsl")
     }
-    assert "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS" in tilelang_ids
+    assert "R19A_CONSTRAINED_STAGE_OFFSET_PIPELINE" in tilelang_ids
+    assert "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS" not in tilelang_ids
 
     cube_only_ctx = build_predicate_context(
         build_objective_physical_ledger(
@@ -1467,7 +1468,8 @@ def test_dual_track_kb_backend_filtering_and_cpp20_rendering(tmp_path: Path) -> 
     trackb_rules = tracker.rank_applicable_rules(ctx, runtime_backend="ascendc_trackb")
     trackb_ids = {r.rule_id for r in trackb_rules}
     assert "R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION" not in trackb_ids
-    assert "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS" not in trackb_ids
+    assert "R19A_CONSTRAINED_STAGE_OFFSET_PIPELINE" not in trackb_ids
+    assert "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS" in trackb_ids
     assert "R02_ONCHIP_L0C_TO_UB_DIRECT" in trackb_ids
     assert "R10_BACKWARD_SYNC_CV_PINGPONG" in trackb_ids
 

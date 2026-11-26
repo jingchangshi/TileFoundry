@@ -178,6 +178,38 @@ def _measure_npu_latency_stats_us(
     return med, cv
 
 
+def _measure_null_launch_us(warmup: int = 5, repeat: int = 20) -> float | None:
+    """Measure median minimal no-op NPU kernel launch latency in microseconds."""
+    npu_mod = getattr(torch, "npu", None)
+    if npu_mod is None or not hasattr(npu_mod, "Event") or not hasattr(npu_mod, "synchronize"):
+        return None
+    is_avail = getattr(npu_mod, "is_available", None)
+    if callable(is_avail) and not is_avail():
+        return None
+    try:
+        buf = torch.empty((1,), dtype=torch.float32, device="npu:0")
+        for _ in range(max(1, int(warmup))):
+            buf.zero_()
+        npu_mod.synchronize()
+        samples_us: list[float] = []
+        for _ in range(max(1, int(repeat))):
+            start_ev = npu_mod.Event(enable_timing=True)
+            end_ev = npu_mod.Event(enable_timing=True)
+            start_ev.record()
+            buf.zero_()
+            end_ev.record()
+            npu_mod.synchronize()
+            elapsed_us = float(start_ev.elapsed_time(end_ev)) * 1000.0
+            if math.isfinite(elapsed_us) and elapsed_us > 0.0:
+                samples_us.append(elapsed_us)
+        if not samples_us:
+            return None
+        med = float(statistics.median(samples_us))
+        return med if math.isfinite(med) and med > 0.0 else None
+    except Exception:
+        return None
+
+
 def _normalize_pmu_ratio(raw_val: int | float) -> float:
     """Normalize a PMU ratio in [0, 1] or percentage in [0, 100] onto [0.0, 1.0]."""
     val = float(raw_val)
@@ -1565,6 +1597,7 @@ def _fast_response_payload(
     candidates: Mapping[str, object] | None = None,
     coverage: Mapping[str, int] | None = None,
     micro_probe: Mapping[str, object] | None = None,
+    null_launch_us: float | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema": FAST_RESPONSE_SCHEMA,
@@ -1588,6 +1621,10 @@ def _fast_response_payload(
     }
     if micro_probe is not None:
         payload["micro_probe"] = dict(micro_probe)
+    if mode == "batch" and null_launch_us is not None:
+        null_val = float(null_launch_us)
+        if math.isfinite(null_val) and null_val > 0.0:
+            payload["null_launch_us"] = null_val
     return payload
 
 
@@ -1652,6 +1689,7 @@ def _run_fast_batch(
             }
         )
 
+    null_launch_us = _measure_null_launch_us()
     results_by_op: dict[str, dict[str, dict[str, object]]] = {}
     failures: list[str] = []
     for batch in normalized_batches:
@@ -1680,6 +1718,7 @@ def _run_fast_batch(
             "expected_msprof_targets": 0,
             "observed_msprof_targets": 0,
         },
+        null_launch_us=null_launch_us,
     )
     _atomic_write_json(response_path, payload)
     print(json.dumps(payload, sort_keys=True), flush=True)

@@ -3210,6 +3210,181 @@ def compute_case_eq3_score(ref_perf_us: float, cand_us: float, t_hw_us: float) -
     return max(0.0, (baseline - t_hw_us) / denom)
 
 
+def compute_case_aligned_eta(anchor: AnchorCaseSpec, measured_dur_us: float) -> float:
+    """Compute clamped hardware efficiency t_hw_us / measured_dur_us for one anchor case."""
+    dur = float(measured_dur_us)
+    t_hw = float(anchor.t_hw_us)
+    if not (math.isfinite(dur) and math.isfinite(t_hw)) or dur <= 0.0 or t_hw <= 0.0:
+        return 0.0
+    return min(1.0, max(0.0, t_hw / dur))
+
+
+_STATIC_WIDTH_KEY_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("D", ("D", "d_dim")),
+    ("N", ("N", "n_depth")),
+    ("K", ("K", "k_dim")),
+    ("d_nope", ("d_nope", "D_nope")),
+    ("d_rope", ("d_rope", "D_rope")),
+    ("dk", ("dk", "D_qk")),
+    ("dv", ("dv", "D_v")),
+    ("n_q", ("n_q", "N_q")),
+    ("n_kv", ("n_kv", "N_kv")),
+    ("half_dim", ("half_dim",)),
+    ("hc_mult", ("hc_mult",)),
+    ("inner", ("inner", "inner_dim")),
+    ("hidden_dim", ("hidden_dim",)),
+    ("w_dim", ("w_dim",)),
+    ("num_regs", ("num_regs",)),
+)
+
+
+def _static_width_signature(
+    dims: Mapping[str, object],
+    *,
+    default_dtype: str = "",
+    default_layout: str = "",
+) -> tuple[tuple[str, object], ...]:
+    sig: list[tuple[str, object]] = []
+    for canon, aliases in _STATIC_WIDTH_KEY_GROUPS:
+        for key in aliases:
+            val = dims.get(key)
+            if isinstance(val, int) and not isinstance(val, bool):
+                sig.append((canon, int(val)))
+                break
+    dtype_val = str(dims.get("tl_dtype") or default_dtype).strip().lower()
+    if dtype_val:
+        sig.append(("tl_dtype", dtype_val))
+    layout_val = str(
+        dims.get("inputLayout", dims.get("input_layout", default_layout))
+    ).strip().upper()
+    if layout_val:
+        sig.append(("input_layout", layout_val))
+    if isinstance(dims.get("is_causal"), bool):
+        sig.append(("is_causal", bool(dims["is_causal"])))
+    return tuple(sig)
+
+
+def collect_distinct_static_width_dims(
+    operator_name: str,
+    regime_spec: RegimeTargetSpec,
+    anchors: Sequence[AnchorCaseSpec],
+    guardrails: Sequence[GuardrailCaseSpec] = (),
+    *,
+    cannbench_repo: Path | None = None,
+    env_file: Path | None = None,
+) -> list[dict[str, object]]:
+    """Collect deduplicated static-width case dims routed to regime_spec across cases and probes."""
+    default_dtype = str(regime_spec.sample_builder_kwargs.get("tl_dtype", "") or "").strip()
+    default_layout = str(
+        regime_spec.sample_builder_kwargs.get(
+            "input_layout",
+            regime_spec.sample_builder_kwargs.get("inputLayout", ""),
+        )
+        or ""
+    ).strip()
+
+    explicit_regime_by_case: dict[int, str] = {}
+    for guard in guardrails:
+        explicit_regime_by_case[int(guard.case_num)] = str(guard.regime_tag)
+    for anchor in anchors:
+        explicit_regime_by_case[int(anchor.case_num)] = str(anchor.regime_tag)
+
+    cases_list: list[Mapping[str, object]] = []
+    proto_inputs: Sequence[Mapping[str, object]] = ()
+    registry: CannbenchOpsRegistry | None = None
+    all_regime_specs: tuple[RegimeTargetSpec, ...] = ()
+
+    try:
+        repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
+        tasks_root = resolve_cannbench_tasks_root(repo)
+        try:
+            registry = CannbenchOpsRegistry(tasks_root=tasks_root)
+        except (FileNotFoundError, KeyError, OSError, ValueError):
+            registry = None
+        if registry is not None and registry.has_operator(operator_name):
+            op_spec = registry.resolve(operator_name)
+            cases_list = list(op_spec.cases)
+            raw_inputs = op_spec.proto.get("inputs")
+            if isinstance(raw_inputs, (list, tuple)):
+                proto_inputs = raw_inputs
+            try:
+                all_regime_specs = registry.get_regime_specs(operator_name)
+            except (FileNotFoundError, KeyError, OSError, ValueError):
+                all_regime_specs = ()
+        else:
+            task = get_operator_task(operator_name)
+            cases_path = tasks_root / task / "cases.yaml"
+            if cases_path.is_file():
+                parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
+                cases_list = [
+                    row for row in (parsed.get("cases") or ()) if isinstance(row, Mapping)
+                ]
+                proto_path = cases_path.parent / "proto.yaml"
+                if proto_path.is_file():
+                    proto_raw = yaml.safe_load(proto_path.read_text(encoding="utf-8")) or {}
+                    op_block = proto_raw.get("operator", proto_raw)
+                    if isinstance(op_block, Mapping) and isinstance(
+                        op_block.get("inputs"), (list, tuple)
+                    ):
+                        proto_inputs = op_block["inputs"]
+    except (FileNotFoundError, KeyError, OSError, ValueError, yaml.YAMLError):
+        pass
+
+    if not all_regime_specs:
+        base_specs = DEFAULT_REGIME_SPECS.get(str(operator_name).strip(), ())
+        if any(spec.regime_tag == regime_spec.regime_tag for spec in base_specs):
+            all_regime_specs = base_specs
+        else:
+            all_regime_specs = (*base_specs, regime_spec)
+
+    collected: list[dict[str, object]] = []
+    seen_sigs: set[tuple[tuple[str, object], ...]] = set()
+
+    for row in cases_list:
+        cid = _coerce_case_int(row.get("case_id"))
+        dims = extract_schema_driven_case_dims(row, proto_inputs=proto_inputs)
+        routed_tag: str | None = None
+        if cid is not None and cid in explicit_regime_by_case:
+            routed_tag = explicit_regime_by_case[cid]
+        elif registry is not None and cid is not None and registry.has_operator(operator_name):
+            try:
+                routed_tag = registry.get_case_regime_tag(operator_name, cid)
+            except (FileNotFoundError, KeyError, OSError, ValueError):
+                routed_tag = None
+        if routed_tag is None:
+            routed_tag = resolve_regime_for_case(
+                operator_name, dims, all_regime_specs
+            ).regime_tag
+        if routed_tag != regime_spec.regime_tag:
+            continue
+        sig = _static_width_signature(
+            dims,
+            default_dtype=default_dtype,
+            default_layout=default_layout,
+        )
+        if sig not in seen_sigs:
+            seen_sigs.add(sig)
+            collected.append(dict(dims))
+
+    rep_raw = regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+    if rep_raw:
+        rep_dims: dict[str, object] = dict(rep_raw)
+        if default_dtype and "tl_dtype" not in rep_dims:
+            rep_dims["tl_dtype"] = default_dtype
+        if default_layout and "inputLayout" not in rep_dims and "input_layout" not in rep_dims:
+            rep_dims["inputLayout"] = default_layout
+        rep_sig = _static_width_signature(
+            rep_dims,
+            default_dtype=default_dtype,
+            default_layout=default_layout,
+        )
+        if rep_sig not in seen_sigs:
+            seen_sigs.add(rep_sig)
+            collected.append(rep_dims)
+
+    return collected
+
+
 _ANCHOR_DIM_ALIASES: dict[str, str] = {
     "N": "n_depth",
     "B": "b_dim",
@@ -3386,6 +3561,8 @@ __all__ = [
     "build_semantic_regime_groups",
     "build_semantic_regime_specs",
     "campaign_case_regime_tag",
+    "collect_distinct_static_width_dims",
+    "compute_case_aligned_eta",
     "compute_case_eq3_score",
     "default_source_root",
     "discover_module_trackb_symbols",

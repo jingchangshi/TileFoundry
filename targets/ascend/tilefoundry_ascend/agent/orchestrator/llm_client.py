@@ -94,6 +94,9 @@ def _capacity_503_policy_from_env(
 _LLM_ENV_PREFIX = "TILEFOUNDRY_NPU_LLM_"
 _AGY_ENV_PREFIX = "TILEFOUNDRY_NPU_AGY_"
 _REASONING_ROLES = frozenset({"explore_creative", "escalate_trackb"})
+PURE_SYNTHESIS_ROLES = frozenset(
+    {"explore_creative", "exploit_rule", "syntax_repair", "escalate_trackb"}
+)
 _EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 _TimeoutStage: TypeAlias = Literal["startup", "idle_stall", "active_ceiling", "after_eof"]
 
@@ -127,7 +130,6 @@ class GenerationRequest:
     role: str
     system_prompt: str
     user_prompt: str
-    json_schema: dict[str, object] | None = None
     effort: str | None = None
     active_timeout_sec: float | None = None
     paradigm_shift: bool = False
@@ -391,18 +393,6 @@ class ProseRefusalError(ValueError, LLMGenerationError):
         self.fault_code = "LLM_PROSE_NO_CODE"
         self.retriable = False
 
-CREATIVE_RESPONSE_SCHEMA: dict[str, object] = {
-    "type": "object",
-    "properties": {
-        "physical_hypothesis": {"type": "string"},
-        "target_local_metric": {"type": "string"},
-        "dsl_source": {"type": "string"},
-    },
-    "required": ["physical_hypothesis", "target_local_metric", "dsl_source"],
-    "additionalProperties": False,
-}
-
-
 def _has_code_or_patch_structure(text: str) -> bool:
     """Return True if *text* has executable Python, SEARCH/REPLACE hunks, or C++ markers."""
     stripped = text.strip()
@@ -419,29 +409,16 @@ def _has_code_or_patch_structure(text: str) -> bool:
     return any(isinstance(node, _EXECUTABLE_AST_NODES) for node in ast.walk(tree))
 
 
+_CREATIVE_HEADER_KEY_RE = re.compile(
+    r"^\s*#\s*(target_bottleneck|structural_hypothesis|physical_hypothesis|target_local_metric)"
+    r"\s*:\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
 def extract_python_dsl(raw_response: str) -> str:
     """Extract clean DSL or Track-B patch text, rejecting pure natural-language refusals."""
     stripped = raw_response.strip()
-    if stripped.startswith("{"):
-        try:
-            payload = json.loads(stripped)
-            if isinstance(payload, dict):
-                if isinstance(payload.get("structured_output"), dict):
-                    dsl = payload["structured_output"].get("dsl_source")
-                    if isinstance(dsl, str):
-                        inner = dsl.strip()
-                        if inner and inner != stripped:
-                            return extract_python_dsl(inner)
-                        raise ProseRefusalError(_PROSE_REFUSAL_ERROR)
-                if isinstance(payload.get("dsl_source"), str):
-                    inner = payload["dsl_source"].strip()
-                    if inner and inner != stripped:
-                        return extract_python_dsl(inner)
-                    raise ProseRefusalError(_PROSE_REFUSAL_ERROR)
-                if isinstance(payload.get("response"), str) and payload["response"].strip():
-                    stripped = payload["response"].strip()
-        except json.JSONDecodeError:
-            pass
     matches = _CODE_FENCE_RE.findall(stripped)
     if matches:
         valid_matches = [m.strip() for m in matches if _has_code_or_patch_structure(m)]
@@ -454,37 +431,39 @@ def extract_python_dsl(raw_response: str) -> str:
 
 
 def extract_creative_payload(raw_response: str) -> dict[str, str]:
-    """Parse structured JSON response or markdown fallback from creative explore worker."""
-    stripped = raw_response.strip()
-    if not stripped.startswith("{") and "```" in stripped:
-        for fence_match in re.finditer(r"```[a-zA-Z0-9_-]*\s*\n(.*?)```", stripped, re.DOTALL):
-            inner = fence_match.group(1).strip()
-            if inner.startswith("{"):
-                stripped = inner
+    """Parse leading metadata comment lines and fenced code from a creative worker."""
+    first_fence = re.search(r"```", raw_response)
+    if first_fence is not None:
+        header_lines = raw_response[: first_fence.start()].splitlines()
+    else:
+        header_lines = []
+        for raw_line in raw_response.splitlines():
+            s = raw_line.strip()
+            if not s:
+                continue
+            if s.startswith("#"):
+                header_lines.append(raw_line)
+            else:
                 break
-    if stripped.startswith("{"):
-        try:
-            obj = json.loads(stripped)
-            if isinstance(obj, dict):
-                if isinstance(obj.get("structured_output"), dict):
-                    obj = obj["structured_output"]
-                elif isinstance(obj.get("response"), str) and obj["response"].strip().startswith(
-                    "{"
-                ):
-                    inner = json.loads(obj["response"])
-                    if isinstance(inner, dict):
-                        obj = inner
-                if isinstance(obj.get("dsl_source"), str):
-                    return {
-                        "physical_hypothesis": str(obj.get("physical_hypothesis", "")),
-                        "target_local_metric": str(obj.get("target_local_metric", "")),
-                        "dsl_source": extract_python_dsl(str(obj["dsl_source"])),
-                    }
-        except json.JSONDecodeError:
-            pass
+
+    physical_hypothesis = ""
+    target_local_metric = ""
+    for line in header_lines:
+        match = _CREATIVE_HEADER_KEY_RE.match(line)
+        if match is None:
+            continue
+        key = match.group(1).lower()
+        val = match.group(2).strip()
+        if not val:
+            continue
+        if key in ("structural_hypothesis", "physical_hypothesis"):
+            physical_hypothesis = val
+        elif key in ("target_bottleneck", "target_local_metric"):
+            target_local_metric = val
+
     return {
-        "physical_hypothesis": "unstructured_fallback",
-        "target_local_metric": "latency_us",
+        "physical_hypothesis": physical_hypothesis or "unstructured_fallback",
+        "target_local_metric": target_local_metric or "latency_us",
         "dsl_source": extract_python_dsl(raw_response),
     }
 
@@ -850,6 +829,26 @@ class AgyCliLLMBackend:
         env["PWD"] = sandbox_dir
         return env
 
+    def _common_args_for_role(self, role: str) -> list[str]:
+        if role not in PURE_SYNTHESIS_ROLES:
+            return list(self._common_args)
+        filtered: list[str] = []
+        skip_next = False
+        for idx, tok in enumerate(self._common_args):
+            if skip_next:
+                skip_next = False
+                continue
+            if tok == "--dangerously-skip-permissions" or tok.startswith("--mode="):
+                continue
+            if tok == "--mode":
+                if idx + 1 < len(self._common_args) and not self._common_args[idx + 1].startswith(
+                    "-"
+                ):
+                    skip_next = True
+                continue
+            filtered.append(tok)
+        return filtered
+
     def build_command(
         self,
         req: GenerationRequest,
@@ -881,16 +880,14 @@ class AgyCliLLMBackend:
             self._bin,
             "--model",
             model_id,
-            *self._common_args,
+            *self._common_args_for_role(req.role),
             "--output-format",
             "stream-json",
             f"--log-file={resolved_log}",
             f"--effort={effort}",
             f"--print-timeout={print_timeout_sec}s",
+            f"--print={full_prompt}",
         ]
-        if req.json_schema is not None:
-            cmd.extend(["--json-schema", json.dumps(req.json_schema)])
-        cmd.append(f"--print={full_prompt}")
         return cmd
 
     def _extract_stream_output(
@@ -903,16 +900,11 @@ class AgyCliLLMBackend:
         stderr_lines: list[str],
         tailer: _AgyLogTailer,
     ) -> str:
+        _ = req
         stderr_text = "\n".join(stderr_lines).strip()
         if result_payload is not None:
             status = str(result_payload.get("status", "SUCCESS")).upper()
             if status == "SUCCESS" and exit_code == 0:
-                structured = result_payload.get("structured_output")
-                if req.json_schema is not None and structured is not None:
-                    if isinstance(structured, (dict, list)):
-                        return json.dumps(structured)
-                    if isinstance(structured, str) and structured.strip():
-                        return structured.strip()
                 resp = result_payload.get("response")
                 if isinstance(resp, str) and resp.strip():
                     return resp.strip()
@@ -952,6 +944,40 @@ class AgyCliLLMBackend:
             is_503=is_503_err,
         )
 
+    @staticmethod
+    def _write_no_tool_sandbox_files(sandbox_dir: str) -> None:
+        agents_dir = Path(sandbox_dir) / ".agents"
+        rules_dir = agents_dir / "rules"
+        rules_dir.mkdir(parents=True, exist_ok=True)
+        (rules_dir / "no_tools.md").write_text(
+            "---\ntrigger: always_on\n---\n"
+            "Zero tool calls allowed in this stateless synthesis session. "
+            "Output ONLY the requested header comments and fenced code block directly.\n",
+            encoding="utf-8",
+        )
+        hooks_payload = {
+            "no-tools": {
+                "PreToolUse": [
+                    {
+                        "matcher": "*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": (
+                                    "echo '{\"decision\":\"deny\","
+                                    "\"reason\":\"Tools disabled in stateless synthesis mode\"}'"
+                                ),
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        (agents_dir / "hooks.json").write_text(
+            json.dumps(hooks_payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
     async def _run_single_attempt(
         self,
         req: GenerationRequest,
@@ -971,6 +997,8 @@ class AgyCliLLMBackend:
             tempfile.TemporaryDirectory(prefix="tf_agy_worker_") as sandbox_dir,
             tempfile.TemporaryDirectory(prefix="tf_agy_log_") as log_dir,
         ):
+            if req.role in PURE_SYNTHESIS_ROLES:
+                self._write_no_tool_sandbox_files(sandbox_dir)
             log_file = Path(log_dir) / "agy_worker.log"
             cmd = self.build_command(
                 req,
@@ -1019,6 +1047,7 @@ class AgyCliLLMBackend:
             got_init = False
             active_tool_steps: set[int] = set()
             anon_tool_calls = 0
+            denied_tool_calls = 0
             text_deltas: list[str] = []
             result_payload: dict[str, object] | None = None
             stderr_lines: list[str] = []
@@ -1064,30 +1093,55 @@ class AgyCliLLMBackend:
                                         got_init = True
                                         last_activity_ts = time.monotonic()
                                         if su.get("step_type") == "tool":
-                                            step_idx = su.get("step_index")
-                                            if isinstance(step_idx, int) and not isinstance(
-                                                step_idx, bool
-                                            ):
-                                                active_tool_steps.add(step_idx)
-                                            elif (
-                                                su.get("state") != "DONE"
-                                                or cfg.max_sandbox_tool_calls == 0
-                                            ):
-                                                anon_tool_calls += 1
+                                            err_obj = su.get("error")
+                                            err_msg = (
+                                                str(err_obj.get("message", ""))
+                                                if isinstance(err_obj, Mapping)
+                                                else str(err_obj or "")
+                                            )
+                                            hook_msg = err_msg or str(su.get("tool_info", "") or "")
                                             if (
-                                                len(active_tool_steps) + anon_tool_calls
-                                            ) > cfg.max_sandbox_tool_calls:
-                                                await _terminate_process_group(proc)
-                                                raise _AttemptFailure(
-                                                    LLMGenerationError(
-                                                        "sandbox_tool_loop_aborted",
-                                                        fault_plane="LLM_TRANSPORT",
-                                                        fault_code="SANDBOX_TOOL_LOOP_ABORTED",
-                                                        retriable=False,
-                                                    ),
-                                                    retriable=True,
-                                                    is_tool_loop=True,
-                                                )
+                                                su.get("state") == "ERROR"
+                                                and "denied by pre-tool hook" in hook_msg.lower()
+                                            ):
+                                                denied_tool_calls += 1
+                                                if denied_tool_calls >= 2:
+                                                    await _terminate_process_group(proc)
+                                                    raise _AttemptFailure(
+                                                        LLMGenerationError(
+                                                            "sandbox_tool_loop_aborted",
+                                                            fault_plane="LLM_TRANSPORT",
+                                                            fault_code="SANDBOX_TOOL_LOOP_ABORTED",
+                                                            retriable=False,
+                                                        ),
+                                                        retriable=True,
+                                                        is_tool_loop=True,
+                                                    )
+                                            else:
+                                                step_idx = su.get("step_index")
+                                                if isinstance(step_idx, int) and not isinstance(
+                                                    step_idx, bool
+                                                ):
+                                                    active_tool_steps.add(step_idx)
+                                                elif (
+                                                    su.get("state") != "DONE"
+                                                    or cfg.max_sandbox_tool_calls == 0
+                                                ):
+                                                    anon_tool_calls += 1
+                                                if (
+                                                    len(active_tool_steps) + anon_tool_calls
+                                                ) > cfg.max_sandbox_tool_calls:
+                                                    await _terminate_process_group(proc)
+                                                    raise _AttemptFailure(
+                                                        LLMGenerationError(
+                                                            "sandbox_tool_loop_aborted",
+                                                            fault_plane="LLM_TRANSPORT",
+                                                            fault_code="SANDBOX_TOOL_LOOP_ABORTED",
+                                                            retriable=False,
+                                                        ),
+                                                        retriable=True,
+                                                        is_tool_loop=True,
+                                                    )
                                         delta = su.get("text_delta")
                                         if isinstance(delta, str) and delta:
                                             text_deltas.append(delta)
@@ -1319,9 +1373,7 @@ _STATELESS_INSTRUCTION = (
 
 
 def _system_prompt(req: GenerationRequest) -> str:
-    if req.json_schema is None:
-        return req.system_prompt
-    return f"{req.system_prompt}\n\nReturn only JSON matching this schema:\n{json.dumps(req.json_schema)}"
+    return req.system_prompt
 
 
 class _NoHTTPRedirects(HTTPRedirectHandler):
@@ -2253,13 +2305,13 @@ def create_llm_backend_from_env(overrides: Mapping[str, str] | None = None) -> K
 
 __all__ = [
     "AgyCliLLMBackend",
-    "CREATIVE_RESPONSE_SCHEMA",
     "GenerationRequest",
     "KernelLLMBackend",
     "LLMGenerationError",
     "LLMTimeoutError",
     "MockLLMBackend",
     "OpenAICompatHTTPBackend",
+    "PURE_SYNTHESIS_ROLES",
     "ProseRefusalError",
     "RE_503_CAPACITY",
     "RE_STREAM_IDLE_LOG",

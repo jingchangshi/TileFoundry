@@ -103,17 +103,32 @@ def _pt(
 
 
 def test_anchor_conservation_point_sigma_and_recoverable_sched() -> None:
-    """Verify paired MAD sigma scaling, 1e-3 relative floor, and recoverable schedule."""
+    """Verify paired MAD sigma scaling, burst CV SEM floor, and recoverable schedule."""
     assert MAD_TO_SIGMA == pytest.approx(1.482602218505602)
 
     p_mad = _pt(1, inc_us=100.0, paired_rel_mad=0.05, cand_us=35.0, t_roof_us=12.0)
     assert p_mad.sigma_paired_us() == pytest.approx(MAD_TO_SIGMA * 0.05 * 100.0)
 
-    p_floor = _pt(2, inc_us=100.0, paired_rel_mad=0.0)
-    assert p_floor.sigma_paired_us() == pytest.approx(0.1)
+    p_zero = _pt(2, inc_us=100.0, paired_rel_mad=0.0)
+    assert p_zero.sigma_paired_us() == pytest.approx(0.0)
 
-    p_tiny = _pt(3, inc_us=0.0, paired_rel_mad=0.0)
-    assert p_tiny.sigma_paired_us() == pytest.approx(1e-9)
+    p_burst = AnchorConservationPoint(
+        case_num=3,
+        regime_tag="decode",
+        ref_us=100.0,
+        inc_us=100.0,
+        cand_us=100.0,
+        t_roof_us=10.0,
+        paired_rel_mad=0.0,
+        accuracy_passed=True,
+        cand_burst_cv=0.40,
+        ref_burst_cv=0.10,
+        burst_count=4,
+    )
+    assert p_burst.sigma_paired_us() == pytest.approx(20.0)
+
+    p_tiny = _pt(4, inc_us=0.0, paired_rel_mad=0.0)
+    assert p_tiny.sigma_paired_us() == pytest.approx(0.0)
 
     assert p_mad.recoverable_sched_us(dispatch_floor_us=3.0) == pytest.approx(20.0)
     assert p_mad.recoverable_sched_us(dispatch_floor_us=30.0) == pytest.approx(0.0)

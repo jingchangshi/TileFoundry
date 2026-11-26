@@ -322,12 +322,19 @@ def safe_eval_predicate(expr: str, env: Mapping[str, object]) -> bool:
 
 _BACKEND_ALIASES = {
     "tilelang": "tilelang_dsl",
+    "tilelang_dsl": "tilelang_dsl",
+    "inline_cce_vf": "tilelang_dsl",
+    "inline_ascendc_vf": "tilelang_dsl",
     "ascendc": "ascendc_trackb",
     "ascendc_template": "ascendc_trackb",
+    "ascendc_trackb": "ascendc_trackb",
+    "cce": "ascendc_trackb",
+    "cpp20": "ascendc_trackb",
     "cce_cpp20": "ascendc_trackb",
     "cce_trackb": "ascendc_trackb",
     "tl_templates_cpp20": "ascendc_trackb",
     "hybrid": "hybrid_trackb",
+    "hybrid_trackb": "hybrid_trackb",
 }
 
 
@@ -335,7 +342,7 @@ def normalize_runtime_backend(backend: str | None) -> str | None:
     """Normalize runtime backend aliases to canonical KB backend identifiers."""
     if backend is None:
         return None
-    cleaned = str(backend).strip()
+    cleaned = str(backend).strip().lower().replace("-", "_")
     if not cleaned:
         return None
     return _BACKEND_ALIASES.get(cleaned, cleaned)
@@ -372,9 +379,11 @@ class AscendCausalRule:
                 f"invalid rule scope {self.scope!r}; expected 'cross_op' or 'operator_local'"
             )
         normalized_backends = tuple(
-            norm
-            for raw in self.compatible_backends
-            if (norm := normalize_runtime_backend(str(raw)))
+            dict.fromkeys(
+                norm
+                for raw in self.compatible_backends
+                if (norm := normalize_runtime_backend(str(raw)))
+            )
         )
         if not normalized_backends:
             raise ValueError("compatible_backends must contain at least one backend")
@@ -411,11 +420,14 @@ class AscendCausalRule:
         validate_rule_predicate(self.expected_postcondition)
 
     def supports_backend(self, runtime_backend: str | None) -> bool:
-        """Return whether this rule applies to *runtime_backend*."""
+        """Return whether this rule applies to *runtime_backend* without dialect leakage."""
         norm = normalize_runtime_backend(runtime_backend)
         if norm is None:
             return True
-        return norm in self.compatible_backends
+        rule_backends = {
+            b for raw in self.compatible_backends if (b := normalize_runtime_backend(str(raw)))
+        }
+        return norm in rule_backends
 
     def render_for_backend(self, runtime_backend: str | None = None) -> AscendCausalRule:
         """Return rule rendered with Track-B CCE (C++20) guidance on C++20 backends."""
@@ -1646,6 +1658,34 @@ def _resolve_simplex_has_l2_pmu(
     return any(key in sig for key in pmu_keys) and has_positive_pmu
 
 
+def normalize_symptom_simplex(
+    raw_weights: Mapping[SymptomFamily, float],
+    *,
+    roofline_eta: float = 0.0,
+    has_l2_pmu: bool = False,
+) -> dict[SymptomFamily, float]:
+    """Normalize deterministic hardware symptoms independently of (1 - eta)."""
+    _ = has_l2_pmu
+    shares: dict[SymptomFamily, float] = {fam: 0.0 for fam in SymptomFamily}
+    det_weights: dict[SymptomFamily, float] = {}
+    for fam in DETERMINISTIC_SYMPTOM_FAMILIES:
+        raw_val = float(raw_weights.get(fam, 0.0) or 0.0)
+        det_weights[fam] = max(0.0, raw_val) if math.isfinite(raw_val) else 0.0
+    s_raw = sum(det_weights.values())
+    safe_eta = float(roofline_eta) if math.isfinite(roofline_eta) else 0.0
+    if s_raw > 1e-12:
+        for fam, weight in det_weights.items():
+            shares[fam] = min(1.0, max(0.0, weight / s_raw))
+        shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL] = 0.0
+        diff = 1.0 - sum(shares.values())
+        if abs(diff) > 0.0:
+            largest_fam = max(DETERMINISTIC_SYMPTOM_FAMILIES, key=lambda fam: shares[fam])
+            shares[largest_fam] = min(1.0, max(0.0, shares[largest_fam] + diff))
+    else:
+        shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL] = 1.0 if safe_eta < 1.0 else 0.0
+    return shares
+
+
 def compute_symptom_simplex(
     obs_or_context: ObservationVector5D | Mapping[str, object],
     *,
@@ -1956,37 +1996,11 @@ def compute_symptom_simplex(
             excess_cycles[fam] = 0.0
 
     eta_for_excess = roofline_eta if roofline_eta > 0.0 else effective_eta
-    delta_eta_excess = 1.0 if eta_for_excess <= 0.0 else max(0.0, 1.0 - eta_for_excess)
-    sum_w = sum(raw_weights.values())
-
-    shares: dict[SymptomFamily, float] = {
-        fam: 0.0 for fam in SymptomFamily
-    }
-    if delta_eta_excess <= 1e-9 or sum_w <= 1e-12:
-        shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL] = 1.0
-    elif sum_w <= delta_eta_excess:
-        for fam, weight in raw_weights.items():
-            shares[fam] = weight / delta_eta_excess
-        det_sum = sum(shares[fam] for fam in DETERMINISTIC_SYMPTOM_FAMILIES)
-        shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL] = max(0.0, 1.0 - det_sum)
-    else:
-        unmodeled_floor = 0.0 if has_l2_pmu else 0.15
-        scale = (1.0 - unmodeled_floor) / sum_w
-        for fam, weight in raw_weights.items():
-            shares[fam] = weight * scale
-        det_sum = sum(shares[fam] for fam in DETERMINISTIC_SYMPTOM_FAMILIES)
-        shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL] = max(0.0, 1.0 - det_sum)
-
-    for fam in shares:
-        shares[fam] = min(1.0, max(0.0, shares[fam]))
-    diff = 1.0 - sum(shares.values())
-    if abs(diff) > 0.0:
-        unmodeled_val = shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL]
-        if 0.0 <= unmodeled_val + diff <= 1.0:
-            shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL] = unmodeled_val + diff
-        else:
-            largest_fam = max(shares, key=lambda fam: shares[fam])
-            shares[largest_fam] = min(1.0, max(0.0, shares[largest_fam] + diff))
+    shares = normalize_symptom_simplex(
+        raw_weights,
+        roofline_eta=eta_for_excess,
+        has_l2_pmu=has_l2_pmu,
+    )
 
     ordered = sorted(
         shares.items(),
@@ -2098,6 +2112,7 @@ __all__ = [
     "default_seed_rules_path",
     "load_seed_rules",
     "normalize_runtime_backend",
+    "normalize_symptom_simplex",
     "rank_symptom_families",
     "safe_eval_predicate",
     "save_rules_yaml",

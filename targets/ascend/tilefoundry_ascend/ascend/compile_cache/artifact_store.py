@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import errno
 import fcntl
 import hashlib
 import json
@@ -34,7 +35,8 @@ _CPP_MARKERS: tuple[str, ...] = (
 _BINARY_SUFFIXES: frozenset[str] = frozenset({".so", ".o", ".bin"})
 
 
-def _is_verified_binary_file(path: Path) -> bool:
+def is_verified_binary_file(path: Path) -> bool:
+    """Return True iff *path* is an existing non-empty compiled binary file."""
     try:
         if not path.is_file():
             return False
@@ -43,6 +45,136 @@ def _is_verified_binary_file(path: Path) -> bool:
         return path.stat().st_size > 0
     except OSError:
         return False
+
+
+def _is_verified_binary_file(path: Path) -> bool:
+    return is_verified_binary_file(path)
+
+
+_CACHE_INTERNAL_FILES: frozenset[str] = frozenset(
+    {
+        "prewarm_manifest_v1.json",
+        ".prewarm_manifest_v1.lock",
+        "artifact_manifest_v1.json",
+        "artifact_index_v1.jsonl",
+        ".artifact_store_v1.lock",
+    }
+)
+
+
+def _is_cache_internal_file(item: Path) -> bool:
+    name = item.name
+    if name in _CACHE_INTERNAL_FILES:
+        return True
+    return name.startswith(".prewarm_manifest_v1.") or name.startswith(".artifact_manifest.")
+
+
+def seed_tl_cache_tree(src_dir: Path, dst_dir: Path) -> None:
+    """Seed an isolated worker cache from *src_dir* via hardlinks or copy fallback."""
+    if not src_dir.is_dir():
+        return
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for item in sorted(src_dir.rglob("*")):
+        rel = item.relative_to(src_dir)
+        if _is_cache_internal_file(item):
+            continue
+        if item.name == "compiled_entries.jsonl":
+            continue
+        if rel.parts and rel.parts[0] == "artifact_blobs":
+            continue
+        target = dst_dir / rel
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(item, target)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                continue
+            shutil.copy2(item, target)
+
+
+def _atomic_copy_into_cache(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{dst.name}.")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        shutil.copy2(src, tmp_path)
+        os.replace(tmp_path, dst)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def merge_tl_cache_tree(src_dir: Path, dst_dir: Path) -> None:
+    """Merge an isolated worker's TileLang cache outputs into *dst_dir*."""
+    if not src_dir.is_dir():
+        return
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for item in sorted(src_dir.rglob("*")):
+        if _is_cache_internal_file(item):
+            continue
+        rel = item.relative_to(src_dir)
+        target = dst_dir / rel
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if item.name == "compiled_entries.jsonl" and target.is_file():
+            existing = target.read_text(encoding="utf-8")
+            addition = item.read_text(encoding="utf-8")
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".compiled_entries.")
+            tmp_path = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(existing + addition)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, target)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+        elif not target.exists():
+            _atomic_copy_into_cache(item, target)
+
+
+def snapshot_tl_cache_binaries(cache_dir: Path) -> dict[Path, tuple[int, int]]:
+    """Snapshot relative binary paths to (size, mtime_ns) inside *cache_dir*."""
+    snap: dict[Path, tuple[int, int]] = {}
+    if not cache_dir.is_dir():
+        return snap
+    for item in cache_dir.rglob("*"):
+        if is_verified_binary_file(item):
+            st = item.stat()
+            snap[item.relative_to(cache_dir)] = (st.st_size, st.st_mtime_ns)
+    return snap
+
+
+def collect_new_tl_cache_binaries(
+    cache_dir: Path,
+    pre_snapshot: Mapping[Path, tuple[int, int]],
+) -> tuple[Path, ...]:
+    """Return relative paths of new or updated binaries in *cache_dir*."""
+    post_new: list[Path] = []
+    all_post: list[Path] = []
+    if not cache_dir.is_dir():
+        return ()
+    for item in sorted(cache_dir.rglob("*")):
+        if not is_verified_binary_file(item):
+            continue
+        rel = item.relative_to(cache_dir)
+        all_post.append(rel)
+        st = item.stat()
+        prev = pre_snapshot.get(rel)
+        if prev is None or prev != (st.st_size, st.st_mtime_ns):
+            post_new.append(rel)
+    return tuple(post_new or all_post)
 
 
 def _extract_cpp_string_literal(node: ast.AST | None) -> str | None:
@@ -387,6 +519,91 @@ def extract_reachable_closure_source(
     return "\n\n".join(part for part in parts if part.strip()).strip()
 
 
+def _canonical_json_value(val: object) -> object:
+    if isinstance(val, Mapping):
+        return {
+            str(k): _canonical_json_value(v)
+            for k, v in sorted(val.items(), key=lambda kv: str(kv[0]))
+        }
+    if isinstance(val, (list, tuple)):
+        return [_canonical_json_value(item) for item in val]
+    if isinstance(val, (set, frozenset)):
+        items = [_canonical_json_value(item) for item in val]
+        return sorted(items, key=lambda x: json.dumps(x, sort_keys=True, separators=(",", ":")))
+    if isinstance(val, (str, int, float, bool)) or val is None:
+        return val
+    return str(val)
+
+
+def compute_compile_task_key(
+    *,
+    normalized_kernel_unit_src: str,
+    cann_target: str = "dav-3510",
+    pass_configs: Mapping[str, object] | None = None,
+    compile_flags: Sequence[str] = (),
+    static_spec_signature: str = "",
+    compiler_stamp: str = "",
+) -> str:
+    """Compute canonical SHA256 task key shared across Stage-B, Prewarm, and L1..L4."""
+    sorted_pass_configs = (
+        _canonical_json_value(pass_configs) if pass_configs is not None else {}
+    )
+    sorted_compile_flags = sorted(
+        {str(flag).strip() for flag in compile_flags if str(flag).strip()}
+    )
+    payload = json.dumps(
+        {
+            "cann_target": str(cann_target),
+            "compile_flags": sorted_compile_flags,
+            "compiler_stamp": str(compiler_stamp),
+            "normalized_kernel_unit_src": str(normalized_kernel_unit_src),
+            "pass_configs": sorted_pass_configs,
+            "static_spec_signature": str(static_spec_signature),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def resolve_unified_tl_cache_dir(
+    tl_cache_dir: str | Path | None = None,
+    *,
+    env_vals: Mapping[str, str] | None = None,
+    source_root: Path | None = None,
+) -> Path:
+    """Resolve the canonical unified TileLang and Track-B ArtifactStore cache directory."""
+    _ = source_root
+    if tl_cache_dir is not None and str(tl_cache_dir).strip():
+        return Path(tl_cache_dir).expanduser().resolve()
+    if env_vals is not None:
+        env_tl = str(env_vals.get("TILELANG_CACHE_DIR", "") or "").strip()
+        if env_tl:
+            return Path(env_tl).expanduser().resolve()
+        env_sf = str(env_vals.get("TF_SURROGATE_TL_CACHE_DIR", "") or "").strip()
+        if env_sf:
+            return Path(env_sf).expanduser().resolve()
+        env_store = str(env_vals.get("TILEFOUNDRY_NPU_ARTIFACT_STORE", "") or "").strip()
+        if env_store:
+            return Path(env_store).expanduser().resolve()
+        env_work = str(env_vals.get("TILEFOUNDRY_NPU_WORK_ROOT", "") or "").strip()
+        if env_work:
+            return Path(env_work).expanduser().resolve() / "surrogate" / "tilelang"
+    for key in (
+        "TILELANG_CACHE_DIR",
+        "TF_SURROGATE_TL_CACHE_DIR",
+        "TILEFOUNDRY_NPU_ARTIFACT_STORE",
+    ):
+        raw_val = os.environ.get(key, "").strip()
+        if raw_val:
+            return Path(raw_val).expanduser().resolve()
+    raw_work = os.environ.get("TILEFOUNDRY_NPU_WORK_ROOT", "").strip()
+    if raw_work:
+        return Path(raw_work).expanduser().resolve() / "surrogate" / "tilelang"
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return (Path(tempfile.gettempdir()) / f"tf_surrogate_tl_cache_{uid}").resolve()
+
+
 def compute_artifact_id(
     *,
     closure_src: str,
@@ -397,19 +614,20 @@ def compute_artifact_id(
     compiler_stamp: str = "",
 ) -> str:
     """Compute SHA256 hex digest identifying a compiled kernel artifact."""
-    payload = json.dumps(
-        {
-            "arch": str(arch),
-            "cann_series": str(cann_series),
-            "closure_src": str(closure_src),
-            "compiler_stamp": str(compiler_stamp),
-            "flags": str(flags),
-            "spec_key": str(spec_key),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+    flag_items = tuple(tok for tok in str(flags).split() if tok)
+    target_tag = (
+        f"{arch}:{cann_series}"
+        if cann_series and cann_series != "cann_9_3"
+        else str(arch)
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return compute_compile_task_key(
+        normalized_kernel_unit_src=str(closure_src),
+        cann_target=target_tag,
+        pass_configs=None,
+        compile_flags=flag_items,
+        static_spec_signature=str(spec_key),
+        compiler_stamp=str(compiler_stamp),
+    )
 
 
 @dataclass(frozen=True)

@@ -19,7 +19,6 @@ from tilefoundry_ascend.agent import (
     StreamWatchdogConfig,
 )
 from tilefoundry_ascend.agent.orchestrator import (
-    CREATIVE_RESPONSE_SCHEMA,
     RoleRoutingConfig,
     SubprocessCliTemplateBackend,
 )
@@ -160,12 +159,11 @@ def main():
                 "event": "result",
                 "result": {
                     "status": "SUCCESS",
-                    "structured_output": {
-                        "physical_hypothesis": "Use L0C direct store",
-                        "target_local_metric": "fixpipe_cycles",
-                        "dsl_source": "x = 42",
-                    },
-                    "response": "",
+                    "response": (
+                        "# target_bottleneck: fixpipe_cycles\\n"
+                        "# structural_hypothesis: Use L0C direct store\\n"
+                        "```python\\nx = 42\\n```"
+                    ),
                 },
             }
         )
@@ -190,11 +188,11 @@ def main():
                 "event": "result",
                 "result": {
                     "status": "SUCCESS",
-                    "structured_output": {
-                        "physical_hypothesis": "Slow but healthy stream",
-                        "target_local_metric": "aic_mad",
-                        "dsl_source": "y = 7",
-                    },
+                    "response": (
+                        "# target_bottleneck: aic_mad\\n"
+                        "# structural_hypothesis: Slow but healthy stream\\n"
+                        "```python\\ny = 7\\n```"
+                    ),
                 },
             }
         )
@@ -415,7 +413,7 @@ def test_command_normalization_effort_routing_and_stdin_devnull(
     assert "return 1" in reply_text
     rec1 = json.loads((state_dir / "record_1.json").read_text(encoding="utf-8"))
     assert rec1["stdin_len"] == 0
-    assert rec1["cwd_entries"] == []
+    assert rec1["cwd_entries"] == [".agents"]
     assert rec1["args"]["output_format"] == "stream-json"
     assert rec1["args"]["effort"] == "medium"
     assert rec1["args"]["print_timeout"] == "15s"
@@ -424,11 +422,11 @@ def test_command_normalization_effort_routing_and_stdin_devnull(
     monkeypatch.setenv("TF_FAKE_AGY_SCENARIO", "ok_structured")
     reply_schema = asyncio.run(
         backend.generate(
-            GenerationRequest("explore_creative", "sys", "usr", CREATIVE_RESPONSE_SCHEMA),
+            GenerationRequest("explore_creative", "sys", "usr"),
             effort_override="xhigh",
         )
     )
-    parsed_schema = json.loads(reply_schema)
+    parsed_schema = extract_creative_payload(reply_schema)
     assert parsed_schema["dsl_source"] == "x = 42"
     rec2 = json.loads((state_dir / "record_2.json").read_text(encoding="utf-8"))
     assert rec2["args"]["effort"] == "high"
@@ -519,10 +517,10 @@ def test_slow_actively_streaming_worker_exceeds_idle_without_false_timeout(
     )
     reply = asyncio.run(
         backend.generate(
-            GenerationRequest("explore_creative", "sys", "usr", CREATIVE_RESPONSE_SCHEMA)
+            GenerationRequest("explore_creative", "sys", "usr")
         )
     )
-    payload = json.loads(reply)
+    payload = extract_creative_payload(reply)
     assert payload["physical_hypothesis"] == "Slow but healthy stream"
     assert payload["dsl_source"] == "y = 7"
 
@@ -658,13 +656,15 @@ def test_runaway_sandbox_tool_calls_aborted(
     assert reply == "bounded_tools_succeeded"
 
 
-def test_json_schema_sse_in_flight_defers_idle_to_ceiling_and_fenced_json_extracts(
+def test_header_fenced_code_extracts_and_sse_in_flight_defers_idle_to_ceiling(
     tmp_path: Path,
 ) -> None:
-    """Verify fenced creative JSON extraction and SSE in-flight log detection."""
+    """Verify header-comment fenced code extraction and SSE in-flight log detection."""
     fenced = (
-        "```json\n"
-        '{"physical_hypothesis": "h", "target_local_metric": "m", "dsl_source": "x = 1"}\n'
+        "# target_bottleneck: m\n"
+        "# structural_hypothesis: h\n"
+        "```python\n"
+        "x = 1\n"
         "```"
     )
     parsed = extract_creative_payload(fenced)
@@ -681,11 +681,11 @@ def test_json_schema_sse_in_flight_defers_idle_to_ceiling_and_fenced_json_extrac
     assert tailer.sse_in_flight is True
 
 
-def test_sse_thinking_defers_idle_timeout_without_json_schema(
+def test_sse_thinking_defers_idle_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify SSE in-flight log defers idle stall to ceiling when json_schema is None."""
+    """Verify SSE in-flight log defers idle stall to ceiling."""
     bin_path, state_dir = _write_fake_agy(tmp_path)
     monkeypatch.setenv("TF_FAKE_AGY_STATE_DIR", str(state_dir))
     monkeypatch.setenv("TF_FAKE_AGY_SCENARIO", "sse_thinking_then_ok")
@@ -700,7 +700,7 @@ def test_sse_thinking_defers_idle_timeout_without_json_schema(
         ),
     )
     reply = asyncio.run(
-        backend.generate(GenerationRequest("explore_creative", "sys", "usr", json_schema=None))
+        backend.generate(GenerationRequest("explore_creative", "sys", "usr"))
     )
     assert reply == "sse_thinking_succeeded"
 

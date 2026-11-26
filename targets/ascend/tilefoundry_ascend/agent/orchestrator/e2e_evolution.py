@@ -362,7 +362,6 @@ def build_hir_seed_request(
         role="exploit_rule",
         system_prompt=sys_prompt,
         user_prompt=user_prompt,
-        json_schema=None,
     )
 
 

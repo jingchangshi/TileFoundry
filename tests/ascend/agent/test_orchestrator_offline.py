@@ -23,7 +23,6 @@ from tilefoundry_ascend.agent import (
 from tilefoundry_ascend.agent.campaign.anchor_specs import build_anchor_var_bindings
 from tilefoundry_ascend.agent.kb import load_seed_rules
 from tilefoundry_ascend.agent.orchestrator import (
-    CREATIVE_RESPONSE_SCHEMA,
     StageBResult,
     StageCResult,
     build_creative_request,
@@ -117,14 +116,18 @@ def test_agy_backend_command_isolation_and_schema_extraction(monkeypatch) -> Non
     cmd_exploit = backend.build_command(req_exploit, "PROMPT_TEXT")
     assert "gemini-4-hydrogen-medium" in cmd_exploit
     assert "--add-dir" not in cmd_exploit
+    assert "--dangerously-skip-permissions" not in cmd_exploit
+    assert "--mode" not in cmd_exploit
     assert "--print=PROMPT_TEXT" in cmd_exploit
     assert "--print" not in cmd_exploit
 
-    req_explore = GenerationRequest("explore_creative", "sys", "usr", CREATIVE_RESPONSE_SCHEMA)
+    req_explore = GenerationRequest("explore_creative", "sys", "usr")
     cmd_explore = backend.build_command(req_explore, "CREATIVE_PROMPT")
     assert "gemini-4-hydrogen-high" in cmd_explore
     assert "--output-format" in cmd_explore
-    assert "--json-schema" in cmd_explore
+    assert "--json-schema" not in cmd_explore
+    assert "--dangerously-skip-permissions" not in cmd_explore
+    assert "--mode" not in cmd_explore
 
     sanitized = backend._sanitized_env("/tmp/empty_box")
     assert "AGY_CONVERSATION_ID" not in sanitized
@@ -132,17 +135,14 @@ def test_agy_backend_command_isolation_and_schema_extraction(monkeypatch) -> Non
     assert "CLAUDECODE" not in sanitized
     assert sanitized["PWD"] == "/tmp/empty_box"
 
-    envelope = json.dumps(
-        {
-            "structured_output": {
-                "physical_hypothesis": "Reduce FixPipe drain stall",
-                "target_local_metric": "aic_fixpipe",
-                "dsl_source": "```python\nx = 1\n```",
-            }
-        }
+    envelope = (
+        "# target_bottleneck: aic_fixpipe\n"
+        "# structural_hypothesis: Reduce FixPipe drain stall\n"
+        "```python\nx = 1\n```"
     )
     parsed = extract_creative_payload(envelope)
     assert parsed["physical_hypothesis"] == "Reduce FixPipe drain stall"
+    assert parsed["target_local_metric"] == "aic_fixpipe"
     assert parsed["dsl_source"] == "x = 1"
 
 
@@ -195,18 +195,16 @@ def test_portfolio_runner_k2_rule_plus_creative_repair_and_two_lane_beam() -> No
     )
 
     broken_syntax = "def broken(:\n    pass"
-    creative_json = json.dumps(
-        {
-            "physical_hypothesis": "Move cross-core metadata into 3 KiB SSBUF",
-            "target_local_metric": "sync_stall_ratio",
-            "dsl_source": _CREATIVE_SSBUF_DSL,
-        }
+    creative_reply = (
+        "# target_bottleneck: sync_stall_ratio\n"
+        "# structural_hypothesis: Move cross-core metadata into 3 KiB SSBUF\n"
+        f"```python\n{_CREATIVE_SSBUF_DSL}\n```"
     )
     mock_backend = MockLLMBackend(
         responses={
             "exploit_rule": [broken_syntax, _SEED_DSL],
             "syntax_repair": [_SEED_DSL],
-            "explore_creative": [creative_json],
+            "explore_creative": [creative_reply],
         }
     )
 
@@ -594,15 +592,13 @@ def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
             "persistent_wave_occupancy": 0.0,
         },
     )
-    creative_json = json.dumps(
-        {
-            "physical_hypothesis": "Explore vector fusion",
-            "target_local_metric": "aiv_vec",
-            "dsl_source": _CREATIVE_SSBUF_DSL,
-        }
+    creative_reply = (
+        "# target_bottleneck: aiv_vec\n"
+        "# structural_hypothesis: Explore vector fusion\n"
+        f"```python\n{_CREATIVE_SSBUF_DSL}\n```"
     )
     sparse_backend = MockLLMBackend(
-        responses={"explore_creative": [creative_json, creative_json, creative_json]}
+        responses={"explore_creative": [creative_reply, creative_reply, creative_reply]}
     )
     sparse_runner = PortfolioRunner(
         backend=sparse_backend,
@@ -1093,17 +1089,15 @@ def test_portfolio_runner_threads_roofline_and_symptom_ranking() -> None:
 
     tracker = _SpyTracker.from_seed_yaml()
     seen_rankings: list[tuple[tuple[str, float], ...]] = []
-    creative_json = json.dumps(
-        {
-            "physical_hypothesis": "Keep roofline fresh",
-            "target_local_metric": "aic_mac",
-            "dsl_source": _SEED_DSL,
-        }
+    creative_reply = (
+        "# target_bottleneck: aic_mac\n"
+        "# structural_hypothesis: Keep roofline fresh\n"
+        f"```python\n{_SEED_DSL}\n```"
     )
     backend = MockLLMBackend(
         responses={
             "apply_rule": [_SEED_DSL, _SEED_DSL],
-            "explore_creative": [creative_json],
+            "explore_creative": [creative_reply],
         }
     )
     funnel = GateFunnel(

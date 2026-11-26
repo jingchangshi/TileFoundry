@@ -671,10 +671,26 @@ class ObservationVector5D:
             roofline=roofline,
         )
 
-        if blueprint_compute_floor_us > 0.0 and measured_latency_us > 0.0:
-            effective_compute_eta = blueprint_compute_floor_us / max(1e-3, measured_latency_us)
+        raw_case_idx = tel.get("anchor_case_idx")
+        has_case_idx = (
+            raw_case_idx is not None
+            and not isinstance(raw_case_idx, bool)
+            and isinstance(raw_case_idx, (int, float))
+            and math.isfinite(float(raw_case_idx))
+        )
+        case_t_hw_us = _telemetry_float(tel, "case_t_hw_us")
+        case_roofline_eta = _telemetry_float(tel, "roofline_eta")
+        if has_case_idx and case_t_hw_us > 0.0 and measured_latency_us > 0.0:
+            raw_eta = case_t_hw_us / max(1e-3, measured_latency_us)
+        elif has_case_idx and case_roofline_eta > 0.0:
+            raw_eta = case_roofline_eta
+        elif blueprint_compute_floor_us > 0.0 and measured_latency_us > 0.0:
+            raw_eta = blueprint_compute_floor_us / max(1e-3, measured_latency_us)
+        elif case_t_hw_us > 0.0 and measured_latency_us > 0.0:
+            raw_eta = case_t_hw_us / max(1e-3, measured_latency_us)
         else:
-            effective_compute_eta = max(0.0, _telemetry_float(tel, "effective_compute_eta"))
+            raw_eta = _telemetry_float(tel, "effective_compute_eta")
+        effective_compute_eta = min(1.0, max(0.0, raw_eta))
 
         scalar_loop_fallback = max(
             float(ub_loops),

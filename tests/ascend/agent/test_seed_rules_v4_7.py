@@ -33,20 +33,24 @@ from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
 
 
 def test_seed_rules_exact_41_mece_provenance_and_ast_validity() -> None:
-    """Verify 41 atomic rules R01..R41, CE over 13 families, unique mechanism tags, and ASTs."""
+    """Verify seed rules R01..R41 plus v55 additions, CE over 13 families, and ASTs."""
     rules = load_seed_rules()
-    assert len(rules) == 41
+    assert len(rules) == 43
     rule_ids = [r.rule_id for r in rules]
-    assert len(set(rule_ids)) == 41
-    for idx, rule_id in enumerate(rule_ids, start=1):
-        assert rule_id.startswith(f"R{idx:02d}_")
+    assert len(set(rule_ids)) == 43
+    for idx in range(1, 42):
+        prefix = f"R{idx:02d}_"
+        assert any(rid.startswith(prefix) for rid in rule_ids)
 
     by_id = {r.rule_id: r for r in rules}
     assert "R17_RMEM_ACCUMULATOR_HOIST" in by_id
+    assert "R19A_CONSTRAINED_STAGE_OFFSET_PIPELINE" in by_id
     assert "R26_UB_256KB_SPR_UNLOCK" in by_id
     assert "R29_W4_AIV_SUBBYTE_UNPACK" in by_id
     assert "R32_GROUPED_ROLLING_CORE_DISPATCH" in by_id
     assert "R34_SCALAR_LOOP_TO_VECTOR_DMA_PIPELINE" in by_id
+    assert "R35_PURE_VECTOR_DUAL_SUBCORE_SPLIT" in by_id
+    assert "R35_Z3_TASK_CYCLE_LATENCY_OVERRIDE" in by_id
     assert "R38_COALESCE_SUB32B_TAIL_DMA_STORE" in by_id
     assert "R39_FIXPIPE_DEQ_SCALE_FOLD" in by_id
     assert "R40_SIMTVF_FP32_WIDEN_BEFORE_SUBBYTE_QUANT" in by_id
@@ -59,7 +63,7 @@ def test_seed_rules_exact_41_mece_provenance_and_ast_validity() -> None:
     covered_families = {SymptomFamily(r.symptom_family) for r in rules}
     assert covered_families == DETERMINISTIC_SYMPTOM_FAMILIES
     mechanism_tags = {r.mechanism_tag for r in rules}
-    assert len(mechanism_tags) == 41
+    assert len(mechanism_tags) == 43
     assert all(tag.strip() for tag in mechanism_tags)
     assert all(r.concept_description.strip() for r in rules)
 
