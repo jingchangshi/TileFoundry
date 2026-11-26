@@ -1059,7 +1059,7 @@ class PortfolioRunner:
         enable_track_router: bool = False,
         enable_tilesize_prescreen: bool = True,
         cost_model: HybridAscendCostModel | None = None,
-        cost_model_mode: str = "auto",
+        cost_model_mode: str = "off",
     ) -> None:
         self._backend = backend
         self._funnel = funnel
@@ -1070,7 +1070,7 @@ class PortfolioRunner:
         self._enable_track_router = enable_track_router
         self._enable_tilesize_prescreen = bool(enable_tilesize_prescreen)
         self._cost_model = cost_model
-        self._cost_model_mode = cost_model_mode
+        self._cost_model_mode = str(cost_model_mode).strip().lower() or "off"
 
     @property
     def beam(self) -> TwoLaneBeamSearch:
@@ -1190,6 +1190,9 @@ class PortfolioRunner:
             matched_rules,
             self._beam.exploited_signatures,
         )
+        eff_mode_raw = cost_model_mode if cost_model_mode is not None else self._cost_model_mode
+        eff_mode = str(eff_mode_raw).strip().lower() or "off"
+        eff_prescreen = self._enable_tilesize_prescreen and eff_mode != "off"
         if cost_gate_decision is None:
             try:
                 from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (  # noqa: PLC0415
@@ -1216,10 +1219,9 @@ class PortfolioRunner:
                         else None
                     )
                 )
-                eff_mode = cost_model_mode if cost_model_mode is not None else self._cost_model_mode
                 cost_gate_decision = evaluate_cost_gate_policy(
                     mode=eff_mode,
-                    enable_prescreen_flag=self._enable_tilesize_prescreen,
+                    enable_prescreen_flag=eff_prescreen,
                     round_idx=round_idx,
                     stagnation_rounds=stagnation_rounds,
                     incumbent_roofline_eta=eff_eta,
@@ -1236,7 +1238,7 @@ class PortfolioRunner:
             if cost_gate_decision is not None
             else True
         )
-        if self._enable_tilesize_prescreen and policy_engaged:
+        if eff_prescreen and policy_engaged:
             prescreen_summary = build_prescreen_summary_from_kwargs(
                 factory_kwargs,
                 dsl_source=parent.dsl_source,

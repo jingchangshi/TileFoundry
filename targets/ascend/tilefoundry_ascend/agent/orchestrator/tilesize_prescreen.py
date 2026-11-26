@@ -1152,6 +1152,33 @@ def _patch_selector_source(
     return patched
 
 
+def _static_dominant_bound_from_ledger(ledger: object) -> str:
+    """Derive dominant bound from Stage-A ledger pipe cycles without CostModel."""
+    dom_pipe = str(getattr(ledger, "dominant_pipe", "") or "").upper()
+    if any(tok in dom_pipe for tok in ("MTE2", "MTE3", "DMA")):
+        return "memory_bound"
+    if any(tok in dom_pipe for tok in ("PIPE_M", "CUBE", "PIPE_V", "VEC", "FIX")):
+        return "compute_bound"
+    pipes = getattr(ledger, "pipe_cycles", None)
+    if isinstance(pipes, Mapping):
+        mte_c = 0
+        comp_c = 0
+        for pname, pval in pipes.items():
+            val = int(pval or 0)
+            if val <= 0:
+                continue
+            up = str(pname).upper()
+            if "MTE2" in up or "MTE3" in up or "DMA" in up:
+                mte_c += val
+            elif any(tok in up for tok in ("PIPE_M", "CUBE", "PIPE_V", "VEC", "FIX")):
+                comp_c += val
+        if mte_c > comp_c:
+            return "memory_bound"
+        if comp_c > 0:
+            return "compute_bound"
+    return "balanced"
+
+
 def sweep_executable_lattice_zero_llm(
     module_source: str,
     *,
@@ -1159,13 +1186,22 @@ def sweep_executable_lattice_zero_llm(
     builder_fn_name: str,
     sample_builder_kwargs: Mapping[str, object],
     dims: Mapping[str, int] | None,
-    cost_model: HybridAscendCostModel,
+    cost_model: HybridAscendCostModel | None = None,
+    target: AscendTarget | None = None,
     max_points: int = 24,
     top_k: int = 3,
 ) -> list[LatticeSweepCandidate]:
-    """Sweep bounded tile lattice with Stage-A static analysis and cost scoring (0 LLM)."""
+    """Sweep bounded tile lattice with Stage-A static analysis and optional cost scoring."""
     if top_k <= 0 or max_points <= 0:
         return []
+    eff_target = target or (
+        cost_model.target if cost_model is not None else AscendTarget("ascend.950pr")
+    )
+    eff_facts = (
+        cost_model.facts
+        if (cost_model is not None and target is None)
+        else eff_target.get_facts(AscendSpaceFacts)
+    )
     base_cfg = _extract_selector_base_config(
         module_source,
         selector_fn_name,
@@ -1174,7 +1210,7 @@ def sweep_executable_lattice_zero_llm(
     )
     if not base_cfg:
         return []
-    override_grid = _generate_lattice_override_grid(base_cfg, cost_model.facts, max_points)
+    override_grid = _generate_lattice_override_grid(base_cfg, eff_facts, max_points)
     if not override_grid:
         return []
 
@@ -1182,8 +1218,8 @@ def sweep_executable_lattice_zero_llm(
         run_stage_a_static,
     )
 
-    candidates: list[LatticeSweepCandidate] = []
-    for ov in override_grid:
+    ranked_candidates: list[tuple[tuple[float, int, int], LatticeSweepCandidate]] = []
+    for idx, ov in enumerate(override_grid):
         try:
             patched_source = _patch_selector_source(module_source, selector_fn_name, ov)
         except (SyntaxError, ValueError):
@@ -1192,7 +1228,7 @@ def sweep_executable_lattice_zero_llm(
             patched_source,
             factory_name=builder_fn_name,
             factory_kwargs={**sample_builder_kwargs, **ov},
-            target=cost_model.target,
+            target=eff_target,
             config_selector_name=selector_fn_name,
             dims=dims,
         )
@@ -1211,29 +1247,43 @@ def sweep_executable_lattice_zero_llm(
         ub_bytes = int(getattr(ub_wl, "peak_allocated_bytes", 0) or 0)
         l1_bytes = int(getattr(l1_wl, "peak_allocated_bytes", 0) or 0)
 
-        policy_hint: dict[str, object] = {**base_cfg, **ov}
-        if all(k in ov for k in ("bm", "bn", "bk")):
-            policy_hint["tile_mnk"] = [ov["bm"], ov["bn"], ov["bk"]]
-        if "num_stages" in ov:
-            policy_hint["l1_stages"] = ov["num_stages"]
-        cf = build_cost_features_from_ledger(
-            ledger,
-            live_plan={"policy": policy_hint},
-            target=cost_model.target,
-        )
-        pred = cost_model.predict(cf)
-        candidates.append(
-            LatticeSweepCandidate(
-                knob_overrides=dict(ov),
-                patched_source=patched_source,
-                pred_us=float(pred.pred_us),
-                dominant_bound=str(pred.dominant_bound),
-                ub_bytes=ub_bytes,
-                l1_bytes=l1_bytes,
+        if cost_model is not None:
+            policy_hint: dict[str, object] = {**base_cfg, **ov}
+            if all(k in ov for k in ("bm", "bn", "bk")):
+                policy_hint["tile_mnk"] = [ov["bm"], ov["bn"], ov["bk"]]
+            if "num_stages" in ov:
+                policy_hint["l1_stages"] = ov["num_stages"]
+            cf = build_cost_features_from_ledger(
+                ledger,
+                live_plan={"policy": policy_hint},
+                target=eff_target,
             )
+            pred = cost_model.predict(cf)
+            pred_us = float(pred.pred_us)
+            dom_bound = str(pred.dominant_bound)
+            rank_key = (pred_us, ub_bytes, idx)
+        else:
+            pipes = getattr(ledger, "pipe_cycles", None) or {}
+            bottleneck_cycles = max(
+                (int(val or 0) for val in pipes.values()),
+                default=0,
+            ) if isinstance(pipes, Mapping) else 0
+            pred_us = 0.0
+            dom_bound = _static_dominant_bound_from_ledger(ledger)
+            rank_key = (float(bottleneck_cycles), -ub_bytes, idx)
+
+        cand = LatticeSweepCandidate(
+            knob_overrides=dict(ov),
+            patched_source=patched_source,
+            pred_us=pred_us,
+            dominant_bound=dom_bound,
+            ub_bytes=ub_bytes,
+            l1_bytes=l1_bytes,
         )
-    candidates.sort(key=lambda item: (item.pred_us, item.ub_bytes))
-    return candidates[: int(top_k)]
+        ranked_candidates.append((rank_key, cand))
+
+    ranked_candidates.sort(key=lambda entry: entry[0])
+    return [entry[1] for entry in ranked_candidates[: int(top_k)]]
 
 
 __all__ = [

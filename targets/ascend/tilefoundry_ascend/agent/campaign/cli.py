@@ -91,8 +91,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cost-model-mode",
-        choices=("auto", "coarse_only", "off"),
-        default="auto",
+        choices=("auto", "coarse_only", "shadow", "off"),
+        default="off",
         help="Cost model prescreen gate policy mode.",
     )
     parser.add_argument(
@@ -124,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
     """Execute a performance evolution campaign and emit JSON summary."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    eff_cost_model_mode = str(args.cost_model_mode).strip().lower()
+    eff_enable_prescreen = bool(args.enable_tilesize_prescreen) and eff_cost_model_mode != "off"
     if args.marathon:
         m_cfg = MarathonConfig(
             operator_name=args.operator,
@@ -144,11 +146,11 @@ def main(argv: list[str] | None = None) -> int:
             disable_early_goal_stop=bool(args.disable_early_goal_stop),
             run_final_l4=True,
             resume=True if args.resume else None,
-            enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
+            enable_tilesize_prescreen=eff_enable_prescreen,
             cost_prescreen_top_k=(
                 int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
             ),
-            cost_model_mode=str(args.cost_model_mode),
+            cost_model_mode=eff_cost_model_mode,
             cost_disengage_eta=float(args.cost_disengage_eta),
             cost_slow_gain_threshold=float(args.cost_slow_gain_threshold),
             pure_golden=bool(args.pure_golden),
@@ -190,11 +192,11 @@ def main(argv: list[str] | None = None) -> int:
         run_final_l4=bool(args.run_final_l4),
         device_id=primary_device_id,
         device_ids=tuple(device for device in device_pool if device != primary_device_id),
-        enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
+        enable_tilesize_prescreen=eff_enable_prescreen,
         cost_prescreen_top_k=(
             int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
         ),
-        cost_model_mode=str(args.cost_model_mode),
+        cost_model_mode=eff_cost_model_mode,
         cost_disengage_eta=float(args.cost_disengage_eta),
         cost_slow_gain_threshold=float(args.cost_slow_gain_threshold),
         pure_golden=bool(args.pure_golden),
