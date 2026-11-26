@@ -133,7 +133,7 @@ from tilefoundry_ascend.ascend.target import AscendTarget
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
-_MAX_L1_COMPILE_WORKERS = 4
+_MAX_L1_COMPILE_WORKERS = 8
 
 _SHAPE_DIM_KEYS: frozenset[str] = frozenset(
     {
@@ -2775,7 +2775,7 @@ class StageGateCoordinator:
         self._pending_speculative = still_pending
 
         stagger_sec = (
-            1.5
+            0.0
             if isinstance(
                 eff_backend,
                 (AgyCliLLMBackend, OpenAICompatHTTPBackend, SubprocessCliTemplateBackend),

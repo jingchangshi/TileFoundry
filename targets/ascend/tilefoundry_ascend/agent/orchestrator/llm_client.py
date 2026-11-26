@@ -657,7 +657,7 @@ class AgyCliLLMBackend:
         "--input-format text --disable-slash-commands "
         "--sandbox --mode plan --dangerously-skip-permissions"
     )
-    DEFAULT_EXPLOIT_MODEL = "gemini-4-hydrogen-medium"
+    DEFAULT_EXPLOIT_MODEL = "gemini-4-hydrogen-low"
     DEFAULT_EXPLORE_MODEL = "gemini-4-hydrogen-high"
     DEFAULT_ESCALATE_MODEL = "gemini-4-hydrogen-high"
 

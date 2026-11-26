@@ -424,7 +424,15 @@ rules:
       annotations={"enable_offset": True}) with outer T.Stage(0) / T.Stage(1) task scopes
       (never nesting T.Stage inside T.Task, T.SimdVF, T.SimtVF, or T.Parallel) and
       T.annotate_buffer_versions({buf: (2, "counter") | "auto"}) instead of hand-rolled
-      manual multi-buffers or inner PIPE_ALL barriers.
+      manual multi-buffers or inner PIPE_ALL barriers. Omitting
+      annotations={"enable_offset": True} fails NONZERO_STAGE_WITHOUT_ENABLE_OFFSET:
+      ```python
+      for k in T.Pipelined(N, num_stages=2, annotations={"enable_offset": True}):
+          with T.Stage(0):
+              ...
+          with T.Stage(1):
+              ...
+      ```
     expected_postcondition: "degraded_buffer_count == 0 and in_loop_pipe_all_barriers <= prev.in_loop_pipe_all_barriers and is_legal"
     source_provenance: "ref:tilelang"
     alpha_prior: 2.8

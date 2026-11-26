@@ -835,3 +835,105 @@ def test_poison_pill_subprocess_isolates_crash_and_timeout_without_breaking_pair
     assert "poison_pill_timeout_or_crash" in batch_res["c_crash"].anchors[0].error_message
     assert batch_res["c_hang"].all_passed is False
     assert "poison_pill_timeout_or_crash" in batch_res["c_hang"].anchors[0].error_message
+
+
+def test_prewarm_anchor_reference_cache_marker_skips_and_invalidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip reference prewarm subprocess when marker and .pt files match; re-run on loss."""
+    fake_root, cann_repo, _tl_stub, work_root, env_file = _setup_prewarm_fixture(tmp_path)
+    anchors = (
+        AnchorCaseSpec("level4/attention_residual", 2, "small_decode", 1.5, 0.5),
+        AnchorCaseSpec("level4/attention_residual", 4, "unaligned_d", 9.9, 3.3),
+    )
+    ref_cache = work_root / "surrogate" / "reference"
+    op_dir = ref_cache / "operators" / "level4__attention_residual"
+    marker_path = op_dir / ".ref_prewarm_v1.json"
+
+    spawn_count = 0
+
+    def _fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal spawn_count
+        spawn_count += 1
+        op_dir.mkdir(parents=True, exist_ok=True)
+        (op_dir / "identity.json").write_text(
+            '{"task": "level4/attention_residual"}',
+            encoding="utf-8",
+        )
+        for cid in (2, 4):
+            (op_dir / f"case_{cid}.oracle.pt").write_bytes(b"ORACLE_PT")
+            (op_dir / f"case_{cid}.native.pt").write_bytes(b"NATIVE_PT")
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
+
+    out1 = surrogate_cannbench.prewarm_anchor_reference_cache(
+        "attention_residual",
+        anchors,
+        cannbench_repo=cann_repo,
+        env_file=env_file,
+        cache_dir=ref_cache,
+        source_root=fake_root,
+    )
+    assert out1 == ref_cache
+    assert spawn_count == 1
+    assert marker_path.is_file()
+    marker_data = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker_data["case_ids"] == [2, 4]
+    assert marker_data["files"] == [
+        "case_2.native.pt",
+        "case_2.oracle.pt",
+        "case_4.native.pt",
+        "case_4.oracle.pt",
+    ]
+
+    surrogate_cannbench.prewarm_anchor_reference_cache(
+        "attention_residual",
+        anchors,
+        cannbench_repo=cann_repo,
+        env_file=env_file,
+        cache_dir=ref_cache,
+        source_root=fake_root,
+    )
+    assert spawn_count == 1
+
+    (op_dir / "case_4.native.pt").unlink()
+    surrogate_cannbench.prewarm_anchor_reference_cache(
+        "attention_residual",
+        anchors,
+        cannbench_repo=cann_repo,
+        env_file=env_file,
+        cache_dir=ref_cache,
+        source_root=fake_root,
+    )
+    assert spawn_count == 2
+    assert (op_dir / "case_4.native.pt").is_file()
+
+    surrogate_cannbench.prewarm_anchor_reference_cache(
+        "attention_residual",
+        anchors[:1],
+        cannbench_repo=cann_repo,
+        env_file=env_file,
+        cache_dir=ref_cache,
+        source_root=fake_root,
+    )
+    assert spawn_count == 2
+
+    cases_path = cann_repo / "tasks" / "level4" / "attention_residual" / "cases.yaml"
+    cases_path.write_text(
+        cases_path.read_text(encoding="utf-8") + "\n# changed\n",
+        encoding="utf-8",
+    )
+    surrogate_cannbench.prewarm_anchor_reference_cache(
+        "attention_residual",
+        anchors,
+        cannbench_repo=cann_repo,
+        env_file=env_file,
+        cache_dir=ref_cache,
+        source_root=fake_root,
+    )
+    assert spawn_count == 3
+    updated_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert updated_marker["cases_yaml_sha256"] != marker_data["cases_yaml_sha256"]
+

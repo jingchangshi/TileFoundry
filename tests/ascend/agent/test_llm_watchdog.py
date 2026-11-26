@@ -415,7 +415,7 @@ def test_command_normalization_effort_routing_and_stdin_devnull(
     assert rec1["stdin_len"] == 0
     assert rec1["cwd_entries"] == [".agents"]
     assert rec1["args"]["output_format"] == "stream-json"
-    assert rec1["args"]["effort"] == "medium"
+    assert rec1["args"]["effort"] == "low"
     assert rec1["args"]["print_timeout"] == "15s"
     assert "### SYSTEM INSTRUCTIONS" in rec1["args"]["prompt"]
 
@@ -462,7 +462,7 @@ def test_agent_flag_stripping_and_tier_adaptive_watchdog(
     exploit_model = backend.select_model("exploit_rule")
     explore_model = backend.select_model("explore_creative")
     escalate_model = backend.select_model("escalate_trackb", effort="xhigh")
-    assert exploit_model == "gemini-4-hydrogen-medium"
+    assert exploit_model == "gemini-4-hydrogen-low"
     assert explore_model == "gemini-4-hydrogen-high"
     assert escalate_model == "gemini-4-hydrogen-high"
 
@@ -480,7 +480,7 @@ def test_agent_flag_stripping_and_tier_adaptive_watchdog(
     cmd_med = backend.build_command(exploit_req, "P")
     cmd_high = backend.build_command(explore_req, "P")
     cmd_xhigh = backend.build_command(escalate_req, "P")
-    assert "gemini-4-hydrogen-medium" in cmd_med
+    assert "gemini-4-hydrogen-low" in cmd_med
     assert "--print-timeout=360s" in cmd_med
     assert "gemini-4-hydrogen-high" in cmd_high
     assert "--print-timeout=480s" in cmd_high

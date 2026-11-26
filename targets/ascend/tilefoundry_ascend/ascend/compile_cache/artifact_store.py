@@ -12,7 +12,7 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -69,32 +69,46 @@ def _is_cache_internal_file(item: Path) -> bool:
     return name.startswith(".prewarm_manifest_v1.") or name.startswith(".artifact_manifest.")
 
 
+_SKIPPED_TL_CACHE_DIRS: frozenset[str] = frozenset({"artifact_blobs", "stage_b_diag_v1"})
+
+
+def _walk_tl_cache_tree(base_dir: Path) -> Iterator[tuple[Path, list[str], list[str]]]:
+    for root_str, dirnames, filenames in os.walk(base_dir):
+        dirnames[:] = [d for d in sorted(dirnames) if d not in _SKIPPED_TL_CACHE_DIRS]
+        yield Path(root_str), dirnames, sorted(filenames)
+
+
+def _mirror_walk_dirs(src_dir: Path, dst_dir: Path, root: Path, dirnames: list[str]) -> Path:
+    rel_root = root.relative_to(src_dir)
+    dst_root = dst_dir if rel_root == Path(".") else dst_dir / rel_root
+    dst_root.mkdir(parents=True, exist_ok=True)
+    for dname in dirnames:
+        (dst_root / dname).mkdir(parents=True, exist_ok=True)
+    return dst_root
+
+
 def seed_tl_cache_tree(src_dir: Path, dst_dir: Path) -> None:
     """Seed an isolated worker cache from *src_dir* via hardlinks or copy fallback."""
     if not src_dir.is_dir():
         return
     dst_dir.mkdir(parents=True, exist_ok=True)
-    for item in sorted(src_dir.rglob("*")):
-        rel = item.relative_to(src_dir)
-        if _is_cache_internal_file(item):
-            continue
-        if item.name == "compiled_entries.jsonl":
-            continue
-        if rel.parts and rel.parts[0] == "artifact_blobs":
-            continue
-        target = dst_dir / rel
-        if item.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-        if target.exists():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.link(item, target)
-        except OSError as exc:
-            if exc.errno == errno.EEXIST:
+    for root, dirnames, filenames in _walk_tl_cache_tree(src_dir):
+        dst_root = _mirror_walk_dirs(src_dir, dst_dir, root, dirnames)
+        for fname in filenames:
+            if fname == "compiled_entries.jsonl":
                 continue
-            shutil.copy2(item, target)
+            item = root / fname
+            if _is_cache_internal_file(item):
+                continue
+            target = dst_root / fname
+            if target.exists():
+                continue
+            try:
+                os.link(item, target)
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    continue
+                shutil.copy2(item, target)
 
 
 def _atomic_copy_into_cache(src: Path, dst: Path) -> None:
@@ -115,41 +129,42 @@ def merge_tl_cache_tree(src_dir: Path, dst_dir: Path) -> None:
     if not src_dir.is_dir():
         return
     dst_dir.mkdir(parents=True, exist_ok=True)
-    for item in sorted(src_dir.rglob("*")):
-        if _is_cache_internal_file(item):
-            continue
-        rel = item.relative_to(src_dir)
-        target = dst_dir / rel
-        if item.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if item.name == "compiled_entries.jsonl" and target.is_file():
-            existing = target.read_text(encoding="utf-8")
-            addition = item.read_text(encoding="utf-8")
-            if not addition or addition == existing:
+    for root, dirnames, filenames in _walk_tl_cache_tree(src_dir):
+        dst_root = _mirror_walk_dirs(src_dir, dst_dir, root, dirnames)
+        for fname in filenames:
+            item = root / fname
+            if _is_cache_internal_file(item):
                 continue
-            if existing and not existing.endswith("\n"):
-                existing += "\n"
-            fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".compiled_entries.")
-            tmp_path = Path(tmp_name)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(existing + addition)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp_path, target)
-            finally:
-                if tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
-        elif not target.exists():
-            _atomic_copy_into_cache(item, target)
-        elif target.is_file():
-            if (
-                target.stat().st_size == item.stat().st_size
-                and target.read_bytes() == item.read_bytes()
-            ):
-                continue
+            target = dst_root / fname
+            if fname == "compiled_entries.jsonl" and target.is_file():
+                existing = target.read_text(encoding="utf-8")
+                addition = item.read_text(encoding="utf-8")
+                if not addition or addition == existing:
+                    continue
+                if existing and not existing.endswith("\n"):
+                    existing += "\n"
+                fd, tmp_name = tempfile.mkstemp(
+                    dir=str(target.parent), prefix=".compiled_entries."
+                )
+                tmp_path = Path(tmp_name)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(existing + addition)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp_path, target)
+                finally:
+                    if tmp_path.exists():
+                        tmp_path.unlink(missing_ok=True)
+            elif not target.exists():
+                _atomic_copy_into_cache(item, target)
+            elif target.is_file():
+                st_item = item.stat()
+                st_tgt = target.stat()
+                if (st_item.st_ino, st_item.st_dev) == (st_tgt.st_ino, st_tgt.st_dev):
+                    continue
+                if st_tgt.st_size == st_item.st_size and target.read_bytes() == item.read_bytes():
+                    continue
 
 
 def snapshot_tl_cache_binaries(cache_dir: Path) -> dict[Path, tuple[int, int]]:
@@ -157,10 +172,12 @@ def snapshot_tl_cache_binaries(cache_dir: Path) -> dict[Path, tuple[int, int]]:
     snap: dict[Path, tuple[int, int]] = {}
     if not cache_dir.is_dir():
         return snap
-    for item in cache_dir.rglob("*"):
-        if is_verified_binary_file(item):
-            st = item.stat()
-            snap[item.relative_to(cache_dir)] = (st.st_size, st.st_mtime_ns)
+    for root, _dirnames, filenames in _walk_tl_cache_tree(cache_dir):
+        for fname in filenames:
+            item = root / fname
+            if is_verified_binary_file(item):
+                st = item.stat()
+                snap[item.relative_to(cache_dir)] = (st.st_size, st.st_mtime_ns)
     return snap
 
 
@@ -172,14 +189,16 @@ def collect_new_tl_cache_binaries(
     post_new: list[Path] = []
     if not cache_dir.is_dir():
         return ()
-    for item in sorted(cache_dir.rglob("*")):
-        if not is_verified_binary_file(item):
-            continue
-        rel = item.relative_to(cache_dir)
-        st = item.stat()
-        prev = pre_snapshot.get(rel)
-        if prev is None or prev != (st.st_size, st.st_mtime_ns):
-            post_new.append(rel)
+    for root, _dirnames, filenames in _walk_tl_cache_tree(cache_dir):
+        for fname in filenames:
+            item = root / fname
+            if not is_verified_binary_file(item):
+                continue
+            rel = item.relative_to(cache_dir)
+            st = item.stat()
+            prev = pre_snapshot.get(rel)
+            if prev is None or prev != (st.st_size, st.st_mtime_ns):
+                post_new.append(rel)
     return tuple(post_new)
 
 

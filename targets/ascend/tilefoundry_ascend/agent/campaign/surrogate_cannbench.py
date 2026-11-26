@@ -3235,7 +3235,7 @@ async def run_l0_l1_round_filter(
     """Filter candidates concurrently via noop guard, L0 static, prescreen, and L1 compile."""
     _ = trackb_prologue_line_offset
     max_attempts = max(0, max_syntax_repairs)
-    bisheng_sem = asyncio.Semaphore(min(4, os.cpu_count() or 2))
+    bisheng_sem = asyncio.Semaphore(min(8, os.cpu_count() or 4))
     repair_intervals: list[tuple[float, float]] = []
     cum_repair_worker_sec = 0.0
     baseline_compare_source = (
@@ -3883,6 +3883,75 @@ def _default_surrogate_tl_cache_dir() -> Path:
     return Path(tempfile.gettempdir()) / f"tf_surrogate_tl_cache_{uid}"
 
 
+def _load_ref_prewarm_marker(marker_path: Path) -> dict[str, object] | None:
+    if not marker_path.is_file():
+        return None
+    try:
+        raw = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+    return dict(raw) if isinstance(raw, Mapping) else None
+
+
+def _ref_prewarm_marker_matches(
+    marker: Mapping[str, object] | None,
+    *,
+    op_dir: Path,
+    cases_yaml_sha256: str,
+    sorted_case_ids: Sequence[int],
+) -> bool:
+    if marker is None or not (op_dir / "identity.json").is_file():
+        return False
+    if marker.get("cases_yaml_sha256") != cases_yaml_sha256:
+        return False
+    raw_case_ids = marker.get("case_ids")
+    raw_files = marker.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        return False
+    try:
+        cached_ids = {int(x) for x in (raw_case_ids or ())}
+        if not set(sorted_case_ids).issubset(cached_ids):
+            return False
+        for fname in raw_files:
+            if not isinstance(fname, str) or not fname:
+                return False
+            fpath = op_dir / fname
+            if not fpath.is_file() or fpath.stat().st_size <= 0:
+                return False
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def _write_ref_prewarm_marker(
+    marker_path: Path,
+    *,
+    task: str,
+    cases_yaml_sha256: str,
+    case_ids: Sequence[int],
+    files: Sequence[str],
+) -> None:
+    payload = {
+        "version": 1,
+        "task": task,
+        "cases_yaml_sha256": cases_yaml_sha256,
+        "case_ids": list(case_ids),
+        "files": list(files),
+    }
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(dir=str(marker_path.parent), prefix=".ref_prewarm_v1.")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(encoded)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, marker_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
 def prewarm_anchor_reference_cache(
     operator_name: str,
     anchors: Sequence[AnchorCaseSpec],
@@ -3897,6 +3966,37 @@ def prewarm_anchor_reference_cache(
     repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
     resolved_cache = Path(cache_dir) if cache_dir is not None else _default_surrogate_cache_dir()
     resolved_cache.mkdir(parents=True, exist_ok=True)
+
+    try:
+        task = get_operator_task(operator_name)
+    except (KeyError, ValueError):
+        task = ""
+    sorted_case_ids = sorted({int(a.case_num) for a in anchors})
+    op_dir = resolved_cache / "operators" / task.replace("/", "__") if task else None
+    marker_path = op_dir / ".ref_prewarm_v1.json" if op_dir is not None else None
+    cases_yaml_sha256 = ""
+    if task:
+        try:
+            cases_path = resolve_cannbench_tasks_root(repo) / task / "cases.yaml"
+            if cases_path.is_file():
+                cases_yaml_sha256 = _sha256_file(cases_path)
+        except (OSError, KeyError, ValueError, RuntimeError):
+            cases_yaml_sha256 = ""
+
+    if (
+        task
+        and sorted_case_ids
+        and op_dir is not None
+        and marker_path is not None
+        and _ref_prewarm_marker_matches(
+            _load_ref_prewarm_marker(marker_path),
+            op_dir=op_dir,
+            cases_yaml_sha256=cases_yaml_sha256,
+            sorted_case_ids=sorted_case_ids,
+        )
+    ):
+        return resolved_cache
+
     env_vals = parse_simple_env_file(env_file) if env_file is not None else {}
     python_bin = (
         env_vals.get("TILEFOUNDRY_NPU_PYTHON")
@@ -3946,6 +4046,37 @@ def prewarm_anchor_reference_cache(
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[-1000:]
         raise RuntimeError(f"prewarm_anchor_reference_cache failed: {detail}")
+
+    if (
+        task
+        and sorted_case_ids
+        and op_dir is not None
+        and marker_path is not None
+        and (op_dir / "identity.json").is_file()
+    ):
+        pt_files = sorted(
+            {
+                p.name
+                for pattern in ("*.oracle.pt", "*.native.pt")
+                for p in op_dir.glob(pattern)
+                if p.is_file() and p.stat().st_size > 0
+            }
+        )
+        if pt_files:
+            merged_ids = set(sorted_case_ids)
+            existing = _load_ref_prewarm_marker(marker_path)
+            if existing is not None and existing.get("cases_yaml_sha256") == cases_yaml_sha256:
+                try:
+                    merged_ids.update(int(x) for x in (existing.get("case_ids") or ()))
+                except (ValueError, TypeError):
+                    pass
+            _write_ref_prewarm_marker(
+                marker_path,
+                task=task,
+                cases_yaml_sha256=cases_yaml_sha256,
+                case_ids=sorted(merged_ids),
+                files=pt_files,
+            )
     return resolved_cache
 
 

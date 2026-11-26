@@ -114,7 +114,7 @@ def test_agy_backend_command_isolation_and_schema_extraction(monkeypatch) -> Non
     )
     req_exploit = GenerationRequest("exploit_rule", "sys", "usr")
     cmd_exploit = backend.build_command(req_exploit, "PROMPT_TEXT")
-    assert "gemini-4-hydrogen-medium" in cmd_exploit
+    assert "gemini-4-hydrogen-low" in cmd_exploit
     assert "--add-dir" not in cmd_exploit
     assert "--dangerously-skip-permissions" not in cmd_exploit
     assert "--mode" not in cmd_exploit

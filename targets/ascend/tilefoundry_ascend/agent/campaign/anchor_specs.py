@@ -3238,6 +3238,34 @@ _STATIC_WIDTH_KEY_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+_STATIC_WIDTH_B1_DTYPES: frozenset[str] = frozenset(
+    {"int8", "uint8", "float8_e4m3fn", "float8_e5m2", "fp8"}
+)
+_STATIC_WIDTH_B2_DTYPES: frozenset[str] = frozenset(
+    {"float16", "bfloat16", "fp16", "bf16", "int16", "uint16"}
+)
+_STATIC_WIDTH_B4_DTYPES: frozenset[str] = frozenset(
+    {"float32", "fp32", "int32", "uint32"}
+)
+_STATIC_WIDTH_B8_DTYPES: frozenset[str] = frozenset(
+    {"float64", "fp64", "int64", "uint64"}
+)
+
+
+def _static_width_dtype_class(dtype_str: str) -> str:
+    """Map numeric dtype strings to bytewidth classes for static width deduplication."""
+    norm = dtype_str.strip().lower().removeprefix("torch.")
+    if norm in _STATIC_WIDTH_B2_DTYPES:
+        return "b2"
+    if norm in _STATIC_WIDTH_B4_DTYPES:
+        return "b4"
+    if norm in _STATIC_WIDTH_B1_DTYPES:
+        return "b1"
+    if norm in _STATIC_WIDTH_B8_DTYPES:
+        return "b8"
+    return norm
+
+
 def _static_width_signature(
     dims: Mapping[str, object],
     *,
@@ -3253,7 +3281,7 @@ def _static_width_signature(
                 break
     dtype_val = str(dims.get("tl_dtype") or default_dtype).strip().lower()
     if dtype_val:
-        sig.append(("tl_dtype", dtype_val))
+        sig.append(("tl_dtype", _static_width_dtype_class(dtype_val)))
     layout_val = str(
         dims.get("inputLayout", dims.get("input_layout", default_layout))
     ).strip().upper()

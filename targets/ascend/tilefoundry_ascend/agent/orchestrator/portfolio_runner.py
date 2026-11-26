@@ -1698,7 +1698,7 @@ class PortfolioRunner:
             ordered_tensor_shapes=resolved_shapes,
         )
         stagger_sec = (
-            1.5
+            0.0
             if isinstance(
                 self._backend,
                 (AgyCliLLMBackend, OpenAICompatHTTPBackend, SubprocessCliTemplateBackend),

@@ -30,6 +30,7 @@ from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
     compute_compile_task_key,
     merge_tl_cache_tree,
     resolve_unified_tl_cache_dir,
+    seed_tl_cache_tree,
     snapshot_tl_cache_binaries,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
@@ -1367,3 +1368,87 @@ def test_run_l1_compile_check_skips_cached_keys_and_populates_manifest(
     )
     assert tb_plan.returncode == 0, tb_plan.stderr
     assert json.loads(tb_plan.stdout.strip().splitlines()[-1]) == {"tasks": []}
+
+
+def test_tl_cache_tree_skips_blob_and_diag_dirs(tmp_path: Path) -> None:
+    """Verify seed, merge, snapshot, and collect skip artifact_blobs and stage_b_diag_v1."""
+    src_dir = tmp_path / "src_cache"
+    dst_dir = tmp_path / "dst_cache"
+    merge_dir = tmp_path / "merge_cache"
+    (src_dir / "sub" / "empty_ok").mkdir(parents=True)
+    (src_dir / "artifact_blobs" / "deep").mkdir(parents=True)
+    (src_dir / "nested" / "artifact_blobs").mkdir(parents=True)
+    (src_dir / "stage_b_diag_v1" / "deep").mkdir(parents=True)
+    (src_dir / "nested" / "stage_b_diag_v1").mkdir(parents=True)
+
+    (src_dir / "keep.so").write_bytes(b"ELF_KEEP")
+    (src_dir / "sub" / "nested.so").write_bytes(b"ELF_NESTED")
+    (src_dir / "compiled_entries.jsonl").write_text('{"k": 1}\n', encoding="utf-8")
+    (src_dir / "prewarm_manifest_v1.json").write_text("{}", encoding="utf-8")
+    (src_dir / "artifact_blobs" / "deep" / "blob.so").write_bytes(b"ELF_BLOB")
+    (src_dir / "nested" / "artifact_blobs" / "blob2.so").write_bytes(b"ELF_BLOB2")
+    (src_dir / "stage_b_diag_v1" / "deep" / "diag.so").write_bytes(b"ELF_DIAG")
+    (src_dir / "nested" / "stage_b_diag_v1" / "diag2.so").write_bytes(b"ELF_DIAG2")
+
+    seed_tl_cache_tree(src_dir, dst_dir)
+    assert (dst_dir / "keep.so").read_bytes() == b"ELF_KEEP"
+    assert (dst_dir / "sub" / "nested.so").read_bytes() == b"ELF_NESTED"
+    assert (dst_dir / "sub" / "empty_ok").is_dir()
+    assert not (dst_dir / "compiled_entries.jsonl").exists()
+    assert not (dst_dir / "prewarm_manifest_v1.json").exists()
+    assert not (dst_dir / "artifact_blobs").exists()
+    assert not (dst_dir / "nested" / "artifact_blobs").exists()
+    assert not (dst_dir / "stage_b_diag_v1").exists()
+    assert not (dst_dir / "nested" / "stage_b_diag_v1").exists()
+
+    snap = snapshot_tl_cache_binaries(src_dir)
+    assert set(snap) == {Path("keep.so"), Path("sub/nested.so")}
+    assert collect_new_tl_cache_binaries(src_dir, {}) == (
+        Path("keep.so"),
+        Path("sub/nested.so"),
+    )
+
+    merge_tl_cache_tree(src_dir, merge_dir)
+    assert (merge_dir / "keep.so").read_bytes() == b"ELF_KEEP"
+    assert (merge_dir / "sub" / "nested.so").read_bytes() == b"ELF_NESTED"
+    assert (merge_dir / "compiled_entries.jsonl").read_text(encoding="utf-8") == '{"k": 1}\n'
+    assert not (merge_dir / "artifact_blobs").exists()
+    assert not (merge_dir / "nested" / "artifact_blobs").exists()
+    assert not (merge_dir / "stage_b_diag_v1").exists()
+    assert not (merge_dir / "nested" / "stage_b_diag_v1").exists()
+
+
+def test_merge_tl_cache_tree_skips_hardlinked_same_inode_without_reading_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify merge_tl_cache_tree short-circuits same-inode hardlinks before read_bytes."""
+    shared_dir = tmp_path / "shared_cache"
+    worker_dir = tmp_path / "worker_cache"
+    shared_dir.mkdir()
+    (shared_dir / "seeded.so").write_bytes(b"ELF_HARDLINKED")
+
+    seed_tl_cache_tree(shared_dir, worker_dir)
+    assert (worker_dir / "seeded.so").stat().st_ino == (shared_dir / "seeded.so").stat().st_ino
+
+    (worker_dir / "new_out.so").write_bytes(b"ELF_NEW_OUT")
+    (shared_dir / "separate.so").write_bytes(b"SAME_CONTENT")
+    (worker_dir / "separate.so").write_bytes(b"SAME_CONTENT")
+
+    orig_read_bytes = Path.read_bytes
+    read_paths: list[Path] = []
+
+    def _guarded_read_bytes(self: Path) -> bytes:
+        read_paths.append(self)
+        if self.name == "seeded.so":
+            raise AssertionError(f"read_bytes called on hardlinked file: {self}")
+        return orig_read_bytes(self)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(Path, "read_bytes", _guarded_read_bytes)
+        merge_tl_cache_tree(worker_dir, shared_dir)
+
+    assert all(p.name != "seeded.so" for p in read_paths)
+    assert any(p.name == "separate.so" for p in read_paths)
+    assert (shared_dir / "new_out.so").read_bytes() == b"ELF_NEW_OUT"
+    assert (shared_dir / "seeded.so").read_bytes() == b"ELF_HARDLINKED"
