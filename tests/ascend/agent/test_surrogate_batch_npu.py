@@ -783,7 +783,10 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     load_anchor_harness_and_cases,
     load_cannbench_contract_module,
 )
-from tests.ascend.agent.test_surrogate_batch_npu import _load_candidate_entrypoint
+from tests.ascend.agent.test_surrogate_batch_npu import (
+    _configure_tilelang_cache,
+    _load_candidate_entrypoint,
+)
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 out_path = Path(sys.argv[2])
@@ -795,8 +798,17 @@ source_root = Path(str(payload["source_root"]))
 cannbench_repo = Path(str(payload["cannbench_repo"]))
 anchors = [AnchorCaseSpec.from_dict(item) for item in payload["anchors"]]
 
+if not hasattr(torch, "npu"):
+    try:
+        importlib.import_module("torch_npu")
+    except ImportError:
+        pass
 if hasattr(torch, "npu") and torch.npu.is_available():
     torch.npu.set_device(0)
+
+tl_cache_env = os.environ.get("TILELANG_CACHE_DIR", "").strip()
+if tl_cache_env:
+    _configure_tilelang_cache(tl_cache_env)
 
 contract_mod = load_cannbench_contract_module(source_root=source_root)
 harness, cases = load_anchor_harness_and_cases(
