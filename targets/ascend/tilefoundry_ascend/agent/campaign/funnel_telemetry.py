@@ -196,6 +196,9 @@ class RoundFunnelEvent:
     delta_speedup: float = 0.0
     noop_identical: bool = False
     wall_sec: float = 0.0
+    stage_timings_sec: dict[str, float] = field(default_factory=dict)
+    prewarm_stats: dict[str, int] = field(default_factory=dict)
+    cost_advisor_predictions: int = 0
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, object]:
