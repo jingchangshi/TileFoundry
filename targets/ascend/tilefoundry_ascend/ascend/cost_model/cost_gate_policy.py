@@ -1,7 +1,8 @@
-"""Adaptive CostModel lifecycle policy and paradigm-shift exemption state machine."""
+"""Statistically gated CostModel lifecycle policy and paradigm-shift exemption."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -9,24 +10,22 @@ from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 
 
 class CostModelMode(StrEnum):
-    """Execution mode for the stage-A cost-model prescreen gate."""
+    """Execution mode for the stage-A cost-model advisory gate."""
 
     OFF = "off"
     SHADOW = "shadow"
-    AUTO = "auto"
-    COARSE_ONLY = "coarse_only"
+    ADVISORY = "advisory"
 
 
 @dataclass(frozen=True, slots=True)
 class CostGateDecision:
-    """Immutable lifecycle gate decision governing prescreen pruning and prompt guidance."""
+    """Immutable lifecycle gate decision governing advisory prompt guidance."""
 
     mode: CostModelMode
     engaged: bool
     reason: str
-    coarse_reject_ratio: float
     allow_prompt_guidance: bool
-    allow_candidate_pruning: bool
+    allow_candidate_pruning: bool = False
 
 
 def is_paradigm_shift_exempt(
@@ -51,18 +50,10 @@ def evaluate_cost_gate_policy(
     *,
     mode: CostModelMode | str = CostModelMode.OFF,
     enable_prescreen_flag: bool = True,
-    round_idx: int = 1,
-    stagnation_rounds: int = 0,
-    incumbent_roofline_eta: float = 0.0,
-    target_roofline_eta: float = 0.85,
-    prev_local_rel_gain: float | None = None,
-    mean_recoverable_excess_us: float | None = None,
-    disengage_roofline_eta: float = 0.65,
-    slow_gain_threshold: float = 0.03,
-    min_recoverable_excess_us: float = 1.0,
-    coarse_reject_ratio: float = 3.0,
+    bucket_clean_samples: int = 0,
+    out_of_sample_spearman_rho: float | None = None,
 ) -> CostGateDecision:
-    """Evaluate whether the adaptive cost-model gate should engage for the current round."""
+    """Evaluate whether advisory cost-model guidance should engage for the current round."""
     resolved_mode = (
         CostModelMode.OFF
         if not enable_prescreen_flag
@@ -73,7 +64,6 @@ def evaluate_cost_gate_policy(
             mode=resolved_mode,
             engaged=False,
             reason="disabled_by_config",
-            coarse_reject_ratio=float("inf"),
             allow_prompt_guidance=False,
             allow_candidate_pruning=False,
         )
@@ -82,74 +72,61 @@ def evaluate_cost_gate_policy(
             mode=resolved_mode,
             engaged=False,
             reason="shadow_observation_only",
-            coarse_reject_ratio=float("inf"),
             allow_prompt_guidance=False,
             allow_candidate_pruning=False,
         )
-    if resolved_mode == CostModelMode.COARSE_ONLY:
+
+    samples = int(bucket_clean_samples)
+    if samples < 8:
+        return CostGateDecision(
+            mode=resolved_mode,
+            engaged=False,
+            reason="insufficient_bucket_samples",
+            allow_prompt_guidance=False,
+            allow_candidate_pruning=False,
+        )
+    if out_of_sample_spearman_rho is None or not math.isfinite(
+        float(out_of_sample_spearman_rho)
+    ):
+        return CostGateDecision(
+            mode=resolved_mode,
+            engaged=False,
+            reason="missing_spearman_rho",
+            allow_prompt_guidance=False,
+            allow_candidate_pruning=False,
+        )
+    rho = float(out_of_sample_spearman_rho)
+    if rho >= 1.0:
         return CostGateDecision(
             mode=resolved_mode,
             engaged=True,
-            reason="forced_coarse_only",
-            coarse_reject_ratio=float(coarse_reject_ratio),
+            reason="advisory_t_stat_validated",
             allow_prompt_guidance=True,
-            allow_candidate_pruning=True,
+            allow_candidate_pruning=False,
         )
-
-    effective_eta_cap = min(
-        float(disengage_roofline_eta),
-        max(0.50, float(target_roofline_eta) - 0.15),
-    )
-    if float(incumbent_roofline_eta) >= effective_eta_cap:
+    if rho <= 0.0:
         return CostGateDecision(
             mode=resolved_mode,
             engaged=False,
-            reason="near_theoretical_limit",
-            coarse_reject_ratio=float("inf"),
+            reason="spearman_t_stat_below_threshold",
             allow_prompt_guidance=False,
             allow_candidate_pruning=False,
         )
-    if (
-        mean_recoverable_excess_us is not None
-        and float(mean_recoverable_excess_us) <= float(min_recoverable_excess_us)
-    ):
+    t_stat = rho * math.sqrt(float(samples - 2) / (1.0 - rho * rho))
+    if t_stat > 2.0:
         return CostGateDecision(
             mode=resolved_mode,
-            engaged=False,
-            reason="near_launch_floor",
-            coarse_reject_ratio=float("inf"),
-            allow_prompt_guidance=False,
-            allow_candidate_pruning=False,
-        )
-    if int(stagnation_rounds) >= 1:
-        return CostGateDecision(
-            mode=resolved_mode,
-            engaged=False,
-            reason="stagnation_detected",
-            coarse_reject_ratio=float("inf"),
-            allow_prompt_guidance=False,
-            allow_candidate_pruning=False,
-        )
-    if (
-        int(round_idx) >= 2
-        and prev_local_rel_gain is not None
-        and float(prev_local_rel_gain) < float(slow_gain_threshold)
-    ):
-        return CostGateDecision(
-            mode=resolved_mode,
-            engaged=False,
-            reason="slow_iteration_velocity",
-            coarse_reject_ratio=float("inf"),
-            allow_prompt_guidance=False,
+            engaged=True,
+            reason="advisory_t_stat_validated",
+            allow_prompt_guidance=True,
             allow_candidate_pruning=False,
         )
     return CostGateDecision(
         mode=resolved_mode,
-        engaged=True,
-        reason="early_coarse_prescreen",
-        coarse_reject_ratio=float(coarse_reject_ratio),
-        allow_prompt_guidance=True,
-        allow_candidate_pruning=True,
+        engaged=False,
+        reason="spearman_t_stat_below_threshold",
+        allow_prompt_guidance=False,
+        allow_candidate_pruning=False,
     )
 
 

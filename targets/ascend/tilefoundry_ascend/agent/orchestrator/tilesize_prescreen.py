@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import ast
-import functools
-import inspect
 import math
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -52,11 +50,12 @@ class TileConfigCandidate:
     dtype: str = ""
     hf32: bool = False
     l1_half_bank_split: bool = True
+    stack_bytes: int = 0
 
 
 @dataclass(frozen=True)
 class PrescreenScore:
-    """Hardware feasibility and arithmetic-intensity score for a tile config."""
+    """Hardware feasibility and zero-parameter Roofline score for a tile config."""
 
     candidate: TileConfigCandidate
     is_feasible: bool
@@ -71,6 +70,8 @@ class PrescreenScore:
     rejection_reason: str | None = None
     cube_macs_per_cycle: int = 4096
     half_l1_penalty: float = 0.0
+    t_roof_us: float = 0.0
+    tail_waste_ratio: float = 0.0
 
 
 def _resolve_candidate_dtype(cand: TileConfigCandidate, explicit_dtype: str | None) -> str:
@@ -94,6 +95,58 @@ def _resolve_cube_macs(facts: AscendSpaceFacts, dtype_name: str, *, hf32: bool) 
     return int(_default_cube_macs_per_cycle(dtype_name, hf32=hf32))
 
 
+def _compute_tile_roofline_and_waste(
+    bm: int,
+    bn: int,
+    bk: int,
+    *,
+    dtype_bytes: int,
+    accum_bytes: int,
+    l0c_bytes: int,
+    facts: AscendSpaceFacts,
+    macs_per_cycle: int,
+    m_dim: int = 0,
+    n_dim: int = 0,
+    k_dim: int = 0,
+) -> tuple[float, float]:
+    """Compute theoretical Roofline lower bound (us) and tail-tile waste ratio."""
+    l0a_slot = bm * bk * dtype_bytes
+    l0b_slot = bk * bn * dtype_bytes
+    flops = float(2 * bm * bn * bk)
+    mem_traffic = float(l0a_slot + l0b_slot + l0c_bytes)
+    clock_ghz = float(getattr(facts, "clock_ghz", 1.65) or 1.65)
+    hbm_bps = float(getattr(facts, "hbm_peak_bandwidth_bps", 0) or 0)
+    fixpipe_bpc = max(1, int(getattr(facts, "fixpipe_bytes_per_cycle", 128) or 128))
+    num_aic = max(1, int(getattr(facts, "num_aic_cores", 28) or 28))
+
+    if m_dim > 0 and n_dim > 0 and k_dim > 0:
+        tiles_m = math.ceil(m_dim / bm)
+        tiles_n = math.ceil(n_dim / bn)
+        tiles_k = math.ceil(k_dim / bk)
+        padded_vol = tiles_m * bm * tiles_n * bn * tiles_k * bk
+        actual_vol = m_dim * n_dim * k_dim
+        tail_waste_ratio = max(0.0, float(padded_vol - actual_vol) / float(max(1, padded_vol)))
+        padded_flops = float(2 * padded_vol)
+        padded_mem = float(
+            tiles_m * tiles_n * tiles_k * (l0a_slot + l0b_slot)
+            + tiles_m * tiles_n * l0c_bytes
+        )
+        cube_cycles = padded_flops / float(num_aic * max(1, macs_per_cycle))
+        fixpipe_cycles = float(tiles_m * tiles_n * l0c_bytes) / float(num_aic * fixpipe_bpc)
+        t_comp_us = max(cube_cycles, fixpipe_cycles) / (clock_ghz * 1e3)
+        t_mem_us = (padded_mem / hbm_bps) * 1e6 if hbm_bps > 0.0 else 0.0
+        return max(t_comp_us, t_mem_us), tail_waste_ratio
+
+    _ = accum_bytes
+    cube_cycles = flops / float(max(1, macs_per_cycle))
+    fixpipe_cycles = float(l0c_bytes) / float(fixpipe_bpc)
+    t_tile_comp_us = max(cube_cycles, fixpipe_cycles) / (clock_ghz * 1e3)
+    t_tile_mem_us = (mem_traffic / hbm_bps) * 1e6 if hbm_bps > 0.0 else 0.0
+    t_tile_roof_us = max(t_tile_comp_us, t_tile_mem_us)
+    t_roof_per_mflop_us = (t_tile_roof_us / max(1.0, flops)) * 1e6
+    return t_roof_per_mflop_us, 0.0
+
+
 def evaluate_tile_candidate(
     cand: TileConfigCandidate,
     facts: AscendSpaceFacts,
@@ -102,13 +155,27 @@ def evaluate_tile_candidate(
     dtype: str | None = None,
     hf32: bool | None = None,
     l1_half_bank_split: bool | None = None,
+    m_dim: int = 0,
+    n_dim: int = 0,
+    k_dim: int = 0,
+    stack_bytes: int | None = None,
 ) -> PrescreenScore:
-    """Compute exact scratchpad occupancy, per-dtype Cube balance, and Half-L1 conflict score."""
+    """Evaluate hard physical feasibility and zero-parameter Roofline lower bound."""
+    _ = l1_half_bank_split
     eff_dtype = _resolve_candidate_dtype(cand, dtype)
     eff_hf32 = cand.hf32 if hf32 is None else bool(hf32)
     macs_per_cycle = max(1, _resolve_cube_macs(facts, eff_dtype, hf32=eff_hf32))
+    eff_stack = int(cand.stack_bytes if stack_bytes is None else stack_bytes)
 
-    if cand.bm <= 0 or cand.bn <= 0 or cand.bk <= 0 or cand.stages < 1 or cand.aiv_split < 1:
+    if (
+        cand.bm <= 0
+        or cand.bn <= 0
+        or cand.bk <= 0
+        or cand.stages < 1
+        or cand.aiv_split < 1
+        or cand.dtype_bytes <= 0
+        or cand.accum_bytes <= 0
+    ):
         return PrescreenScore(
             candidate=cand,
             is_feasible=False,
@@ -159,7 +226,9 @@ def evaluate_tile_candidate(
     ub_bytes = cand.stages * ub_rows * ub_width * cand.accum_bytes
 
     ub_limit = facts.ub_limit_bytes("simtvf" if simtvf else "simdvf")
-    if l1_bytes > facts.l1_bytes:
+    if eff_stack > 0:
+        reason: str | None = f"stack_overflow:{eff_stack}>0"
+    elif l1_bytes > facts.l1_bytes:
         reason = f"L1_overflow:{l1_bytes}>{facts.l1_bytes}"
     elif l0a_bytes > facts.l0a_bytes:
         reason = f"L0A_overflow:{l0a_bytes}>{facts.l0a_bytes}"
@@ -172,29 +241,26 @@ def evaluate_tile_candidate(
     else:
         reason = None
 
-    eff_half_split = cand.l1_half_bank_split if l1_half_bank_split is None else bool(l1_half_bank_split)
-    half_l1_limit = int(getattr(facts, "l1_bank_bytes", facts.l1_bytes // 2) or (facts.l1_bytes // 2))
-    half_l1_penalty = 0.0
-    if cand.stages >= 2:
-        if not eff_half_split:
-            half_l1_penalty = 0.25
-        else:
-            stages_per_bank = math.ceil(cand.stages / 2)
-            half_bank_bytes = stages_per_bank * (l0a_slot + l0b_slot)
-            if half_bank_bytes > half_l1_limit:
-                overflow_ratio = (half_bank_bytes - half_l1_limit) / float(max(1, half_l1_limit))
-                half_l1_penalty = min(0.75, 0.25 + 0.50 * overflow_ratio)
-
     flops = float(2 * cand.bm * cand.bn * cand.bk)
     mem_traffic = float(l0a_slot + l0b_slot + l0c_bytes)
     intensity = flops / mem_traffic if mem_traffic > 0.0 else 0.0
     cube_cycles = max(1.0, flops / float(macs_per_cycle))
     fixpipe_cycles = float(l0c_bytes) / float(max(1, facts.fixpipe_bytes_per_cycle))
     fp_ratio = fixpipe_cycles / cube_cycles
-    stage_bonus = 1.25 if cand.stages >= 2 else 1.0
-    score = (intensity * stage_bonus) / (
-        (1.0 + max(0.0, fp_ratio - 1.0)) * (1.0 + half_l1_penalty)
+    t_roof_us, tail_waste = _compute_tile_roofline_and_waste(
+        cand.bm,
+        cand.bn,
+        cand.bk,
+        dtype_bytes=cand.dtype_bytes,
+        accum_bytes=cand.accum_bytes,
+        l0c_bytes=l0c_bytes,
+        facts=facts,
+        macs_per_cycle=macs_per_cycle,
+        m_dim=m_dim,
+        n_dim=n_dim,
+        k_dim=k_dim,
     )
+    score = (1.0 / max(1e-12, t_roof_us)) * max(0.0, 1.0 - tail_waste)
 
     return PrescreenScore(
         candidate=cand,
@@ -209,7 +275,9 @@ def evaluate_tile_candidate(
         score=score if reason is None else 0.0,
         rejection_reason=reason,
         cube_macs_per_cycle=macs_per_cycle,
-        half_l1_penalty=round(half_l1_penalty, 6),
+        half_l1_penalty=0.0,
+        t_roof_us=t_roof_us,
+        tail_waste_ratio=tail_waste,
     )
 
 
@@ -222,8 +290,13 @@ def prescreen_tile_configs(
     dtype: str | None = None,
     hf32: bool | None = None,
     l1_half_bank_split: bool | None = None,
+    m_dim: int = 0,
+    n_dim: int = 0,
+    k_dim: int = 0,
+    cost_model_mode: str = "off",
 ) -> list[PrescreenScore]:
-    """Batch-filter and rank candidate tile shapes by scratchpad legality and balance."""
+    """Filter tile shapes by hard physical feasibility and rank by Roofline and tail waste."""
+    _ = cost_model_mode
     facts = (target or AscendTarget("ascend.950pr")).get_facts(AscendSpaceFacts)
     scored = [
         evaluate_tile_candidate(
@@ -233,11 +306,23 @@ def prescreen_tile_configs(
             dtype=dtype,
             hf32=hf32,
             l1_half_bank_split=l1_half_bank_split,
+            m_dim=m_dim,
+            n_dim=n_dim,
+            k_dim=k_dim,
         )
         for c in candidates
     ]
     feasible = [item for item in scored if item.is_feasible]
-    feasible.sort(key=lambda item: item.score, reverse=True)
+    feasible.sort(
+        key=lambda item: (
+            round(item.t_roof_us, 12),
+            round(item.tail_waste_ratio, 12),
+            item.candidate.bm,
+            item.candidate.bn,
+            item.candidate.bk,
+            item.candidate.stages,
+        )
+    )
     if top_k is not None and top_k >= 0:
         return feasible[:top_k]
     return feasible
@@ -505,15 +590,6 @@ class CostRankedCandidate:
     ledger: object | None = None
     parent_relative_ratio: float = 1.0
     coarse_reject_exempt: bool = False
-    coarse_rejected: bool = False
-
-    def exceeds_coarse_reject_ratio(self, coarse_reject_ratio: float = 3.0) -> bool:
-        """Return True when candidate cost exceeds the parent ratio cap without exemption."""
-        if self.coarse_reject_exempt:
-            return False
-        if not math.isfinite(coarse_reject_ratio) or coarse_reject_ratio <= 0.0:
-            return False
-        return self.parent_relative_ratio > float(coarse_reject_ratio)
 
 
 def rank_stage_a_candidates_with_cost_model(
@@ -526,7 +602,6 @@ def rank_stage_a_candidates_with_cost_model(
     sil_advisory: object | None = None,
     parent_ledger: object | None = None,
     parent_features: CostFeatures | None = None,
-    coarse_reject_ratio: float = 3.0,
     creative_candidate_ids: Collection[str] | None = None,
     parent_workspace_stages: int = 0,
 ) -> list[CostRankedCandidate]:
@@ -579,13 +654,6 @@ def rank_stage_a_candidates_with_cost_model(
             parent_workspace_stages=int(parent_workspace_stages),
             is_creative=str(cand_id) in creative_ids,
         )
-        rejected = (
-            parent_pred is not None
-            and not exempt
-            and math.isfinite(coarse_reject_ratio)
-            and float(coarse_reject_ratio) > 0.0
-            and rel_ratio > float(coarse_reject_ratio)
-        )
         ranked_item = CostRankedCandidate(
             candidate_id=str(cand_id),
             pred_us=score,
@@ -596,11 +664,41 @@ def rank_stage_a_candidates_with_cost_model(
             ledger=ledger,
             parent_relative_ratio=rel_ratio,
             coarse_reject_exempt=exempt,
-            coarse_rejected=rejected,
         )
         scored.append((ranked_item.pred_us, idx, ranked_item))
     scored.sort(key=lambda entry: (entry[0], entry[1]))
     return [entry[2] for entry in scored]
+
+
+def _extract_problem_mnk(
+    var_bindings: Mapping[str, int] | None,
+    dims: Mapping[str, object] | None,
+) -> tuple[int, int, int]:
+    m_val = 0
+    n_val = 0
+    k_val = 0
+    for src in (var_bindings, dims):
+        if not isinstance(src, Mapping):
+            continue
+        for key, target_name in (
+            ("M", "m"),
+            ("m_dim", "m"),
+            ("m_rows", "m"),
+            ("total_rows", "m"),
+            ("N", "n"),
+            ("n_dim", "n"),
+            ("K", "k"),
+            ("k_dim", "k"),
+        ):
+            raw = src.get(key)
+            if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+                if target_name == "m" and m_val == 0:
+                    m_val = int(raw)
+                elif target_name == "n" and n_val == 0:
+                    n_val = int(raw)
+                elif target_name == "k" and k_val == 0:
+                    k_val = int(raw)
+    return m_val, n_val, k_val
 
 
 def prescreen_live_ir_neighborhood(
@@ -617,6 +715,7 @@ def prescreen_live_ir_neighborhood(
     target: AscendTarget | None = None,
     max_variants: int = 8,
     cost_model: HybridAscendCostModel | None = None,
+    cost_model_mode: str | None = None,
     axes: TopologyAxes | None = None,
     live_plan: object | None = None,
     blueprint: object | None = None,
@@ -624,6 +723,11 @@ def prescreen_live_ir_neighborhood(
     ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> str:
     """Run bounded Stage A live-IR dry-runs across aligned tile variants around center."""
+    eff_cost_model = (
+        None
+        if (cost_model_mode is not None and str(cost_model_mode).strip().lower() == "off")
+        else cost_model
+    )
     params, has_varkw = inspect_builder_tile_params(dsl_source, factory_name)
     m_keys = ("bm", "tile_m", "block_m", "tile_rows", "row_tile")
     n_keys = ("bn", "tile_n", "block_n")
@@ -696,7 +800,12 @@ def prescreen_live_ir_neighborhood(
             ):
                 total_rows = int(b_val) * int(s_val)
                 break
-    num_aiv_cores = max(1, int(ascend_space_facts(target or AscendTarget()).num_aiv_cores))
+    eff_target = target or AscendTarget()
+    facts = ascend_space_facts(eff_target)
+    num_aiv_cores = max(1, int(facts.num_aiv_cores))
+    m_dim, n_dim, k_dim = _extract_problem_mnk(var_bindings, dims)
+    clock_ghz = float(getattr(facts, "clock_ghz", 1.65) or 1.65)
+    hbm_bps = float(getattr(facts, "hbm_peak_bandwidth_bps", 0) or 0)
 
     records: list[
         tuple[
@@ -718,6 +827,52 @@ def prescreen_live_ir_neighborhood(
     parent_features: CostFeatures | None = None
     parent_pred: CostPrediction | None = None
     for idx, cand in enumerate(variants):
+        if (
+            cand.bm <= 0
+            or cand.bn <= 0
+            or cand.bk <= 0
+            or cand.stages < 1
+            or cand.aiv_split < 1
+            or cand.dtype_bytes <= 0
+            or cand.accum_bytes <= 0
+        ):
+            records.append(
+                (
+                    False,
+                    (float("inf"), 1.0, float(idx)),
+                    cand,
+                    "REJECT(non_positive_tile_dimension)",
+                    {},
+                    0,
+                    None,
+                    1.0,
+                    0,
+                    0.0,
+                    None,
+                    0.0,
+                )
+            )
+            continue
+        if (not pure_vector_row_tile) and (
+            cand.bm % 16 != 0 or cand.bn % 16 != 0 or cand.bk % 16 != 0
+        ):
+            records.append(
+                (
+                    False,
+                    (float("inf"), 1.0, float(idx)),
+                    cand,
+                    "REJECT(unaligned_mmad_16x16x16_atom)",
+                    {},
+                    0,
+                    None,
+                    1.0,
+                    0,
+                    0.0,
+                    None,
+                    0.0,
+                )
+            )
+            continue
         cand_kwargs = _apply_tile_candidate_to_kwargs(
             base_kwargs,
             cand,
@@ -740,7 +895,7 @@ def prescreen_live_ir_neighborhood(
             records.append(
                 (
                     False,
-                    (float("inf"), 10**9, idx),
+                    (float("inf"), 1.0, float(idx)),
                     cand,
                     f"REJECT({res.error_message or 'stage_a_failed'})",
                     {},
@@ -773,9 +928,16 @@ def prescreen_live_ir_neighborhood(
                 overflow_item = (scope, wl.peak_allocated_bytes, wl.capacity_bytes)
                 break
 
+        stack_bytes = max(
+            int(getattr(ledger, "stack_bytes", 0) or 0),
+            int(getattr(res, "stack_bytes", 0) or 0),
+        )
         if overflow_item is not None:
             sc, pk, cap = overflow_item
             status = f"REJECT({sc}_overflow:{pk}>{cap})"
+            is_ok = False
+        elif stack_bytes > 0:
+            status = f"REJECT(stack_overflow:{stack_bytes}>0)"
             is_ok = False
         elif degraded:
             status = f"REJECT(degraded_single_buffers:{','.join(degraded)})"
@@ -787,54 +949,83 @@ def prescreen_live_ir_neighborhood(
             status = "OK"
             is_ok = True
 
-        ii_rank = (
-            float(ledger.steady_state_ii)
-            if ledger.steady_state_ii is not None and ledger.steady_state_ii > 0
-            else float("inf")
-        )
         dom_cycles = ledger.pipe_cycles.get(
             ledger.dominant_pipe,
             max((v for v in ledger.pipe_cycles.values() if v > 0), default=0),
         )
-        min_dma = int(getattr(ledger, "min_gm_dma_bytes", 0))
-        raw_eff = float(getattr(ledger, "dma_burst_efficiency_ratio", 1.0))
-        if 0 < min_dma < 4096:
-            raw_eff = raw_eff * max(0.15, float(min_dma) / 4096.0)
-        burst_eff = max(raw_eff, 0.05)
+        burst_eff = float(getattr(ledger, "dma_burst_efficiency_ratio", 1.0) or 1.0)
         est_waves = (
             math.ceil(math.ceil(total_rows / cand.bm) / float(num_aiv_cores))
             if (pure_vector_row_tile and total_rows > 0 and cand.bm > 0)
             else 0
         )
-        wave_burst_score = (
-            (float(est_waves) * float(cand.bm)) / burst_eff
-            if est_waves > 0
-            else (1.0 / burst_eff if pure_vector_row_tile else 0.0)
-        )
-        if pure_vector_row_tile and est_waves > 0:
-            sort_key: tuple[float, ...] = (wave_burst_score, ii_rank, float(dom_cycles), float(idx))
-        elif pure_vector_row_tile:
-            sort_key = (ii_rank, -burst_eff, float(dom_cycles), float(idx))
+        if pure_vector_row_tile:
+            padded_rows = (
+                math.ceil(total_rows / cand.bm) * cand.bm
+                if (total_rows > 0 and cand.bm > 0)
+                else 0
+            )
+            tail_waste = (
+                max(0.0, float(padded_rows - total_rows) / float(max(1, padded_rows)))
+                if padded_rows > 0
+                else 0.0
+            )
+            waves_mult = max(1, est_waves)
+            t_comp_us = (float(waves_mult) * float(dom_cycles)) / (clock_ghz * 1e3)
+            gm_bytes = float(
+                ledger.total_gm_bytes()
+                if hasattr(ledger, "total_gm_bytes")
+                else getattr(ledger, "gm_roundtrip_bytes", 0)
+            )
+            t_mem_us = (gm_bytes / hbm_bps) * 1e6 if hbm_bps > 0.0 else 0.0
+            t_roof_us = max(t_comp_us, t_mem_us)
+            wave_burst_score = t_roof_us
+            sort_key: tuple[float, ...] = (
+                t_roof_us,
+                tail_waste,
+                float(dom_cycles),
+                float(idx),
+            )
         else:
-            area = max(1.0, float(cand.bm * cand.bn))
-            norm_ii = (ii_rank / area) if ii_rank != float("inf") else float("inf")
-            norm_cycles = float(dom_cycles) / area
-            sort_key = (norm_ii, norm_cycles, -area, float(idx))
+            eff_dtype = _resolve_candidate_dtype(cand, None)
+            macs_per_cycle = max(1, _resolve_cube_macs(facts, eff_dtype, hf32=cand.hf32))
+            l0c_bytes = (
+                _align512(cand.bm * (cand.d_out or cand.bn) * cand.accum_bytes)
+                + _align512(cand.bm * cand.bn * cand.accum_bytes)
+                if (cand.d_out > 0 or cand.dual_accumulator)
+                else cand.bm * cand.bn * cand.accum_bytes
+            )
+            t_roof_us, tail_waste = _compute_tile_roofline_and_waste(
+                cand.bm,
+                cand.bn,
+                cand.bk,
+                dtype_bytes=cand.dtype_bytes,
+                accum_bytes=cand.accum_bytes,
+                l0c_bytes=l0c_bytes,
+                facts=facts,
+                macs_per_cycle=macs_per_cycle,
+                m_dim=m_dim,
+                n_dim=n_dim,
+                k_dim=k_dim,
+            )
+            wave_burst_score = t_roof_us
+            sort_key = (t_roof_us, tail_waste, float(dom_cycles), float(idx))
+
         cost_pred: CostPrediction | None = None
         cost_score = 0.0
-        if cost_model is not None:
+        if eff_cost_model is not None:
             cf = build_cost_features_from_ledger(
                 ledger,
                 live_plan=live_plan,
                 axes=axes,
                 blueprint=blueprint,
                 sil_advisory=sil_advisory,
-                target=cost_model.target,
+                target=eff_cost_model.target,
             )
-            cost_pred = cost_model.predict(cf)
+            cost_pred = eff_cost_model.predict(cf)
             cost_score = float(cost_pred.pred_us)
             if parent_pred is not None and parent_features is not None:
-                ratio = cost_model.predict_delta_ratio(cf, parent_features)
+                ratio = eff_cost_model.predict_delta_ratio(cf, parent_features)
                 cost_score = float(parent_pred.pred_us) * float(ratio)
             sort_key = (cost_score, *sort_key)
             if idx == 0:
@@ -943,6 +1134,8 @@ class LatticeSweepCandidate:
     dominant_bound: str
     ub_bytes: int
     l1_bytes: int
+    t_roof_us: float = 0.0
+    tail_waste_ratio: float = 0.0
 
 
 def _extract_selector_base_config(
@@ -1187,19 +1380,25 @@ def sweep_executable_lattice_zero_llm(
     sample_builder_kwargs: Mapping[str, object],
     dims: Mapping[str, int] | None,
     cost_model: HybridAscendCostModel | None = None,
+    cost_model_mode: str | None = None,
     target: AscendTarget | None = None,
     max_points: int = 24,
     top_k: int = 3,
 ) -> list[LatticeSweepCandidate]:
-    """Sweep bounded tile lattice with Stage-A static analysis and optional cost scoring."""
+    """Sweep bounded tile lattice with Stage-A feasibility and Roofline ranking."""
     if top_k <= 0 or max_points <= 0:
         return []
+    eff_cost_model = (
+        None
+        if (cost_model_mode is not None and str(cost_model_mode).strip().lower() == "off")
+        else cost_model
+    )
     eff_target = target or (
-        cost_model.target if cost_model is not None else AscendTarget("ascend.950pr")
+        eff_cost_model.target if eff_cost_model is not None else AscendTarget("ascend.950pr")
     )
     eff_facts = (
-        cost_model.facts
-        if (cost_model is not None and target is None)
+        eff_cost_model.facts
+        if (eff_cost_model is not None and target is None)
         else eff_target.get_facts(AscendSpaceFacts)
     )
     base_cfg = _extract_selector_base_config(
@@ -1218,8 +1417,17 @@ def sweep_executable_lattice_zero_llm(
         run_stage_a_static,
     )
 
-    ranked_candidates: list[tuple[tuple[float, int, int], LatticeSweepCandidate]] = []
+    m_dim, n_dim, k_dim = _extract_problem_mnk(None, dims)
+    clock_ghz = float(getattr(eff_facts, "clock_ghz", 1.65) or 1.65)
+    hbm_bps = float(getattr(eff_facts, "hbm_peak_bandwidth_bps", 0) or 0)
+    ranked_candidates: list[tuple[tuple[float, ...], LatticeSweepCandidate]] = []
     for idx, ov in enumerate(override_grid):
+        if any(int(v) <= 0 for v in ov.values()):
+            continue
+        if all(k in ov for k in ("bm", "bn", "bk")) and (
+            ov["bm"] % 16 != 0 or ov["bn"] % 16 != 0 or ov["bk"] % 16 != 0
+        ):
+            continue
         try:
             patched_source = _patch_selector_source(module_source, selector_fn_name, ov)
         except (SyntaxError, ValueError):
@@ -1239,6 +1447,10 @@ def sweep_executable_lattice_zero_llm(
             continue
         if int(getattr(ledger, "max_overflow_bytes", 0) or 0) > 0:
             continue
+        if int(getattr(ledger, "stack_bytes", 0) or 0) > 0:
+            continue
+        if int(getattr(stage_a, "stack_bytes", 0) or 0) > 0:
+            continue
         waterlines = getattr(ledger, "waterlines", None) or {}
         if any(int(getattr(wl, "overflow_bytes", 0) or 0) > 0 for wl in waterlines.values()):
             continue
@@ -1247,7 +1459,48 @@ def sweep_executable_lattice_zero_llm(
         ub_bytes = int(getattr(ub_wl, "peak_allocated_bytes", 0) or 0)
         l1_bytes = int(getattr(l1_wl, "peak_allocated_bytes", 0) or 0)
 
-        if cost_model is not None:
+        t_roof_us = 0.0
+        tail_waste = 0.0
+        if all(k in ov for k in ("bm", "bn", "bk")):
+            dtype_str = str(base_cfg.get("dtype") or base_cfg.get("tl_dtype") or "f16").lower()
+            dtype_bytes = (
+                4 if ("32" in dtype_str and "bf" not in dtype_str and "hf" not in dtype_str) else 2
+            )
+            macs = max(1, _resolve_cube_macs(eff_facts, dtype_str, hf32=False))
+            t_roof_us, tail_waste = _compute_tile_roofline_and_waste(
+                int(ov["bm"]),
+                int(ov["bn"]),
+                int(ov["bk"]),
+                dtype_bytes=dtype_bytes,
+                accum_bytes=4,
+                l0c_bytes=int(ov["bm"]) * int(ov["bn"]) * 4,
+                facts=eff_facts,
+                macs_per_cycle=macs,
+                m_dim=m_dim,
+                n_dim=n_dim,
+                k_dim=k_dim,
+            )
+        else:
+            pipes = getattr(ledger, "pipe_cycles", None) or {}
+            bottleneck_cycles = (
+                max((int(val or 0) for val in pipes.values()), default=0)
+                if isinstance(pipes, Mapping)
+                else 0
+            )
+            t_comp_us = float(bottleneck_cycles) / (clock_ghz * 1e3)
+            gm_bytes = float(
+                ledger.total_gm_bytes()
+                if hasattr(ledger, "total_gm_bytes")
+                else getattr(ledger, "gm_roundtrip_bytes", 0)
+            )
+            t_mem_us = (gm_bytes / hbm_bps) * 1e6 if hbm_bps > 0.0 else 0.0
+            t_roof_us = max(t_comp_us, t_mem_us)
+            tile_m = ov.get("tile_m") or ov.get("chunk_t") or 0
+            if m_dim > 0 and tile_m > 0:
+                padded_m = math.ceil(m_dim / int(tile_m)) * int(tile_m)
+                tail_waste = max(0.0, float(padded_m - m_dim) / float(max(1, padded_m)))
+
+        if eff_cost_model is not None:
             policy_hint: dict[str, object] = {**base_cfg, **ov}
             if all(k in ov for k in ("bm", "bn", "bk")):
                 policy_hint["tile_mnk"] = [ov["bm"], ov["bn"], ov["bk"]]
@@ -1258,19 +1511,25 @@ def sweep_executable_lattice_zero_llm(
                 live_plan={"policy": policy_hint},
                 target=eff_target,
             )
-            pred = cost_model.predict(cf)
+            pred = eff_cost_model.predict(cf)
             pred_us = float(pred.pred_us)
             dom_bound = str(pred.dominant_bound)
-            rank_key = (pred_us, ub_bytes, idx)
+            rank_key: tuple[float, ...] = (pred_us, float(ub_bytes), float(idx))
         else:
             pipes = getattr(ledger, "pipe_cycles", None) or {}
-            bottleneck_cycles = max(
-                (int(val or 0) for val in pipes.values()),
-                default=0,
-            ) if isinstance(pipes, Mapping) else 0
+            bottleneck_cycles = (
+                max((int(val or 0) for val in pipes.values()), default=0)
+                if isinstance(pipes, Mapping)
+                else 0
+            )
             pred_us = 0.0
             dom_bound = _static_dominant_bound_from_ledger(ledger)
-            rank_key = (float(bottleneck_cycles), -ub_bytes, idx)
+            rank_key = (
+                round(t_roof_us, 12),
+                round(tail_waste, 12),
+                float(bottleneck_cycles),
+                float(idx),
+            )
 
         cand = LatticeSweepCandidate(
             knob_overrides=dict(ov),
@@ -1279,6 +1538,8 @@ def sweep_executable_lattice_zero_llm(
             dominant_bound=dom_bound,
             ub_bytes=ub_bytes,
             l1_bytes=l1_bytes,
+            t_roof_us=t_roof_us,
+            tail_waste_ratio=tail_waste,
         )
         ranked_candidates.append((rank_key, cand))
 
