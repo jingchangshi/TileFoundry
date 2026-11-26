@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -4692,6 +4694,179 @@ def _detect_tilelang_include_dir() -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _AscendcCompileContext:
+    extra_flags: list[str]
+    has_explicit_x: bool
+    std_flags: list[str]
+    include_flags: list[str]
+    env: dict[str, str]
+
+
+def _prepare_ascendc_compile_context(
+    *,
+    compile_flags: Sequence[str] | str | None,
+    cann_root: str | Path | None,
+    resolved_bisheng: str,
+    extra_include_dirs: Sequence[str | Path] | str | Path | None,
+) -> _AscendcCompileContext:
+    extra_flags = _normalize_flag_list(compile_flags)
+    has_explicit_std = any(f.startswith("-std=") for f in extra_flags)
+    has_explicit_x = "-x" in extra_flags
+    std_flags: list[str] = [] if has_explicit_std else ["-std=c++20"]
+
+    include_flags: list[str] = []
+    seen_inc_flags = set(extra_flags)
+
+    def _add_inc(inc_dir: str) -> None:
+        flag = f"-I{inc_dir}"
+        if inc_dir and Path(inc_dir).is_dir() and flag not in seen_inc_flags:
+            seen_inc_flags.add(flag)
+            include_flags.append(flag)
+
+    if extra_include_dirs is not None:
+        extra_inc_list = (
+            [extra_include_dirs]
+            if isinstance(extra_include_dirs, (str, Path))
+            else list(extra_include_dirs)
+        )
+        for inc_item in extra_inc_list:
+            _add_inc(str(inc_item).strip())
+    tl_inc = _detect_tilelang_include_dir()
+    if tl_inc:
+        _add_inc(tl_inc)
+    for cann_inc in _detect_cann_include_dirs(cann_root, bisheng_bin=resolved_bisheng):
+        _add_inc(cann_inc)
+
+    env = dict(os.environ)
+    resolved_cann = _resolve_cann_root(cann_root, bisheng_bin=resolved_bisheng)
+    cann_root_str = str(resolved_cann).strip() if resolved_cann is not None else ""
+    if cann_root_str and Path(cann_root_str).is_dir() and not env.get("ASCEND_HOME_PATH"):
+        env["ASCEND_HOME_PATH"] = cann_root_str
+
+    return _AscendcCompileContext(
+        extra_flags=extra_flags,
+        has_explicit_x=has_explicit_x,
+        std_flags=std_flags,
+        include_flags=include_flags,
+        env=env,
+    )
+
+
+def _atomic_copy_file(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{dst.name}.")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        shutil.copy2(src, tmp_path)
+        os.replace(tmp_path, dst)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def _build_trackb_shared_link_cmd(
+    resolved_bisheng: str,
+    *,
+    arch: str,
+    ctx: _AscendcCompileContext,
+    src_path: Path,
+    so_path: Path,
+) -> list[str]:
+    return [
+        resolved_bisheng,
+        "-O2",
+        "-fPIC",
+        *ctx.std_flags,
+        "-mllvm",
+        "-cce-aicore-dcpreload-args=false",
+        f"--npu-arch={arch}",
+        *ctx.include_flags,
+        *ctx.extra_flags,
+        "-Wl,--no-mmap-output-file",
+        "-shared",
+        str(src_path),
+        "-o",
+        str(so_path),
+    ]
+
+
+def compute_trackb_shared_so_filename(
+    cpp_source: str,
+    compile_flags: Sequence[str] | str | None = None,
+) -> str:
+    """Compute canonical cached shared-object filename for a Track-B TU and flags."""
+    non_inc = [f for f in _normalize_flag_list(compile_flags) if not f.startswith("-I")]
+    sig = hashlib.sha256((cpp_source + "|" + " ".join(non_inc)).encode("utf-8")).hexdigest()[:16]
+    return f"trackb_{sig}.so"
+
+
+def compile_trackb_shared_so(
+    cpp_source: str,
+    *,
+    cache_dir: str | Path,
+    compile_flags: Sequence[str] | str | None = None,
+    arch: str = "dav-3510",
+    bisheng_bin: str | Path | None = None,
+    cann_root: str | Path | None = None,
+    extra_include_dirs: Sequence[str | Path] | str | Path | None = None,
+    timeout_sec: int = 120,
+) -> tuple[bool, Path | None, str]:
+    """Compile a Track-B C++20 TU into a content-addressed cached .so via bisheng."""
+    if not isinstance(cpp_source, str) or not cpp_source.strip():
+        return (False, None, "stage_b_ascendc_empty_source")
+    cache_root = Path(cache_dir).expanduser().resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    target_so = cache_root / compute_trackb_shared_so_filename(cpp_source, compile_flags)
+    if is_verified_binary_file(target_so):
+        return (True, target_so, "")
+
+    resolved_bisheng = _resolve_bisheng_bin(bisheng_bin, cann_root=cann_root)
+    if resolved_bisheng is None:
+        return (False, None, "stage_b_ascendc_bisheng_not_found")
+
+    ctx = _prepare_ascendc_compile_context(
+        compile_flags=compile_flags,
+        cann_root=cann_root,
+        resolved_bisheng=resolved_bisheng,
+        extra_include_dirs=extra_include_dirs,
+    )
+    with tempfile.TemporaryDirectory(prefix="tf_trackb_shared_") as tmp_dir:
+        src_name = "kernel.cpp" if ctx.has_explicit_x else "kernel.asc"
+        src_path = Path(tmp_dir) / src_name
+        tmp_so = Path(tmp_dir) / "kernel.so"
+        src_path.write_text(cpp_source, encoding="utf-8")
+        link_cmd = _build_trackb_shared_link_cmd(
+            resolved_bisheng,
+            arch=arch,
+            ctx=ctx,
+            src_path=src_path,
+            so_path=tmp_so,
+        )
+        try:
+            link_proc = subprocess.run(
+                link_cmd,
+                text=True,
+                capture_output=True,
+                cwd=tmp_dir,
+                env=ctx.env,
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired:
+            return (False, None, f"stage_b_ascendc_shared_link_timeout:{timeout_sec}s")
+        link_raw = (link_proc.stderr or "") + "\n" + (link_proc.stdout or "")
+        if link_proc.returncode != 0 or not is_verified_binary_file(tmp_so):
+            link_detail = _bounded_compile_diagnostic(link_raw)
+            return (
+                False,
+                None,
+                f"stage_b_ascendc_shared_link_failed (rc={link_proc.returncode}): {link_detail}",
+            )
+        _atomic_copy_file(tmp_so, target_so)
+        return (True, target_so, "")
+
+
 def run_stage_b_ascendc_compile(
     cpp_source: str,
     *,
@@ -4703,6 +4878,7 @@ def run_stage_b_ascendc_compile(
     timeout_sec: int = 120,
     enable_device_compile: bool = True,
     verify_shared_link: bool = False,
+    emit_shared_so_cache_dir: str | Path | None = None,
     artifact_store: ArtifactStore | None = None,
     artifact_id: str = "",
     regime_tag: str = "",
@@ -4733,51 +4909,41 @@ def run_stage_b_ascendc_compile(
             failed_tier="stage_b",
         )
 
-    extra_flags = _normalize_flag_list(compile_flags)
-    has_explicit_std = any(f.startswith("-std=") for f in extra_flags)
-    has_explicit_x = "-x" in extra_flags
-    has_tl_templates = "tl_templates/ascend/" in cpp_source or "c_api/asc_" in cpp_source
-
-    std_flags: list[str] = [] if has_explicit_std else ["-std=c++20"]
-
-    include_flags: list[str] = []
-    seen_inc_flags = set(extra_flags)
-
-    def _add_inc(inc_dir: str) -> None:
-        flag = f"-I{inc_dir}"
-        if inc_dir and Path(inc_dir).is_dir() and flag not in seen_inc_flags:
-            seen_inc_flags.add(flag)
-            include_flags.append(flag)
-
-    if extra_include_dirs is not None:
-        extra_inc_list = (
-            [extra_include_dirs]
-            if isinstance(extra_include_dirs, (str, Path))
-            else list(extra_include_dirs)
-        )
-        for inc_item in extra_inc_list:
-            _add_inc(str(inc_item).strip())
-    if has_tl_templates or True:
-        tl_inc = _detect_tilelang_include_dir()
-        if tl_inc:
-            _add_inc(tl_inc)
-    for cann_inc in _detect_cann_include_dirs(cann_root, bisheng_bin=resolved_bisheng):
-        _add_inc(cann_inc)
-
-    env = dict(os.environ)
-    resolved_cann = _resolve_cann_root(cann_root, bisheng_bin=resolved_bisheng)
-    cann_root_str = str(resolved_cann).strip() if resolved_cann is not None else ""
-    if cann_root_str and Path(cann_root_str).is_dir() and not env.get("ASCEND_HOME_PATH"):
-        env["ASCEND_HOME_PATH"] = cann_root_str
+    ctx = _prepare_ascendc_compile_context(
+        compile_flags=compile_flags,
+        cann_root=cann_root,
+        resolved_bisheng=resolved_bisheng,
+        extra_include_dirs=extra_include_dirs,
+    )
+    extra_flags = ctx.extra_flags
+    std_flags = ctx.std_flags
+    include_flags = ctx.include_flags
+    env = ctx.env
 
     resolved_store = _resolve_artifact_store(artifact_store)
     recorded_aid = ""
     recorded_bins: tuple[str, ...] = ()
     with tempfile.TemporaryDirectory(prefix="tf_stage_b_ascendc_") as tmp_dir:
-        src_name = "kernel.cpp" if has_explicit_x else "kernel.asc"
+        src_name = "kernel.cpp" if ctx.has_explicit_x else "kernel.asc"
         src_path = Path(tmp_dir) / src_name
         obj_path = Path(tmp_dir) / "kernel.o"
         src_path.write_text(cpp_source, encoding="utf-8")
+
+        should_verify_shared = (
+            verify_shared_link
+            and 'extern "C"' in cpp_source
+            and "<<<" in cpp_source
+            and not ctx.has_explicit_x
+            and bool(env.get("ASCEND_HOME_PATH"))
+        )
+        cached_so: Path | None = (
+            Path(emit_shared_so_cache_dir).expanduser().resolve()
+            / compute_trackb_shared_so_filename(cpp_source, extra_flags)
+            if should_verify_shared and emit_shared_so_cache_dir is not None
+            else None
+        )
+        cached_so_hit = cached_so is not None and is_verified_binary_file(cached_so)
+        so_path = Path(tmp_dir) / "kernel.so"
 
         def _invoke(*, use_legacy_cce_flags: bool) -> subprocess.CompletedProcess[str]:
             arch_flags = (
@@ -4814,130 +4980,20 @@ def run_stage_b_ascendc_compile(
                 timeout=timeout_sec,
             )
 
+        link_executor: ThreadPoolExecutor | None = None
+        link_future = None
         try:
-            proc = _invoke(use_legacy_cce_flags=False)
-            if proc.returncode != 0:
-                combined_err = (proc.stderr or "") + "\n" + (proc.stdout or "")
-                low_err = combined_err.lower()
-                if "--npu-arch" in low_err and any(
-                    tok in low_err for tok in ("unknown", "unrecognized", "unsupported", "invalid")
-                ):
-                    proc = _invoke(use_legacy_cce_flags=True)
-        except subprocess.TimeoutExpired:
-            return StageBResult(
-                passed=False,
-                error_message=f"stage_b_ascendc_compile_timeout:{timeout_sec}s",
-                elapsed_sec=time.monotonic() - t0,
-                fault_plane="STAGE_B_COMPILE",
-                fault_code="STAGE_B_ASCENDC_COMPILE_TIMEOUT",
-                failed_tier="stage_b",
-            )
-
-        combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        if proc.returncode != 0 or not obj_path.is_file():
-            spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
-                combined_out,
-                asm_or_dump_text=cpp_source,
-            )
-            ma_profile = (
-                extract_microarch_profile_from_cce(cpp_source).to_dict()
-                if cpp_source.strip()
-                else None
-            )
-            raw_detail = (
-                proc.stderr or proc.stdout or "bisheng failed without diagnostics"
-            )
-            detail = _bounded_compile_diagnostic(raw_detail)
-            fault_code = _classify_stage_b_overflow_fault_code(
-                raw_detail,
-                summary,
-                "STAGE_B_ASCENDC_COMPILE_FAILED",
-            )
-            return StageBResult(
-                passed=False,
-                error_message=f"stage_b_ascendc_compile_failed (rc={proc.returncode}): {detail}",
-                elapsed_sec=time.monotonic() - t0,
-                generated_cce=cpp_source,
-                spill_bytes=spill_bytes,
-                vloopv2_hit=vloopv2_hit,
-                compiler_summary=summary,
-                microarch_profile=ma_profile,
-                full_diagnostic=raw_detail,
-                fault_plane="STAGE_B_COMPILE",
-                fault_code=fault_code,
-                failed_tier="stage_b",
-            )
-
-        inst_ok, inst_err = _verify_object_has_instantiated_kernel(
-            obj_path, bisheng_bin=resolved_bisheng
-        )
-        objdump_text = _disassemble_object(obj_path, bisheng_bin=resolved_bisheng)
-        telemetry_out = _augment_bisheng_telemetry_text(combined_out, objdump_text)
-        dump_text = f"{objdump_text}\n{cpp_source}" if objdump_text.strip() else cpp_source
-        spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
-            telemetry_out,
-            asm_or_dump_text=dump_text,
-        )
-        ma_profile = _merge_disassembly_microarch_profile(cpp_source, objdump_text)
-        if not inst_ok:
-            return StageBResult(
-                passed=False,
-                error_message=inst_err,
-                elapsed_sec=time.monotonic() - t0,
-                generated_cce=cpp_source,
-                spill_bytes=spill_bytes,
-                vloopv2_hit=vloopv2_hit,
-                compiler_summary=summary,
-                microarch_profile=ma_profile,
-                fault_plane="STAGE_B_COMPILE",
-                fault_code="STAGE_B_ASCENDC_UNINSTANTIATED_TEMPLATE",
-                failed_tier="stage_b",
-            )
-        if _has_vf_stack_overflow_signal(telemetry_out, summary, extra_flags):
-            return StageBResult(
-                passed=False,
-                error_message=(
-                    f"stage_b_ascendc_vf_stack_overflow: stack_bytes={summary.stack_bytes}"
-                ),
-                elapsed_sec=time.monotonic() - t0,
-                generated_cce=cpp_source,
-                spill_bytes=spill_bytes,
-                vloopv2_hit=vloopv2_hit,
-                compiler_summary=summary,
-                microarch_profile=ma_profile,
-                full_diagnostic=telemetry_out,
-                fault_plane="STAGE_B_COMPILE",
-                fault_code="VF_STACK_OVERFLOW",
-                failed_tier="stage_b",
-            )
-
-        so_path_opt: Path | None = None
-        if (
-            verify_shared_link
-            and 'extern "C"' in cpp_source
-            and "<<<" in cpp_source
-            and not has_explicit_x
-            and env.get("ASCEND_HOME_PATH")
-        ):
-            so_path = Path(tmp_dir) / "kernel.so"
-            link_cmd = [
-                resolved_bisheng,
-                "-O2",
-                "-fPIC",
-                *std_flags,
-                "-mllvm",
-                "-cce-aicore-dcpreload-args=false",
-                f"--npu-arch={arch}",
-                *include_flags,
-                *extra_flags,
-                "-Wl,--no-mmap-output-file",
-                "-shared",
-                str(src_path),
-                "-o",
-                str(so_path),
-            ]
-            try:
-                link_proc = subprocess.run(
+            if should_verify_shared and not cached_so_hit:
+                link_cmd = _build_trackb_shared_link_cmd(
+                    resolved_bisheng,
+                    arch=arch,
+                    ctx=ctx,
+                    src_path=src_path,
+                    so_path=so_path,
+                )
+                link_executor = ThreadPoolExecutor(max_workers=2)
+                link_future = link_executor.submit(
+                    subprocess.run,
                     link_cmd,
                     text=True,
                     capture_output=True,
@@ -4945,44 +5001,164 @@ def run_stage_b_ascendc_compile(
                     env=env,
                     timeout=timeout_sec,
                 )
+
+            try:
+                proc = _invoke(use_legacy_cce_flags=False)
+                if proc.returncode != 0:
+                    combined_err = (proc.stderr or "") + "\n" + (proc.stdout or "")
+                    low_err = combined_err.lower()
+                    if "--npu-arch" in low_err and any(
+                        tok in low_err
+                        for tok in ("unknown", "unrecognized", "unsupported", "invalid")
+                    ):
+                        proc = _invoke(use_legacy_cce_flags=True)
             except subprocess.TimeoutExpired:
                 return StageBResult(
                     passed=False,
-                    error_message=f"stage_b_ascendc_shared_link_timeout:{timeout_sec}s",
+                    error_message=f"stage_b_ascendc_compile_timeout:{timeout_sec}s",
                     elapsed_sec=time.monotonic() - t0,
-                    spill_bytes=spill_bytes,
-                    vloopv2_hit=vloopv2_hit,
-                    compiler_summary=summary,
-                    microarch_profile=ma_profile,
                     fault_plane="STAGE_B_COMPILE",
-                    fault_code="STAGE_B_ASCENDC_SHARED_LINK_TIMEOUT",
+                    fault_code="STAGE_B_ASCENDC_COMPILE_TIMEOUT",
                     failed_tier="stage_b",
                 )
-            link_raw = (link_proc.stderr or "") + "\n" + (link_proc.stdout or "")
-            if link_proc.returncode != 0 or not so_path.is_file():
-                link_detail = _bounded_compile_diagnostic(link_raw)
-                link_fault_code = _classify_stage_b_overflow_fault_code(
-                    link_raw,
+
+            combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            if proc.returncode != 0 or not obj_path.is_file():
+                spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
+                    combined_out,
+                    asm_or_dump_text=cpp_source,
+                )
+                ma_profile = (
+                    extract_microarch_profile_from_cce(cpp_source).to_dict()
+                    if cpp_source.strip()
+                    else None
+                )
+                raw_detail = (
+                    proc.stderr or proc.stdout or "bisheng failed without diagnostics"
+                )
+                detail = _bounded_compile_diagnostic(raw_detail)
+                fault_code = _classify_stage_b_overflow_fault_code(
+                    raw_detail,
                     summary,
-                    "STAGE_B_ASCENDC_SHARED_LINK_FAILED",
+                    "STAGE_B_ASCENDC_COMPILE_FAILED",
                 )
                 return StageBResult(
                     passed=False,
                     error_message=(
-                        f"stage_b_ascendc_shared_link_failed (rc={link_proc.returncode}): "
-                        f"{link_detail}"
+                        f"stage_b_ascendc_compile_failed (rc={proc.returncode}): {detail}"
                     ),
                     elapsed_sec=time.monotonic() - t0,
+                    generated_cce=cpp_source,
                     spill_bytes=spill_bytes,
                     vloopv2_hit=vloopv2_hit,
                     compiler_summary=summary,
                     microarch_profile=ma_profile,
-                    full_diagnostic=link_raw,
+                    full_diagnostic=raw_detail,
                     fault_plane="STAGE_B_COMPILE",
-                    fault_code=link_fault_code,
+                    fault_code=fault_code,
                     failed_tier="stage_b",
                 )
-            so_path_opt = so_path
+
+            inst_ok, inst_err = _verify_object_has_instantiated_kernel(
+                obj_path, bisheng_bin=resolved_bisheng
+            )
+            objdump_text = _disassemble_object(obj_path, bisheng_bin=resolved_bisheng)
+            telemetry_out = _augment_bisheng_telemetry_text(combined_out, objdump_text)
+            dump_text = (
+                f"{objdump_text}\n{cpp_source}" if objdump_text.strip() else cpp_source
+            )
+            spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
+                telemetry_out,
+                asm_or_dump_text=dump_text,
+            )
+            ma_profile = _merge_disassembly_microarch_profile(cpp_source, objdump_text)
+            if not inst_ok:
+                return StageBResult(
+                    passed=False,
+                    error_message=inst_err,
+                    elapsed_sec=time.monotonic() - t0,
+                    generated_cce=cpp_source,
+                    spill_bytes=spill_bytes,
+                    vloopv2_hit=vloopv2_hit,
+                    compiler_summary=summary,
+                    microarch_profile=ma_profile,
+                    fault_plane="STAGE_B_COMPILE",
+                    fault_code="STAGE_B_ASCENDC_UNINSTANTIATED_TEMPLATE",
+                    failed_tier="stage_b",
+                )
+            if _has_vf_stack_overflow_signal(telemetry_out, summary, extra_flags):
+                return StageBResult(
+                    passed=False,
+                    error_message=(
+                        f"stage_b_ascendc_vf_stack_overflow: stack_bytes={summary.stack_bytes}"
+                    ),
+                    elapsed_sec=time.monotonic() - t0,
+                    generated_cce=cpp_source,
+                    spill_bytes=spill_bytes,
+                    vloopv2_hit=vloopv2_hit,
+                    compiler_summary=summary,
+                    microarch_profile=ma_profile,
+                    full_diagnostic=telemetry_out,
+                    fault_plane="STAGE_B_COMPILE",
+                    fault_code="VF_STACK_OVERFLOW",
+                    failed_tier="stage_b",
+                )
+
+            so_path_opt: Path | None = None
+            if should_verify_shared:
+                if cached_so_hit:
+                    so_path_opt = cached_so
+                elif link_future is not None:
+                    try:
+                        link_proc = link_future.result()
+                    except subprocess.TimeoutExpired:
+                        return StageBResult(
+                            passed=False,
+                            error_message=f"stage_b_ascendc_shared_link_timeout:{timeout_sec}s",
+                            elapsed_sec=time.monotonic() - t0,
+                            spill_bytes=spill_bytes,
+                            vloopv2_hit=vloopv2_hit,
+                            compiler_summary=summary,
+                            microarch_profile=ma_profile,
+                            fault_plane="STAGE_B_COMPILE",
+                            fault_code="STAGE_B_ASCENDC_SHARED_LINK_TIMEOUT",
+                            failed_tier="stage_b",
+                        )
+                    link_raw = (link_proc.stderr or "") + "\n" + (link_proc.stdout or "")
+                    if link_proc.returncode != 0 or not so_path.is_file():
+                        link_detail = _bounded_compile_diagnostic(link_raw)
+                        link_fault_code = _classify_stage_b_overflow_fault_code(
+                            link_raw,
+                            summary,
+                            "STAGE_B_ASCENDC_SHARED_LINK_FAILED",
+                        )
+                        return StageBResult(
+                            passed=False,
+                            error_message=(
+                                f"stage_b_ascendc_shared_link_failed "
+                                f"(rc={link_proc.returncode}): {link_detail}"
+                            ),
+                            elapsed_sec=time.monotonic() - t0,
+                            spill_bytes=spill_bytes,
+                            vloopv2_hit=vloopv2_hit,
+                            compiler_summary=summary,
+                            microarch_profile=ma_profile,
+                            full_diagnostic=link_raw,
+                            fault_plane="STAGE_B_COMPILE",
+                            fault_code=link_fault_code,
+                            failed_tier="stage_b",
+                        )
+                    if cached_so is not None:
+                        _atomic_copy_file(so_path, cached_so)
+                    so_path_opt = so_path
+        finally:
+            if link_future is not None:
+                try:
+                    link_future.result()
+                except Exception:
+                    pass
+            if link_executor is not None:
+                link_executor.shutdown(wait=True)
 
         built_bins = [
             p
@@ -5692,6 +5868,8 @@ __all__ = [
     "build_stage_b_driver_source",
     "check_npu_entrypoint_purity",
     "check_repair_monotonicity",
+    "compile_trackb_shared_so",
+    "compute_trackb_shared_so_filename",
     "evaluate_ascendc_candidate",
     "extract_ordered_tensor_shapes",
     "ledger_to_json",

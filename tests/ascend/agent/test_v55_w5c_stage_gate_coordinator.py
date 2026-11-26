@@ -1856,5 +1856,162 @@ def test_collect_distinct_width_dims_skips_non_width_int_sigs_when_no_hook(
     assert collected_with_max == [{"D": 512, "B": 1, "tl_dtype": "float16"}]
 
 
+def test_run_l1_hybrid_trackb_runs_trackb_fail_fast_before_tilelang(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid Track-B _run_l1 validates C++ and prebuilds anchor .so before TileLang."""
+    unified_cache = tmp_path / "unified_tl_cache"
+    monkeypatch.setenv("TILELANG_CACHE_DIR", str(unified_cache))
+    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
+
+    hyb_src = (
+        '_HYB_CPP = """\n'
+        '__global__ void hyb_tb_kernel() {}\n'
+        'extern "C" void launch_hyb() { hyb_tb_kernel<<<1, 0, 0>>>(); }\n'
+        '"""\n'
+        "def _render_trackb_tu(D=128, trackb_src='', **_kw):\n"
+        "    return f'// D={D}\\n{trackb_src}'\n"
+        "def _build_hyb_prim(tile_m=16):\n"
+        "    return int(tile_m)\n"
+    )
+    hyb_spec = RegimeTargetSpec(
+        regime_tag="decode",
+        builder_candidates=("_build_hyb_prim",),
+        sample_builder_kwargs={"tile_m": 16},
+        editable_symbols=("_build_hyb_prim", "_HYB_CPP", "_render_trackb_tu"),
+        runtime_backend="hybrid_trackb",
+        trackb_symbols=("_HYB_CPP",),
+        representative_anchor_dims={"D": 128},
+    )
+
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_regime_config",
+        lambda *_a, **_kw: types.SimpleNamespace(
+            builder_name="_build_hyb_prim",
+            builder_kwargs={"tile_m": 16},
+            pass_configs={},
+            compile_flags=(),
+            selector_name="",
+            combine_kwargs={},
+        ),
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_cannbench_repo",
+        lambda **_kw: (_ for _ in ()).throw(FileNotFoundError("isolated")),
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "lookup_case_static_spec",
+        lambda _op, cnum, **_kw: {"D": 128 if int(cnum) == 0 else 256},
+    )
+
+    l1_calls: list[str] = []
+
+    def _fake_l1_check(src: str, **_kw: object) -> StageBResult:
+        l1_calls.append(src)
+        return StageBResult(passed=True, elapsed_sec=0.25)
+
+    monkeypatch.setattr(stage_gate_coordinator, "run_l1_compile_check", _fake_l1_check)
+
+    bin_file = tmp_path / "prebuilt.o"
+    bin_file.write_bytes(b"ELF_HYB_FF")
+    tb_calls: list[dict[str, object]] = []
+    sec_calls: list[str] = []
+    tb_should_fail = True
+
+    def _fake_ascendc_compile(
+        cpp_source: str,
+        *,
+        verify_shared_link: bool = False,
+        emit_shared_so_cache_dir: Path | None = None,
+        **_kw: object,
+    ) -> StageBResult:
+        tb_calls.append(
+            {
+                "cpp_source": cpp_source,
+                "verify_shared_link": verify_shared_link,
+                "emit_shared_so_cache_dir": emit_shared_so_cache_dir,
+            }
+        )
+        if tb_should_fail:
+            return StageBResult(
+                passed=False,
+                error_message="syntax error in hyb_tb_kernel",
+                elapsed_sec=0.2,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code="STAGE_B_ASCENDC_COMPILE_FAILED",
+                failed_tier="stage_b",
+            )
+        return StageBResult(
+            passed=True,
+            elapsed_sec=0.3,
+            binary_paths=(str(bin_file),),
+        )
+
+    def _fake_compile_shared_so(
+        cpp_source: str,
+        *,
+        cache_dir: Path,
+        compile_flags: Sequence[str] | str | None = None,
+        **_kw: object,
+    ) -> tuple[bool, Path | None, str]:
+        sec_calls.append(cpp_source)
+        so_p = Path(cache_dir) / stage_gate_coordinator.compute_trackb_shared_so_filename(
+            cpp_source, compile_flags
+        )
+        so_p.parent.mkdir(parents=True, exist_ok=True)
+        so_p.write_bytes(b"ELF_SO_SEC")
+        return True, so_p, ""
+
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "run_stage_b_ascendc_compile",
+        _fake_ascendc_compile,
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "compile_trackb_shared_so",
+        _fake_compile_shared_so,
+    )
+
+    coord = StageGateCoordinator(
+        operator_name="mla",
+        source_root=tmp_path,
+        target_module_path=tmp_path / "kernel.py",
+        regime_specs=(hyb_spec,),
+        scoreboard_anchors=(
+            AnchorCaseSpec("level4/mla", 0, "decode", 20.0, 2.0),
+            AnchorCaseSpec("level4/mla", 1, "prefill", 20.0, 2.0),
+        ),
+        static_width_dims_fn=lambda _s: (),
+    )
+
+    fail_res = coord._run_l1(hyb_src, hyb_spec)
+    assert fail_res.passed is False
+    assert "trackb_ascendc(_HYB_CPP):" in fail_res.error_message
+    assert len(l1_calls) == 0
+    assert len(tb_calls) == 1
+    assert tb_calls[0]["verify_shared_link"] is True
+    assert tb_calls[0]["emit_shared_so_cache_dir"] == unified_cache
+    assert len(sec_calls) == 1
+    assert "// D=256" in sec_calls[0]
+
+    tb_calls.clear()
+    sec_calls.clear()
+    l1_calls.clear()
+    tb_should_fail = False
+
+    pass_res = coord._run_l1(hyb_src, hyb_spec)
+    assert pass_res.passed is True
+    assert len(tb_calls) == 1
+    assert len(l1_calls) == 1
+    assert len(sec_calls) == 0
+    assert pass_res.elapsed_sec == pytest.approx(0.55)
+
+
+
 
 

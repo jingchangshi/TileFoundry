@@ -18,9 +18,12 @@ import yaml
 
 from tilefoundry_ascend.agent.campaign import surrogate_cannbench
 from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec
+from tilefoundry_ascend.agent.orchestrator import gate_funnel
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
+    compile_trackb_shared_so,
+    compute_trackb_shared_so_filename,
     evaluate_ascendc_candidate,
     run_stage_a_static,
     run_stage_b_ascendc_compile,
@@ -682,3 +685,158 @@ def test_device_fault_receipt_rotates_healthy_card_or_raises_structured_error(
         )
         is False
     )
+
+
+def _sample_hybrid_mla_module(*, trackb_val: str = "1.0f") -> str:
+    return (
+        "import tilelang\n"
+        "import tilelang.language as T\n\n"
+        "def _select_mla_split_kv_decode_config(B=1, S_kv=1024, tl_dtype='bfloat16'):\n"
+        "    return {'bm': 64, 'compile_flags': ['-O2']}\n\n"
+        "def _build_mla_split_kv_decode_func(B=1, S_kv=1024, tl_dtype='bfloat16'):\n"
+        "    @T.prim_func\n"
+        "    def mla_split_kv_decode_kernel(q: T.Tensor((1, 64), 'float32')):\n"
+        "        T.nop()\n"
+        "    return mla_split_kv_decode_kernel\n\n"
+        "def _select_mla_c1c1c2_config(B=1, S_kv=1024, tl_dtype='bfloat16'):\n"
+        "    return {'bm': 64, 'compile_flags': ['-O2']}\n\n"
+        '_MLA_TRACKB_SRC = r"""\n'
+        "#include <tl_templates/ascend/common.h>\n"
+        'extern "C" __global__ __vector__ void mla_kv_reuse_c1c1c2(__gm__ float* q) {\n'
+        f"    q[0] = {trackb_val};\n"
+        "}\n"
+        '"""\n\n'
+        "def _render_trackb_tu(regime_tag='', **_dims):\n"
+        "    return _MLA_TRACKB_SRC\n\n"
+        "def _get_kernel(builder_fn=None, pass_configs=None, compile_flags=None):\n"
+        "    return builder_fn()\n"
+    )
+
+
+def test_hybrid_closure_excludes_trackb_src_when_prim_func_builder_matches() -> None:
+    """Hybrid TileLang regime with @T.prim_func builder ignores sibling _MLA_TRACKB_SRC."""
+    base_src = _sample_hybrid_mla_module(trackb_val="1.0f")
+    mut_src = _sample_hybrid_mla_module(trackb_val="99.0f")
+
+    c_base = extract_reachable_closure_source(base_src, regime_tag="split_kv_decode")
+    c_mut = extract_reachable_closure_source(mut_src, regime_tag="split_kv_decode")
+    assert c_base == c_mut
+    assert "_build_mla_split_kv_decode_func" in c_base
+    assert "_MLA_TRACKB_SRC" not in c_base
+    assert "mla_kv_reuse_c1c1c2" not in c_base
+
+    tb_base = extract_reachable_closure_source(base_src, regime_tag="c1c1c2")
+    tb_mut = extract_reachable_closure_source(mut_src, regime_tag="c1c1c2")
+    assert tb_base != tb_mut
+    assert "_MLA_TRACKB_SRC" in tb_base
+    assert "mla_kv_reuse_c1c1c2" in tb_base
+
+
+def test_trackb_shared_so_cache_helpers_and_stage_b_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shared .so cache ignores -I flags, short-circuits hits, and integrates with Stage B."""
+    tu = (
+        '#include "kernel_operator.h"\n'
+        'extern "C" __global__ __vector__ void k(__gm__ float* x) { x[0] = 1.0f; }\n'
+        'extern "C" int launch_k(void* s, float* x) { k<<<1, nullptr, s>>>(x); return 0; }\n'
+    )
+    f1 = compute_trackb_shared_so_filename(tu, ["-O2", "-I/tmp/a", "-DFOO=1"])
+    f2 = compute_trackb_shared_so_filename(tu, ["-O2", "-I/tmp/b", "-DFOO=1"])
+    f3 = compute_trackb_shared_so_filename(tu, ["-O2", "-DFOO=2"])
+    assert f1 == f2
+    assert f1 != f3
+    assert f1.startswith("trackb_") and f1.endswith(".so") and len(f1) == len("trackb_") + 19
+
+    cann_root = tmp_path / "cann"
+    (cann_root / "include").mkdir(parents=True)
+    bisheng = tmp_path / "bin" / "bisheng"
+    bisheng.parent.mkdir(parents=True)
+    bisheng.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    bisheng.chmod(0o755)
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(cann_root))
+
+    cache_dir = tmp_path / "shared_so_cache"
+    target_so = cache_dir / f1
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target_so.write_bytes(b"\x7fELF_CACHED_SO")
+
+    def _fail_if_called(*_a, **_kw):
+        raise AssertionError("bisheng should not be invoked when cached .so already exists")
+
+    monkeypatch.setattr(gate_funnel.subprocess, "run", _fail_if_called)
+    hit_ok, hit_path, hit_err = compile_trackb_shared_so(
+        tu,
+        cache_dir=cache_dir,
+        compile_flags=["-O2", "-I/tmp/c", "-DFOO=1"],
+        bisheng_bin=bisheng,
+        cann_root=cann_root,
+    )
+    assert hit_ok is True
+    assert hit_path == target_so.resolve()
+    assert hit_err == ""
+
+    target_so.unlink()
+    seen_cmds: list[list[str]] = []
+
+    def _mock_bisheng_run(cmd, **_kw):
+        cmd_list = [str(x) for x in cmd]
+        seen_cmds.append(cmd_list)
+        if "-o" in cmd_list:
+            out = Path(cmd_list[cmd_list.index("-o") + 1])
+            out.write_bytes(b"\x7fELF_BUILT" * 16)
+        return subprocess.CompletedProcess(cmd_list, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(gate_funnel.subprocess, "run", _mock_bisheng_run)
+    monkeypatch.setattr(
+        gate_funnel, "_verify_object_has_instantiated_kernel", lambda *_a, **_kw: (True, "")
+    )
+    monkeypatch.setattr(gate_funnel, "_disassemble_object", lambda *_a, **_kw: "")
+
+    store = ArtifactStore(tmp_path / "store")
+    sb1 = run_stage_b_ascendc_compile(
+        tu,
+        compile_flags=["-O2", "-I/tmp/x", "-DFOO=1"],
+        bisheng_bin=bisheng,
+        cann_root=cann_root,
+        verify_shared_link=True,
+        emit_shared_so_cache_dir=cache_dir,
+        artifact_store=store,
+    )
+    assert sb1.passed is True
+    assert len(sb1.binary_paths) == 2
+    assert any("-shared" in c for c in seen_cmds)
+    assert any("-c" in c for c in seen_cmds)
+    assert target_so.is_file() and target_so.stat().st_size > 0
+
+    seen_cmds.clear()
+    direct_cache_dir = tmp_path / "direct_shared_so_cache"
+    miss_ok, miss_path, miss_err = compile_trackb_shared_so(
+        tu,
+        cache_dir=direct_cache_dir,
+        compile_flags=["-O2", "-I/tmp/z", "-DFOO=1"],
+        bisheng_bin=bisheng,
+        cann_root=cann_root,
+    )
+    assert miss_ok is True
+    assert miss_err == ""
+    assert miss_path == (direct_cache_dir / f1).resolve()
+    assert miss_path.is_file() and miss_path.stat().st_size > 0
+    assert len(seen_cmds) == 1 and "-shared" in seen_cmds[0]
+
+    seen_cmds.clear()
+    sb2 = run_stage_b_ascendc_compile(
+        tu,
+        compile_flags=["-O2", "-I/tmp/y", "-DFOO=1"],
+        bisheng_bin=bisheng,
+        cann_root=cann_root,
+        verify_shared_link=True,
+        emit_shared_so_cache_dir=cache_dir,
+        artifact_store=store,
+    )
+    assert sb2.passed is True
+    assert len(sb2.binary_paths) == 2
+    assert any("-c" in c for c in seen_cmds)
+    assert not any("-shared" in c for c in seen_cmds)
+

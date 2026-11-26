@@ -91,6 +91,8 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
     _normalize_trackb_unit_source,
+    compile_trackb_shared_so,
+    compute_trackb_shared_so_filename,
     evaluate_ascendc_candidate,
     resolve_trackb_compile_flags,
     run_stage_a_static,
@@ -113,6 +115,7 @@ from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
     ArtifactRecord,
     ArtifactStore,
     compute_compile_task_key,
+    is_verified_binary_file,
     resolve_unified_tl_cache_dir,
 )
 from tilefoundry_ascend.ascend.cost_model import (
@@ -1233,15 +1236,23 @@ class StageGateCoordinator:
         *,
         artifact_store: ArtifactStore | None = None,
         regime_tag: str = "",
+        verify_shared_link: bool = False,
+        emit_shared_so_cache_dir: Path | None = None,
     ) -> StageBResult:
         override = self._owner_override("_compile_trackb_stage_b")
         if override is not None:
+            override_kwargs: dict[str, object] = {
+                "selector_flags": selector_flags,
+                "artifact_store": artifact_store,
+                "regime_tag": regime_tag,
+                "verify_shared_link": verify_shared_link,
+            }
+            if emit_shared_so_cache_dir is not None:
+                override_kwargs["emit_shared_so_cache_dir"] = emit_shared_so_cache_dir
             return self._invoke_with_optional_kwargs(
                 override,
                 cpp_source,
-                selector_flags=selector_flags,
-                artifact_store=artifact_store,
-                regime_tag=regime_tag,
+                **override_kwargs,
             )
         env_vals = parse_simple_env_file(self._env_file) if self._env_file else None
         unified_tl_cache = resolve_unified_tl_cache_dir(
@@ -1262,15 +1273,62 @@ class StageGateCoordinator:
             "run_stage_b_ascendc_compile",
             run_stage_b_ascendc_compile,
         )
+        compile_kwargs: dict[str, object] = {
+            "compile_flags": flags,
+            "bisheng_bin": bisheng_bin,
+            "cann_root": cann_root,
+            "artifact_store": eff_store,
+            "regime_tag": regime_tag,
+            "verify_shared_link": verify_shared_link,
+        }
+        if emit_shared_so_cache_dir is not None:
+            compile_kwargs["emit_shared_so_cache_dir"] = emit_shared_so_cache_dir
         return self._invoke_with_optional_kwargs(
             compile_fn,
             cpp_source,
-            compile_flags=flags,
-            bisheng_bin=bisheng_bin,
-            cann_root=cann_root,
-            artifact_store=eff_store,
-            regime_tag=regime_tag,
+            **compile_kwargs,
         )
+
+    def _collect_hybrid_trackb_anchor_tus(
+        self,
+        module_source: str,
+        tb_cpp: str,
+        regime_spec: RegimeTargetSpec,
+        selector_flags: Sequence[str] | None,
+    ) -> list[tuple[str, tuple[str, ...]]]:
+        """Render distinct (TU, effective flags) pairs across all scoreboard anchors."""
+        rendered_pairs: list[tuple[str, tuple[str, ...]]] = []
+        seen_keys: set[tuple[str, tuple[str, ...]]] = set()
+        for anc in self._scoreboard_anchors:
+            cnum = int(anc.case_num)
+            anc_rtag = str(anc.regime_tag or regime_spec.regime_tag)
+            anc_dims = (
+                self._lookup_case_static_spec_safe(cnum)
+                or self._lookup_case_dims_safe(cnum, anc_rtag)
+            )
+            if not anc_dims:
+                continue
+            anc_spec = replace(
+                regime_spec,
+                regime_tag=anc_rtag,
+                representative_anchor_dims=dict(anc_dims),
+            )
+            a_tu = self._invoke_with_optional_kwargs(
+                self._instantiate_trackb_tu,
+                module_source,
+                tb_cpp,
+                anc_spec,
+                anchor_dims_override=dict(anc_dims),
+            )
+            a_flags = self._resolve_trackb_selector_flags(module_source, anc_spec)
+            if not a_flags and not anc_spec.config_selector_fn and selector_flags:
+                a_flags = tuple(selector_flags)
+            a_eff_flags = tuple(resolve_trackb_compile_flags(a_tu, a_flags))
+            key = (a_tu, a_eff_flags)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                rendered_pairs.append(key)
+        return rendered_pairs
 
     def _resolve_trackb_selector_flags(
         self,
@@ -1764,6 +1822,139 @@ class StageGateCoordinator:
             )
         return res
 
+    def _run_hybrid_trackb_stage_b(
+        self,
+        module_source: str,
+        tb_extracted: tuple[str, str],
+        regime_spec: RegimeTargetSpec,
+        resolved: _ResolvedConfigLike,
+        unified_tl_cache: Path,
+        eff_store: ArtifactStore,
+        *,
+        has_tb_override: bool,
+    ) -> tuple[StageBResult | None, ArtifactRecord | None, float, StageBResult | None]:
+        """Run Track-B compile plus missing anchor shared libraries for hybrid regimes."""
+        tb_sym, tb_cpp = tb_extracted
+        instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
+        primary_eff_flags = tuple(
+            resolve_trackb_compile_flags(instantiated_tu, resolved.compile_flags or None)
+        )
+        cached_tb_rec = self._lookup_verified_hybrid_trackb_artifact(
+            instantiated_tu,
+            resolved.compile_flags or None,
+            eff_store,
+            regime_spec.regime_tag,
+        )
+        needs_primary_so = 'extern "C"' in instantiated_tu and "<<<" in instantiated_tu
+        primary_so_path = unified_tl_cache / compute_trackb_shared_so_filename(
+            instantiated_tu,
+            primary_eff_flags,
+        )
+        primary_so_ok = (
+            has_tb_override
+            or not needs_primary_so
+            or is_verified_binary_file(primary_so_path)
+        )
+        run_primary_tb = cached_tb_rec is None or not primary_so_ok
+        missing_anchor_sos: list[tuple[str, tuple[str, ...]]] = []
+        if not has_tb_override:
+            for a_tu, a_eff_flags in self._collect_hybrid_trackb_anchor_tus(
+                module_source,
+                tb_cpp,
+                regime_spec,
+                resolved.compile_flags or None,
+            ):
+                if (a_tu, a_eff_flags) == (instantiated_tu, primary_eff_flags):
+                    continue
+                if not ('extern "C"' in a_tu and "<<<" in a_tu):
+                    continue
+                a_so_path = unified_tl_cache / compute_trackb_shared_so_filename(
+                    a_tu,
+                    a_eff_flags,
+                )
+                if not is_verified_binary_file(a_so_path):
+                    missing_anchor_sos.append((a_tu, a_eff_flags))
+
+        cann_root = self._resolve_cann_root_from_env_file(self._env_file)
+        bisheng_bin: str | None = None
+        if cann_root is not None:
+            cand_bin = cann_root / "bin" / "bisheng"
+            if cand_bin.is_file():
+                bisheng_bin = str(cand_bin)
+
+        def _run_primary_tb() -> StageBResult:
+            return self._invoke_with_optional_kwargs(
+                self._compile_trackb_stage_b,
+                instantiated_tu,
+                selector_flags=resolved.compile_flags or None,
+                artifact_store=eff_store,
+                regime_tag=regime_spec.regime_tag,
+                verify_shared_link=not has_tb_override,
+                emit_shared_so_cache_dir=None if has_tb_override else unified_tl_cache,
+            )
+
+        def _run_secondary_so(
+            item: tuple[str, tuple[str, ...]],
+        ) -> tuple[bool, float, str]:
+            a_tu, a_eff_flags = item
+            t_so = time.monotonic()
+            ok, _so_path, err_msg = compile_trackb_shared_so(
+                a_tu,
+                cache_dir=unified_tl_cache,
+                compile_flags=a_eff_flags,
+                bisheng_bin=bisheng_bin,
+                cann_root=cann_root,
+            )
+            return ok, time.monotonic() - t_so, err_msg
+
+        tb_b: StageBResult | None = None
+        tb_elapsed_sec = 0.0
+        sec_err = ""
+        total_tb_tasks = (1 if run_primary_tb else 0) + len(missing_anchor_sos)
+        if total_tb_tasks == 1:
+            if run_primary_tb:
+                tb_b = _run_primary_tb()
+                tb_elapsed_sec = tb_b.elapsed_sec
+            else:
+                ok, dt, err_msg = _run_secondary_so(missing_anchor_sos[0])
+                tb_elapsed_sec = dt
+                if not ok:
+                    sec_err = err_msg or "shared_link_failed"
+        elif total_tb_tasks > 1:
+            workers = min(_MAX_L1_COMPILE_WORKERS, total_tb_tasks)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                primary_fut = pool.submit(_run_primary_tb) if run_primary_tb else None
+                sec_futs = [pool.submit(_run_secondary_so, item) for item in missing_anchor_sos]
+                if primary_fut is not None:
+                    tb_b = primary_fut.result()
+                    tb_elapsed_sec += tb_b.elapsed_sec
+                for fut in sec_futs:
+                    ok, dt, err_msg = fut.result()
+                    tb_elapsed_sec += dt
+                    if not ok and not sec_err:
+                        sec_err = err_msg or "shared_link_failed"
+
+        if tb_b is not None and not tb_b.passed:
+            fail_res = self._normalize_primary_vf_overflow(
+                replace(
+                    tb_b,
+                    error_message=f"trackb_ascendc({tb_sym}): {tb_b.error_message}",
+                    elapsed_sec=tb_elapsed_sec,
+                )
+            )
+            return tb_b, cached_tb_rec, tb_elapsed_sec, fail_res
+        if sec_err:
+            fail_res = StageBResult(
+                passed=False,
+                error_message=f"trackb_ascendc({tb_sym}): {sec_err}",
+                elapsed_sec=tb_elapsed_sec,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code="STAGE_B_ASCENDC_SHARED_LINK_FAILED",
+                failed_tier="stage_b",
+            )
+            return tb_b, cached_tb_rec, tb_elapsed_sec, fail_res
+        return tb_b, cached_tb_rec, tb_elapsed_sec, None
+
     def _run_l1(
         self,
         module_source: str,
@@ -1973,6 +2164,45 @@ class StageGateCoordinator:
                 passed=False,
                 error_message=f"l1_config_resolve_error: {type(exc).__name__}: {exc}",
             )
+        env_vals = parse_simple_env_file(self._env_file) if self._env_file is not None else None
+        unified_tl_cache = resolve_unified_tl_cache_dir(
+            env_vals=env_vals,
+            source_root=self._source_root,
+        )
+        eff_store = ArtifactStore(unified_tl_cache)
+
+        has_tb_override = (
+            self._owner_override("_compile_trackb_stage_b") is not None
+            or "_compile_trackb_stage_b" in self.__dict__
+        )
+        ascendc_hook = self._resolve_hook(
+            "run_stage_b_ascendc_compile",
+            run_stage_b_ascendc_compile,
+        )
+        defer_hybrid_trackb = has_tb_override or (
+            l1_check_fn is not _ORIG_CAMPAIGN_HOOKS["run_l1_compile_check"]
+            and ascendc_hook is _ORIG_CAMPAIGN_HOOKS["run_stage_b_ascendc_compile"]
+        )
+        tb_b: StageBResult | None = None
+        cached_tb_rec: ArtifactRecord | None = None
+        tb_elapsed_sec = 0.0
+        if (
+            regime_spec.runtime_backend == "hybrid_trackb"
+            and tb_extracted is not None
+            and not defer_hybrid_trackb
+        ):
+            tb_b, cached_tb_rec, tb_elapsed_sec, fail_res = self._run_hybrid_trackb_stage_b(
+                module_source,
+                tb_extracted,
+                regime_spec,
+                resolved,
+                unified_tl_cache,
+                eff_store,
+                has_tb_override=has_tb_override,
+            )
+            if fail_res is not None:
+                return fail_res
+
         uses_unreserved_ubuf = any(
             "--cce-disable-vf-stack-reserved-ubuf" in str(fl) for fl in resolved.compile_flags
         )
@@ -2036,12 +2266,6 @@ class StageGateCoordinator:
                 same_cfg_widths.append(w_dims)
             else:
                 extra_width_checks.append((w_dims, w_resolved))
-        env_vals = parse_simple_env_file(self._env_file) if self._env_file is not None else None
-        unified_tl_cache = resolve_unified_tl_cache_dir(
-            env_vals=env_vals,
-            source_root=self._source_root,
-        )
-        eff_store = ArtifactStore(unified_tl_cache)
         primary_b = self._invoke_with_optional_kwargs(
             l1_check_fn,
             module_source,
@@ -2067,17 +2291,34 @@ class StageGateCoordinator:
                 and tb_extracted is not None
                 and not _has_prim_func_builder(module_source, regime_spec.builder_candidates)
             ):
-                instantiated_tu = self._instantiate_trackb_tu(
-                    module_source, tb_extracted[1], regime_spec
-                )
-                tb_fb = self._invoke_with_optional_kwargs(
-                    self._compile_trackb_stage_b,
-                    instantiated_tu,
-                    selector_flags=resolved.compile_flags or None,
-                    artifact_store=eff_store,
-                    regime_tag=regime_spec.regime_tag,
-                )
-                return self._normalize_primary_vf_overflow(tb_fb)
+                if defer_hybrid_trackb:
+                    tb_b, cached_tb_rec, tb_elapsed_sec, fail_res = (
+                        self._run_hybrid_trackb_stage_b(
+                            module_source,
+                            tb_extracted,
+                            regime_spec,
+                            resolved,
+                            unified_tl_cache,
+                            eff_store,
+                            has_tb_override=has_tb_override,
+                        )
+                    )
+                    if fail_res is not None:
+                        return fail_res
+                if tb_b is not None:
+                    tb_out = (
+                        replace(tb_b, elapsed_sec=tb_elapsed_sec)
+                        if tb_elapsed_sec != tb_b.elapsed_sec
+                        else tb_b
+                    )
+                    return self._normalize_primary_vf_overflow(tb_out)
+                if cached_tb_rec is not None:
+                    return StageBResult(
+                        passed=True,
+                        elapsed_sec=tb_elapsed_sec,
+                        artifact_id=cached_tb_rec.artifact_id,
+                        binary_paths=cached_tb_rec.binary_paths,
+                    )
             return self._normalize_primary_vf_overflow(primary_b)
 
         final_b = primary_b
@@ -2153,18 +2394,30 @@ class StageGateCoordinator:
                 )
             combine_elapsed_sec = combine_b.elapsed_sec
         if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
-            tb_sym, tb_cpp = tb_extracted
-            instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
-            cached_tb_rec = self._lookup_verified_hybrid_trackb_artifact(
-                instantiated_tu,
-                resolved.compile_flags or None,
-                eff_store,
-                regime_spec.regime_tag,
-            )
+            if defer_hybrid_trackb:
+                tb_b, cached_tb_rec, tb_elapsed_sec, fail_res = (
+                    self._run_hybrid_trackb_stage_b(
+                        module_source,
+                        tb_extracted,
+                        regime_spec,
+                        resolved,
+                        unified_tl_cache,
+                        eff_store,
+                        has_tb_override=has_tb_override,
+                    )
+                )
+                if fail_res is not None:
+                    return replace(
+                        fail_res,
+                        elapsed_sec=total_elapsed + combine_elapsed_sec + tb_elapsed_sec,
+                    )
+            agg_elapsed_sec = total_elapsed + combine_elapsed_sec + tb_elapsed_sec
+            if tb_b is not None:
+                return replace(tb_b, elapsed_sec=agg_elapsed_sec)
             if cached_tb_rec is not None:
                 return StageBResult(
                     passed=True,
-                    elapsed_sec=total_elapsed + combine_elapsed_sec,
+                    elapsed_sec=agg_elapsed_sec,
                     spill_bytes=final_b.spill_bytes,
                     vloopv2_hit=final_b.vloopv2_hit,
                     compiler_summary=final_b.compiler_summary,
@@ -2172,23 +2425,6 @@ class StageGateCoordinator:
                     artifact_id=cached_tb_rec.artifact_id,
                     binary_paths=cached_tb_rec.binary_paths,
                 )
-            tb_b = self._invoke_with_optional_kwargs(
-                self._compile_trackb_stage_b,
-                instantiated_tu,
-                selector_flags=resolved.compile_flags or None,
-                artifact_store=eff_store,
-                regime_tag=regime_spec.regime_tag,
-            )
-            agg_elapsed_sec = total_elapsed + combine_elapsed_sec + tb_b.elapsed_sec
-            if not tb_b.passed:
-                return self._normalize_primary_vf_overflow(
-                    replace(
-                        tb_b,
-                        error_message=f"trackb_ascendc({tb_sym}): {tb_b.error_message}",
-                        elapsed_sec=agg_elapsed_sec,
-                    )
-                )
-            return replace(tb_b, elapsed_sec=agg_elapsed_sec)
         if total_elapsed != final_b.elapsed_sec:
             return replace(final_b, elapsed_sec=total_elapsed)
         return final_b

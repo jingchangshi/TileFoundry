@@ -43,6 +43,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_operator_entrypoint,
     get_operator_module_relpath,
     get_operator_task,
+    infer_module_runtime_backend,
     lookup_case_dims,
     parse_simple_env_file,
     resolve_cannbench_repo,
@@ -67,6 +68,8 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     _parse_cce_res_usage_with_summary,
     build_stage_b_driver_source,
     check_repair_monotonicity,
+    compile_trackb_shared_so,
+    compute_trackb_shared_so_filename,
     extract_ordered_tensor_shapes,
     run_stage_a_static,
     run_stage_b_compile,
@@ -4595,6 +4598,7 @@ elif mode == "trackb":
         extract_reachable_trackb_source,
     )
     from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+        compute_trackb_shared_so_filename,
         resolve_trackb_compile_flags,
         run_stage_b_ascendc_compile,
     )
@@ -4639,7 +4643,7 @@ elif mode == "trackb":
         except Exception:
             compile_ascend_fn = None
     if callable(compile_ascend_fn):
-        so_path = cache_dir / f"trackb_{{task_sig}}.so"
+        so_path = cache_dir / compute_trackb_shared_so_filename(cpp_src, cf_list)
         compile_ascend_fn(
             cpp_src,
             target_format="so",
@@ -4976,6 +4980,309 @@ def _build_prewarm_plan_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+_VERIFIED_HYBRID_TRACKB_SO_KEYS: set[tuple[str, str, str, str]] = set()
+_VERIFIED_HYBRID_TRACKB_SO_LOCK = threading.Lock()
+
+_HYBRID_TRACKB_SO_PLAN_TEMPLATE = """import json
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+sys.path.insert(0, {ascend_target_dir!r})
+from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    discover_module_trackb_symbols,
+    extract_trackb_cpp_source,
+    get_default_regime_specs,
+    resolve_regime_for_case,
+)
+from tilefoundry_ascend.agent.campaign.regime_slice_patcher import (
+    _render_trackb_tu_from_module,
+    _resolve_selector_compile_flags,
+)
+from tilefoundry_ascend.agent.campaign.surrogate_cannbench import lookup_case_static_spec
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    compute_trackb_shared_so_filename,
+    resolve_trackb_compile_flags,
+)
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import is_verified_binary_file
+
+op_name = {op_name!r}
+case_ids = {case_ids_json}
+cand_paths = {cand_paths_json}
+repo = {repo!r}
+anchor_regimes = {anchor_regimes_json}
+tl_cache_dir = Path({tl_cache_dir!r})
+
+try:
+    regime_specs = get_default_regime_specs(op_name)
+except Exception:
+    regime_specs = ()
+
+case_specs = []
+for cid_num in case_ids:
+    try:
+        case_dims = lookup_case_static_spec(op_name, cid_num, cannbench_repo=repo)
+        regime = resolve_regime_for_case(op_name, case_dims, regime_specs)
+        case_specs.append((cid_num, case_dims, regime))
+    except Exception:
+        continue
+
+missing = []
+by_fname = {{}}
+cand_errors = []
+for cid, mod_path in cand_paths:
+    try:
+        mod_src = Path(mod_path).read_text(encoding="utf-8")
+        mod_tb_syms = discover_module_trackb_symbols(mod_src)
+        for cid_num, case_dims, regime in case_specs:
+            syms = tuple(getattr(regime, "trackb_symbols", ()) or mod_tb_syms)
+            extracted = extract_trackb_cpp_source(mod_src, syms)
+            if extracted is None:
+                continue
+            _tb_sym, tb_cpp = extracted
+            r_tag = str(
+                anchor_regimes.get(str(cid_num)) or getattr(regime, "regime_tag", "") or ""
+            )
+            anc_spec = replace(
+                regime,
+                regime_tag=r_tag,
+                representative_anchor_dims=dict(case_dims),
+            )
+            a_tu = _render_trackb_tu_from_module(
+                mod_src,
+                tb_cpp,
+                anc_spec,
+                require_renderer=False,
+                anchor_dims_override=dict(case_dims),
+            )
+            if 'extern "C"' not in a_tu or "<<<" not in a_tu:
+                continue
+            a_flags = _resolve_selector_compile_flags(mod_src, anc_spec, dims=case_dims)
+            eff_flags = list(resolve_trackb_compile_flags(a_tu, a_flags or None))
+            fname = compute_trackb_shared_so_filename(a_tu, eff_flags)
+            if is_verified_binary_file(tl_cache_dir / fname):
+                continue
+            existing = by_fname.get(fname)
+            if existing is None:
+                entry = {{
+                    "candidate_ids": [cid],
+                    "cpp_src": a_tu,
+                    "compile_flags": eff_flags,
+                    "fname": fname,
+                }}
+                by_fname[fname] = entry
+                missing.append(entry)
+            elif cid not in existing["candidate_ids"]:
+                existing["candidate_ids"].append(cid)
+    except Exception as exc:
+        cand_errors.append({{"candidate_id": cid, "error": f"{{type(exc).__name__}}: {{exc}}"}})
+
+print(json.dumps({{"missing": missing, "cand_errors": cand_errors}}))
+"""
+
+
+def _build_prewarm_subprocess_env(
+    env_vals: Mapping[str, str],
+    root: Path,
+    resolved_ref_cache: Path,
+    resolved_tl_cache: Path,
+) -> tuple[dict[str, str], Callable[[Path], list[str]], str]:
+    python_bin = (
+        env_vals.get("TILEFOUNDRY_NPU_PYTHON")
+        or os.environ.get("TILEFOUNDRY_NPU_PYTHON")
+        or sys.executable
+    )
+    cann_setup = (
+        env_vals.get("TILEFOUNDRY_NPU_CANN_SETUP")
+        or os.environ.get("TILEFOUNDRY_NPU_CANN_SETUP")
+        or ""
+    ).strip()
+    tl_source = (
+        env_vals.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
+        or os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
+        or ""
+    ).strip()
+
+    run_env = dict(os.environ)
+    run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+    run_env["ASCEND_RT_VISIBLE_DEVICES"] = ""
+    run_env["USE_CUDA"] = "0"
+    run_env["CANNBENCH_CACHE_DIR"] = str(resolved_ref_cache)
+    run_env["TILELANG_CACHE_DIR"] = str(resolved_tl_cache)
+    run_env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
+    run_env["TILELANG_DISABLE_CACHE"] = "0"
+    run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    pp_parts = [str(root), str(root / "src"), str(root / "targets" / "ascend")]
+    if tl_source:
+        pp_parts.insert(0, tl_source)
+    if run_env.get("PYTHONPATH"):
+        pp_parts.append(run_env["PYTHONPATH"])
+    run_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
+
+    need_cann_source = bool(
+        cann_setup and Path(cann_setup).is_file() and shutil.which("bisheng") is None
+    )
+
+    def _build_argv(script_path: Path) -> list[str]:
+        if need_cann_source:
+            bash_cmd = (
+                f"set +u && source {shlex.quote(cann_setup)} >/dev/null 2>&1 "
+                f"&& exec {shlex.quote(python_bin)} {shlex.quote(str(script_path))}"
+            )
+            return ["/bin/bash", "-c", bash_cmd]
+        return [python_bin, str(script_path)]
+
+    return run_env, _build_argv, cann_setup
+
+
+def _ensure_hybrid_trackb_shared_sos_cached(
+    *,
+    operator_name: str,
+    valid_candidates: Sequence[tuple[str, str]],
+    cand_sources: Mapping[str, str],
+    anchors: Sequence[AnchorCaseSpec],
+    repo: Path,
+    root: Path,
+    resolved_tl_cache: Path,
+    resolved_ref_cache: Path,
+    cases_yaml_sha256: str,
+    env_vals: Mapping[str, str],
+    timeout_sec: int,
+    isolate_non_incumbent: bool,
+    failed_by_cid: dict[str, str],
+) -> None:
+    try:
+        entrypoint = get_operator_entrypoint(operator_name)
+    except (KeyError, FileNotFoundError, ValueError):
+        entrypoint = ""
+    anchor_nums_key = ",".join(str(int(a.case_num)) for a in anchors)
+    pending_cands: list[tuple[str, str, tuple[str, str, str, str]]] = []
+    for cid, mod_path_str in valid_candidates:
+        if cid in failed_by_cid:
+            continue
+        mod_src = cand_sources.get(cid, "")
+        if "def _render_trackb_tu" not in mod_src:
+            continue
+        if infer_module_runtime_backend(mod_src, entrypoint)[0] != "hybrid_trackb":
+            continue
+        mod_sha = hashlib.sha256(mod_src.encode("utf-8")).hexdigest()
+        cache_key = (mod_sha, str(resolved_tl_cache), cases_yaml_sha256, anchor_nums_key)
+        with _VERIFIED_HYBRID_TRACKB_SO_LOCK:
+            if cache_key in _VERIFIED_HYBRID_TRACKB_SO_KEYS:
+                continue
+        pending_cands.append((cid, mod_path_str, cache_key))
+
+    if not pending_cands:
+        return
+
+    run_env, build_argv, cann_setup = _build_prewarm_subprocess_env(
+        env_vals, root, resolved_ref_cache, resolved_tl_cache
+    )
+    case_ids = [int(a.case_num) for a in anchors]
+    anchor_regimes = {str(int(a.case_num)): str(a.regime_tag or "") for a in anchors}
+    cand_paths = [(cid, mod_path_str) for cid, mod_path_str, _key in pending_cands]
+
+    with tempfile.TemporaryDirectory(prefix="tf_hyb_so_warm_") as tmp_dir:
+        plan_path = Path(tmp_dir) / "hybrid_trackb_so_plan.py"
+        plan_path.write_text(
+            _HYBRID_TRACKB_SO_PLAN_TEMPLATE.format(
+                ascend_target_dir=str(root / "targets" / "ascend"),
+                op_name=operator_name,
+                case_ids_json=json.dumps(case_ids),
+                cand_paths_json=json.dumps(cand_paths),
+                repo=str(repo),
+                anchor_regimes_json=json.dumps(anchor_regimes),
+                tl_cache_dir=str(resolved_tl_cache),
+            ),
+            encoding="utf-8",
+        )
+        proc = subprocess.run(
+            build_argv(plan_path),
+            text=True,
+            capture_output=True,
+            cwd=str(root),
+            env=run_env,
+            timeout=timeout_sec,
+        )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[-1000:]
+        raise RuntimeError(f"prewarm_surrogate_tilelang_cache failed: {detail}")
+
+    payload = json.loads((proc.stdout or "{}").strip().splitlines()[-1])
+    for item in payload.get("cand_errors") or ():
+        if not isinstance(item, Mapping):
+            continue
+        err_cid = str(item.get("candidate_id", ""))
+        err_msg = str(item.get("error", ""))
+        if err_cid == "incumbent_slot" or not isolate_non_incumbent:
+            raise RuntimeError(f"prewarm_surrogate_tilelang_cache failed: {err_msg[:1000]}")
+        if err_cid and err_cid not in failed_by_cid:
+            failed_by_cid[err_cid] = err_msg
+
+    compile_items = [
+        item
+        for item in (payload.get("missing") or ())
+        if isinstance(item, Mapping)
+        and any(str(c) not in failed_by_cid for c in (item.get("candidate_ids") or ()))
+    ]
+    if compile_items:
+        cann_root = Path(cann_setup).expanduser().parent if cann_setup else None
+        if cann_root is not None and not cann_root.is_dir():
+            cann_root = None
+        bisheng_bin: str | None = None
+        if cann_root is not None and (cann_root / "bin" / "bisheng").is_file():
+            bisheng_bin = str(cann_root / "bin" / "bisheng")
+
+        def _compile_so(item: Mapping[str, object]) -> tuple[bool, str, list[str], str]:
+            cids = [str(c) for c in (item.get("candidate_ids") or ())]
+            fname = str(item.get("fname") or "")
+            ok, _so_p, err = compile_trackb_shared_so(
+                str(item.get("cpp_src") or ""),
+                cache_dir=resolved_tl_cache,
+                compile_flags=[str(f) for f in (item.get("compile_flags") or ())],
+                bisheng_bin=bisheng_bin,
+                cann_root=cann_root,
+                timeout_sec=timeout_sec,
+            )
+            return ok, err, cids, fname
+
+        if len(compile_items) == 1:
+            results = [_compile_so(compile_items[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=min(4, len(compile_items))) as pool:
+                results = list(pool.map(_compile_so, compile_items))
+
+        fatal_errs: list[str] = []
+        for ok, err, cids, fname in results:
+            if not ok or (fname and not is_verified_binary_file(resolved_tl_cache / fname)):
+                err_text = err or f"trackb_shared_so_failed:{fname}"
+                if "incumbent_slot" in cids or not isolate_non_incumbent:
+                    fatal_errs.append(err_text)
+                for err_cid in cids:
+                    if err_cid not in failed_by_cid:
+                        failed_by_cid[err_cid] = err_text
+        if fatal_errs:
+            raise RuntimeError(
+                f"prewarm_surrogate_tilelang_cache failed: {'; '.join(fatal_errs)[:1000]}"
+            )
+
+    fnames_by_cid: dict[str, list[str]] = {}
+    for item in compile_items:
+        fname = str(item.get("fname") or "")
+        if not fname:
+            continue
+        for c in item.get("candidate_ids") or ():
+            fnames_by_cid.setdefault(str(c), []).append(fname)
+
+    with _VERIFIED_HYBRID_TRACKB_SO_LOCK:
+        for cid, _mod_path_str, cache_key in pending_cands:
+            if cid in failed_by_cid:
+                continue
+            needed = fnames_by_cid.get(cid, ())
+            if all(is_verified_binary_file(resolved_tl_cache / fn) for fn in needed):
+                _VERIFIED_HYBRID_TRACKB_SO_KEYS.add(cache_key)
+
+
 def prewarm_surrogate_tilelang_cache_with_stats(
     operator_name: str,
     candidates: Sequence[tuple[str, str | Path]],
@@ -5100,6 +5407,21 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 missed_cases_by_cid.setdefault(cid, set()).add(cnum)
 
     if not missed_cands:
+        _ensure_hybrid_trackb_shared_sos_cached(
+            operator_name=operator_name,
+            valid_candidates=valid_candidates,
+            cand_sources=cand_sources,
+            anchors=anchors,
+            repo=repo,
+            root=root,
+            resolved_tl_cache=resolved_tl_cache,
+            resolved_ref_cache=resolved_ref_cache,
+            cases_yaml_sha256=cases_yaml_sha256,
+            env_vals=env_vals,
+            timeout_sec=timeout_sec,
+            isolate_non_incumbent=isolate_non_incumbent,
+            failed_by_cid=failed_by_cid,
+        )
         stats = {
             "total_tasks": cache_hits,
             "cache_hits": cache_hits,
@@ -5113,50 +5435,9 @@ def prewarm_surrogate_tilelang_cache_with_stats(
             elapsed_sec=time.monotonic() - t0,
         )
 
-    python_bin = (
-        env_vals.get("TILEFOUNDRY_NPU_PYTHON")
-        or os.environ.get("TILEFOUNDRY_NPU_PYTHON")
-        or sys.executable
+    run_env, _build_argv, _cann_setup = _build_prewarm_subprocess_env(
+        env_vals, root, resolved_ref_cache, resolved_tl_cache
     )
-    cann_setup = (
-        env_vals.get("TILEFOUNDRY_NPU_CANN_SETUP")
-        or os.environ.get("TILEFOUNDRY_NPU_CANN_SETUP")
-        or ""
-    ).strip()
-    tl_source = (
-        env_vals.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
-        or os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
-        or ""
-    ).strip()
-
-    run_env = dict(os.environ)
-    run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
-    run_env["ASCEND_RT_VISIBLE_DEVICES"] = ""
-    run_env["USE_CUDA"] = "0"
-    run_env["CANNBENCH_CACHE_DIR"] = str(resolved_ref_cache)
-    run_env["TILELANG_CACHE_DIR"] = str(resolved_tl_cache)
-    run_env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
-    run_env["TILELANG_DISABLE_CACHE"] = "0"
-    run_env["PYTHONDONTWRITEBYTECODE"] = "1"
-    pp_parts = [str(root), str(root / "src"), str(root / "targets" / "ascend")]
-    if tl_source:
-        pp_parts.insert(0, tl_source)
-    if run_env.get("PYTHONPATH"):
-        pp_parts.append(run_env["PYTHONPATH"])
-    run_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
-
-    need_cann_source = bool(
-        cann_setup and Path(cann_setup).is_file() and shutil.which("bisheng") is None
-    )
-
-    def _build_argv(script_path: Path) -> list[str]:
-        if need_cann_source:
-            bash_cmd = (
-                f"set +u && source {shlex.quote(cann_setup)} >/dev/null 2>&1 "
-                f"&& exec {shlex.quote(python_bin)} {shlex.quote(str(script_path))}"
-            )
-            return ["/bin/bash", "-c", bash_cmd]
-        return [python_bin, str(script_path)]
 
     missed_cand_paths = [
         (cid, missed_cands[cid])
@@ -5478,6 +5759,21 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 finally:
                     fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
+    _ensure_hybrid_trackb_shared_sos_cached(
+        operator_name=operator_name,
+        valid_candidates=valid_candidates,
+        cand_sources=cand_sources,
+        anchors=anchors,
+        repo=repo,
+        root=root,
+        resolved_tl_cache=resolved_tl_cache,
+        resolved_ref_cache=resolved_ref_cache,
+        cases_yaml_sha256=cases_yaml_sha256,
+        env_vals=env_vals,
+        timeout_sec=timeout_sec,
+        isolate_non_incumbent=isolate_non_incumbent,
+        failed_by_cid=failed_by_cid,
+    )
     stats = {
         "total_tasks": cache_hits + compiled_tasks + failed_task_count,
         "cache_hits": cache_hits,

@@ -432,29 +432,30 @@ def extract_reachable_closure_source(
             max_oth = max(s for s, _ in scored_other)
             seeds.extend(n for s, n in scored_other if s == max_oth)
 
-        matched_cpp: list[tuple[int, str, str]] = []
-        for cname, cpp_txt in cpp_constants.items():
-            cscore = _score_name_for_regime(cname, regime_tag)
-            kname = select_active_trackb_kernel(
-                cpp_txt,
-                regime_tag=regime_tag,
-                module_source=module_source,
-            )
-            kscore = _score_name_for_regime(kname or "", regime_tag)
-            if cscore > 0 or kscore > 0:
-                matched_cpp.append((max(cscore, kscore), cname, kname or ""))
-        if matched_cpp:
-            matched_cpp.sort(key=lambda row: row[0], reverse=True)
-            top_cscore = matched_cpp[0][0]
-            for cscore, cname, kname in matched_cpp:
-                if cscore == top_cscore:
+        if not scored_builders:
+            matched_cpp: list[tuple[int, str, str]] = []
+            for cname, cpp_txt in cpp_constants.items():
+                cscore = _score_name_for_regime(cname, regime_tag)
+                kname = select_active_trackb_kernel(
+                    cpp_txt,
+                    regime_tag=regime_tag,
+                    module_source=module_source,
+                )
+                kscore = _score_name_for_regime(kname or "", regime_tag)
+                if cscore > 0 or kscore > 0:
+                    matched_cpp.append((max(cscore, kscore), cname, kname or ""))
+            if matched_cpp:
+                matched_cpp.sort(key=lambda row: row[0], reverse=True)
+                top_cscore = matched_cpp[0][0]
+                for cscore, cname, kname in matched_cpp:
+                    if cscore == top_cscore:
+                        if cname not in seeds:
+                            seeds.append(cname)
+                        if not active_cpp_kernel and kname:
+                            active_cpp_kernel = kname
+                for cname in cpp_constants:
                     if cname not in seeds:
-                        seeds.append(cname)
-                    if not active_cpp_kernel and kname:
-                        active_cpp_kernel = kname
-            for cname in cpp_constants:
-                if cname not in seeds:
-                    excluded_siblings.add(cname)
+                        excluded_siblings.add(cname)
 
         if seeds:
             for rname in regime_entry_fns:

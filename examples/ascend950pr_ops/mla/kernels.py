@@ -2,10 +2,12 @@
 
 import contextlib
 import ctypes
+import hashlib
 import math
 import os
 from pathlib import Path
 import tempfile
+import uuid
 
 import tilelang
 import tilelang.ascend.language as T
@@ -15,6 +17,7 @@ import torch
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 
 _KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+_TRACKB_SO_CACHE: dict[str, object] = {}
 _DISPATCH_CACHE: dict[tuple[object, ...], dict[str, object]] = {}
 _WORKSPACE_CACHE: dict[tuple[object, int, int], tuple[int, torch.Tensor, torch.Tensor]] = {}
 
@@ -4040,11 +4043,50 @@ extern "C" int launch_mla_trackb(
     )
 
 
+def _resolve_trackb_bm(
+    b_dim: int,
+    s_dim: int,
+    s_kv: int,
+    n_q: int,
+    trackb_bm: object = None,
+) -> int:
+    """Resolve the Track-B block-M tile size for MLA problem dimensions."""
+    if (
+        isinstance(trackb_bm, int)
+        and not isinstance(trackb_bm, bool)
+        and trackb_bm in (32, 64, 128)
+    ):
+        return int(trackb_bm)
+    if n_q >= 128:
+        if b_dim == 1 and s_dim == 1 and s_kv >= 1024:
+            return 32
+        if s_dim <= 2 and b_dim <= 32 and s_kv >= 1024:
+            return 64
+        return 128
+    if n_q >= 64:
+        return 64
+    return 32
+
+
 def _render_trackb_tu(**dims: object) -> str:
     """Render an instantiated C++20 Track-B translation unit for MLA."""
     raw_src = dims.get("trackb_src")
     trackb_src = str(raw_src) if raw_src is not None else _MLA_TRACKB_SRC
-    bm = int(dims.get("bm", 64) or 64)
+    raw_tb_bm = dims.get("trackb_bm")
+    raw_nq = dims.get("n_q", dims.get("N_q"))
+    if (
+        isinstance(raw_tb_bm, int)
+        and not isinstance(raw_tb_bm, bool)
+        and raw_tb_bm in (32, 64, 128)
+    ):
+        bm = int(raw_tb_bm)
+    elif raw_nq is not None:
+        b_dim = int(dims.get("b_dim", dims.get("B", 1)) or 1)
+        s_dim = int(dims.get("s_dim", dims.get("S_q", dims.get("S", 1))) or 1)
+        s_kv = int(dims.get("s_kv", dims.get("S_kv", dims.get("K", 128))) or 128)
+        bm = _resolve_trackb_bm(b_dim, s_dim, s_kv, int(raw_nq))
+    else:
+        bm = int(dims.get("bm", 64) or 64)
     d_nope = int(dims.get("d_nope", dims.get("D_nope", 512)) or 512)
     raw_dt = str(dims.get("tl_dtype", dims.get("dtype", "float16")) or "float16").strip()
     tl_dtype = raw_dt if raw_dt in ("float16", "bfloat16") else "float16"
@@ -4071,18 +4113,47 @@ def _build_mla_trackb_callable(
         tl_dtype=tl_dtype,
     )
     tl_inc = str(Path(tilelang.__file__).resolve().parent.parent / "src")
-    opts = [f"-I{tl_inc}", *_cann_include_flags()]
-    opts.extend(PURE_SIMDVF_UBUF_FLAGS)
-    so_dir = tempfile.mkdtemp(prefix="mla_trackb_")
-    so_path = os.path.join(so_dir, "mla_trackb.so")
-    compile_ascend(
-        launcher_src,
-        target_format="so",
-        npu_arch="dav-3510",
-        options=opts,
-        path_target=so_path,
-    )
-    lib = ctypes.CDLL(so_path)
+    non_inc_flags = () if "__simt_vf__" in launcher_src else tuple(PURE_SIMDVF_UBUF_FLAGS)
+    opts = [f"-I{tl_inc}", *_cann_include_flags(), *non_inc_flags]
+    trackb_sig = hashlib.sha256(
+        (launcher_src + "|" + " ".join(non_inc_flags)).encode("utf-8")
+    ).hexdigest()[:16]
+    cache_root = os.environ.get("TILELANG_CACHE_DIR", "").strip()
+    if cache_root:
+        os.makedirs(cache_root, exist_ok=True)
+        so_path = os.path.join(cache_root, f"trackb_{trackb_sig}.so")
+        if not (os.path.isfile(so_path) and os.path.getsize(so_path) > 0):
+            tmp_so = os.path.join(
+                cache_root,
+                f".trackb_{trackb_sig}.{os.getpid()}.{uuid.uuid4().hex[:8]}.so",
+            )
+            try:
+                compile_ascend(
+                    launcher_src,
+                    target_format="so",
+                    npu_arch="dav-3510",
+                    options=opts,
+                    path_target=tmp_so,
+                )
+                os.replace(tmp_so, so_path)
+            finally:
+                with contextlib.suppress(OSError):
+                    if os.path.exists(tmp_so):
+                        os.remove(tmp_so)
+    else:
+        so_dir = tempfile.mkdtemp(prefix="mla_trackb_")
+        so_path = os.path.join(so_dir, "mla_trackb.so")
+        compile_ascend(
+            launcher_src,
+            target_format="so",
+            npu_arch="dav-3510",
+            options=opts,
+            path_target=so_path,
+        )
+    lib = _TRACKB_SO_CACHE.get(so_path)
+    if lib is None:
+        lib = ctypes.CDLL(so_path)
+        _TRACKB_SO_CACHE[so_path] = lib
     fn = lib.launch_mla_trackb
     fn.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 7 + [ctypes.c_float]
     is_bnsd = 1 if input_layout == "BNSD" else 0
@@ -4416,24 +4487,7 @@ def mla(
         use_trackb = default_use_trackb
 
     if use_trackb:
-        raw_tb_bm = cfg.get("trackb_bm")
-        if (
-            isinstance(raw_tb_bm, int)
-            and not isinstance(raw_tb_bm, bool)
-            and raw_tb_bm in (32, 64, 128)
-        ):
-            bm = int(raw_tb_bm)
-        elif n_q >= 128:
-            if b_dim == 1 and s_dim == 1 and s_kv >= 1024:
-                bm = 32
-            elif s_dim <= 2 and b_dim <= 32 and s_kv >= 1024:
-                bm = 64
-            else:
-                bm = 128
-        elif n_q >= 64:
-            bm = 64
-        else:
-            bm = 32
+        bm = _resolve_trackb_bm(b_dim, s_dim, s_kv, n_q, cfg.get("trackb_bm"))
         num_kv_splits = 1
         merged_bk = dict(extra_builder_kwargs or {})
         merged_bk["_trackb"] = True
