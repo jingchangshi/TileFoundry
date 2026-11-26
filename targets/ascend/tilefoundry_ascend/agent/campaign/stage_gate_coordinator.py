@@ -29,6 +29,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     GuardrailCaseSpec,
     RegimeTargetSpec,
     _has_flat_operator_layout,
+    _static_width_signature,
     build_anchor_var_bindings,
     collect_distinct_static_width_dims,
     compute_case_eq3_score,
@@ -707,16 +708,27 @@ class StageGateCoordinator:
     ) -> bool:
         if not w_dims or not regime_anchor_specs:
             return False
+        w_sig = _static_width_signature(w_dims)
+        w_cfg = (
+            w_resolved.builder_name,
+            tuple(w_resolved.compile_flags or ()),
+            dict(w_resolved.pass_configs or {}),
+        )
         for a_spec, a_resolved in regime_anchor_specs:
             if dict(w_dims) == dict(a_spec):
                 if a_resolved is None or w_resolved == a_resolved:
                     return True
                 continue
-            if (
-                a_resolved is not None
-                and w_resolved == a_resolved
-                and all(a_spec.get(k) == v for k, v in w_dims.items())
-            ):
+            if a_resolved is None:
+                continue
+            if w_resolved == a_resolved and all(a_spec.get(k) == v for k, v in w_dims.items()):
+                return True
+            a_cfg = (
+                a_resolved.builder_name,
+                tuple(a_resolved.compile_flags or ()),
+                dict(a_resolved.pass_configs or {}),
+            )
+            if w_cfg == a_cfg and w_sig and w_sig == _static_width_signature(a_spec):
                 return True
         return False
 
@@ -1655,13 +1667,31 @@ class StageGateCoordinator:
         | None,
     ) -> list[dict[str, object]]:
         seen: list[dict[str, object]] = [dict(anchor_dims)] if anchor_dims else []
+        seen_sigs: set[tuple[tuple[str, object], ...]] = set()
+        if anchor_dims:
+            anchor_sig = _static_width_signature(anchor_dims)
+            if anchor_sig:
+                seen_sigs.add(anchor_sig)
         targets: list[dict[str, object]] = []
+
+        def _append_distinct(cand: dict[str, object], *, require_int_dim: bool) -> None:
+            if not cand or cand in seen:
+                return
+            if require_int_dim and not any(
+                isinstance(v, int) and not isinstance(v, bool) for v in cand.values()
+            ):
+                return
+            sig = _static_width_signature(cand)
+            if sig:
+                if sig in seen_sigs:
+                    return
+                seen_sigs.add(sig)
+            seen.append(cand)
+            targets.append(cand)
+
         if static_width_dims_fn is not None:
             for item in static_width_dims_fn(regime_spec):
-                cand = dict(item)
-                if cand and cand not in seen:
-                    seen.append(cand)
-                    targets.append(cand)
+                _append_distinct(dict(item), require_int_dim=False)
         elif self._l1_compiler is None and self._config.operator_name:
             anchors_for_width = self._scoreboard_anchors or self._initial_anchors
             for item in collect_distinct_static_width_dims(
@@ -1672,15 +1702,14 @@ class StageGateCoordinator:
                 cannbench_repo=self._cannbench_repo,
                 env_file=self._env_file,
             ):
-                cand = dict(item)
-                if cand and cand not in seen:
-                    seen.append(cand)
-                    targets.append(cand)
+                _append_distinct(dict(item), require_int_dim=True)
         if uses_unreserved_ubuf:
             max_dims = self._resolve_max_row_width_dims(regime_spec)
-            if max_dims and dict(max_dims) not in seen:
-                seen.append(dict(max_dims))
-                targets.append(dict(max_dims))
+            if max_dims:
+                _append_distinct(
+                    dict(max_dims),
+                    require_int_dim=static_width_dims_fn is None,
+                )
         return targets
 
     def _build_width_failure_result(

@@ -1315,3 +1315,124 @@ def test_prewarm_worker_skips_builder_fn_when_get_kernel_omits_param(
     assert json.loads(emit_path.read_text(encoding="utf-8")) == []
 
 
+def test_run_l1_compile_check_dedups_static_width_across_anchor_flags_and_specs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reuse anchor workers across selector flags and dedup identical static width specs."""
+    tl_stub = tmp_path / "tl_stub"
+    tl_stub.mkdir()
+    work_root = tmp_path / "work_root"
+    env_file = tmp_path / "env.sh"
+    env_file.write_text(
+        f"TILEFOUNDRY_NPU_WORK_ROOT={work_root}\n"
+        f"TILEFOUNDRY_NPU_TILELANG_SOURCE={tl_stub}\n"
+        f"TILEFOUNDRY_NPU_PYTHON={sys.executable}\n",
+        encoding="utf-8",
+    )
+    mod_src = (
+        "def build_op(d_dim=4096, tl_dtype='bfloat16', m_rows=1):\n"
+        "    return {'d_dim': int(d_dim), 'tl_dtype': tl_dtype}\n"
+    )
+    primary_dims = {"d_dim": 4096, "tl_dtype": "bfloat16", "m_rows": 1}
+    anchors = [(2, "small_decode", dict(primary_dims))]
+    static_specs = [
+        {"d_dim": 4096, "tl_dtype": "float16", "m_rows": 8},
+        {"d_dim": 1000, "tl_dtype": "bfloat16", "m_rows": 2},
+        {"D": 1000, "tl_dtype": "float16", "m_rows": 16},
+    ]
+
+    anchor_plan_payload = {
+        "tasks": [
+            {
+                "case_num": 2,
+                "regime_tag": "small_decode",
+                "mode": "generic",
+                "builder_name": "build_op",
+                "selector_name": "",
+                "factory_kwargs": {},
+                "dims": dict(primary_dims),
+                "kwargs": {"d_dim": 4096, "tl_dtype": "bfloat16"},
+                "pass_configs": {"tir.disable_cse_tir": True},
+                "compile_flags": ["-O2"],
+            }
+        ]
+    }
+    compile_driver_sources: list[str] = []
+
+    def _mock_run(cmd, *args, **kwargs):
+        _ = args
+        script_path = Path(str(cmd[-1]))
+        script_name = script_path.name
+        if script_name == "diag_driver.py":
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        if script_name == "anchor_plan.py":
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps(anchor_plan_payload) + "\n",
+                stderr="",
+            )
+        if script_name == "compile_driver.py":
+            compile_driver_sources.append(script_path.read_text(encoding="utf-8"))
+            w_cache = Path(str(kwargs["env"]["TILELANG_CACHE_DIR"]))
+            w_cache.mkdir(parents=True, exist_ok=True)
+            (w_cache / f"stub_{len(compile_driver_sources)}.so").write_bytes(b"ELF_STUB")
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected script: {script_name}")
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _mock_run)
+
+    res1 = surrogate_cannbench.run_l1_compile_check(
+        mod_src,
+        builder_name="build_op",
+        builder_kwargs={},
+        compile_flags=None,
+        dims=primary_dims,
+        static_spec_dims_list=static_specs,
+        source_root=tmp_path,
+        env_file=env_file,
+        tl_cache_dir=work_root / "tl_cache",
+        anchor_case_specs=anchors,
+        operator_name="attention_residual",
+    )
+    assert res1.passed is True
+    assert len(compile_driver_sources) == 2
+
+    compile_driver_sources.clear()
+    res_cached = surrogate_cannbench.run_l1_compile_check(
+        mod_src,
+        builder_name="build_op",
+        builder_kwargs={},
+        compile_flags=None,
+        dims=primary_dims,
+        static_spec_dims_list=[{"d_dim": 4096, "tl_dtype": "float16", "m_rows": 32}],
+        source_root=tmp_path,
+        env_file=env_file,
+        tl_cache_dir=work_root / "tl_cache",
+        anchor_case_specs=anchors,
+        operator_name="attention_residual",
+    )
+    assert res_cached.passed is True
+    assert len(compile_driver_sources) == 0
+    assert res_cached.binary_paths
+
+    compile_driver_sources.clear()
+    res_strict_flags = surrogate_cannbench.run_l1_compile_check(
+        mod_src,
+        builder_name="build_op",
+        builder_kwargs={},
+        compile_flags=("-O3",),
+        dims=primary_dims,
+        static_spec_dims_list=static_specs[:1],
+        source_root=tmp_path,
+        env_file=env_file,
+        tl_cache_dir=work_root / "tl_cache",
+        anchor_case_specs=anchors,
+        operator_name="attention_residual",
+    )
+    assert res_strict_flags.passed is True
+    assert len(compile_driver_sources) == 1
+
+
+

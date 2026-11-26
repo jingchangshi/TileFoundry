@@ -799,9 +799,11 @@ def _default_batch_request(source_root: Path, cannbench_repo: Path) -> dict[str,
 
 
 _INCUMBENT_CANDIDATE_IDS = frozenset({"incumbent_slot", "__incumbent__", "incumbent_baseline"})
+_POISON_PILL_SKIP_INCUMBENT_IDS = frozenset({"incumbent_slot", "__incumbent__"})
 
 
 _POISON_PILL_WORKER_SCRIPT = """import importlib
+import importlib.util
 import json
 import os
 import sys
@@ -815,10 +817,33 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     load_anchor_harness_and_cases,
     load_cannbench_contract_module,
 )
-from tests.ascend.agent.test_surrogate_batch_npu import (
-    _configure_tilelang_cache,
-    _load_candidate_entrypoint,
-)
+
+
+def _configure_tilelang_cache(tl_cache_dir: str) -> None:
+    resolved = Path(tl_cache_dir).resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
+    os.environ["TILELANG_CACHE_DIR"] = str(resolved)
+    os.environ["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
+    os.environ["TILELANG_DISABLE_CACHE"] = "0"
+    tl_env_mod = importlib.import_module("tilelang.env")
+    tl_env_mod.env.enable_cache()
+    kc_mod = importlib.import_module("tilelang.cache.kernel_cache")
+    kc_mod.KernelCache._get_cache_namespace.cache_clear()
+    kc_mod.KernelCache._get_tilelang_lib_stamp.cache_clear()
+    kc_mod.KernelCache._create_dirs()
+
+
+def _load_candidate_entrypoint(module_path: Path, entrypoint: str, unique_tag: str):
+    mod_name = f"_tf_surrogate_cand_{unique_tag}"
+    spec = importlib.util.spec_from_file_location(mod_name, str(module_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load candidate module {module_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, entrypoint):
+        raise AttributeError(f"{module_path} does not define {entrypoint!r}")
+    return getattr(mod, entrypoint), mod
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 out_path = Path(sys.argv[2])
@@ -1186,7 +1211,9 @@ def _evaluate_operator_batch(
             metrics_by_cid: dict[str, AnchorEvalMetrics] = {}
 
             for orig_idx, (cid, fn, mod_obj) in enumerate(loaded_cands):
-                if use_poison_pill and cid in phase_a_passed_ids:
+                if use_poison_pill and (
+                    cid in phase_a_passed_ids or cid in _POISON_PILL_SKIP_INCUMBENT_IDS
+                ):
                     passed_cands.append((orig_idx, cid, fn, mod_obj))
                     continue
                 npu_tensors = None

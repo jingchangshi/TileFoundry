@@ -1807,3 +1807,170 @@ def test_stage_b_cache_driver_propagates_defaults_and_collects_tl_cache_attrs(
     assert res_override["bins"][0].endswith("tl_key_01/kernel.so")
 
 
+def test_poison_pill_skips_incumbent_slot_compare_and_worker_is_self_contained(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify incumbent_slot skips redundant compare under poison pill and worker is standalone."""
+    worker_src = batch_harness._POISON_PILL_WORKER_SCRIPT
+    assert "tests.ascend.agent.test_surrogate_batch_npu" not in worker_src
+    assert "def _configure_tilelang_cache(" in worker_src
+    assert "def _load_candidate_entrypoint(" in worker_src
+    compile(worker_src, "poison_pill_worker.py", "exec")
+
+    compare_calls: list[str] = []
+
+    class _Case:
+        def __init__(self, case_num: int) -> None:
+            self.case_num = case_num
+
+    class _Tensor:
+        def npu(self) -> _Tensor:
+            return self
+
+    class _Harness:
+        def prepare(self, _case: object) -> dict[str, _Tensor]:
+            return {"x": _Tensor()}
+
+        def reference_output(
+            self,
+            _case: object,
+            _ts: object,
+            native: bool = False,
+        ) -> str:
+            _ = native
+            return "ref"
+
+        def params(self, _case: object, tensors: dict[str, _Tensor]) -> dict[str, object]:
+            return {"x": tensors["x"]}
+
+        def compare(
+            self,
+            _case: object,
+            actual: object,
+            _oracle: object,
+            _tensors: object,
+            _native_fn: object,
+        ) -> tuple[bool, dict[str, object]]:
+            compare_calls.append(str(actual))
+            return True, {}
+
+    class _RefCache:
+        def __init__(self, _harness: object) -> None:
+            self.folder = tmp_path / "ref_cache"
+            self.folder.mkdir(parents=True, exist_ok=True)
+            self._store: dict[tuple[int, str], object] = {}
+
+        def __enter__(self) -> _RefCache:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get(self, case: object, tag: str, builder: object) -> object:
+            key = (int(getattr(case, "case_num", 0)), tag)
+            if key not in self._store:
+                self._store[key] = builder()
+            return self._store[key]
+
+    fake_contract = SimpleNamespace(
+        ReferenceCache=_RefCache,
+        map_tensors=lambda obj, fn: {k: fn(v) for k, v in obj.items()},
+    )
+    monkeypatch.setattr(
+        batch_harness,
+        "load_cannbench_contract_module",
+        lambda **_kw: fake_contract,
+    )
+    monkeypatch.setattr(
+        batch_harness,
+        "load_anchor_harness_and_cases",
+        lambda _op, anc, **_kw: (_Harness(), [_Case(int(a.case_num)) for a in anc]),
+    )
+
+    class _FakeEvent:
+        def __init__(self, enable_timing: bool = True) -> None:
+            _ = enable_timing
+
+        def record(self) -> None:
+            return None
+
+        def elapsed_time(self, _other: _FakeEvent) -> float:
+            return 0.01
+
+    fake_npu = SimpleNamespace(
+        Event=_FakeEvent,
+        synchronize=lambda: None,
+        empty_cache=lambda: None,
+        is_available=lambda: True,
+        set_device=lambda _idx: None,
+    )
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+
+    inc_mod = tmp_path / "inc.py"
+    inc_mod.write_text("def run_op(x):\n    return 'inc'\n", encoding="utf-8")
+    good_mod = tmp_path / "good.py"
+    good_mod.write_text("def run_op(x):\n    return 'good'\n", encoding="utf-8")
+    base_mod = tmp_path / "base.py"
+    base_mod.write_text("def run_op(x):\n    return 'base'\n", encoding="utf-8")
+
+    def _fake_load(mod_path: Path, _entrypoint: str, _tag: str) -> tuple[object, object]:
+        tag = "inc" if mod_path == inc_mod else ("good" if mod_path == good_mod else "base")
+        return (lambda x, _t=tag: _t), SimpleNamespace()
+
+    monkeypatch.setattr(batch_harness, "_load_candidate_entrypoint", _fake_load)
+    monkeypatch.setattr(
+        batch_harness,
+        "_screen_candidate_isolated",
+        lambda **_kw: (True, "", {3: (True, "")}),
+    )
+    monkeypatch.setattr(
+        batch_harness,
+        "measure_paired_interleaved_micro_burst",
+        lambda *_a, **_k: {
+            "incumbent_slot": (20.0, 1, 0.01, 1.0, 0.0),
+            "c_good": (10.0, 1, 0.01, 2.0, 0.01),
+        },
+    )
+
+    anchors = [AnchorCaseSpec("level4/mla", 3, "decode", 20.0, 6.0).to_dict()]
+    paired_res = batch_harness._evaluate_operator_batch(
+        {
+            "operator_name": "mla",
+            "entrypoint": "run_op",
+            "candidates": [
+                {"candidate_id": "incumbent_slot", "module_path": str(inc_mod)},
+                {"candidate_id": "c_good", "module_path": str(good_mod)},
+            ],
+            "anchors": anchors,
+        },
+        source_root=tmp_path,
+        cannbench_repo=tmp_path,
+        warmup=1,
+        repeat=3,
+        poison_pill_isolation=True,
+    )
+    assert paired_res["incumbent_slot"].all_passed is True
+    assert paired_res["c_good"].all_passed is True
+    assert compare_calls == []
+
+    baseline_res = batch_harness._evaluate_operator_batch(
+        {
+            "operator_name": "mla",
+            "entrypoint": "run_op",
+            "candidates": [
+                {"candidate_id": "incumbent_baseline", "module_path": str(base_mod)},
+            ],
+            "anchors": anchors,
+        },
+        source_root=tmp_path,
+        cannbench_repo=tmp_path,
+        warmup=1,
+        repeat=3,
+        poison_pill_isolation=None,
+    )
+    assert baseline_res["incumbent_baseline"].all_passed is True
+    assert compare_calls == ["base"]
+
+
+

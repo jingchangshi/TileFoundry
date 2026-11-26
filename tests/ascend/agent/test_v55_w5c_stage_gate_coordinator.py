@@ -1407,4 +1407,120 @@ def test_run_l1_hybrid_trackb_skips_compile_when_verified_in_eff_store(
     assert overridden_res.elapsed_sec == pytest.approx(0.35)
 
 
+def test_collect_distinct_width_dims_dedups_static_signatures_and_skips_dtype_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deduplicate duplicate static-width signatures and skip dtype-only dicts."""
+    target_path = tmp_path / "kernel.py"
+    target_path.write_text(_PARENT_MODULE_SRC, encoding="utf-8")
+    spec = _make_regime_spec()
+    coord = StageGateCoordinator(
+        operator_name="rms_norm",
+        source_root=tmp_path,
+        target_module_path=target_path,
+        regime_specs=(spec,),
+        scoreboard_anchors=_make_anchors(),
+    )
+
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "collect_distinct_static_width_dims",
+        lambda *_a, **_kw: (
+            {"tl_dtype": "float16"},
+            {"is_causal": True, "tl_dtype": "bfloat16"},
+            {"D": 16384, "B": 1, "tl_dtype": "float16"},
+            {"D": 16384, "B": 2, "tl_dtype": "bfloat16", "epsilon": 1e-6},
+            {"D": 1023, "B": 1, "tl_dtype": "float16"},
+            {"D": 1023, "B": 4, "tl_dtype": "bfloat16", "shape_0_dim_0": 4},
+        ),
+    )
+    collected = coord._collect_distinct_width_dims(
+        spec,
+        {"D": 128, "tl_dtype": "float16"},
+        False,
+        None,
+    )
+    assert collected == [
+        {"D": 16384, "B": 1, "tl_dtype": "float16"},
+        {"D": 1023, "B": 1, "tl_dtype": "float16"},
+    ]
+
+    custom_collected = coord._collect_distinct_width_dims(
+        spec,
+        {"D": 16384, "tl_dtype": "float16"},
+        False,
+        lambda _s: (
+            {"D": 16384, "B": 8, "tl_dtype": "bfloat16"},
+            {"D": 1023, "B": 1, "tl_dtype": "float16"},
+            {"D": 1023, "B": 2, "tl_dtype": "bfloat16"},
+            {"tile_m": 16},
+            {"tile_m": 16},
+            {"tile_m": 32},
+        ),
+    )
+    assert custom_collected == [
+        {"D": 1023, "B": 1, "tl_dtype": "float16"},
+        {"tile_m": 16},
+        {"tile_m": 32},
+    ]
+
+
+def test_width_covered_by_anchor_specs_matches_static_width_signature() -> None:
+    """Cover widths with matching compile config and static-width signature."""
+
+    def _cfg(
+        *,
+        builder_name: str = "_build_main",
+        compile_flags: tuple[str, ...] = (),
+        pass_configs: dict[str, object] | None = None,
+        builder_kwargs: dict[str, object] | None = None,
+    ) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            builder_name=builder_name,
+            builder_kwargs=builder_kwargs or {"tile_m": 16},
+            pass_configs=pass_configs or {},
+            compile_flags=compile_flags,
+            selector_name="_sel",
+            combine_kwargs={},
+        )
+
+    anchor_spec = {
+        "D": 16384,
+        "tl_dtype": "float16",
+        "epsilon": 1e-5,
+        "shape_0_dim_0": 64,
+    }
+    anchor_cfg = _cfg(builder_kwargs={"tile_m": 32})
+    width_dims = {
+        "D": 16384,
+        "tl_dtype": "bfloat16",
+        "epsilon": 1e-6,
+        "shape_0_dim_0": 128,
+    }
+    same_compile_cfg = _cfg(builder_kwargs={"tile_m": 64})
+    assert StageGateCoordinator._width_covered_by_anchor_specs(
+        width_dims,
+        same_compile_cfg,
+        [(anchor_spec, anchor_cfg)],
+    )
+
+    diff_flags_cfg = _cfg(compile_flags=("--extra",), builder_kwargs={"tile_m": 64})
+    assert not StageGateCoordinator._width_covered_by_anchor_specs(
+        width_dims,
+        diff_flags_cfg,
+        [(anchor_spec, anchor_cfg)],
+    )
+    assert not StageGateCoordinator._width_covered_by_anchor_specs(
+        width_dims,
+        same_compile_cfg,
+        [(anchor_spec, None)],
+    )
+    assert not StageGateCoordinator._width_covered_by_anchor_specs(
+        {"tile_m": 16, "epsilon": 1e-6},
+        same_compile_cfg,
+        [({"tile_m": 16, "epsilon": 1e-5}, anchor_cfg)],
+    )
+
+
 

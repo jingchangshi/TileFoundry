@@ -36,6 +36,7 @@ import yaml
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
+    _static_width_signature,
     compute_case_eq3_score,
     default_source_root,
     get_default_anchors,
@@ -2577,6 +2578,21 @@ def run_l1_compile_check(
                 tuple[str, str, str, tuple[str, ...]],
                 tuple[int | None, tuple[Path, ...]],
             ] = {}
+            covered_anchor_static_sigs: dict[
+                tuple[str, tuple[tuple[str, object], ...]],
+                list[
+                    tuple[
+                        int | None,
+                        tuple[Path, ...],
+                        Mapping[str, object],
+                        tuple[str, ...],
+                    ]
+                ],
+            ] = {}
+            seen_task_static_entries: dict[
+                tuple[str, tuple[tuple[str, object], ...], str, tuple[str, ...]],
+                tuple[int | None, tuple[Path, ...]],
+            ] = {}
 
             def _get_anchor_closure(rtag: str) -> tuple[str, str]:
                 if rtag not in anchor_closure_cache:
@@ -2654,6 +2670,7 @@ def run_l1_compile_check(
                     separators=(",", ":"),
                     default=str,
                 )
+                t_static_sig = _static_width_signature(t_dims) if t_dims else ()
                 covered_anchor_t_keys.add(t_key)
                 if resolved_store.has_verified_artifact(t_key):
                     cached_manifest_tasks[t_key] = {
@@ -2680,6 +2697,10 @@ def run_l1_compile_check(
                             (t_bname, t_dims_sig, t_pc_sig, t_cf),
                             (None, art_bins_tuple),
                         )
+                    if t_static_sig:
+                        covered_anchor_static_sigs.setdefault(
+                            (t_bname, t_static_sig), []
+                        ).append((None, art_bins_tuple, t_pc, t_cf))
                     continue
                 if dedup_key not in dedup_idx_by_key:
                     dedup_idx_by_key[dedup_key] = len(unique_compile_specs)
@@ -2700,6 +2721,10 @@ def run_l1_compile_check(
                         (t_bname, t_dims_sig, t_pc_sig, t_cf),
                         (w_idx, ()),
                     )
+                if t_static_sig:
+                    covered_anchor_static_sigs.setdefault(
+                        (t_bname, t_static_sig), []
+                    ).append((w_idx, (), t_pc, t_cf))
                 spec_label = f"{operator_name}:{cnum}" if operator_name else ta_sig
                 task_record_bindings.append(
                     (w_idx, t_key, spec_label, t_bname, c_id, c_src, t_cf, ())
@@ -2803,6 +2828,57 @@ def run_l1_compile_check(
                         )
                     )
                     continue
+                v_static_sig = _static_width_signature(v_dims) if v_dims else ()
+                if v_static_sig:
+                    matched_anchor = next(
+                        (
+                            (cov_w_idx, cov_bins)
+                            for cov_w_idx, cov_bins, cov_pc, cov_cf in (
+                                covered_anchor_static_sigs.get(
+                                    (builder_name, v_static_sig), ()
+                                )
+                            )
+                            if all(cov_pc.get(k) == v for k, v in norm_pc.items())
+                            and set(norm_cf).issubset(set(cov_cf))
+                        ),
+                        None,
+                    )
+                    if matched_anchor is not None:
+                        cov_w_idx, cov_bins = matched_anchor
+                        task_record_bindings.append(
+                            (
+                                cov_w_idx,
+                                t_key,
+                                v_spec_sig,
+                                builder_name,
+                                cand_sha,
+                                closure_src,
+                                norm_cf_tuple,
+                                cov_bins,
+                            )
+                        )
+                        continue
+                    static_task_key = (
+                        builder_name,
+                        v_static_sig,
+                        norm_pc_sig,
+                        norm_cf_tuple,
+                    )
+                    if static_task_key in seen_task_static_entries:
+                        seen_w_idx, seen_bins = seen_task_static_entries[static_task_key]
+                        task_record_bindings.append(
+                            (
+                                seen_w_idx,
+                                t_key,
+                                v_spec_sig,
+                                builder_name,
+                                cand_sha,
+                                closure_src,
+                                norm_cf_tuple,
+                                seen_bins,
+                            )
+                        )
+                        continue
                 is_tail_var = (
                     has_tail and idx == 1 and dict(v_dims) == dict(tail_anchor_dims or {})
                 )
@@ -2819,6 +2895,10 @@ def run_l1_compile_check(
                     }
                 )
                 w_idx = dedup_idx_by_key[dedup_key]
+                if v_static_sig:
+                    seen_task_static_entries[
+                        (builder_name, v_static_sig, norm_pc_sig, norm_cf_tuple)
+                    ] = (w_idx, ())
                 task_record_bindings.append(
                     (
                         w_idx,
@@ -2905,7 +2985,7 @@ def run_l1_compile_check(
             else:
                 diag_jobs = 0 if (cached_diag is not None or diag_fut is not None) else 1
                 total_jobs = len(unique_compile_specs) + diag_jobs
-                max_workers = min(12, os.cpu_count() or 4, max(1, total_jobs))
+                max_workers = min(16, os.cpu_count() or 8, max(1, total_jobs))
                 with ThreadPoolExecutor(max_workers=max_workers) as pool:
                     if cached_diag is None and diag_fut is None:
                         diag_fut = pool.submit(_run_diag_worker)
