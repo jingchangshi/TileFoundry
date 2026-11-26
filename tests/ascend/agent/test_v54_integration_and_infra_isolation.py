@@ -1,4 +1,4 @@
-"""V5.4 integration tests for infra isolation, promotion gates, flywheel, and NPU provenance."""
+"""Integration tests for infra isolation, promotion gates, flywheel, and NPU provenance."""
 
 from __future__ import annotations
 
@@ -145,13 +145,9 @@ def test_l2_infra_fault_isolates_bandit_stagnation_and_logs_funnel(
         responses={
             "exploit_rule": [_CANDIDATE_SRC] * 4,
             "explore_creative": [
-                json.dumps(
-                    {
-                        "physical_hypothesis": "Double tile_m",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": _CANDIDATE_SRC,
-                    }
-                )
+                "# target_bottleneck: aiv_vec\n"
+                "# structural_hypothesis: Double tile_m\n"
+                f"```python\n{_CANDIDATE_SRC}```"
             ]
             * 4,
         }
@@ -223,13 +219,9 @@ def test_l3_infra_deferred_isolates_bandit_and_stagnation(tmp_path: Path) -> Non
         responses={
             "exploit_rule": [_CANDIDATE_SRC] * 4,
             "explore_creative": [
-                json.dumps(
-                    {
-                        "physical_hypothesis": "Double tile_m",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": _CANDIDATE_SRC,
-                    }
-                )
+                "# target_bottleneck: aiv_vec\n"
+                "# structural_hypothesis: Double tile_m\n"
+                f"```python\n{_CANDIDATE_SRC}```"
             ]
             * 4,
         }
@@ -283,7 +275,7 @@ def test_l3_infra_deferred_isolates_bandit_and_stagnation(tmp_path: Path) -> Non
 def test_promotion_coordinator_and_flywheel_coordinator_and_report_fields(
     tmp_path: Path,
 ) -> None:
-    """Verify PromotionCoordinator, FlywheelCoordinator 3-sigma gate, and V5.4 provenance fields."""
+    """Verify PromotionCoordinator, FlywheelCoordinator 3-sigma gate, and provenance fields."""
     target_path = tmp_path / "target_kernels.py"
     target_path.write_text(_BASELINE_SRC, encoding="utf-8")
     written: list[tuple[Path, str]] = []

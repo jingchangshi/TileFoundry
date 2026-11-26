@@ -145,7 +145,14 @@ def test_all_10_implemented_ops_resolve_metadata_and_regime_selectors() -> None:
                 (root / expected_rel).read_text(encoding="utf-8"),
                 regime_specs[0],
             )
-            assert primary_fn == f"_build_{op_name}_prim_func"
+            if (
+                regime_specs[0].runtime_backend in ("ascendc_trackb", "hybrid_trackb")
+                and regime_specs[0].trackb_symbols
+            ):
+                assert primary_fn == f"_select_{op_name}_config"
+                assert f"def _build_{op_name}_prim_func(" not in snippet
+            else:
+                assert primary_fn == f"_build_{op_name}_prim_func"
             assert f"def _select_{op_name}_config(" in snippet
 
 

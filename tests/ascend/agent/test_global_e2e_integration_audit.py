@@ -259,18 +259,16 @@ def test_audit2_reconciled_truth_tables_and_bayesian_axis_transfer_in_runners(tm
         latency_us=35.0,
         accuracy_passed=True,
     )
-    creative_json = json.dumps(
-        {
-            "physical_hypothesis": "vector test",
-            "target_local_metric": "dur_us",
-            "dsl_source": _SIMPLE_VECTOR_DSL,
-        }
+    creative_reply = (
+        "# physical_hypothesis: vector test\n"
+        "# target_local_metric: dur_us\n"
+        f"```python\n{_SIMPLE_VECTOR_DSL.strip()}\n```\n"
     )
     runner = PortfolioRunner(
         backend=MockLLMBackend(
             responses={
                 "exploit_rule": [_SIMPLE_VECTOR_DSL, _SIMPLE_VECTOR_DSL],
-                "explore_creative": [creative_json, creative_json],
+                "explore_creative": [creative_reply, creative_reply],
             }
         ),
         funnel=funnel,
@@ -316,19 +314,21 @@ def test_audit2_reconciled_truth_tables_and_bayesian_axis_transfer_in_runners(tm
             responses={
                 "exploit_rule": ["def _select_dummy_config(**kw):\n    return {'M': 64, 'N': 64}\n"],
                 "explore_creative": [
-                    json.dumps(
-                        {
-                            "physical_hypothesis": "creative",
-                            "target_local_metric": "dur_us",
-                            "dsl_source": "def _select_dummy_config(**kw):\n    return {'M': 64, 'N': 64}\n",
-                        }
+                    (
+                        "# physical_hypothesis: creative\n"
+                        "# target_local_metric: dur_us\n"
+                        "```python\n"
+                        "def _select_dummy_config(**kw):\n"
+                        "    return {'M': 64, 'N': 64}\n"
+                        "```\n"
                     ),
-                    json.dumps(
-                        {
-                            "physical_hypothesis": "creative2",
-                            "target_local_metric": "dur_us",
-                            "dsl_source": "def _select_dummy_config(**kw):\n    return {'M': 64, 'N': 64}\n",
-                        }
+                    (
+                        "# physical_hypothesis: creative2\n"
+                        "# target_local_metric: dur_us\n"
+                        "```python\n"
+                        "def _select_dummy_config(**kw):\n"
+                        "    return {'M': 64, 'N': 64}\n"
+                        "```\n"
                     ),
                 ],
             }

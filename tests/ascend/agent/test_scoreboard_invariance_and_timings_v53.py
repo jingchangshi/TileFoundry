@@ -302,12 +302,10 @@ async def test_scoreboard_invariance_on_l3_failure_and_no_post_budget_round(
             else:
                 code = "def _build_small(tile_m=2):\n    return tile_m\n"
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "test",
-                        "target_local_metric": "aiv",
-                        "dsl_source": code,
-                    }
+                return (
+                    "# target_bottleneck: aiv\n"
+                    "# structural_hypothesis: test\n"
+                    f"```python\n{code}```\n"
                 )
             return code
 
@@ -433,12 +431,13 @@ async def test_guardrail_105x_rejection_and_winner_refresh_keeps_scoreboard_immu
         async def generate(self, req: GenerationRequest, *, effort_override: object = None) -> str:
             _ = effort_override
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "opt",
-                        "target_local_metric": "aiv",
-                        "dsl_source": "def _build_small(tile_m=2):\n    return tile_m\n",
-                    }
+                return (
+                    "# target_bottleneck: aiv\n"
+                    "# structural_hypothesis: opt\n"
+                    "```python\n"
+                    "def _build_small(tile_m=2):\n"
+                    "    return tile_m\n"
+                    "```\n"
                 )
             return "def _build_small(tile_m=2):\n    return tile_m\n"
 
@@ -758,7 +757,10 @@ async def test_substage_timings_prewarm_stats_and_48kb_trackb_passthrough(
         max_bytes=14800,
     )
     assert "MIDDLE BODY OMITTED" not in compacted
-    assert compacted == trackb_src
+    assert "LINES OMITTED" not in compacted
+    assert "/* TRACK-B SCOPED SLICE: symbol=_MLA_TRACKB_SRC active=tb_kernel */" in compacted
+    assert "[L0002] #include <tl_templates/ascend/common.h>" in compacted
+    assert "[L2404] }" in compacted
 
     target_path = tmp_path / "kernels.py"
     target_path.write_text(_base_module_src(), encoding="utf-8")
@@ -811,12 +813,12 @@ async def test_substage_timings_prewarm_stats_and_48kb_trackb_passthrough(
             if req.role == "syntax_repair":
                 return "def _build_small(tile_m=2):\n    return tile_m\n"
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "opt",
-                        "target_local_metric": "aiv",
-                        "dsl_source": "def _build_small(tile_m=bad_syntax(\n",
-                    }
+                return (
+                    "# target_bottleneck: aiv\n"
+                    "# structural_hypothesis: opt\n"
+                    "```python\n"
+                    "def _build_small(tile_m=bad_syntax(\n"
+                    "```\n"
                 )
             return "def _build_small(tile_m=2):\n    return tile_m\n"
 

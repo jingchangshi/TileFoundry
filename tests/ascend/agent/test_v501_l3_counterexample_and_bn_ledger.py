@@ -8,7 +8,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
-from tilefoundry_ascend.agent.campaign import campaign_runner, surrogate_cannbench
+from tilefoundry_ascend.agent.campaign import (
+    campaign_runner,
+    l3_l4_recovery,
+    round_context_builder,
+    stage_gate_coordinator,
+    surrogate_cannbench,
+)
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
@@ -142,12 +148,10 @@ def kernel(x):
             _ = effort_override
             seen_prompt_barriers.append(req.user_prompt)
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "Eliminate barrier",
-                        "target_local_metric": "sync",
-                        "dsl_source": "def _build_small_decode(tile_m=4):\n    return tile_m\n",
-                    }
+                return (
+                    "# target_bottleneck: sync\n"
+                    "# structural_hypothesis: Eliminate barrier\n"
+                    "```python\ndef _build_small_decode(tile_m=4):\n    return tile_m\n```"
                 )
             return "def _build_small_decode(tile_m=4):\n    return tile_m\n"
 
@@ -178,8 +182,11 @@ def kernel(x):
         return {"B": 1, "S": 1, "D": 1024}
 
     monkeypatch.setattr(runner, "_lookup_case_dims_safe", _lookup_dims)
+    monkeypatch.setattr(runner._round_context_builder, "_lookup_case_dims_safe", _lookup_dims)
+    monkeypatch.setattr(runner._stage_gate_coordinator, "_lookup_case_dims_safe", _lookup_dims)
     monkeypatch.setattr(runner, "_collect_msprof_for_regimes", lambda *_a, **_kw: None)
     monkeypatch.setattr(campaign_runner, "scan_tilelang_pipe_gaps", lambda: None)
+    monkeypatch.setattr(round_context_builder, "scan_tilelang_pipe_gaps", lambda: None)
     from tilefoundry_ascend.agent.orchestrator import llm_constraints
 
     monkeypatch.setattr(llm_constraints, "format_target_dialect_layer", lambda *_a, **_kw: "")
@@ -216,11 +223,13 @@ def kernel(x):
         return list(orig_rank(ctx))
 
     monkeypatch.setattr(campaign_runner, "rank_symptom_families", _spy_rank)
+    monkeypatch.setattr(round_context_builder, "rank_symptom_families", _spy_rank)
 
     async def _empty_filter(*_a: object, **_kw: object) -> list[surrogate_cannbench.L0L1CandidateCheck]:
         return []
 
     monkeypatch.setattr(campaign_runner, "run_l0_l1_round_filter", _empty_filter)
+    monkeypatch.setattr(stage_gate_coordinator, "run_l0_l1_round_filter", _empty_filter)
 
     best_result = _make_surrogate_result(
         "base",
@@ -295,7 +304,7 @@ async def test_l3_counterexample_promotes_anchor_and_one_shot_repair_promotes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify L3 candidate failure promotes case 14 and 1-shot unfolded repair passes & promotes."""
+    """Verify Top-2 L3 fallback promotes rank-2 when rank-1 fails L3 with zero cx_repair calls."""
     incumbent_src = '''
 _TRACKB_CPP = """
 __aicore__ inline void tail_helper(int k_cur, int bk) {
@@ -329,7 +338,7 @@ __global__ void gmm_kernel(int k_cur, int bk) {
 }
 """
 '''
-    repaired_cand_snippet = '''
+    fallback_cand_snippet = '''
 _TRACKB_CPP = """
 __aicore__ inline void tail_helper(int k_cur, int bk) {
     if (k_cur < bk) {
@@ -362,7 +371,7 @@ __global__ void gmm_kernel(int k_cur, int bk) {
 
     repair_prompts: list[GenerationRequest] = []
 
-    class _RepairLLM:
+    class _TopTwoLLM:
         async def generate(
             self,
             req: GenerationRequest,
@@ -370,17 +379,17 @@ __global__ void gmm_kernel(int k_cur, int bk) {
             effort_override: object = None,
         ) -> str:
             _ = effort_override
-            if req.role_hint == "l3_counterexample_repair":
+            hint = str(getattr(req, "role_hint", "") or "")
+            if hint == "l3_counterexample_repair" or "l3_cx_repair" in hint:
                 repair_prompts.append(req)
-                return f"```python\n{repaired_cand_snippet}\n```"
+                return f"```python\n{fallback_cand_snippet}\n```"
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "Fast main loop",
-                        "target_local_metric": "aic",
-                        "dsl_source": broken_cand_snippet,
-                    }
+                return (
+                    "# target_bottleneck: aic\n"
+                    "# structural_hypothesis: Fix tail loop\n"
+                    f"```python\n{fallback_cand_snippet}\n```"
                 )
+            await asyncio.sleep(0.02)
             return broken_cand_snippet
 
     def _l2_eval(
@@ -409,7 +418,12 @@ __global__ void gmm_kernel(int k_cur, int bk) {
                         )
                     )
                 else:
-                    cand_us = 3.0 if has_fast else 9.0
+                    if has_fast and not has_fixed_tail:
+                        cand_us = 2.5
+                    elif has_fast:
+                        cand_us = 3.0
+                    else:
+                        cand_us = 9.0
                     metrics.append(
                         _make_anchor_metric(
                             case_num=anc.case_num,
@@ -425,7 +439,7 @@ __global__ void gmm_kernel(int k_cur, int bk) {
 
     l3_seen_sources: list[str] = []
 
-    def _l3_runner(mod_path: Path, **_kw: object) -> L3AcceptanceResult:
+    def _l3_runner(mod_path: Path, **_kw: object) -> surrogate_cannbench.L3AcceptanceResult:
         src = mod_path.read_text(encoding="utf-8")
         l3_seen_sources.append(src)
         if "k_cur < bk" in src:
@@ -445,13 +459,24 @@ __global__ void gmm_kernel(int k_cur, int bk) {
             device_id="1",
         )
 
+    rule = AscendCausalRule(
+        rule_id="R_TEST_TOP2_FALLBACK",
+        regime_guard="True",
+        precondition="True",
+        transform_template="Optimize main loop",
+        expected_postcondition="True",
+        source_provenance="test",
+        compatible_backends=("ascendc_trackb",),
+    )
+    tracker = BayesianRuleTracker(rules={})
+    tracker.admit_rule(rule)
     ledger = _make_ledger()
     route = route_execution_track(None, ledger=ledger)
     runner = PerfTargetCampaignRunner(
         config=CampaignConfig(
             operator_name="grouped_matmul",
             max_rounds=1,
-            k_rule_workers=0,
+            k_rule_workers=1,
             enable_tilesize_prescreen=False,
             min_surrogate_gain=0.05,
         ),
@@ -459,8 +484,8 @@ __global__ void gmm_kernel(int k_cur, int bk) {
         perf_target=PerfTargetSpec("grouped_matmul", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=(spec,),
-        llm_backend=_RepairLLM(),
-        tracker=BayesianRuleTracker(rules={}),
+        llm_backend=_TopTwoLLM(),
+        tracker=tracker,
         l0_checker=lambda _s, _r: StageAResult(
             passed=True,
             prim_func=None,
@@ -474,18 +499,20 @@ __global__ void gmm_kernel(int k_cur, int bk) {
         l3_contract_runner=_l3_runner,
         checkpoint_path=tmp_path / "ckpt.json",
     )
-    monkeypatch.setattr(
-        runner,
-        "_lookup_case_dims_safe",
-        lambda cnum, _tag="": {"K": 127} if int(cnum) == 14 else {"K": 256},
-    )
+
+    def _lookup_dims(cnum: int, _tag: str = "") -> dict[str, object]:
+        return {"K": 127} if int(cnum) == 14 else {"K": 256}
+
+    monkeypatch.setattr(runner, "_lookup_case_dims_safe", _lookup_dims)
+    monkeypatch.setattr(runner._stage_gate_coordinator, "_lookup_case_dims_safe", _lookup_dims)
+    monkeypatch.setattr(runner._round_context_builder, "_lookup_case_dims_safe", _lookup_dims)
+    monkeypatch.setattr(runner._l3_l4_recovery, "_lookup_case_dims_fn", _lookup_dims)
     monkeypatch.setattr(runner, "_collect_msprof_for_regimes", lambda *_a, **_kw: None)
     monkeypatch.setattr(campaign_runner, "scan_tilelang_pipe_gaps", lambda: None)
-    monkeypatch.setattr(
-        campaign_runner,
-        "lookup_case_metadata",
-        lambda *_a, **_kw: (12.0, 2.0),
-    )
+    monkeypatch.setattr(round_context_builder, "scan_tilelang_pipe_gaps", lambda: None)
+    monkeypatch.setattr(campaign_runner, "lookup_case_metadata", lambda *_a, **_kw: (12.0, 2.0))
+    monkeypatch.setattr(l3_l4_recovery, "lookup_case_metadata", lambda *_a, **_kw: (12.0, 2.0))
+    monkeypatch.setattr(runner._tracker, "rank_applicable_rules", lambda *_a, **_kw: [rule])
 
     best_result = _make_surrogate_result(
         "base",
@@ -504,14 +531,11 @@ __global__ void gmm_kernel(int k_cur, int bk) {
         )
     )
 
+    assert repair_prompts == []
     assert [a.case_num for a in anchors] == [2]
-    assert [g.case_num for g in runner._guardrail_cases] == [14]
-    assert len(repair_prompts) == 1
-    assert "k_cur <= bk - 16" in repair_prompts[0].user_prompt
-    assert "MIDDLE BODY OMITTED" not in repair_prompts[0].user_prompt
-    assert '"K": 127' in repair_prompts[0].user_prompt
-    assert "G5 PARENT MONOTONICITY LOCK" in repair_prompts[0].user_prompt
     assert len(l3_seen_sources) == 2
+    assert "k_cur <= bk - 16" in l3_seen_sources[0]
+    assert "k_cur < bk" in l3_seen_sources[1]
     assert promoted is True
     assert rolled_back is False
     assert blocked is False
@@ -526,7 +550,7 @@ async def test_l3_counterexample_repair_failure_keeps_anchor_and_rolls_back(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify failed counterexample repair restores incumbent while retaining promoted anchor."""
+    """Verify L3 rejection records monotonic guardrails, rolls back, and skips cx_repair."""
     incumbent_src = '''
 def _build_gmm():
     return 1
@@ -535,7 +559,6 @@ def kernel(x):
     return x
 '''
     cand_snippet = "def _build_gmm():\n    return 2\n"
-    still_bad_snippet = "def _build_gmm():\n    return 3\n"
     target_path = tmp_path / "kernels.py"
     target_path.write_text(incumbent_src, encoding="utf-8")
 
@@ -548,8 +571,9 @@ def kernel(x):
         representative_hir_dims={"M": 64, "K": 256, "N": 128},
     )
     anchors = [AnchorCaseSpec("level4/grouped_matmul", 2, "ragged_gmm", 10.0, 2.0)]
+    repair_prompts: list[GenerationRequest] = []
 
-    class _BadRepairLLM:
+    class _RejectLLM:
         async def generate(
             self,
             req: GenerationRequest,
@@ -557,15 +581,15 @@ def kernel(x):
             effort_override: object = None,
         ) -> str:
             _ = effort_override
-            if req.role_hint == "l3_counterexample_repair":
-                return still_bad_snippet
+            hint = str(getattr(req, "role_hint", "") or "")
+            if hint == "l3_counterexample_repair" or "l3_cx_repair" in hint:
+                repair_prompts.append(req)
+                return cand_snippet
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "Try return 2",
-                        "target_local_metric": "aiv",
-                        "dsl_source": cand_snippet,
-                    }
+                return (
+                    "# target_bottleneck: aiv\n"
+                    "# structural_hypothesis: Try return 2\n"
+                    f"```python\n{cand_snippet}\n```"
                 )
             return cand_snippet
 
@@ -603,7 +627,7 @@ def kernel(x):
         perf_target=PerfTargetSpec("grouped_matmul", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=(spec,),
-        llm_backend=_BadRepairLLM(),
+        llm_backend=_RejectLLM(),
         tracker=BayesianRuleTracker(rules={}),
         l0_checker=lambda _s, _r: StageAResult(
             passed=True,
@@ -622,9 +646,29 @@ def kernel(x):
         checkpoint_path=tmp_path / "ckpt.json",
     )
     monkeypatch.setattr(runner, "_lookup_case_dims_safe", lambda cnum, _tag="": {"K": int(cnum)})
+    monkeypatch.setattr(
+        runner._stage_gate_coordinator,
+        "_lookup_case_dims_safe",
+        lambda cnum, _tag="": {"K": int(cnum)},
+    )
+    monkeypatch.setattr(
+        runner._l3_l4_recovery,
+        "_lookup_case_dims_fn",
+        lambda cnum, _tag="": {"K": int(cnum)},
+    )
+    monkeypatch.setattr(
+        l3_l4_recovery,
+        "lookup_case_dims",
+        lambda _op, cnum, **_kw: {"K": int(cnum)},
+    )
     monkeypatch.setattr(runner, "_collect_msprof_for_regimes", lambda *_a, **_kw: None)
     monkeypatch.setattr(
         campaign_runner,
+        "lookup_case_metadata",
+        lambda *_a, **_kw: (_ for _ in ()).throw(FileNotFoundError("no metadata")),
+    )
+    monkeypatch.setattr(
+        l3_l4_recovery,
         "lookup_case_metadata",
         lambda *_a, **_kw: (_ for _ in ()).throw(FileNotFoundError("no metadata")),
     )
@@ -646,6 +690,7 @@ def kernel(x):
         )
     )
 
+    assert repair_prompts == []
     assert [a.case_num for a in anchors] == [2]
     assert [g.case_num for g in runner._guardrail_cases] == [14, 15, 16]
     assert promoted is False
@@ -718,10 +763,12 @@ def test_device_pool_forwarding_l3_pool_rotation_and_main_wiring(
         )
 
     monkeypatch.setattr(campaign_runner, "run_surrogate_batch_via_agent_gates", _fake_l2)
+    monkeypatch.setattr(stage_gate_coordinator, "run_surrogate_batch_via_agent_gates", _fake_l2)
     monkeypatch.setattr(campaign_runner, "collect_bottleneck_msprof_via_agent_gates", _fake_msprof)
     monkeypatch.setattr(campaign_runner, "collect_p2_deep_dive_via_agent_gates", _fake_p2)
     monkeypatch.setattr(campaign_runner, "run_micro_probe_via_agent_gates", _fake_probe)
     monkeypatch.setattr(campaign_runner, "run_l3_full_contract_via_agent_gates", _fake_l3)
+    monkeypatch.setattr(l3_l4_recovery, "run_l3_full_contract_via_agent_gates", _fake_l3)
 
     flywheel = FlywheelDistiller(
         funnel=GateFunnel(skip_stage_b=True),

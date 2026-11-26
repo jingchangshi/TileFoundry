@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -26,6 +27,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     RegimeTargetSpec,
     _has_flat_operator_layout,
     build_anchor_var_bindings,
+    collect_distinct_static_width_dims,
     compute_case_eq3_score,
     default_source_root,
     extract_trackb_cpp_source,
@@ -44,12 +46,27 @@ from tilefoundry_ascend.agent.campaign.fault_types import (
 )
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import DeterministicSearchBoundaryLedger
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import evaluate_promotion_gate
+from tilefoundry_ascend.agent.campaign.regime_slice_patcher import (
+    _active_trackb_kernel,
+    _compact_trackb_snippet_source,
+    _detect_trackb_dead_code_edit,
+    _extract_p2_focus_lines_and_diag,
+    _has_prim_func_builder,
+    _ordered_top_level_trackb_kernels,
+    _render_trackb_tu_from_module,
+    _resolve_selector_compile_flags,
+    _trackb_kernel_names,
+    extract_regime_snippet,
+    patch_regime_into_module,
+    resolve_regime_config,
+)
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     AgentGatesDeviceFaultError,
     AnchorEvalMetrics,
     CandidateSurrogateResult,
     L0L1CandidateCheck,
     L2BatchResults,
+    OccupancyExhaustedError,
     aggregate_surrogate_result,
     extract_ordered_tensor_shapes,
     run_l0_l1_round_filter,
@@ -84,6 +101,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     rank_stage_a_candidates_with_cost_model,
 )
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import resolve_unified_tl_cache_dir
 from tilefoundry_ascend.ascend.cost_model import (
     BishengResourceSummary,
     CostFeatures,
@@ -133,11 +151,18 @@ _SHAPE_DIM_KEYS: frozenset[str] = frozenset(
     }
 )
 
-
-class OccupancyExhaustedError(RuntimeError):
-    """Typed infrastructure error raised when NPU card occupancy is exhausted."""
-
-    fault_plane: str = "INFRA_OCCUPANCY"
+_ORIG_CAMPAIGN_HOOKS: dict[str, object] = {
+    "evaluate_ascendc_candidate": evaluate_ascendc_candidate,
+    "lookup_case_dims": lookup_case_dims,
+    "rank_stage_a_candidates_with_cost_model": rank_stage_a_candidates_with_cost_model,
+    "resolve_cannbench_repo": resolve_cannbench_repo,
+    "resolve_regime_config": resolve_regime_config,
+    "run_l0_l1_round_filter": run_l0_l1_round_filter,
+    "run_l1_compile_check": run_l1_compile_check,
+    "run_stage_a_static": run_stage_a_static,
+    "run_stage_b_ascendc_compile": run_stage_b_ascendc_compile,
+    "run_surrogate_batch_via_agent_gates": run_surrogate_batch_via_agent_gates,
+}
 
 
 class StageGateConfig(Protocol):
@@ -278,6 +303,7 @@ class StageGateCoordinator:
         | None = None,
         config: StageGateConfig | None = None,
         active_incumbent_source: str = "",
+        owner: object | None = None,
     ) -> None:
         self._config: StageGateConfig = (
             config
@@ -331,6 +357,7 @@ class StageGateCoordinator:
         self._l1_compiler = l1_compiler
         self._l2_batch_evaluator = l2_batch_evaluator
         self._static_width_dims_fn = static_width_dims_fn
+        self._owner = owner
 
         self._active_incumbent_source: str = active_incumbent_source
         self._incumbent_anchor_us_by_case: dict[int, float] = {}
@@ -347,10 +374,45 @@ class StageGateCoordinator:
         self._pending_speculative: list[
             tuple[int, str, object, asyncio.Task[SpeculativeCreativeResult]]
         ] = []
+        self._active_owner_overrides: set[str] = set()
 
     @staticmethod
     def _source_sha256(source: str) -> str:
         return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _resolve_hook(name: str, local_val: _T) -> _T:
+        orig = _ORIG_CAMPAIGN_HOOKS.get(name)
+        if local_val is not orig:
+            return local_val
+        cr_mod = sys.modules.get("tilefoundry_ascend.agent.campaign.campaign_runner")
+        if cr_mod is not None:
+            cr_val = getattr(cr_mod, name, None)
+            if cr_val is not None and cr_val is not orig:
+                return cr_val
+        return local_val
+
+    def _owner_override(self, method_name: str) -> Callable[..., object] | None:
+        if method_name in self.__dict__ or method_name in self._active_owner_overrides:
+            return None
+        owner = self._owner
+        if owner is None:
+            return None
+        owner_dict = getattr(owner, "__dict__", None)
+        if not isinstance(owner_dict, dict):
+            return None
+        fn = owner_dict.get(method_name)
+        if not callable(fn):
+            return None
+
+        def _guarded(*args: object, **kwargs: object) -> object:
+            self._active_owner_overrides.add(method_name)
+            try:
+                return self._invoke_with_optional_kwargs(fn, *args, **kwargs)
+            finally:
+                self._active_owner_overrides.discard(method_name)
+
+        return _guarded
 
     @staticmethod
     def _invoke_with_optional_kwargs(
@@ -508,8 +570,12 @@ class StageGateCoordinator:
 
     def _resolve_cannbench_tasks_root(self) -> Path | None:
         """Resolve the cann-bench tasks root, falling back to the in-repo mirror."""
+        override = self._owner_override("_resolve_cannbench_tasks_root")
+        if override is not None:
+            return override()
+        resolve_repo_fn = self._resolve_hook("resolve_cannbench_repo", resolve_cannbench_repo)
         try:
-            repo = resolve_cannbench_repo(
+            repo = resolve_repo_fn(
                 cannbench_repo=self._cannbench_repo,
                 env_file=self._env_file,
             )
@@ -527,13 +593,17 @@ class StageGateCoordinator:
         case_num: int,
         regime_tag: str = "",
     ) -> dict[str, object]:
+        override = self._owner_override("_lookup_case_dims_safe")
+        if override is not None:
+            return override(case_num, regime_tag)
         cnum = int(case_num)
         if cnum in self._case_dims_cache:
             return dict(self._case_dims_cache[cnum])
         dims: dict[str, object] = {}
+        lookup_fn = self._resolve_hook("lookup_case_dims", lookup_case_dims)
         try:
             dims = dict(
-                lookup_case_dims(
+                lookup_fn(
                     self._config.operator_name,
                     cnum,
                     cannbench_repo=self._cannbench_repo,
@@ -613,15 +683,12 @@ class StageGateCoordinator:
         """Extract canonical sorted knob signature for deterministic boundary ledger."""
         if not mod_src.strip():
             return ""
-        from tilefoundry_ascend.agent.campaign.campaign_runner import (  # noqa: PLC0415
-            resolve_regime_config,
-        )
-
         anchor_dims = (
             regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
         )
+        resolve_cfg_fn = self._resolve_hook("resolve_regime_config", resolve_regime_config)
         try:
-            resolved = resolve_regime_config(mod_src, regime_spec, dims=anchor_dims)
+            resolved = resolve_cfg_fn(mod_src, regime_spec, dims=anchor_dims)
         except (
             SyntaxError,
             AttributeError,
@@ -732,6 +799,9 @@ class StageGateCoordinator:
         resolved: _ResolvedConfigLike,
     ) -> tuple[str, dict[str, object]] | None:
         """Return combine builder symbol and kwargs when combine gate applies."""
+        override = self._owner_override("_resolve_combine_gate_spec")
+        if override is not None:
+            return override(module_source, regime_spec, resolved)
         combine_fn = next(
             (
                 sym
@@ -789,10 +859,15 @@ class StageGateCoordinator:
         anchor_dims_override: Mapping[str, object] | None = None,
     ) -> str:
         """Instantiate Track-B C++20 TU via module _render_trackb_tu if present."""
-        from tilefoundry_ascend.agent.campaign.campaign_runner import (  # noqa: PLC0415
-            _render_trackb_tu_from_module,
-        )
-
+        override = self._owner_override("_instantiate_trackb_tu")
+        if override is not None:
+            return self._invoke_with_optional_kwargs(
+                override,
+                module_source,
+                cpp_source,
+                regime_spec,
+                anchor_dims_override=anchor_dims_override,
+            )
         return _render_trackb_tu_from_module(
             module_source,
             cpp_source,
@@ -812,17 +887,13 @@ class StageGateCoordinator:
         extracted = extract_trackb_cpp_source(module_source, regime_spec.trackb_symbols)
         if extracted is None:
             return ()
-        from tilefoundry_ascend.agent.campaign.campaign_runner import (  # noqa: PLC0415
-            _ordered_top_level_trackb_kernels,
-            _trackb_kernel_names,
-        )
-
         rendered = self._instantiate_trackb_tu(module_source, extracted[1], regime_spec)
         kernels = _trackb_kernel_names(extracted[1])
         ordered = _ordered_top_level_trackb_kernels(rendered, extracted[1], kernels)
         if ordered:
             return ordered
-        single = self._resolve_active_trackb_kernel(module_source, regime_spec)
+        single_fn = self._owner_override("_resolve_active_trackb_kernel") or self._resolve_active_trackb_kernel
+        single = single_fn(module_source, regime_spec)
         return (single,) if single else ()
 
     def _resolve_active_trackb_kernel(
@@ -838,12 +909,6 @@ class StageGateCoordinator:
             return None
         cache_key = (self._source_sha256(module_source), regime_spec.regime_tag)
         if cache_key not in self._active_kernel_cache:
-            from tilefoundry_ascend.agent.campaign.campaign_runner import (  # noqa: PLC0415
-                _active_trackb_kernel,
-                _ordered_top_level_trackb_kernels,
-                _trackb_kernel_names,
-            )
-
             rendered = self._instantiate_trackb_tu(module_source, extracted[1], regime_spec)
             if rendered == extracted[1]:
                 fallback = select_active_trackb_kernel(
@@ -887,6 +952,9 @@ class StageGateCoordinator:
         regime_spec: RegimeTargetSpec,
     ) -> ConstraintRelaxationMask:
         """Return active 7-facet mask for *regime_spec*, seeding Track-B baseline facets once."""
+        override = self._owner_override("_resolve_trackb_freedom_mask")
+        if override is not None:
+            return override(regime_spec)
         existing = self._freedom_masks.get(regime_spec.regime_tag)
         if existing is not None:
             return existing
@@ -944,6 +1012,13 @@ class StageGateCoordinator:
         cpp_source: str,
         selector_flags: Sequence[str] | str | None = None,
     ) -> StageBResult:
+        override = self._owner_override("_compile_trackb_stage_b")
+        if override is not None:
+            return self._invoke_with_optional_kwargs(
+                override,
+                cpp_source,
+                selector_flags=selector_flags,
+            )
         cann_root = self._resolve_cann_root_from_env_file(self._env_file)
         bisheng_bin: str | None = None
         flags = list(resolve_trackb_compile_flags(cpp_source, selector_flags))
@@ -953,7 +1028,11 @@ class StageGateCoordinator:
                 bisheng_bin = str(cand_bin)
             if (cann_root / "include").is_dir():
                 flags.append(f"-I{cann_root / 'include'}")
-        return run_stage_b_ascendc_compile(
+        compile_fn = self._resolve_hook(
+            "run_stage_b_ascendc_compile",
+            run_stage_b_ascendc_compile,
+        )
+        return compile_fn(
             cpp_source,
             compile_flags=flags,
             bisheng_bin=bisheng_bin,
@@ -965,16 +1044,15 @@ class StageGateCoordinator:
         module_source: str,
         regime_spec: RegimeTargetSpec,
     ) -> tuple[str, ...]:
-        from tilefoundry_ascend.agent.campaign.campaign_runner import (  # noqa: PLC0415
-            _resolve_selector_compile_flags,
-        )
-
         anchor_dims = (
             regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
         )
         return _resolve_selector_compile_flags(module_source, regime_spec, dims=anchor_dims)
 
     def _resolve_operator_semantics_for_gates(self) -> PyTorchOpSemantics | None:
+        override = self._owner_override("_resolve_operator_semantics_for_gates")
+        if override is not None:
+            return override()
         if self._operator_semantics_loaded:
             return self._operator_semantics_cache
         self._operator_semantics_loaded = True
@@ -1010,11 +1088,6 @@ class StageGateCoordinator:
         *,
         anchor_dims_override: Mapping[str, object] | None = None,
     ) -> StageAResult:
-        from tilefoundry_ascend.agent.campaign.campaign_runner import (  # noqa: PLC0415
-            _has_prim_func_builder,
-            resolve_regime_config,
-        )
-
         op_semantics = self._resolve_operator_semantics_for_gates()
         req_dma = bool(op_semantics is not None and not op_semantics.has_indirect_index)
         req_cube = bool(op_semantics is not None and op_semantics.has_gemm_contraction)
@@ -1028,6 +1101,12 @@ class StageGateCoordinator:
         baseline_tb_tu = (
             self._resolve_trackb_baseline_tu(regime_spec) if tb_extracted is not None else None
         )
+        eval_ascendc_fn = self._resolve_hook(
+            "evaluate_ascendc_candidate",
+            evaluate_ascendc_candidate,
+        )
+        stage_a_fn = self._resolve_hook("run_stage_a_static", run_stage_a_static)
+        resolve_cfg_fn = self._resolve_hook("resolve_regime_config", resolve_regime_config)
         if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
             active_mask = self._resolve_trackb_freedom_mask(regime_spec)
             instantiated_tu = self._invoke_with_optional_kwargs(
@@ -1037,7 +1116,7 @@ class StageGateCoordinator:
                 regime_spec,
                 anchor_dims_override=anchor_dims_override,
             )
-            return evaluate_ascendc_candidate(
+            return eval_ascendc_fn(
                 instantiated_tu,
                 freedom_mask=active_mask,
                 target=self._target,
@@ -1056,7 +1135,7 @@ class StageGateCoordinator:
             or regime_spec.representative_hir_dims
         )
         try:
-            resolved = resolve_regime_config(module_source, regime_spec, dims=anchor_dims)
+            resolved = resolve_cfg_fn(module_source, regime_spec, dims=anchor_dims)
         except (
             SyntaxError,
             AttributeError,
@@ -1082,7 +1161,7 @@ class StageGateCoordinator:
             dims=anchor_dims,
             proto=self._operator_proto_cache,
         )
-        primary_res = run_stage_a_static(
+        primary_res = stage_a_fn(
             module_source,
             factory_name=resolved.builder_name,
             factory_kwargs=resolved.builder_kwargs,
@@ -1106,7 +1185,7 @@ class StageGateCoordinator:
                     regime_spec,
                     anchor_dims_override=anchor_dims_override,
                 )
-                return evaluate_ascendc_candidate(
+                return eval_ascendc_fn(
                     instantiated_tu,
                     freedom_mask=active_mask,
                     target=self._target,
@@ -1122,7 +1201,7 @@ class StageGateCoordinator:
         combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
         if combine_spec is not None:
             combine_fn, combine_kwargs = combine_spec
-            combine_res = run_stage_a_static(
+            combine_res = stage_a_fn(
                 module_source,
                 factory_name=combine_fn,
                 factory_kwargs=combine_kwargs,
@@ -1156,7 +1235,7 @@ class StageGateCoordinator:
                 regime_spec,
                 anchor_dims_override=anchor_dims_override,
             )
-            tb_res = evaluate_ascendc_candidate(
+            tb_res = eval_ascendc_fn(
                 instantiated_tu,
                 freedom_mask=active_mask,
                 target=self._target,
@@ -1221,7 +1300,9 @@ class StageGateCoordinator:
                 regime_spec,
                 anchor_dims_override=anchor_dims_override,
             )
-        return self._default_l0_checker(
+        default_l0_fn = self._owner_override("_default_l0_checker") or self._default_l0_checker
+        return self._invoke_with_optional_kwargs(
+            default_l0_fn,
             module_source,
             regime_spec,
             anchor_dims_override=anchor_dims_override,
@@ -1232,6 +1313,9 @@ class StageGateCoordinator:
         regime_spec: RegimeTargetSpec,
     ) -> dict[str, object] | None:
         """Return the largest-row-width case dims routed to ``regime_spec``."""
+        override = self._owner_override("_resolve_max_row_width_dims")
+        if override is not None:
+            return override(regime_spec)
         candidates: list[dict[str, object]] = []
         tasks_root = self._resolve_cannbench_tasks_root()
         if tasks_root is not None:
@@ -1296,6 +1380,9 @@ class StageGateCoordinator:
         regime_spec: RegimeTargetSpec,
     ) -> dict[str, object] | None:
         """Return the smallest-element case dims routed to ``regime_spec`` when distinct."""
+        override = self._owner_override("_resolve_tail_anchor_dims")
+        if override is not None:
+            return override(regime_spec)
         primary_dims = dict(
             regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
         )
@@ -1352,6 +1439,20 @@ class StageGateCoordinator:
         targets: list[dict[str, object]] = []
         if static_width_dims_fn is not None:
             for item in static_width_dims_fn(regime_spec):
+                cand = dict(item)
+                if cand and cand not in seen:
+                    seen.append(cand)
+                    targets.append(cand)
+        elif self._l1_compiler is None and self._config.operator_name:
+            anchors_for_width = self._scoreboard_anchors or self._initial_anchors
+            for item in collect_distinct_static_width_dims(
+                self._config.operator_name,
+                regime_spec,
+                anchors_for_width,
+                self._guardrail_cases,
+                cannbench_repo=self._cannbench_repo,
+                env_file=self._env_file,
+            ):
                 cand = dict(item)
                 if cand and cand not in seen:
                     seen.append(cand)
@@ -1469,7 +1570,11 @@ class StageGateCoordinator:
             sel_flags = self._resolve_trackb_selector_flags(module_source, regime_spec)
             effective_flags = resolve_trackb_compile_flags(instantiated_tu, sel_flags)
             tb_res = (
-                self._compile_trackb_stage_b(instantiated_tu, selector_flags=sel_flags)
+                self._invoke_with_optional_kwargs(
+                    self._compile_trackb_stage_b,
+                    instantiated_tu,
+                    selector_flags=sel_flags,
+                )
                 if sel_flags
                 else self._compile_trackb_stage_b(instantiated_tu)
             )
@@ -1490,7 +1595,11 @@ class StageGateCoordinator:
                 w_eff_flags = resolve_trackb_compile_flags(w_tu, w_flags)
                 if w_tu != instantiated_tu or w_eff_flags != effective_flags:
                     w_b = (
-                        self._compile_trackb_stage_b(w_tu, selector_flags=w_flags)
+                        self._invoke_with_optional_kwargs(
+                            self._compile_trackb_stage_b,
+                            w_tu,
+                            selector_flags=w_flags,
+                        )
                         if w_flags
                         else self._compile_trackb_stage_b(w_tu)
                     )
@@ -1501,13 +1610,10 @@ class StageGateCoordinator:
                 return replace(tb_res, elapsed_sec=total_elapsed)
             return tb_res
 
-        from tilefoundry_ascend.agent.campaign.campaign_runner import (  # noqa: PLC0415
-            _has_prim_func_builder,
-            resolve_regime_config,
-        )
-
+        resolve_cfg_fn = self._resolve_hook("resolve_regime_config", resolve_regime_config)
+        l1_check_fn = self._resolve_hook("run_l1_compile_check", run_l1_compile_check)
         try:
-            resolved = resolve_regime_config(module_source, regime_spec, dims=anchor_dims)
+            resolved = resolve_cfg_fn(module_source, regime_spec, dims=anchor_dims)
         except (
             SyntaxError,
             AttributeError,
@@ -1522,50 +1628,20 @@ class StageGateCoordinator:
                 passed=False,
                 error_message=f"l1_config_resolve_error: {type(exc).__name__}: {exc}",
             )
-        primary_b = self._invoke_with_optional_kwargs(
-            run_l1_compile_check,
-            module_source,
-            builder_name=resolved.builder_name,
-            builder_kwargs=resolved.builder_kwargs,
-            config_selector_name=regime_spec.config_selector_fn or None,
-            pass_configs=resolved.pass_configs or None,
-            compile_flags=resolved.compile_flags or None,
-            source_root=self._source_root,
-            env_file=self._env_file,
-            tail_anchor_dims=tail_anchor_dims,
-        )
-        if not primary_b.passed:
-            if (
-                regime_spec.runtime_backend == "hybrid_trackb"
-                and tb_extracted is not None
-                and not _has_prim_func_builder(module_source, regime_spec.builder_candidates)
-            ):
-                instantiated_tu = self._instantiate_trackb_tu(
-                    module_source, tb_extracted[1], regime_spec
-                )
-                tb_fb = (
-                    self._compile_trackb_stage_b(
-                        instantiated_tu,
-                        selector_flags=resolved.compile_flags,
-                    )
-                    if resolved.compile_flags
-                    else self._compile_trackb_stage_b(instantiated_tu)
-                )
-                return self._normalize_primary_vf_overflow(tb_fb)
-            return self._normalize_primary_vf_overflow(primary_b)
-
-        final_b = primary_b
         uses_unreserved_ubuf = any(
             "--cce-disable-vf-stack-reserved-ubuf" in str(fl) for fl in resolved.compile_flags
         )
-        if uses_unreserved_ubuf and self._has_vf_stack_overflow(final_b):
-            return self._build_width_failure_result(final_b, final_b.elapsed_sec)
-        total_elapsed = final_b.elapsed_sec
-        for w_dims in self._collect_distinct_width_dims(
-            regime_spec, anchor_dims, uses_unreserved_ubuf, eff_width_fn
-        ):
+        width_dims = self._collect_distinct_width_dims(
+            regime_spec,
+            anchor_dims,
+            uses_unreserved_ubuf,
+            eff_width_fn,
+        )
+        same_cfg_widths: list[dict[str, object]] = []
+        extra_width_checks: list[tuple[dict[str, object], _ResolvedConfigLike]] = []
+        for w_dims in width_dims:
             try:
-                w_resolved = resolve_regime_config(module_source, regime_spec, dims=w_dims)
+                w_resolved = resolve_cfg_fn(module_source, regime_spec, dims=w_dims)
             except (
                 SyntaxError,
                 AttributeError,
@@ -1577,27 +1653,81 @@ class StageGateCoordinator:
                 ValueError,
             ):
                 w_resolved = resolved
-            if w_resolved != resolved or eff_width_fn is not None:
-                w_b = run_l1_compile_check(
-                    module_source,
-                    builder_name=w_resolved.builder_name,
-                    builder_kwargs=w_resolved.builder_kwargs,
-                    config_selector_name=regime_spec.config_selector_fn or None,
-                    pass_configs=w_resolved.pass_configs or None,
-                    compile_flags=w_resolved.compile_flags or None,
-                    dims=w_dims,
-                    source_root=self._source_root,
-                    env_file=self._env_file,
+            if w_resolved == resolved and eff_width_fn is None:
+                same_cfg_widths.append(w_dims)
+            else:
+                extra_width_checks.append((w_dims, w_resolved))
+        env_vals = parse_simple_env_file(self._env_file) if self._env_file is not None else None
+        unified_tl_cache = resolve_unified_tl_cache_dir(
+            env_vals=env_vals,
+            source_root=self._source_root,
+        )
+        primary_b = self._invoke_with_optional_kwargs(
+            l1_check_fn,
+            module_source,
+            builder_name=resolved.builder_name,
+            builder_kwargs=resolved.builder_kwargs,
+            config_selector_name=regime_spec.config_selector_fn or None,
+            pass_configs=resolved.pass_configs or None,
+            compile_flags=resolved.compile_flags or None,
+            dims=dict(anchor_dims) if anchor_dims else None,
+            static_spec_dims_list=same_cfg_widths or None,
+            source_root=self._source_root,
+            env_file=self._env_file,
+            tail_anchor_dims=tail_anchor_dims,
+            regime_tag=regime_spec.regime_tag,
+            tl_cache_dir=unified_tl_cache,
+        )
+        if not primary_b.passed:
+            if (
+                regime_spec.runtime_backend == "hybrid_trackb"
+                and tb_extracted is not None
+                and not _has_prim_func_builder(module_source, regime_spec.builder_candidates)
+            ):
+                instantiated_tu = self._instantiate_trackb_tu(
+                    module_source, tb_extracted[1], regime_spec
                 )
-                total_elapsed += w_b.elapsed_sec
-                if not w_b.passed or self._has_vf_stack_overflow(w_b):
-                    return self._build_width_failure_result(w_b, total_elapsed)
+                tb_fb = (
+                    self._invoke_with_optional_kwargs(
+                        self._compile_trackb_stage_b,
+                        instantiated_tu,
+                        selector_flags=resolved.compile_flags,
+                    )
+                    if resolved.compile_flags
+                    else self._compile_trackb_stage_b(instantiated_tu)
+                )
+                return self._normalize_primary_vf_overflow(tb_fb)
+            return self._normalize_primary_vf_overflow(primary_b)
+
+        final_b = primary_b
+        if uses_unreserved_ubuf and self._has_vf_stack_overflow(final_b):
+            return self._build_width_failure_result(final_b, final_b.elapsed_sec)
+        total_elapsed = final_b.elapsed_sec
+        for w_dims, w_resolved in extra_width_checks:
+            w_b = self._invoke_with_optional_kwargs(
+                l1_check_fn,
+                module_source,
+                builder_name=w_resolved.builder_name,
+                builder_kwargs=w_resolved.builder_kwargs,
+                config_selector_name=regime_spec.config_selector_fn or None,
+                pass_configs=w_resolved.pass_configs or None,
+                compile_flags=w_resolved.compile_flags or None,
+                dims=w_dims,
+                source_root=self._source_root,
+                env_file=self._env_file,
+                regime_tag=regime_spec.regime_tag,
+                tl_cache_dir=unified_tl_cache,
+            )
+            total_elapsed += w_b.elapsed_sec
+            if not w_b.passed or self._has_vf_stack_overflow(w_b):
+                return self._build_width_failure_result(w_b, total_elapsed)
 
         combine_elapsed_sec = 0.0
         combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
         if combine_spec is not None:
             combine_fn, combine_kwargs = combine_spec
-            combine_b = run_l1_compile_check(
+            combine_b = self._invoke_with_optional_kwargs(
+                l1_check_fn,
                 module_source,
                 builder_name=combine_fn,
                 builder_kwargs=combine_kwargs,
@@ -1606,6 +1736,8 @@ class StageGateCoordinator:
                 compile_flags=resolved.compile_flags or None,
                 source_root=self._source_root,
                 env_file=self._env_file,
+                regime_tag=regime_spec.regime_tag,
+                tl_cache_dir=unified_tl_cache,
             )
             if not combine_b.passed:
                 return StageBResult(
@@ -1619,7 +1751,8 @@ class StageGateCoordinator:
             tb_sym, tb_cpp = tb_extracted
             instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
             tb_b = (
-                self._compile_trackb_stage_b(
+                self._invoke_with_optional_kwargs(
+                    self._compile_trackb_stage_b,
                     instantiated_tu,
                     selector_flags=resolved.compile_flags,
                 )
@@ -1648,7 +1781,8 @@ class StageGateCoordinator:
         """Compile the parent once per source when no promoted stone carries L1 data."""
         cache_key = (self._source_sha256(module_source), regime_spec.regime_tag)
         if cache_key not in self._l1_summary_cache:
-            result = self._run_l1(module_source, regime_spec)
+            run_l1_fn = self._owner_override("_run_l1") or self._run_l1
+            result = run_l1_fn(module_source, regime_spec)
             if not result.passed:
                 logger.warning(
                     "First-round parent L1 for regime %s failed: %s",
@@ -1691,7 +1825,9 @@ class StageGateCoordinator:
                         (anc.ref_perf_us / eff_us) if anc.ref_perf_us > 0.0 else anc.speedup
                     )
                     eff_eta = (
-                        (anc.t_hw_us / eff_us) if anc.t_hw_us > 0.0 else anc.roofline_eta
+                        min(1.0, max(0.0, anc.t_hw_us / eff_us))
+                        if anc.t_hw_us > 0.0
+                        else anc.roofline_eta
                     )
                     eff_eq3 = compute_case_eq3_score(anc.ref_perf_us, eff_us, anc.t_hw_us)
                     updated_anchors.append(
@@ -1761,6 +1897,7 @@ class StageGateCoordinator:
             "prewarm_stats": {},
             "l2_prewarm_sec": 0.0,
             "l2_npu_sec": None,
+            "null_launch_us": None,
         }
 
         def _capture_l2_meta(evaluated: object) -> None:
@@ -1777,6 +1914,9 @@ class StageGateCoordinator:
             raw_npu_sec = getattr(evaluated, "l2_npu_sec", None)
             if isinstance(raw_npu_sec, (int, float)) and not isinstance(raw_npu_sec, bool):
                 l2_meta["l2_npu_sec"] = float(raw_npu_sec)
+            raw_null = getattr(evaluated, "null_launch_us", None)
+            if isinstance(raw_null, (int, float)) and not isinstance(raw_null, bool):
+                l2_meta["null_launch_us"] = float(raw_null)
 
         def _dispatch(
             batch_cands: Sequence[tuple[str, Path]],
@@ -1787,8 +1927,12 @@ class StageGateCoordinator:
                 if isinstance(evaluated, L2BatchResults):
                     return dict(evaluated), dict(evaluated.run_ids)
                 return dict(evaluated), {}
-            results, run_id, _receipt = self._invoke_with_optional_kwargs(
+            l2_batch_fn = self._resolve_hook(
+                "run_surrogate_batch_via_agent_gates",
                 run_surrogate_batch_via_agent_gates,
+            )
+            results, run_id, _receipt = self._invoke_with_optional_kwargs(
+                l2_batch_fn,
                 self._config.operator_name,
                 batch_cands,
                 eval_anchors,
@@ -1835,8 +1979,23 @@ class StageGateCoordinator:
                     )
                 else:
                     stripped_results[cid] = replace(cand_res, anchors=())
-            return stripped_results, run_ids
-        return normalized, run_ids
+            final_map = stripped_results
+        else:
+            final_map = normalized
+        pw_map = l2_meta.get("prewarm_stats")
+        wrapped = L2BatchResults(
+            final_map,
+            run_ids,
+            prewarm_stats=pw_map if isinstance(pw_map, Mapping) else None,
+            l2_prewarm_sec=float(l2_meta.get("l2_prewarm_sec") or 0.0),
+            l2_npu_sec=float(l2_meta.get("l2_npu_sec") or 0.0),
+            null_launch_us=(
+                float(l2_meta["null_launch_us"])
+                if isinstance(l2_meta.get("null_launch_us"), (int, float))
+                else None
+            ),
+        )
+        return wrapped, run_ids
 
     def _recheck_single_sibling_anchor(
         self,
@@ -1879,9 +2038,6 @@ class StageGateCoordinator:
         sibling_specs: Sequence[RegimeTargetSpec] = (),
     ) -> str | None:
         """Compute canonical AST+Track-B-TU hash for one regime's reachable closure."""
-        from tilefoundry_ascend.agent.campaign.campaign_runner import (  # noqa: PLC0415
-            extract_regime_snippet,
-        )
         from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: PLC0415
             _normalized_module_ast_signature,
         )
@@ -2398,13 +2554,6 @@ class StageGateCoordinator:
         syntax_repair_sec = 0.0
 
         if raw_candidates:
-            from tilefoundry_ascend.agent.campaign.campaign_runner import (  # noqa: PLC0415
-                _compact_trackb_snippet_source,
-                _detect_trackb_dead_code_edit,
-                _extract_p2_focus_lines_and_diag,
-                patch_regime_into_module,
-            )
-
             prescreen_top_k: int | None = None
             stage_a_ranker = None
             parent_analytical_us: float | None = None
@@ -2435,9 +2584,13 @@ class StageGateCoordinator:
                     passers: Sequence[tuple[str, str, StageAResult]],
                 ) -> list[tuple[str, float]]:
                     if self._cost_advisor.underlying_cost_model is not None:
+                        rank_fn = self._resolve_hook(
+                            "rank_stage_a_candidates_with_cost_model",
+                            rank_stage_a_candidates_with_cost_model,
+                        )
                         return [
                             (item.candidate_id, item.pred_us)
-                            for item in rank_stage_a_candidates_with_cost_model(
+                            for item in rank_fn(
                                 passers,
                                 cost_model=self._cost_advisor.underlying_cost_model,
                                 live_plan=batch.live_plan,
@@ -2546,6 +2699,13 @@ class StageGateCoordinator:
                 if meta_by_id.get(cid, ("", None, ""))[0] == "creative_explore"
             } | set(batch.creative_candidate_ids)
 
+            run_l0_fn = self._owner_override("_run_l0") or self._run_l0
+            run_l1_fn = self._owner_override("_run_l1") or self._run_l1
+            filter_fn = self._resolve_hook(
+                "run_l0_l1_round_filter",
+                run_l0_l1_round_filter,
+            )
+
             def _candidate_l0_check(mod_src: str) -> StageAResult:
                 cand_sha_in = compute_source_sha256(mod_src)
                 knob_sig_in = self._extract_knob_signature(mod_src, batch.regime_spec)
@@ -2574,7 +2734,7 @@ class StageGateCoordinator:
                         backend_kind="ascendc",
                     )
                 return self._invoke_with_optional_kwargs(
-                    self._run_l0,
+                    run_l0_fn,
                     mod_src,
                     batch.regime_spec,
                     anchor_dims_override=batch.bn_dims or None,
@@ -2655,14 +2815,14 @@ class StageGateCoordinator:
                 else None
             )
             l0_l1_t0 = time.monotonic()
-            l0_l1_checks = await run_l0_l1_round_filter(
+            l0_l1_checks = await filter_fn(
                 raw_candidates,
                 patch_fn=lambda snip: _patch_against(batch.parent_module_source, snip),
                 repatch_from_current_fn=lambda cur_mod_src, snip: _patch_against(
                     cur_mod_src, snip
                 ),
                 l0_checker=_candidate_l0_check,
-                l1_compiler=lambda mod_src: self._run_l1(mod_src, batch.regime_spec),
+                l1_compiler=lambda mod_src: run_l1_fn(mod_src, batch.regime_spec),
                 repair_backend=timed_repair_backend,
                 max_syntax_repairs=self._config.max_syntax_repairs,
                 slice_hint=self._slice_contract_instruction(

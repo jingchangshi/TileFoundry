@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from tilefoundry_ascend.agent.campaign import campaign_runner, surrogate_cannbench
+from tilefoundry_ascend.agent.campaign import (
+    campaign_runner,
+    l3_l4_recovery,
+    round_context_builder,
+    stage_gate_coordinator,
+    surrogate_cannbench,
+)
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
@@ -101,6 +107,7 @@ def _make_ledger(
 
 def _patch_prompt_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(campaign_runner, "scan_tilelang_pipe_gaps", lambda: None)
+    monkeypatch.setattr(round_context_builder, "scan_tilelang_pipe_gaps", lambda: None)
     from tilefoundry_ascend.agent.orchestrator import llm_constraints
 
     monkeypatch.setattr(llm_constraints, "format_target_dialect_layer", lambda *_a, **_kw: "")
@@ -136,7 +143,7 @@ def kernel(x):
 
 
 def test_round_record_closed_loop_fields_roundtrip() -> None:
-    """Verify new CampaignRoundRecord fields serialize and deserialize cleanly."""
+    """Verify CampaignRoundRecord closed-loop fields serialize and deserialize cleanly."""
     rec = CampaignRoundRecord(
         round_idx=2,
         regime_tag="small_decode",
@@ -154,7 +161,6 @@ def test_round_record_closed_loop_fields_roundtrip() -> None:
         prescreen_pruned_ids=("c2",),
         l3_failed_cases=(14,),
         l3_failure_stage="accuracy",
-        l3_cx_repair_passed=True,
         infeasible_boundaries_added=2,
     )
     encoded = rec.to_dict()
@@ -162,7 +168,6 @@ def test_round_record_closed_loop_fields_roundtrip() -> None:
     assert encoded["prescreen_pruned_ids"] == ["c2"]
     assert encoded["l3_failed_cases"] == [14]
     assert encoded["l3_failure_stage"] == "accuracy"
-    assert encoded["l3_cx_repair_passed"] is True
     assert encoded["infeasible_boundaries_added"] == 2
 
     decoded = CampaignRoundRecord.from_dict(encoded)
@@ -170,7 +175,6 @@ def test_round_record_closed_loop_fields_roundtrip() -> None:
     assert decoded.prescreen_pruned_ids == ("c2",)
     assert decoded.l3_failed_cases == (14,)
     assert decoded.l3_failure_stage == "accuracy"
-    assert decoded.l3_cx_repair_passed is True
     assert decoded.infeasible_boundaries_added == 2
 
 
@@ -179,7 +183,7 @@ async def test_p0_1a_l3_counterexample_reaggregates_best_result_and_avoids_false
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify slow L3 counterexample re-aggregates best_result before repair tail guard."""
+    """Verify L3 counterexample absorbs guardrail without cx_repair and avoids false tail reject."""
     target_path = tmp_path / "kernels.py"
     target_path.write_text(_BASE_MODULE_SRC, encoding="utf-8")
     spec = _basic_spec("ragged_gmm", dims={"M": 64, "K": 256, "N": 128})
@@ -192,7 +196,7 @@ def _select_op_config(**_kw):
 def _build_op(tile_m=8):
     return tile_m + 1
 '''
-    repaired_cand = '''
+    tail_fixed_cand = '''
 def _select_op_config(**_kw):
     return {"tile_m": 8}
 
@@ -201,7 +205,12 @@ def _build_op(tile_m=8):
     return tile_m + 2
 '''
 
-    class _RepairLLM:
+    repair_calls: list[GenerationRequest] = []
+
+    class _CreativeTwoRoundLLM:
+        def __init__(self) -> None:
+            self._creative_calls = 0
+
         async def generate(
             self,
             req: GenerationRequest,
@@ -209,15 +218,17 @@ def _build_op(tile_m=8):
             effort_override: object = None,
         ) -> str:
             _ = effort_override
-            if req.role_hint == "l3_counterexample_repair":
-                return repaired_cand
+            hint = str(getattr(req, "role_hint", "") or "")
+            if hint == "l3_counterexample_repair" or "l3_cx_repair" in hint:
+                repair_calls.append(req)
+                return tail_fixed_cand
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "Increase tile_m",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": fast_cand,
-                    }
+                self._creative_calls += 1
+                body = fast_cand if self._creative_calls == 1 else tail_fixed_cand
+                return (
+                    "# target_bottleneck: aiv_vec\n"
+                    "# structural_hypothesis: Increase tile_m\n"
+                    f"```python\n{body}\n```"
                 )
             return fast_cand
 
@@ -276,7 +287,7 @@ def _build_op(tile_m=8):
     runner = PerfTargetCampaignRunner(
         config=CampaignConfig(
             operator_name="grouped_matmul",
-            max_rounds=1,
+            max_rounds=2,
             k_rule_workers=0,
             enable_tilesize_prescreen=False,
             min_surrogate_gain=0.01,
@@ -285,7 +296,7 @@ def _build_op(tile_m=8):
         perf_target=PerfTargetSpec("grouped_matmul", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=(spec,),
-        llm_backend=_RepairLLM(),
+        llm_backend=_CreativeTwoRoundLLM(),
         tracker=BayesianRuleTracker(rules={}),
         l0_checker=lambda _s, _r: StageAResult(
             passed=True,
@@ -302,23 +313,27 @@ def _build_op(tile_m=8):
     )
     _patch_prompt_env(monkeypatch)
     monkeypatch.setattr(runner, "_collect_msprof_for_regimes", lambda *_a, **_kw: None)
+
+    def _lookup_dims(cnum: int, _tag: str = "") -> dict[str, object]:
+        return {"B": 1, "S": 1, "D": 127} if int(cnum) == 14 else {"B": 1, "S": 1, "D": 128}
+
+    monkeypatch.setattr(runner, "_lookup_case_dims_safe", _lookup_dims)
+    monkeypatch.setattr(runner._stage_gate_coordinator, "_lookup_case_dims_safe", _lookup_dims)
+    monkeypatch.setattr(runner._l3_l4_recovery, "_lookup_case_dims_fn", _lookup_dims)
     monkeypatch.setattr(
-        runner,
-        "_lookup_case_dims_safe",
-        lambda cnum, _tag="": {"B": 1, "S": 1, "D": 127} if int(cnum) == 14 else {"B": 1, "S": 1, "D": 128},
+        l3_l4_recovery,
+        "lookup_case_dims",
+        lambda _op, cnum, **_kw: _lookup_dims(int(cnum)),
     )
-    monkeypatch.setattr(
-        campaign_runner,
-        "lookup_case_metadata",
-        lambda *_a, **_kw: (20.0, 2.0),
-    )
+    monkeypatch.setattr(campaign_runner, "lookup_case_metadata", lambda *_a, **_kw: (20.0, 2.0))
+    monkeypatch.setattr(l3_l4_recovery, "lookup_case_metadata", lambda *_a, **_kw: (20.0, 2.0))
 
     best_result = _make_surrogate_result(
         "base",
         "grouped_matmul",
         [_make_anchor_metric(case_num=2, regime_tag="ragged_gmm", cand_us=4.0, ref_perf_us=10.0)],
     )
-    rec, new_inc, new_best, _stag, promoted, rolled_back, _esc, blocked = (
+    rec1, inc1, best1, stag1, promoted1, rolled_back1, _esc1, blocked1 = (
         await runner._execute_single_round(
             round_idx=1,
             regime_spec=spec,
@@ -330,21 +345,22 @@ def _build_op(tile_m=8):
         )
     )
 
+    assert repair_calls == []
     assert [a.case_num for a in anchors] == [2]
     assert [g.case_num for g in runner._guardrail_cases] == [14]
-    assert promoted is True
-    assert rolled_back is False
-    assert blocked is False
-    assert "tail_fixed" in new_inc
-    assert {int(a.case_num) for a in new_best.anchors} == {2}
-    assert rec.l3_failed_cases == (14,)
-    assert rec.l3_failure_stage == "accuracy"
-    assert rec.l3_cx_repair_passed is True
-    assert rec.tail_guard_reject_reason == ""
+    assert promoted1 is False
+    assert rolled_back1 is True
+    assert blocked1 is False
+    assert rec1.l3_failed_cases == (14,)
+    assert rec1.l3_failure_stage == "accuracy"
 
     cx_path = lake_dir / "counterexample_anchors.jsonl"
     assert cx_path.is_file()
-    cx_records = [json.loads(line) for line in cx_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    cx_records = [
+        json.loads(line)
+        for line in cx_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     assert len(cx_records) == 1
     assert cx_records[0]["case_num"] == 14
     assert cx_records[0]["failure_stage"] == "accuracy"
@@ -352,27 +368,40 @@ def _build_op(tile_m=8):
     assert cx_records[0]["has_prime_dim"] is True
     assert cx_records[0]["non_32b_aligned"] is True
 
+    rec2, new_inc, new_best, _stag2, promoted2, rolled_back2, _esc2, blocked2 = (
+        await runner._execute_single_round(
+            round_idx=2,
+            regime_spec=spec,
+            incumbent_source=inc1,
+            best_result=best1,
+            active_anchors=anchors,
+            stagnation_rounds=stag1,
+            admitted_rule_ids=[],
+        )
+    )
+
+    assert repair_calls == []
+    assert promoted2 is True
+    assert rolled_back2 is False
+    assert blocked2 is False
+    assert "tail_fixed" in new_inc
+    assert {int(a.case_num) for a in new_best.anchors} == {2}
+    assert rec2.tail_guard_reject_reason == ""
+
 
 @pytest.mark.anyio
 async def test_p0_1b_non_terminal_repaired_l3_preserves_target_and_saves_active_promotion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify non-terminal repaired_l3 preserves target file and persists active_promotion."""
+    """Verify non-terminal L3 preserves target and persists active_promotion."""
     target_path = tmp_path / "kernels.py"
     target_path.write_text(_BASE_MODULE_SRC, encoding="utf-8")
     ckpt_path = tmp_path / "ckpt.json"
     spec = _basic_spec("ragged_gmm", dims={"M": 64, "K": 256, "N": 128})
     anchors = (AnchorCaseSpec("level4/grouped_matmul", 2, "ragged_gmm", 10.0, 2.0),)
 
-    fast_cand = '''
-def _select_op_config(**_kw):
-    return {"tile_m": 8}
-
-def _build_op(tile_m=8):
-    return tile_m + 1
-'''
-    repaired_cand = '''
+    pending_cand = '''
 def _select_op_config(**_kw):
     return {"tile_m": 8}
 
@@ -380,8 +409,9 @@ def _build_op(tile_m=8):
     # repaired_pending_tag
     return tile_m + 2
 '''
+    repair_calls: list[GenerationRequest] = []
 
-    class _RepairLLM:
+    class _PendingLLM:
         async def generate(
             self,
             req: GenerationRequest,
@@ -389,17 +419,17 @@ def _build_op(tile_m=8):
             effort_override: object = None,
         ) -> str:
             _ = effort_override
-            if req.role_hint == "l3_counterexample_repair":
-                return repaired_cand
+            hint = str(getattr(req, "role_hint", "") or "")
+            if hint == "l3_counterexample_repair" or "l3_cx_repair" in hint:
+                repair_calls.append(req)
+                return pending_cand
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "Increase tile_m",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": fast_cand,
-                    }
+                return (
+                    "# target_bottleneck: aiv_vec\n"
+                    "# structural_hypothesis: Increase tile_m\n"
+                    f"```python\n{pending_cand}\n```"
                 )
-            return fast_cand
+            return pending_cand
 
     def _l2_eval(
         cands: Sequence[tuple[str, Path]],
@@ -429,29 +459,18 @@ def _build_op(tile_m=8):
         on_execution_started: object = None,
         **_kw: object,
     ) -> surrogate_cannbench.L3AcceptanceResult:
-        src = mod_path.read_text(encoding="utf-8")
+        _ = mod_path
         if callable(on_execution_started):
             on_execution_started("exec-live-99", "1")
-        if "repaired_pending_tag" in src:
-            return surrogate_cannbench.L3AcceptanceResult(
-                passed=False,
-                failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
-                execution_terminal=False,
-                pending=True,
-                execution_id="exec-live-99",
-                run_id="run-live-99",
-                device_id="1",
-                error_message="wait_timeout_still_running",
-            )
         return surrogate_cannbench.L3AcceptanceResult(
             passed=False,
-            failure_kind=surrogate_cannbench.FAILURE_KIND_CANDIDATE,
-            failed_case_nums=(14,),
-            failure_stage="accuracy",
-            error_message="numeric mismatch case=14",
-            execution_id="exec-cx-14",
-            run_id="run-cx-14",
+            failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+            execution_terminal=False,
+            pending=True,
+            execution_id="exec-live-99",
+            run_id="run-live-99",
             device_id="1",
+            error_message="wait_timeout_still_running",
         )
 
     ledger = _make_ledger()
@@ -468,7 +487,7 @@ def _build_op(tile_m=8):
         perf_target=PerfTargetSpec("grouped_matmul", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=(spec,),
-        llm_backend=_RepairLLM(),
+        llm_backend=_PendingLLM(),
         tracker=BayesianRuleTracker(rules={}),
         l0_checker=lambda _s, _r: StageAResult(
             passed=True,
@@ -492,6 +511,7 @@ def _build_op(tile_m=8):
 
     report = await runner.run(resume=False)
 
+    assert repair_calls == []
     assert report.stop_reason == "promotion_blocked"
     assert report.promotion_blocked is True
     assert report.rolled_back_rounds == ()
@@ -563,6 +583,11 @@ def _build_large():
         checkpoint_path=tmp_path / "ckpt.json",
     )
     monkeypatch.setattr(runner, "_resolve_cannbench_tasks_root", lambda: None)
+    monkeypatch.setattr(
+        runner._stage_gate_coordinator,
+        "_resolve_cannbench_tasks_root",
+        lambda: None,
+    )
 
     def _lookup_dims(case_num: int, _tag: str = "") -> dict[str, object]:
         if int(case_num) == 16:
@@ -570,8 +595,9 @@ def _build_large():
         return {"N": 2, "B": 1, "S": 1, "D": 128}
 
     monkeypatch.setattr(runner, "_lookup_case_dims_safe", _lookup_dims)
+    monkeypatch.setattr(runner._stage_gate_coordinator, "_lookup_case_dims_safe", _lookup_dims)
     monkeypatch.setattr(
-        campaign_runner,
+        stage_gate_coordinator,
         "resolve_regime_for_case",
         lambda _op, dims, _specs: (
             large_spec if int(dims.get("D", 0) or 0) >= 4096 else small_spec
@@ -603,16 +629,20 @@ def _build_large():
             return StageBResult(passed=True)
         return non_stack_fail
 
-    monkeypatch.setattr(runner, "_compile_trackb_stage_b", _fake_compile_trackb)
     monkeypatch.setattr(
-        runner,
+        runner._stage_gate_coordinator,
+        "_compile_trackb_stage_b",
+        _fake_compile_trackb,
+    )
+    monkeypatch.setattr(
+        runner._stage_gate_coordinator,
         "_resolve_max_row_width_dims",
         lambda _reg: {"N": 2, "B": 1, "S": 2, "D": 256},
     )
     monkeypatch.setattr(
-        runner,
+        runner._stage_gate_coordinator,
         "_instantiate_trackb_tu",
-        lambda _src, cpp, spec: f"// D={spec.representative_anchor_dims.get('D')}\n{cpp}",
+        lambda _src, cpp, spec, **_kw: f"// D={spec.representative_anchor_dims.get('D')}\n{cpp}",
     )
 
     stage_b = runner._run_l1(trackb_src, small_spec)
@@ -641,12 +671,10 @@ async def test_p1_2_non_associative_recurrent_aiv_does_not_trigger_paradigm_shif
         ) -> str:
             _ = effort_override
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "Tune vector tile",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": _BASE_MODULE_SRC,
-                    }
+                return (
+                    "# target_bottleneck: aiv_vec\n"
+                    "# structural_hypothesis: Tune vector tile\n"
+                    f"```python\n{_BASE_MODULE_SRC}\n```"
                 )
             return _BASE_MODULE_SRC
 
@@ -693,6 +721,11 @@ async def test_p1_2_non_associative_recurrent_aiv_does_not_trigger_paradigm_shif
         "_resolve_operator_semantics_for_gates",
         lambda: _NonAssociativeRecurrent(),
     )
+    monkeypatch.setattr(
+        runner._round_context_builder,
+        "_resolve_operator_semantics_for_gates",
+        lambda: _NonAssociativeRecurrent(),
+    )
 
     low_eta_best = _make_surrogate_result(
         "base",
@@ -716,6 +749,11 @@ async def test_p1_2_non_associative_recurrent_aiv_does_not_trigger_paradigm_shif
 
     monkeypatch.setattr(
         runner,
+        "_resolve_operator_semantics_for_gates",
+        lambda: _AssociativeRecurrent(),
+    )
+    monkeypatch.setattr(
+        runner._round_context_builder,
         "_resolve_operator_semantics_for_gates",
         lambda: _AssociativeRecurrent(),
     )
@@ -762,12 +800,10 @@ def _build_op(tile_m=256):
             _ = effort_override
             captured_requests.append(req)
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "Try large tile_m",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": bad_cand,
-                    }
+                return (
+                    "# target_bottleneck: aiv_vec\n"
+                    "# structural_hypothesis: Try large tile_m\n"
+                    f"```python\n{bad_cand}\n```"
                 )
             return bad_cand
 
@@ -1017,14 +1053,13 @@ async def test_arc3_spearman_quarantine_and_round_funnel_events_emitted(
             _ = effort_override
             self.call_idx += 1
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "Variant C",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": (
-                            f"def _build_op(tile_m=4):\n    # marker_c\n    return tile_m + {10 + self.call_idx}\n"
-                        ),
-                    }
+                cand_src = (
+                    f"def _build_op(tile_m=4):\n    # marker_c\n    return tile_m + {10 + self.call_idx}\n"
+                )
+                return (
+                    "# target_bottleneck: aiv_vec\n"
+                    "# structural_hypothesis: Variant C\n"
+                    f"```python\n{cand_src}\n```"
                 )
             if "R_TEST_0" in req.user_prompt:
                 return f"def _build_op(tile_m=4):\n    # marker_a\n    return tile_m + {100 + self.call_idx}\n"
@@ -1114,15 +1149,21 @@ async def test_arc3_spearman_quarantine_and_round_funnel_events_emitted(
         "rank_symptom_families",
         lambda _ctx: [(next(iter(SymptomFamily)), 1.0)],
     )
+    monkeypatch.setattr(
+        round_context_builder,
+        "rank_symptom_families",
+        lambda _ctx: [(next(iter(SymptomFamily)), 1.0)],
+    )
 
     seen_prescreen_top_k: list[int | None] = []
-    orig_filter = campaign_runner.run_l0_l1_round_filter
+    orig_filter = stage_gate_coordinator.run_l0_l1_round_filter
 
     async def _spy_filter(candidates: Sequence[tuple[str, str]], **kwargs: object) -> list[surrogate_cannbench.L0L1CandidateCheck]:
         seen_prescreen_top_k.append(kwargs.get("cost_prescreen_top_k"))
         return await orig_filter(candidates, **kwargs)
 
     monkeypatch.setattr(campaign_runner, "run_l0_l1_round_filter", _spy_filter)
+    monkeypatch.setattr(stage_gate_coordinator, "run_l0_l1_round_filter", _spy_filter)
 
     report = await runner.run(resume=False)
 

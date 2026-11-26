@@ -1331,8 +1331,22 @@ def test_cce_cpp20_surface_warns_against_simtvf_ubuf_flags_and_raw_ub_casts() ->
 
 
 def test_syntax_repair_includes_bounded_parent_source_and_round_filter_forwards_it() -> None:
-    """Include bounded parent source in repair prompts and forward on ast_patch_error."""
-    huge_parent = ("__global__ void k() {}\n" * 1000).strip()
+    """Include unclipped reachable closure parent source in repair prompts and forward it."""
+    active_lines = ["__global__ void k(float* out) {"]
+    for idx in range(700):
+        active_lines.append(f"    float v_{idx} = h_live((float){idx});")
+    active_lines.append("    out[0] = v_699;")
+    active_lines.append("}")
+    huge_parent = (
+        "__aicore__ inline float h_live(float x) { return x + 1.0f; }\n"
+        + "\n".join(active_lines)
+        + "\n__global__ void sibling_k(float* s) { s[0] = 0.0f; }\n"
+        + 'extern "C" int launch(void* stream, float* out) {\n'
+        + "    k<<<28, nullptr, stream>>>(out);\n"
+        + "    return 0;\n"
+        + "}"
+    ).strip()
+    assert len(huge_parent.encode("utf-8")) > 16384
     req = build_syntax_repair_request(
         "<<<<<<< SEARCH\nmissing\n=======\nrep\n>>>>>>> REPLACE",
         "ast_patch_error: ValueError: did not match",
@@ -1340,12 +1354,15 @@ def test_syntax_repair_includes_bounded_parent_source_and_round_filter_forwards_
         parent_source=huge_parent,
     )
     assert "### PARENT AUTHORIZED SOURCE" in req.user_prompt
-    assert "/* ... parent source truncated ... */" in req.user_prompt
+    assert "/* ... parent source truncated ... */" not in req.user_prompt
     parent_section = (
         req.user_prompt.split("### PARENT AUTHORIZED SOURCE", 1)[1]
         .split("### COMPILER / GATE DIAGNOSTIC", 1)[0]
     )
-    assert len(parent_section) < 16200
+    assert "h_live" in parent_section
+    assert "out[0] = v_699;" in parent_section
+    assert "float v_0 = h_live((float)0);" in parent_section
+    assert "sibling_k(float* s) { s[0] = 0.0f; }" not in parent_section
 
     backend = _ScriptedBackend(["__global__ void repaired_snippet() {}"])
 
@@ -2084,14 +2101,15 @@ def test_worst_element_diagnostic_and_npu_compare_shim_ast(tmp_path: Path) -> No
     actual = torch.tensor([[1.0, 2.0, 3.0], [4.0, 10.5, 6.0]], dtype=torch.float32)
     golden = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.5, 6.0]], dtype=torch.float32)
     diag = _format_worst_element_diagnostic(actual, golden)
-    assert diag.startswith("worst_element=(idx=[1, 1], ref=5.5, got=10.5, abs_diff=5.000000e+00")
+    assert diag.startswith("worst_element=(idx=[1, 1], ref=5.5, got=10.5, abs_diff=5.0")
+    assert "e+00" in diag
     assert "rel_err=" in diag
 
     actual_mixed = torch.tensor([[float("nan"), 1.0], [2.0, 7.0]], dtype=torch.float32)
     golden_mixed = torch.tensor([[0.0, 1.0], [2.0, 3.0]], dtype=torch.float32)
     mixed_diag = _format_worst_element_diagnostic(actual_mixed, golden_mixed)
     assert "idx=[1, 1]" in mixed_diag
-    assert "abs_diff=4.000000e+00" in mixed_diag
+    assert "abs_diff=4.0" in mixed_diag and "e+00" in mixed_diag
 
     fake_cann = tmp_path / "cann_repo"
     (fake_cann / "src" / "kernel_eval" / "utils").mkdir(parents=True)
@@ -2130,7 +2148,7 @@ def test_worst_element_diagnostic_and_npu_compare_shim_ast(tmp_path: Path) -> No
         assert res.passed is False
         assert "NaN position mismatch" in res.message
         assert "worst_element=(idx=[1, 1]" in res.message
-        assert "raw=MERE=2.500000e-01" in res.message
+        assert "raw=MERE=2.5" in res.message and "e-01" in res.message
     finally:
         for key, prev in saved_mods.items():
             if prev is None:

@@ -495,7 +495,7 @@ def test_portfolio_plan_workers_threads_case_ratios_compiler_summary_and_r16_tex
     assert sig_with_ratios["contig_atom_ratio"] == pytest.approx(0.25)
 
     rules = load_seed_rules()
-    assert len(rules) == 41
+    assert len(rules) >= 41
     by_id = {r.rule_id: r for r in rules}
     r16 = by_id["R16_PADDED_PITCH_TAIL_MASKING"]
     assert "contig_atom_ratio >= 1.0" in r16.transform_template

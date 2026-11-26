@@ -86,34 +86,31 @@ def make_kernel():
     return main
 """
 
-_CREATIVE_SSBUF_JSON = json.dumps(
-    {
-        "physical_hypothesis": "Stage dynamic rescale descriptors through 8B-aligned SSBUF and dual_copy.",
-        "expected_bottleneck_shift": "Reduce cross-core sync_stall_ratio with 2-stage double buffering.",
-        "dsl_source": """
-import tilelang.ascend.language as T
-
-def make_kernel():
-    @T.prim_func
-    def main(
-        X: T.Tensor((128, 128), "bfloat16"),
-        W: T.Tensor((128, 128), "bfloat16"),
-        Y: T.Tensor((128, 128), "float32"),
-    ):
-        with T.MixedKernel(8) as (_, sid):
-            ss = T.alloc_ss((2,), "uint32")
-            x_l1 = T.alloc_l1((128, 64), "bfloat16")
-            w_l1 = T.alloc_l1((128, 64), "bfloat16")
-            acc = T.alloc_l0c((128, 128), "float32")
-            ss[sid] = T.Cast("uint32", 0)
-            for kt in T.Pipelined(2, num_stages=2):
-                T.copy(X[0:128, kt * 64 : (kt + 1) * 64], x_l1)
-                T.copy(W[0:128, kt * 64 : (kt + 1) * 64], w_l1)
-                T.gemm(x_l1, w_l1, acc, transpose_B=True, clear_accum=kt == 0)
-            T.copy(acc, Y[0:128, 0:128])
-    return main
-""".strip(),
-    }
+_CREATIVE_SSBUF_RESPONSE = (
+    "# target_bottleneck: Reduce cross-core sync_stall_ratio with 2-stage double buffering.\n"
+    "# structural_hypothesis: Stage dynamic rescale descriptors through 8B-aligned SSBUF.\n"
+    "```python\n"
+    "import tilelang.ascend.language as T\n\n"
+    "def make_kernel():\n"
+    "    @T.prim_func\n"
+    "    def main(\n"
+    '        X: T.Tensor((128, 128), "bfloat16"),\n'
+    '        W: T.Tensor((128, 128), "bfloat16"),\n'
+    '        Y: T.Tensor((128, 128), "float32"),\n'
+    "    ):\n"
+    "        with T.MixedKernel(8) as (_, sid):\n"
+    '            ss = T.alloc_ss((2,), "uint32")\n'
+    '            x_l1 = T.alloc_l1((128, 64), "bfloat16")\n'
+    '            w_l1 = T.alloc_l1((128, 64), "bfloat16")\n'
+    '            acc = T.alloc_l0c((128, 128), "float32")\n'
+    '            ss[sid] = T.Cast("uint32", 0)\n'
+    "            for kt in T.Pipelined(2, num_stages=2):\n"
+    "                T.copy(X[0:128, kt * 64 : (kt + 1) * 64], x_l1)\n"
+    "                T.copy(W[0:128, kt * 64 : (kt + 1) * 64], w_l1)\n"
+    "                T.gemm(x_l1, w_l1, acc, transpose_B=True, clear_accum=kt == 0)\n"
+    "            T.copy(acc, Y[0:128, 0:128])\n"
+    "    return main\n"
+    "```\n"
 )
 
 
@@ -151,8 +148,8 @@ def test_e2e_evolution_offline_golden_to_converged_trajectories() -> None:
                     _RULE_IMPROVED_DSL,
                 ],
                 "explore_creative": [
-                    _CREATIVE_SSBUF_JSON,
-                    _CREATIVE_SSBUF_JSON,
+                    _CREATIVE_SSBUF_RESPONSE,
+                    _CREATIVE_SSBUF_RESPONSE,
                 ],
             },
             default_response=_RULE_IMPROVED_DSL,
@@ -246,7 +243,7 @@ def test_np3_golden_navigation_router_off_and_universal_blueprint(monkeypatch) -
     backend = MockLLMBackend(
         responses={
             "exploit_rule": [_BASELINE_DSL, _RULE_IMPROVED_DSL, _RULE_IMPROVED_DSL],
-            "explore_creative": [_CREATIVE_SSBUF_JSON],
+            "explore_creative": [_CREATIVE_SSBUF_RESPONSE],
         },
         default_response=_RULE_IMPROVED_DSL,
     )

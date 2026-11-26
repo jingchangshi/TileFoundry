@@ -289,12 +289,12 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
                 if rule_calls == 1:
                     return "```python\ndef kernel(m_dim=65):\n    # MID\n    return m_dim\n```"
                 return "```python\ndef kernel(m_dim=66):\n    # SLOW\n    return m_dim\n```"
-            return json.dumps(
-                {
-                    "physical_hypothesis": "try fast candidate",
-                    "target_local_metric": "latency_us",
-                    "dsl_source": "def kernel(m_dim=67):\n    # FAST\n    return m_dim\n",
-                }
+            return (
+                "# target_bottleneck: latency_us\n"
+                "# structural_hypothesis: try fast candidate\n"
+                "```python\n"
+                "def kernel(m_dim=67):\n    # FAST\n    return m_dim\n"
+                "```\n"
             )
 
     def _l0_campaign(mod_src: str, _spec: RegimeTargetSpec) -> StageAResult:

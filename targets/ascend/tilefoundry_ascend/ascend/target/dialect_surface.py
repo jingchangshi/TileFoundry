@@ -1533,7 +1533,10 @@ def _note_relevant(
 ) -> bool:
     _ = entries
     low = note.lower()
-    if ("__simt_vf__" in low or "t.simtvf" in low) and not has_simt:
+    if (
+        any(tok in low for tok in ("__simt_vf__", "t.simtvf", "cuda warp", "__shfl_"))
+        and not has_simt
+    ):
         return False
     if any(tok in low for tok in ("t.gemm", "ascend_gemm_l1", "asc_mmad", "t.mixedkernel")):
         if not has_cube:

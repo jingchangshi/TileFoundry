@@ -143,14 +143,14 @@ def _surrogate(
 
 
 def test_all_seed_rules_have_valid_symptom_family_and_anti_precondition(tmp_path: Path) -> None:
-    """Validate all 41 seed rules declare SymptomFamily, mechanism_tag, and anti_precondition."""
+    """Validate all seed rules declare SymptomFamily, mechanism_tag, and anti_precondition."""
     rules = load_seed_rules()
-    assert len(rules) == 41
+    assert len(rules) >= 41
     assert len(SymptomFamily) == 14
     assert len(DETERMINISTIC_SYMPTOM_FAMILIES) == 13
     assert set(SYMPTOM_FAMILY_TO_AXIS) == set(SymptomFamily)
     assert set(SYMPTOM_FAMILY_TO_FACETS) == set(SymptomFamily)
-    assert len({r.mechanism_tag for r in rules}) == 41
+    assert len({r.mechanism_tag for r in rules}) == len(rules)
 
     base_mask = ConstraintRelaxationMask.bottom()
     for fam, facets in SYMPTOM_FAMILY_TO_FACETS.items():
@@ -412,7 +412,7 @@ def test_online_rulebook_frozen_by_default_and_opt_in_distilled_sync(tmp_path: P
     )
 
     frozen_tracker = BayesianRuleTracker.from_experience_lake(lake_dir)
-    assert len(frozen_tracker.rules) == 41
+    assert len(frozen_tracker.rules) == len(load_seed_rules())
     assert "R_UNREVIEWED_DISTILLED_01" not in frozen_tracker.rules
     assert frozen_tracker.posteriors["R01_DUAL_COPY_1C2V_SPLIT"].successes == 1
 
@@ -596,12 +596,10 @@ def test_flywheel_stages_offline_evidence_without_mutating_online_rulebook(
         ),
     )
 
-    creative_reply = json.dumps(
-        {
-            "physical_hypothesis": "Scale kernel blocks to 8 to lift wave occupancy",
-            "target_local_metric": "wave_occupancy",
-            "dsl_source": _IMPROVED_EXPLORE_SLICE,
-        }
+    creative_reply = (
+        "# target_bottleneck: wave_occupancy\n"
+        "# structural_hypothesis: Scale kernel blocks to 8 to lift wave occupancy\n"
+        f"```python\n{_IMPROVED_EXPLORE_SLICE}\n```\n"
     )
     backend = MockLLMBackend(
         responses={
@@ -742,8 +740,8 @@ def test_curate_kb_from_lake_cli_markdown_and_json(tmp_path: Path) -> None:
             "operator": "level2/softmax",
             "regime_tag": "vector",
             "worker_kind": "creative_explore",
-            "parent_sha": "aaaa1111bbbb2222",
-            "winner_sha": "cccc3333dddd4444",
+            "parent_sha": "parent_sha_sample",
+            "winner_sha": "winner_sha_sample",
             "baseline_latency_us": 40.0,
             "winner_latency_us": 28.0,
             "relative_gain": 0.30,

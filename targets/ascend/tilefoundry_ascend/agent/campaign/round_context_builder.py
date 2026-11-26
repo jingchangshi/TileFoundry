@@ -21,6 +21,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     RegimeTargetSpec,
     _has_flat_operator_layout,
     build_anchor_var_bindings,
+    compute_case_aligned_eta,
     get_input_domain_envelope,
     lookup_case_dims,
     resolve_cannbench_repo,
@@ -334,6 +335,10 @@ class RoundContextBuilder:
         resolve_op_semantics_fn: Callable[[], PyTorchOpSemantics | None] | None = None,
         resolve_active_trackb_kernel_fn: Callable[[str, RegimeTargetSpec], str | None]
         | None = None,
+        lookup_case_dims_fn: Callable[[int, str], dict[str, object]] | None = None,
+        resolve_cannbench_tasks_root_fn: Callable[[], Path | None] | None = None,
+        resolve_trackb_freedom_mask_fn: Callable[[RegimeTargetSpec], ConstraintRelaxationMask]
+        | None = None,
     ) -> None:
         self._config = config
         self._regime_specs = tuple(regime_specs)
@@ -344,7 +349,9 @@ class RoundContextBuilder:
         self._source_root = Path(source_root).resolve()
         self._perf_target = perf_target
         self._env_file = Path(env_file).resolve() if env_file is not None else None
-        self._cannbench_repo = Path(cannbench_repo).resolve() if cannbench_repo is not None else None
+        self._cannbench_repo = (
+            Path(cannbench_repo).resolve() if cannbench_repo is not None else None
+        )
         self._enable_track_router = bool(enable_track_router)
         self._run_id = run_id
         self._experience_lake = experience_lake
@@ -352,7 +359,9 @@ class RoundContextBuilder:
         self._sil_advisory = sil_advisory
         self._topology_axes = topology_axes
         self._semantic_topology_axes: TopologyAxes | None = None
-        self._freedom_masks: dict[str, ConstraintRelaxationMask] = dict(freedom_masks or {})
+        self._freedom_masks: dict[str, ConstraintRelaxationMask] = (
+            freedom_masks if isinstance(freedom_masks, dict) else dict(freedom_masks or {})
+        )
         self._boundary_ledger = boundary_ledger or DeterministicSearchBoundaryLedger()
         self._run_l0_fn = run_l0_fn
         self._l1_summary_fn = l1_summary_fn
@@ -360,6 +369,19 @@ class RoundContextBuilder:
         self._collect_p2_fn = collect_p2_fn
         self._resolve_op_semantics_fn = resolve_op_semantics_fn
         self._resolve_active_trackb_kernel_fn = resolve_active_trackb_kernel_fn
+        self._lookup_case_dims_fn = lookup_case_dims_fn
+        self._resolve_cannbench_tasks_root_fn = resolve_cannbench_tasks_root_fn
+        self._resolve_trackb_freedom_mask_fn = resolve_trackb_freedom_mask_fn
+        self._hook_resolve_cannbench_repo: Callable[..., Path] | None = None
+        self._hook_lookup_case_dims: Callable[..., Mapping[str, object]] | None = None
+        self._hook_resolve_regime_config: Callable[..., object] | None = None
+        self._hook_rank_symptom_families: (
+            Callable[..., Sequence[tuple[SymptomFamily, float]]] | None
+        ) = None
+        self._hook_evaluate_ascendc_candidate: Callable[..., StageAResult] | None = None
+        self._hook_run_stage_a_static: Callable[..., StageAResult] | None = None
+        self._hook_build_prescreen_summary_from_kwargs: Callable[..., str] | None = None
+        self._hook_scan_tilelang_pipe_gaps: Callable[..., object] | None = None
 
         self._case_dims_cache: dict[int, dict[str, object]] = {}
         self._golden_abi_block_cache: str | None = None
@@ -407,8 +429,11 @@ class RoundContextBuilder:
 
     def _resolve_cannbench_tasks_root(self) -> Path | None:
         """Resolve the cann-bench tasks root, falling back to the in-repo mirror."""
+        if self._resolve_cannbench_tasks_root_fn is not None:
+            return self._resolve_cannbench_tasks_root_fn()
+        repo_fn = self._hook_resolve_cannbench_repo or resolve_cannbench_repo
         try:
-            repo = resolve_cannbench_repo(
+            repo = repo_fn(
                 cannbench_repo=self._cannbench_repo,
                 env_file=self._env_file,
             )
@@ -701,6 +726,11 @@ class RoundContextBuilder:
             else None
         )
         mask = self._freedom_masks.get(regime_spec.regime_tag, ConstraintRelaxationMask.bottom())
+        eval_ascendc_fn = (
+            self._hook_evaluate_ascendc_candidate or evaluate_ascendc_candidate
+        )
+        resolve_cfg_fn = self._hook_resolve_regime_config or resolve_regime_config
+        stage_a_fn = self._hook_run_stage_a_static or run_stage_a_static
         if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
             instantiated_tu = _render_trackb_tu_from_module(
                 module_source,
@@ -709,7 +739,7 @@ class RoundContextBuilder:
                 require_renderer=False,
                 anchor_dims_override=anchor_dims_override,
             )
-            return evaluate_ascendc_candidate(
+            return eval_ascendc_fn(
                 instantiated_tu,
                 freedom_mask=mask,
                 target=self._target,
@@ -725,14 +755,14 @@ class RoundContextBuilder:
             or regime_spec.representative_anchor_dims
             or regime_spec.representative_hir_dims
         )
-        resolved = resolve_regime_config(module_source, regime_spec, dims=anchor_dims)
+        resolved = resolve_cfg_fn(module_source, regime_spec, dims=anchor_dims)
         var_bindings = build_anchor_var_bindings(anchor_dims, kwargs=resolved.builder_kwargs)
         ordered_tensor_shapes = extract_ordered_tensor_shapes(
             case_entry=regime_spec.representative_case_entry,
             dims=anchor_dims,
             proto=self._operator_proto_cache,
         )
-        primary_res = run_stage_a_static(
+        primary_res = stage_a_fn(
             module_source,
             factory_name=resolved.builder_name,
             factory_kwargs=resolved.builder_kwargs,
@@ -754,7 +784,7 @@ class RoundContextBuilder:
                 require_renderer=False,
                 anchor_dims_override=anchor_dims_override,
             )
-            return evaluate_ascendc_candidate(
+            return eval_ascendc_fn(
                 instantiated_tu,
                 freedom_mask=mask,
                 target=self._target,
@@ -866,14 +896,15 @@ class RoundContextBuilder:
 
     def _is_regime_satisfied(
         self,
-        regime_spec: RegimeTargetSpec,
+        regime_spec: RegimeTargetSpec | str,
         best_result: CandidateSurrogateResult,
         active_anchors: Sequence[AnchorCaseSpec],
     ) -> bool:
         if self._perf_target is None:
             return False
+        tag = regime_spec if isinstance(regime_spec, str) else regime_spec.regime_tag
         anchor_nums = {
-            a.case_num for a in active_anchors if a.regime_tag == regime_spec.regime_tag
+            a.case_num for a in active_anchors if a.regime_tag == tag
         }
         matched = [a for a in best_result.anchors if a.case_num in anchor_nums]
         if not matched:
@@ -893,13 +924,14 @@ class RoundContextBuilder:
     def _regime_mean_recoverable_excess_us(
         self,
         best_result: CandidateSurrogateResult,
-        regime_spec: RegimeTargetSpec,
+        regime_spec: RegimeTargetSpec | str,
     ) -> float | None:
         """Compute mean recoverable silicon excess (us) above calibrated dispatch floor."""
+        tag = regime_spec if isinstance(regime_spec, str) else regime_spec.regime_tag
         matched = [
             a
             for a in best_result.anchors
-            if a.regime_tag == regime_spec.regime_tag and a.cand_us > 0.0
+            if a.regime_tag == tag and a.cand_us > 0.0
         ]
         if not matched:
             return None
@@ -1311,13 +1343,16 @@ class RoundContextBuilder:
         regime_tag: str = "",
     ) -> dict[str, object]:
         """Look up case dimensions from CANNBench or fall back to representative dims."""
+        if self._lookup_case_dims_fn is not None:
+            return dict(self._lookup_case_dims_fn(case_num, regime_tag))
         cnum = int(case_num)
         if cnum in self._case_dims_cache:
             return dict(self._case_dims_cache[cnum])
         dims: dict[str, object] = {}
+        lookup_fn = self._hook_lookup_case_dims or lookup_case_dims
         try:
             dims = dict(
-                lookup_case_dims(
+                lookup_fn(
                     self._config.operator_name,
                     cnum,
                     cannbench_repo=self._cannbench_repo,
@@ -1522,7 +1557,9 @@ class RoundContextBuilder:
         track_section = f"{constraint_text}\n\n"
         msprof_section = self._format_msprof_section(parent_residual, p2_diag=p2_diag)
         op_name = str(
-            getattr(self._config, "operator_name", "") or getattr(self._config, "operator", "") or ""
+            getattr(self._config, "operator_name", "")
+            or getattr(self._config, "operator", "")
+            or ""
         )
         domain_env = get_input_domain_envelope(op_name)
         domain_section = (
@@ -1679,7 +1716,9 @@ class RoundContextBuilder:
         )
         msprof_section = self._format_msprof_section(parent_residual, p2_diag=p2_diag)
         op_name = str(
-            getattr(self._config, "operator_name", "") or getattr(self._config, "operator", "") or ""
+            getattr(self._config, "operator_name", "")
+            or getattr(self._config, "operator", "")
+            or ""
         )
         domain_env = get_input_domain_envelope(op_name)
         domain_section = (
@@ -1739,6 +1778,8 @@ class RoundContextBuilder:
         self,
         regime_spec: RegimeTargetSpec,
     ) -> ConstraintRelaxationMask:
+        if self._resolve_trackb_freedom_mask_fn is not None:
+            return self._resolve_trackb_freedom_mask_fn(regime_spec)
         existing = self._freedom_masks.get(regime_spec.regime_tag)
         if existing is not None:
             return existing
@@ -2027,18 +2068,22 @@ class RoundContextBuilder:
 
         has_same_case_roof = bn_anchor is not None and bn_anchor.t_hw_us > 0.0 and case_dur_us > 0.0
         if has_same_case_roof and bn_anchor is not None:
-            eta_case = min(1.0, max(0.0, float(bn_anchor.t_hw_us) / case_dur_us))
+            eta_case = compute_case_aligned_eta(bn_anchor, case_dur_us)
         elif bn_anchor is not None:
             eta_case = float(bn_anchor.roofline_eta)
         else:
             eta_case = float(local_best.avg_roofline_eta)
 
-        residual_roofline = None if has_same_case_roof else blueprint_roofline
+        residual_roofline = blueprint_roofline
         if cached_parent_msprof:
             telemetry_payload: dict[str, object] = {
                 "dur_us": case_dur_us,
                 "roofline_eta": eta_case,
             }
+            if bn_anchor is not None:
+                telemetry_payload["anchor_case_idx"] = int(bn_anchor.case_num)
+                if bn_anchor.t_hw_us > 0.0:
+                    telemetry_payload["case_t_hw_us"] = float(bn_anchor.t_hw_us)
             if has_same_case_roof:
                 telemetry_payload["effective_compute_eta"] = eta_case
             for k, v in cached_parent_msprof.items():
@@ -2049,6 +2094,10 @@ class RoundContextBuilder:
                 telemetry_payload[str(k)] = v
             telemetry_payload["dur_us"] = case_dur_us
             telemetry_payload["roofline_eta"] = eta_case
+            if bn_anchor is not None:
+                telemetry_payload["anchor_case_idx"] = int(bn_anchor.case_num)
+                if bn_anchor.t_hw_us > 0.0:
+                    telemetry_payload["case_t_hw_us"] = float(bn_anchor.t_hw_us)
             parent_residual = self._compute_residual_with_roofline(
                 parent_ledger,
                 telemetry_payload,
@@ -2077,6 +2126,10 @@ class RoundContextBuilder:
                 "dur_us": case_dur_us,
                 "roofline_eta": eta_case,
             }
+            if bn_anchor is not None:
+                telemetry_payload["anchor_case_idx"] = int(bn_anchor.case_num)
+                if bn_anchor.t_hw_us > 0.0:
+                    telemetry_payload["case_t_hw_us"] = float(bn_anchor.t_hw_us)
             if has_same_case_roof:
                 telemetry_payload["effective_compute_eta"] = eta_case
             parent_residual = self._compute_residual_with_roofline(
@@ -2105,7 +2158,8 @@ class RoundContextBuilder:
                 if isinstance(extra_sig_map, dict):
                     extra_sig_map.pop("scalar_compute_loop_fallback", None)
 
-        ranked_families = tuple(rank_symptom_families(ctx))
+        rank_families_fn = self._hook_rank_symptom_families or rank_symptom_families
+        ranked_families = tuple(rank_families_fn(ctx))
         p2_escalated = should_escalate_diagnostic_or_creative(
             list(ranked_families),
             stagnation_rounds=stagnation_rounds,
@@ -2247,7 +2301,8 @@ class RoundContextBuilder:
                 compiler_summary=parent_comp_summary,
                 structural_features=sf_ctx,
             )
-            pipe_gap_report = scan_tilelang_pipe_gaps()
+            scan_fn = self._hook_scan_tilelang_pipe_gaps or scan_tilelang_pipe_gaps
+            pipe_gap_report = scan_fn()
             if (
                 escalation_decision is not None
                 and bool(getattr(escalation_decision, "should_escalate", False))
@@ -2335,8 +2390,9 @@ class RoundContextBuilder:
             prescreen_factory = func_name
             prescreen_pc: dict[str, object] = {}
             prescreen_cf: tuple[str, ...] = ()
+            resolve_cfg_fn = self._hook_resolve_regime_config or resolve_regime_config
             try:
-                resolved_cfg = resolve_regime_config(
+                resolved_cfg = resolve_cfg_fn(
                     parent_module_source,
                     selected_spec,
                     dims=anchor_dims,
@@ -2365,7 +2421,11 @@ class RoundContextBuilder:
                 dims=anchor_dims,
                 proto=self._operator_proto_cache,
             )
-            prescreen_summary = build_prescreen_summary_from_kwargs(
+            prescreen_fn = (
+                self._hook_build_prescreen_summary_from_kwargs
+                or build_prescreen_summary_from_kwargs
+            )
+            prescreen_summary = prescreen_fn(
                 prescreen_kwargs,
                 dsl_source=parent_module_source,
                 factory_name=prescreen_factory,

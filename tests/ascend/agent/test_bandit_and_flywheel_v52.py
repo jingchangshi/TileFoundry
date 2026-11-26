@@ -227,12 +227,12 @@ async def test_b_stage_a_uses_calibrated_pred_us(
         async def generate(self, req: GenerationRequest, *, effort_override: object = None) -> str:
             _ = effort_override
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "test tile",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": "def _build_op(tile_m=32):\n    return tile_m + 3\n",
-                    }
+                return (
+                    "# target_bottleneck: aiv_vec\n"
+                    "# structural_hypothesis: test tile\n"
+                    "```python\n"
+                    "def _build_op(tile_m=32):\n    return tile_m + 3\n"
+                    "```\n"
                 )
             if "R_SLOW" in req.user_prompt:
                 return "def _build_op(tile_m=8):\n    return tile_m + 1\n"

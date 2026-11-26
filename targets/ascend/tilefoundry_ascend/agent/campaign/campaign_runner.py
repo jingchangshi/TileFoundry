@@ -1,280 +1,166 @@
-"""Unattended performance-driven campaign runner with checkpointing and L3 rollback guard."""
+"""Unattended performance-driven campaign runner delegating to focused coordinators."""
 
 from __future__ import annotations
 
 import argparse
-import ast
 import asyncio
-import copy
+import ast
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 import hashlib
-import importlib.util
-import inspect
 import json
 import logging
 import math
 import os
-import re
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
-import textwrap
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import TypeVar
 
-import yaml
-
+from tilefoundry_ascend.agent.campaign import (
+    l3_l4_recovery as _l3_l4_recovery_mod,
+    stage_gate_coordinator as _stage_gate_coordinator_mod,
+    telemetry_ledger_writer as _telemetry_ledger_writer_mod,
+)
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
-    AnchorCaseSpec,
-    CannbenchOpSpec,
-    CannbenchOpsRegistry,
-    CasePhysicsRatios,
-    GuardrailCaseSpec,
-    PerfTargetSpec,
-    RegimeTargetSpec,
-    _has_flat_operator_layout,
-    build_anchor_var_bindings,
-    compute_case_eq3_score,
-    default_source_root,
-    extract_trackb_cpp_source,
-    get_default_anchors,
-    get_default_perf_target,
-    get_default_regime_specs,
-    get_input_domain_envelope,
-    get_operator_entrypoint,
-    get_operator_module_relpath,
-    get_operator_task,
-    lookup_case_dims,
-    lookup_case_metadata,
-    parse_simple_env_file,
-    resolve_cannbench_repo,
-    resolve_cannbench_tasks_root,
-    resolve_regime_for_case,
+    AnchorCaseSpec, CasePhysicsRatios, GuardrailCaseSpec, PerfTargetSpec, RegimeTargetSpec,
+    compute_case_eq3_score, default_source_root, extract_trackb_cpp_source, get_default_anchors,
+    get_default_perf_target, get_default_regime_specs, get_operator_module_relpath,
+    lookup_case_dims, lookup_case_metadata, parse_simple_env_file, resolve_cannbench_repo,
+    resolve_cannbench_tasks_root, resolve_regime_for_case,
+)
+from tilefoundry_ascend.agent.campaign.calibration_service import (
+    CalibrationService, CalibrationSnapshot,
+    _invoke_with_optional_kwargs as _cal_invoke_with_optional_kwargs,
 )
 from tilefoundry_ascend.agent.campaign.fault_types import (
-    FaultPlane,
-    L3Resolution,
-    TypedFault,
-    TypedFaultError,
-    coerce_fault_plane,
+    FaultPlane, L3Resolution, TypedFault, coerce_fault_plane,
 )
 from tilefoundry_ascend.agent.campaign.flywheel_coordinator import FlywheelCoordinator
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
-    ANOMALY_LOG_ERROR_THRESHOLD,
-    MAX_CLEAN_CALIBRATION_BURST_CV,
-    DeterministicSearchBoundaryLedger,
-    RoundFunnelEvent,
-    append_round_funnel_event,
+    DeterministicSearchBoundaryLedger, RoundFunnelEvent, append_round_funnel_event,
     compute_spearman_rho,
-    is_clean_calibration_sample,
+)
+from tilefoundry_ascend.agent.campaign.l3_l4_recovery import (
+    CAMPAIGN_DEVICE_IDS_ENV_KEY, L3L4RecoveryCoordinator, PendingL4,
+    atomic_write_text as _atomic_write_text, canonical_device_id as _canonical_device_id,
+    is_occupancy_blocked_env as _is_occupancy_blocked_env, parse_device_ids,
+    resolve_campaign_device_plan, resolve_l4_device_pool as _resolve_l4_device_pool,
+    write_source_and_verify,
 )
 from tilefoundry_ascend.agent.campaign.latency_algebra import (
-    AnchorConservationPoint,
-    calibrate_dispatch_floor_us,
-    geometric_speedup,
-    is_regime_saturated,
-    regime_bandit_ucb_us,
+    calibrate_dispatch_floor_us, compute_paired_sigma_us, geometric_speedup,
 )
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import (
-    PendingPromotion,
-    PromotionCoordinator,
-    classify_l3_resolution,
-    evaluate_promotion_gate,
-    to_conservation_point,
+    PendingPromotion, PromotionCoordinator, RankedL2Candidate, RankedL2Survivors,
+    select_top_two_l2_survivors, to_conservation_point,
 )
-from tilefoundry_ascend.agent.cost_advisor import (
-    CostModelAdvisor,
-    create_cost_advisor,
+from tilefoundry_ascend.agent.campaign.regime_slice_patcher import (
+    _HIR_DIM_ALIASES, ResolvedRegimeConfig, _active_trackb_kernel,
+    _apply_scoped_trackb_patch_to_module, _apply_spliced_trackb_units_to_module,
+    _case_ratio_predicate_entries, _collect_top_level_symbols, _compact_trackb_snippet_source,
+    _derive_dynamic_protected_symbols, _detect_trackb_dead_code_edit,
+    _extract_p2_focus_lines_and_diag, _extract_regime_abi_context, _extract_trackb_cpp_source,
+    _filter_callable_kwargs, _has_prim_func_builder, _is_real_tir_primfunc,
+    _looks_like_bare_trackb_cpp, _ordered_top_level_trackb_kernels, _parses_as_python,
+    _reject_trackb_context_markers, _render_trackb_tu_from_module,
+    _resolve_cann_root_from_env_file, _resolve_operator_entrypoint_safe,
+    _resolve_selector_compile_flags, _trackb_kernel_names, _trackb_python_residual,
+    apply_ast_patch, extract_regime_snippet, patch_regime_into_module,
+    resolve_regime_config, split_readonly_host_tail,
 )
-from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
-    extract_golden_entrypoint_contract,
-    format_golden_entrypoint_prompt_block,
+from tilefoundry_ascend.agent.campaign.round_context_builder import (
+    ChampionState, RoundContextBuilder, RoundSynthesisBundle, _format_anchor_telemetry,
+)
+from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import (
+    CandidateBatch, StageGateCoordinator, StageGateOutcome,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    FAILURE_KIND_CANDIDATE,
-    FAILURE_KIND_INFRASTRUCTURE,
-    AgentGatesDeviceFaultError,
-    AnchorEvalMetrics,
-    CandidateSurrogateResult,
-    L0L1CandidateCheck,
-    L2BatchResults,
-    L3AcceptanceResult,
-    L4CannbenchResult,
-    aggregate_surrogate_result,
-    bottleneck_anchor_for_regime,
-    collect_bottleneck_msprof_via_agent_gates,
-    collect_p2_deep_dive_via_agent_gates,
-    extract_ordered_tensor_shapes,
-    run_l0_l1_round_filter,
-    run_l1_compile_check,
-    run_l3_full_contract_via_agent_gates,
-    run_l4_official_cannbench_via_agent_gates,
-    run_micro_probe_via_agent_gates,
-    run_surrogate_batch_via_agent_gates,
+    FAILURE_KIND_CANDIDATE, FAILURE_KIND_INFRASTRUCTURE, AnchorEvalMetrics,
+    CandidateSurrogateResult, L0L1CandidateCheck, L2BatchResults, L3AcceptanceResult,
+    L4CannbenchResult, OccupancyExhaustedError, aggregate_surrogate_result,
+    bottleneck_anchor_for_regime, collect_bottleneck_msprof_via_agent_gates,
+    collect_p2_deep_dive_via_agent_gates, run_l0_l1_round_filter, run_l1_compile_check,
+    run_l3_full_contract_via_agent_gates, run_l4_official_cannbench_via_agent_gates,
+    run_micro_probe_via_agent_gates, run_surrogate_batch_via_agent_gates,
 )
+from tilefoundry_ascend.agent.campaign.telemetry_ledger_writer import (
+    TelemetryLedgerWriter, source_sha256,
+)
+from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor, create_cost_advisor
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
 from tilefoundry_ascend.agent.kb.bayesian_tracker import (
-    BayesianRuleTracker,
-    append_kb_event_shard,
-    append_rule_misapplication,
-    append_winning_edge,
+    BayesianRuleTracker, append_rule_misapplication, append_winning_edge,
     save_distilled_rule_file,
-    save_staging_candidate_rule,
 )
 from tilefoundry_ascend.agent.kb.schema import (
-    SYMPTOM_FAMILY_TO_FACETS,
-    AscendCausalRule,
-    SymptomFamily,
-    build_predicate_context,
-    load_seed_rules,
-    normalize_runtime_backend,
-    rank_symptom_families,
-    should_escalate_diagnostic_or_creative,
-)
-from tilefoundry_ascend.agent.orchestrator import (
-    cpp_slice_protocol as _cpp_slice_protocol_mod,
-)
-from tilefoundry_ascend.agent.orchestrator import (
-    tilesize_prescreen as _tilesize_prescreen_mod,
-)
-from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
-    _LAUNCH_CONFIG_RE,
-    _SEARCH_REPLACE_PATTERNS,
-    _scoped_editable_units,
-    _split_cpp_units,
-    apply_scoped_trackb_patch,
-    build_trackb_context_view,
-    escalate_primfunc_to_trackb_tu,
-    extract_cpp_diagnostic_lines,
-    extract_reachable_trackb_source,
-    parse_scoped_search_replace_blocks,
-    resolve_instantiated_trackb_kernel,
-    select_active_trackb_kernel,
-    splice_cpp_units_into_tu,
-    strip_cpp_comments_and_strings,
+    AscendCausalRule, build_predicate_context, rank_symptom_families,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
-    GateFunnel,
-    StageAResult,
-    StageBResult,
-    evaluate_ascendc_candidate,
-    resolve_trackb_compile_flags,
-    run_stage_a_static,
-    run_stage_b_ascendc_compile,
+    GateFunnel, StageAResult, StageBResult, evaluate_ascendc_candidate,
+    resolve_trackb_compile_flags, run_stage_a_static, run_stage_b_ascendc_compile,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
-    AgyCliLLMBackend,
-    GenerationRequest,
-    KernelLLMBackend,
-    OpenAICompatHTTPBackend,
-    SubprocessCliTemplateBackend,
-    create_llm_backend_from_env,
-    extract_creative_payload,
-    extract_python_dsl,
-    sanitize_effort,
+    GenerationRequest, KernelLLMBackend, create_llm_backend_from_env,
 )
-from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
-    build_progressive_llm_constraints,
-    format_g5_parent_monotonicity_lock,
-)
+from tilefoundry_ascend.agent.orchestrator.llm_constraints import scan_tilelang_pipe_gaps
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
-    CREATIVE_FOCUS_HINTS,
     build_prescreen_summary_from_kwargs,
-    summarize_excluded_mechanisms,
 )
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
-    BeamCandidate,
-    StaticDynamicResidual,
-    TwoLaneBeamSearch,
-    compiler_summary_from_residual,
-    compute_static_dynamic_residual,
-    extract_structural_signature,
+    BeamCandidate, StaticDynamicResidual, TwoLaneBeamSearch, compiler_summary_from_residual,
+    compute_static_dynamic_residual, extract_structural_signature,
 )
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     rank_stage_a_candidates_with_cost_model,
 )
-from tilefoundry_ascend.agent.router.capability_gate import evaluate_track_escalation
-from tilefoundry_ascend.agent.router.isa_gap_scanner import scan_tilelang_pipe_gaps
-from tilefoundry_ascend.ascend.cost_model import (
-    BishengResourceSummary,
-    CostFeatures,
-    build_cost_features_from_ledger,
-)
+from tilefoundry_ascend.ascend.cost_model import BishengResourceSummary
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
-    CandidateArtifactRecord,
-    CaseObservationRecord,
-    ExperienceLake,
-    append_counterexample_boundary,
-    compute_source_sha256,
-    project_case_workload,
-    resolve_default_experience_lake_dir,
+    ExperienceLake, resolve_default_experience_lake_dir,
 )
-from tilefoundry_ascend.ascend.cost_model.microarch_profile import merge_microarch_profiles
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
-    HirBlueprintPacket,
-    HirRooflineSummary,
+    HirBlueprintPacket, HirRooflineSummary,
 )
-from tilefoundry_ascend.ascend.passes.observation_space import (
-    ObservationVector5D,
-    compute_transfer_inflation_ratio,
-)
-from tilefoundry_ascend.ascend.passes.physical_ledger import (
-    ObjectivePhysicalLedger,
-)
+from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.schedule.regime_solver import (
-    RegimePiecewiseSolver,
-    RegimePlanResult,
-    recompute_regime_for_live_buffers,
+    RegimePiecewiseSolver, RegimePlanResult,
 )
-from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
-from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
-    PyTorchOpSemantics,
-    PyTorchSemanticAnalyzer,
-    RepresentativeCase,
-)
-from tilefoundry_ascend.ascend.sil.schema import (
-    ConstraintRelaxationMask,
-    RegimeSlice,
-    TopologyAxes,
-)
-from tilefoundry_ascend.ascend.sil.verifier import verify_source_against_facets
+from tilefoundry_ascend.ascend.sil.pytorch_frontend import PyTorchOpSemantics
+from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask, TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendTarget
-from tilefoundry_ascend.ascend.templates.registry import (
-    relax_facets_for_bottleneck,
-    unlock_cross_topology_paradigm_shift,
-)
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
-
-
-def _is_occupancy_blocked_env(failure_kind: str, blocked_env_category: str) -> bool:
-    """Return True only for a signed occupancy BLOCKED_ENV preemption.
-
-    A shared build lock or a machine-wide environment fault also ends as
-    BLOCKED_ENV; rotating every card on those would only repeat the same
-    failure. The receipt's ``errorCategory`` must say ``occupancy``.
-    """
-    return (
-        failure_kind == FAILURE_KIND_INFRASTRUCTURE
-        and blocked_env_category == "occupancy"
-    )
+_ORIG_HOOKS: dict[str, object] = {
+    "resolve_cannbench_repo": resolve_cannbench_repo,
+    "scan_tilelang_pipe_gaps": scan_tilelang_pipe_gaps,
+    "lookup_case_dims": lookup_case_dims,
+    "lookup_case_metadata": lookup_case_metadata,
+    "evaluate_ascendc_candidate": evaluate_ascendc_candidate,
+    "run_stage_a_static": run_stage_a_static,
+    "run_stage_b_ascendc_compile": run_stage_b_ascendc_compile,
+    "resolve_regime_config": resolve_regime_config,
+    "run_l0_l1_round_filter": run_l0_l1_round_filter,
+    "run_surrogate_batch_via_agent_gates": run_surrogate_batch_via_agent_gates,
+    "collect_bottleneck_msprof_via_agent_gates": collect_bottleneck_msprof_via_agent_gates,
+    "collect_p2_deep_dive_via_agent_gates": collect_p2_deep_dive_via_agent_gates,
+    "run_micro_probe_via_agent_gates": run_micro_probe_via_agent_gates,
+    "run_l3_full_contract_via_agent_gates": run_l3_full_contract_via_agent_gates,
+    "run_l4_official_cannbench_via_agent_gates": run_l4_official_cannbench_via_agent_gates,
+    "build_prescreen_summary_from_kwargs": build_prescreen_summary_from_kwargs,
+    "rank_symptom_families": rank_symptom_families,
+    "rank_stage_a_candidates_with_cost_model": rank_stage_a_candidates_with_cost_model,
+    "resolve_regime_for_case": resolve_regime_for_case,
+    "run_l1_compile_check": run_l1_compile_check,
+}
+_PROPAGATED_HOOKS: set[tuple[object, str]] = set()
 
 
 @dataclass(frozen=True)
 class CampaignConfig:
-    """Configuration controlling stopping policy, escalation, and gate thresholds.
-
-    ``device_id`` is the primary card and first whole-L4 candidate; ``device_ids``
-    adds authorized pool cards; an empty pool keeps the single-card bounded backoff.
-    A terminal occupancy BLOCKED_ENV moves the complete official run to the next
-    untried card before any backoff, while ``retry_device_id`` keeps its single
-    whole-run retry and joins that pool. The managed env file may declare it via
-    ``TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS``; ``round_regime_tags`` forces one
-    regime per 1-based round position.
-    """
+    """Configuration controlling stopping policy, escalation, and gate thresholds."""
 
     operator_name: str
     max_rounds: int = 12
@@ -302,101 +188,6 @@ class CampaignConfig:
     pure_golden: bool = False
     cost_model_mode: str = "off"
     enable_phase0_lattice_sweep: bool = False
-
-
-_DEVICE_ID_PATTERN = re.compile(r"[0-9]+")
-_L3_CASE_NUM_RE = re.compile(r"\bcase=(\d+)\b")
-CAMPAIGN_DEVICE_IDS_ENV_KEY = "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS"
-
-
-def parse_device_ids(raw: str) -> tuple[str, ...]:
-    """Parse one comma-separated ``--device-ids`` value into physical card IDs."""
-    if not raw.strip():
-        return ()
-    parts = [part.strip() for part in raw.split(",")]
-    if any(not part for part in parts):
-        raise ValueError(f"device list contains an empty entry: {raw!r}")
-    return tuple(parts)
-
-
-def _canonical_device_id(value: str, *, field: str) -> str:
-    """Canonicalize one physical NPU ID exactly as AgentGates records it."""
-    text = value.strip()
-    if not _DEVICE_ID_PATTERN.fullmatch(text):
-        raise ValueError(f"{field} must be a nonnegative decimal device ID, got {value!r}")
-    return str(int(text))
-
-
-def resolve_campaign_device_plan(
-    *,
-    device_id: str,
-    device_ids: tuple[str, ...],
-    env_device_ids: tuple[str, ...],
-    visible_device_ids: tuple[str, ...] = (),
-) -> tuple[str, tuple[str, ...]]:
-    """Resolve the primary card and ordered pool from CLI and managed env declarations.
-
-    Explicit ``--device-ids`` cards override the env-file pool; otherwise the
-    env-file pool is the declaration source. The primary is an explicit
-    ``--device-id``, else the first configured pool card, else the legacy ``"1"``.
-    ``visible_device_ids`` only narrows this plan; a missing card is never used and
-    an entirely invisible plan is a configuration error, not an implicit expansion.
-    """
-    configured = device_ids or env_device_ids
-    canonical_configured = tuple(
-        _canonical_device_id(value, field=f"configured_device_ids[{index}]")
-        for index, value in enumerate(configured)
-    )
-    explicit_primary = bool(device_id.strip())
-    primary = _canonical_device_id(device_id, field="device_id") if explicit_primary else ""
-    if not primary:
-        primary = canonical_configured[0] if canonical_configured else "1"
-    pool = [primary]
-    for canonical in canonical_configured:
-        if canonical not in pool:
-            pool.append(canonical)
-
-    if visible_device_ids:
-        visible = {
-            _canonical_device_id(value, field=f"visible_device_ids[{index}]")
-            for index, value in enumerate(visible_device_ids)
-        }
-        if explicit_primary and primary not in visible:
-            raise ValueError(
-                f"requested device {primary!r} is not visible to this process "
-                f"(visible: {', '.join(sorted(visible))})"
-            )
-        narrowed = [device for device in pool if device in visible]
-        if not narrowed:
-            raise ValueError(
-                "configured device pool has no card visible to this process "
-                f"(pool: {', '.join(pool)}; visible: {', '.join(sorted(visible))})"
-            )
-        primary = primary if primary in visible else narrowed[0]
-        pool = [primary, *(device for device in narrowed if device != primary)]
-    return primary, tuple(pool)
-
-
-def _resolve_l4_device_pool(config: CampaignConfig) -> tuple[str, ...]:
-    """Return the ordered physical-card pool for whole-L4 attempts.
-
-    The campaign's primary card is always first; configured extra cards follow
-    in declaration order and the legacy single-retry card is appended. The pool
-    only narrows what AgentGates authorizes: every attempt is still a managed
-    submission on that card, so the adapter keeps ownership of the lease and
-    the idle preflight.
-    """
-    pool = [_canonical_device_id(config.device_id, field="device_id")]
-    for index, value in enumerate(config.device_ids):
-        device_id = _canonical_device_id(value, field=f"device_ids[{index}]")
-        if device_id not in pool:
-            pool.append(device_id)
-    retry_device_id = config.retry_device_id.strip()
-    if retry_device_id:
-        retry_device = _canonical_device_id(retry_device_id, field="retry_device_id")
-        if retry_device not in pool:
-            pool.append(retry_device)
-    return tuple(pool)
 
 
 @dataclass(frozen=True)
@@ -432,7 +223,6 @@ class CampaignRoundRecord:
     prescreen_pruned_ids: tuple[str, ...] = ()
     l3_failed_cases: tuple[int, ...] = ()
     l3_failure_stage: str = ""
-    l3_cx_repair_passed: bool = False
     infeasible_boundaries_added: int = 0
     stage_timings_sec: dict[str, float] = field(default_factory=dict)
     prewarm_stats: dict[str, int] = field(default_factory=dict)
@@ -441,10 +231,8 @@ class CampaignRoundRecord:
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignRoundRecord into a JSON-compatible dictionary."""
         return {
-            "round_idx": self.round_idx,
-            "regime_tag": self.regime_tag,
-            "builder_name": self.builder_name,
-            "parent_lane": self.parent_lane,
+            "round_idx": self.round_idx, "regime_tag": self.regime_tag,
+            "builder_name": self.builder_name, "parent_lane": self.parent_lane,
             "creative_effort": self.creative_effort,
             "l0_l1_passed_ids": list(self.l0_l1_passed_ids),
             "l0_l1_failed": [list(item) for item in self.l0_l1_failed],
@@ -452,8 +240,7 @@ class CampaignRoundRecord:
             "best_so_far_speedup": round(self.best_so_far_speedup, 6),
             "best_round_surrogate_score": round(self.best_round_surrogate_score, 6),
             "best_so_far_surrogate_score": round(self.best_so_far_surrogate_score, 6),
-            "promoted": self.promoted,
-            "l3_resolution": self.l3_resolution,
+            "promoted": self.promoted, "l3_resolution": self.l3_resolution,
             "stagnation_rounds_after": self.stagnation_rounds_after,
             "admitted_rule_ids": list(self.admitted_rule_ids),
             "pruned_rule_ids": list(self.pruned_rule_ids),
@@ -468,13 +255,11 @@ class CampaignRoundRecord:
             "paradigm_shift_rule_ids": list(self.paradigm_shift_rule_ids),
             "round_spearman_rho": (
                 round(float(self.round_spearman_rho), 6)
-                if self.round_spearman_rho is not None
-                else None
+                if self.round_spearman_rho is not None else None
             ),
             "prescreen_pruned_ids": list(self.prescreen_pruned_ids),
             "l3_failed_cases": list(self.l3_failed_cases),
             "l3_failure_stage": self.l3_failure_stage,
-            "l3_cx_repair_passed": bool(self.l3_cx_repair_passed),
             "infeasible_boundaries_added": int(self.infeasible_boundaries_added),
             "stage_timings_sec": {
                 str(k): round(float(v), 6) for k, v in self.stage_timings_sec.items()
@@ -486,52 +271,34 @@ class CampaignRoundRecord:
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> CampaignRoundRecord:
         """Reconstruct CampaignRoundRecord from a JSON mapping."""
-        failed_raw = payload.get("l0_l1_failed", ())
         failed = tuple(
-            (str(item[0]), str(item[1]), str(item[2]))
-            for item in failed_raw
-            if isinstance(item, Sequence) and len(item) >= 3
+            (str(it[0]), str(it[1]), str(it[2]))
+            for it in payload.get("l0_l1_failed", ())
+            if isinstance(it, Sequence) and len(it) >= 3
         )
         raw_rho = payload.get("round_spearman_rho")
-        round_spearman_rho = (
-            float(raw_rho)
-            if raw_rho is not None and not isinstance(raw_rho, bool)
-            else None
+        rho = float(raw_rho) if raw_rho is not None and not isinstance(raw_rho, bool) else None
+        raw_t = payload.get("stage_timings_sec")
+        timings = (
+            {str(k): float(v) for k, v in raw_t.items()
+             if isinstance(v, (int, float)) and not isinstance(v, bool)}
+            if isinstance(raw_t, Mapping) else {}
         )
-        raw_timings = payload.get("stage_timings_sec")
-        stage_timings_sec = (
-            {
-                str(k): float(v)
-                for k, v in raw_timings.items()
-                if isinstance(v, (int, float)) and not isinstance(v, bool)
-            }
-            if isinstance(raw_timings, Mapping)
-            else {}
-        )
-        raw_prewarm = payload.get("prewarm_stats")
-        prewarm_stats = (
-            {
-                str(k): int(v)
-                for k, v in raw_prewarm.items()
-                if isinstance(v, (int, float)) and not isinstance(v, bool)
-            }
-            if isinstance(raw_prewarm, Mapping)
-            else {}
+        raw_pw = payload.get("prewarm_stats")
+        prewarm = (
+            {str(k): int(v) for k, v in raw_pw.items()
+             if isinstance(v, (int, float)) and not isinstance(v, bool)}
+            if isinstance(raw_pw, Mapping) else {}
         )
         return cls(
-            round_idx=int(payload["round_idx"]),
-            regime_tag=str(payload["regime_tag"]),
-            builder_name=str(payload["builder_name"]),
-            parent_lane=str(payload["parent_lane"]),
+            round_idx=int(payload["round_idx"]), regime_tag=str(payload["regime_tag"]),
+            builder_name=str(payload["builder_name"]), parent_lane=str(payload["parent_lane"]),
             creative_effort=str(payload["creative_effort"]),
             l0_l1_passed_ids=tuple(str(x) for x in payload.get("l0_l1_passed_ids", ())),
-            l0_l1_failed=failed,
-            best_round_speedup=float(payload["best_round_speedup"]),
+            l0_l1_failed=failed, best_round_speedup=float(payload["best_round_speedup"]),
             best_so_far_speedup=float(payload["best_so_far_speedup"]),
             promoted=bool(payload["promoted"]),
-            l3_resolution=str(
-                payload.get("l3_resolution", L3Resolution.NOT_RUN.value)
-            ),
+            l3_resolution=str(payload.get("l3_resolution", L3Resolution.NOT_RUN.value)),
             stagnation_rounds_after=int(payload["stagnation_rounds_after"]),
             admitted_rule_ids=tuple(str(x) for x in payload.get("admitted_rule_ids", ())),
             best_round_surrogate_score=float(payload.get("best_round_surrogate_score", 0.0)),
@@ -539,13 +306,10 @@ class CampaignRoundRecord:
             pruned_rule_ids=tuple(str(x) for x in payload.get("pruned_rule_ids", ())),
             promotion_attempts=tuple(
                 {str(k): str(v) for k, v in item.items()}
-                for item in payload.get("promotion_attempts", ())
-                if isinstance(item, Mapping)
+                for item in payload.get("promotion_attempts", ()) if isinstance(item, Mapping)
             ),
             trackb_evidence=tuple(
-                dict(item)
-                for item in payload.get("trackb_evidence", ())
-                if isinstance(item, Mapping)
+                dict(it) for it in payload.get("trackb_evidence", ()) if isinstance(it, Mapping)
             ),
             cost_model_mode=str(payload.get("cost_model_mode", "off") or "off"),
             cost_model_engaged=bool(payload.get("cost_model_engaged", False)),
@@ -556,145 +320,13 @@ class CampaignRoundRecord:
             paradigm_shift_rule_ids=tuple(
                 str(x) for x in payload.get("paradigm_shift_rule_ids", ())
             ),
-            round_spearman_rho=round_spearman_rho,
-            prescreen_pruned_ids=tuple(
-                str(x) for x in (payload.get("prescreen_pruned_ids") or ())
-            ),
-            l3_failed_cases=tuple(
-                int(x) for x in (payload.get("l3_failed_cases") or ())
-            ),
+            round_spearman_rho=rho,
+            prescreen_pruned_ids=tuple(str(x) for x in (payload.get("prescreen_pruned_ids") or ())),
+            l3_failed_cases=tuple(int(x) for x in (payload.get("l3_failed_cases") or ())),
             l3_failure_stage=str(payload.get("l3_failure_stage", "") or ""),
-            l3_cx_repair_passed=bool(payload.get("l3_cx_repair_passed", False)),
-            infeasible_boundaries_added=int(
-                payload.get("infeasible_boundaries_added", 0) or 0
-            ),
-            stage_timings_sec=stage_timings_sec,
-            prewarm_stats=prewarm_stats,
+            infeasible_boundaries_added=int(payload.get("infeasible_boundaries_added", 0) or 0),
+            stage_timings_sec=timings, prewarm_stats=prewarm,
             cost_advisor_predictions=int(payload.get("cost_advisor_predictions", 0) or 0),
-        )
-
-
-@dataclass(frozen=True)
-class PendingL4:
-    """An official L4 execution preserved across wait timeouts and process restarts.
-
-    L4 is never split across cards: a retry elsewhere is a complete run. The
-    original execution/run IDs, receipt, card, and candidate digest stay attached.
-    ``device_pool`` snapshots usable cards; attempted and rejected device ids keep
-    a blocked-env round and managed refusals from repeating, while quota and occupancy
-    category fields bound backoff and prevent build-lock rotation. ``None`` quota
-    means a legacy record; explicit ``0`` forbids another round.
-    """
-
-    target_path: str
-    candidate_relative: str
-    candidate_sha256: str
-    execution_id: str = ""
-    run_id: str = ""
-    receipt_path: str = ""
-    device_id: str = ""
-    state: str = ""
-    error_message: str = ""
-    failure_kind: str = FAILURE_KIND_INFRASTRUCTURE
-    execution_terminal: bool = True
-    retry_used: bool = False
-    device_pool: tuple[str, ...] = ()
-    blocked_env_round_attempted_device_ids: tuple[str, ...] = ()
-    blocked_env_rounds_used: int = 0
-    blocked_env_round_limit: int | None = None
-    blocked_env_category: str = ""
-    device_rejected: bool = False
-    rejected_device_ids: tuple[str, ...] = ()
-    attempts: tuple[dict[str, str], ...] = ()
-    prior_stop_reason: str = ""
-
-    def to_dict(self) -> dict[str, object]:
-        """Serialize the pending L4 record for the checkpoint and report."""
-        return {
-            "target_path": self.target_path,
-            "candidate_relative": self.candidate_relative,
-            "candidate_sha256": self.candidate_sha256,
-            "execution_id": self.execution_id,
-            "run_id": self.run_id,
-            "receipt_path": self.receipt_path,
-            "device_id": self.device_id,
-            "state": self.state,
-            "error_message": self.error_message,
-            "failure_kind": self.failure_kind,
-            "execution_terminal": self.execution_terminal,
-            "retry_used": self.retry_used,
-            "device_pool": list(self.device_pool),
-            "blocked_env_round_attempted_device_ids": list(
-                self.blocked_env_round_attempted_device_ids
-            ),
-            "blocked_env_rounds_used": self.blocked_env_rounds_used,
-            "blocked_env_round_limit": self.blocked_env_round_limit,
-            "blocked_env_category": self.blocked_env_category,
-            "device_rejected": self.device_rejected,
-            "rejected_device_ids": list(self.rejected_device_ids),
-            "attempts": [dict(item) for item in self.attempts],
-            "prior_stop_reason": self.prior_stop_reason,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> PendingL4:
-        """Reconstruct a pending L4 record from a checkpoint mapping.
-
-        Pre-pool checkpoints counted same-card retries, which are exactly
-        single-card blocked-env rounds.
-        """
-        attempts = tuple(
-            {str(k): str(v) for k, v in item.items()}
-            for item in payload.get("attempts", ())
-            if isinstance(item, Mapping)
-        )
-        return cls(
-            target_path=str(payload.get("target_path", "")),
-            candidate_relative=str(payload.get("candidate_relative", "")),
-            candidate_sha256=str(payload.get("candidate_sha256", "")),
-            execution_id=str(payload.get("execution_id", "")),
-            run_id=str(payload.get("run_id", "")),
-            receipt_path=str(payload.get("receipt_path", "")),
-            device_id=str(payload.get("device_id", "")),
-            state=str(payload.get("state", "")),
-            error_message=str(payload.get("error_message", "")),
-            failure_kind=str(payload.get("failure_kind", FAILURE_KIND_INFRASTRUCTURE)),
-            execution_terminal=bool(payload.get("execution_terminal", True)),
-            retry_used=bool(payload.get("retry_used", False)),
-            device_pool=tuple(str(item) for item in payload.get("device_pool", ())),
-            blocked_env_round_attempted_device_ids=tuple(
-                str(item)
-                for item in payload.get(
-                    "blocked_env_round_attempted_device_ids",
-                    (),
-                )
-            ),
-            blocked_env_rounds_used=max(
-                0,
-                int(
-                    payload.get(
-                        "blocked_env_rounds_used",
-                        payload.get("same_card_retries_used", 0),
-                    )
-                    or 0
-                ),
-            ),
-            blocked_env_round_limit=(
-                max(0, int(payload["blocked_env_round_limit"]))
-                if payload.get("blocked_env_round_limit") is not None
-                else (
-                    max(0, int(payload["same_card_retry_limit"]))
-                    if payload.get("same_card_retry_limit") is not None
-                    else None
-                )
-            ),
-            blocked_env_category=str(payload.get("blocked_env_category", "")),
-            device_rejected=bool(payload.get("device_rejected", False)),
-            rejected_device_ids=tuple(
-                str(item) for item in payload.get("rejected_device_ids", ())
-            ),
-            attempts=attempts,
-            prior_stop_reason=str(payload.get("prior_stop_reason", "")),
         )
 
 
@@ -730,9 +362,9 @@ class CampaignReport:
 
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignReport into a JSON-compatible dictionary."""
+        anchors = self.scoreboard_anchors or self.active_anchors
         return {
-            "operator_name": self.operator_name,
-            "stop_reason": self.stop_reason,
+            "operator_name": self.operator_name, "stop_reason": self.stop_reason,
             "total_rounds": self.total_rounds,
             "baseline_result": self.baseline_result.to_dict(),
             "best_result": self.best_result.to_dict(),
@@ -744,12 +376,9 @@ class CampaignReport:
             "active_anchors": [a.to_dict() for a in self.active_anchors],
             "scoreboard_anchor_count": (
                 int(self.scoreboard_anchor_count)
-                if self.scoreboard_anchor_count > 0
-                else len(self.scoreboard_anchors or self.active_anchors)
+                if self.scoreboard_anchor_count > 0 else len(anchors)
             ),
-            "scoreboard_anchors": [
-                a.to_dict() for a in (self.scoreboard_anchors or self.active_anchors)
-            ],
+            "scoreboard_anchors": [a.to_dict() for a in anchors],
             "admitted_rule_ids": list(self.admitted_rule_ids),
             "l4_result": self.l4_result.to_dict() if self.l4_result else None,
             "l4_status": self.l4_status,
@@ -757,8 +386,7 @@ class CampaignReport:
                 self.pending_promotion.to_dict() if self.pending_promotion else None
             ),
             "pending_l4": self.pending_l4.to_dict() if self.pending_l4 else None,
-            "promotion_blocked": self.promotion_blocked,
-            "pure_golden_mode": self.pure_golden_mode,
+            "promotion_blocked": self.promotion_blocked, "pure_golden_mode": self.pure_golden_mode,
             "blueprint_provenance": dict(self.blueprint_provenance),
             "stagnation_diagnosis": dict(self.stagnation_diagnosis),
             "real_npu_path": bool(self.real_npu_path),
@@ -767,1915 +395,38 @@ class CampaignReport:
         }
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            tmp_path = Path(fh.name)
-            fh.write(content)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-
-
-def _derive_dynamic_protected_symbols(
-    module_source: str,
-    regime_spec: RegimeTargetSpec,
-    *,
-    operator_entrypoint: str = "",
-    sibling_specs: Sequence[RegimeTargetSpec] = (),
-) -> set[str]:
-    """Derive protected entrypoint, cache, and sibling symbols from AST and specs."""
-    protected: set[str] = {"kernel"}
-    if operator_entrypoint:
-        protected.add(operator_entrypoint)
-    if module_source.strip():
-        try:
-            tree = ast.parse(module_source)
-        except SyntaxError:
-            tree = None
-        if tree is not None:
-            top_funcs: dict[str, ast.FunctionDef] = {}
-            for node in tree.body:
-                if isinstance(node, ast.FunctionDef):
-                    top_funcs[node.name] = node
-                    if node.name == "_ascend_target_ctx" or (
-                        node.name.startswith("_get_") and node.name.endswith("_kernel")
-                    ) or node.name == "_get_kernel":
-                        protected.add(node.name)
-                elif isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name) and target.id.endswith("_CACHE"):
-                            protected.add(target.id)
-                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                    if node.target.id.endswith("_CACHE"):
-                        protected.add(node.target.id)
-            for root_name in tuple(protected):
-                fn = top_funcs.get(root_name)
-                if fn is None:
-                    continue
-                for sub in ast.walk(fn):
-                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
-                        if sub.func.id in top_funcs:
-                            protected.add(sub.func.id)
-    own_editable = set(regime_spec.editable_symbols)
-    own_builders = set(regime_spec.builder_candidates)
-    for spec in sibling_specs:
-        if spec.regime_tag == regime_spec.regime_tag:
-            continue
-        for sym in spec.editable_symbols:
-            if sym not in own_editable:
-                protected.add(sym)
-        if spec.config_selector_fn and spec.config_selector_fn not in own_editable:
-            protected.add(spec.config_selector_fn)
-        for cand in spec.builder_candidates:
-            if cand not in own_editable and cand not in own_builders:
-                protected.add(cand)
-    protected.difference_update(own_editable)
-    return protected
-
-_HIR_DIM_ALIASES: dict[str, str] = {
-    "N": "n_depth",
-    "B": "b_dim",
-    "S": "s_dim",
-    "S_kv": "s_kv",
-    "D": "d_dim",
-    "N_q": "n_q",
-    "N_kv": "n_kv",
-    "D_nope": "d_nope",
-    "D_rope": "d_rope",
-    "inner": "inner_dim",
-}
-
-
-@dataclass(frozen=True)
-class ResolvedRegimeConfig:
-    """Resolved builder, tile hyperparameters, and pass/compile flags for a regime."""
-
-    builder_name: str
-    builder_kwargs: dict[str, object]
-    pass_configs: dict[str, object]
-    compile_flags: tuple[str, ...]
-    selector_name: str = ""
-    combine_kwargs: dict[str, object] = field(default_factory=dict)
-
-
-def _filter_callable_kwargs(fn: object, kwargs: Mapping[str, object]) -> dict[str, object]:
-    sig = inspect.signature(fn)
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-        return dict(kwargs)
-    return {k: v for k, v in kwargs.items() if k in sig.parameters}
-
-
-def _norm_flag_seq(raw: object) -> list[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        text = raw.strip()
-        return text.split() if text else []
-    if isinstance(raw, (tuple, list)) or (
-        hasattr(raw, "__iter__") and not isinstance(raw, (bytes, bytearray, Mapping))
-    ):
-        out: list[str] = []
-        for item in raw:
-            val = str(getattr(item, "value", item)).strip()
-            if val and val not in out:
-                out.append(val)
-        return out
-    text = str(raw).strip()
-    return [text] if text else []
-
-
-def _load_module_and_run_selector(
-    file_path: Path,
-    regime_spec: RegimeTargetSpec,
-    dims: Mapping[str, object] | None = None,
-) -> tuple[object, dict[str, object], dict[str, object], list[str], str, dict[str, object]]:
-    spec = importlib.util.spec_from_file_location("_tf_resolve_cfg", str(file_path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load module spec from {file_path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    context: dict[str, object] = dict(regime_spec.sample_builder_kwargs)
-    for h_key, h_val in regime_spec.representative_hir_dims.items():
-        mapped = _HIR_DIM_ALIASES.get(str(h_key), str(h_key))
-        if mapped not in context:
-            context[mapped] = h_val
-    if dims:
-        for d_key, d_val in dims.items():
-            mapped = _HIR_DIM_ALIASES.get(str(d_key), str(d_key))
-            context[mapped] = d_val
-    if "half_dim" not in context and isinstance(context.get("d_dim"), int):
-        context["half_dim"] = max(1, int(context["d_dim"]) // 2)
-
-    pass_configs: dict[str, object] = {}
-    compile_flags: list[str] = []
-    combine_kwargs: dict[str, object] = {}
-
-    def _absorb_pass_configs(raw_pc: object) -> None:
-        if isinstance(raw_pc, Mapping):
-            for k, v in raw_pc.items():
-                if str(k) == "tl.device_compile_flags":
-                    for fl in _norm_flag_seq(v):
-                        if fl not in compile_flags:
-                            compile_flags.append(fl)
-                else:
-                    pass_configs[str(k)] = v
-        elif raw_pc is not None:
-            for fl in _norm_flag_seq(raw_pc):
-                if fl not in compile_flags:
-                    compile_flags.append(fl)
-
-    _absorb_pass_configs(context.pop("pass_configs", None))
-    for fl in _norm_flag_seq(context.pop("compile_flags", None)):
-        if fl not in compile_flags:
-            compile_flags.append(fl)
-
-    selector_name = regime_spec.config_selector_fn
-    if not (selector_name and callable(getattr(mod, selector_name, None))):
-        for cand_sym in regime_spec.editable_symbols:
-            if cand_sym.startswith("_select_") and callable(getattr(mod, cand_sym, None)):
-                selector_name = cand_sym
-                break
-    if selector_name and callable(getattr(mod, selector_name, None)):
-        selector_fn = getattr(mod, selector_name)
-        sel_args = _filter_callable_kwargs(selector_fn, context)
-        sel_out = selector_fn(**sel_args)
-        if isinstance(sel_out, Mapping):
-            _absorb_pass_configs(sel_out.get("pass_configs"))
-            for fl in _norm_flag_seq(sel_out.get("compile_flags")):
-                if fl not in compile_flags:
-                    compile_flags.append(fl)
-            for k, v in sel_out.items():
-                if k not in (
-                    "pass_configs",
-                    "compile_flags",
-                    "builder_kwargs",
-                    "combine_kwargs",
-                ):
-                    context[str(k)] = v
-            raw_bk = sel_out.get("builder_kwargs")
-            if isinstance(raw_bk, Mapping):
-                for k, v in raw_bk.items():
-                    context[str(k)] = v
-            raw_ck = sel_out.get("combine_kwargs")
-            if isinstance(raw_ck, Mapping):
-                combine_kwargs = {str(k): v for k, v in raw_ck.items()}
-    return mod, context, pass_configs, compile_flags, selector_name, combine_kwargs
-
-
-def _resolve_selector_compile_flags(
-    module_source: str,
-    regime_spec: RegimeTargetSpec,
-    dims: Mapping[str, object] | None = None,
-) -> tuple[str, ...]:
-    """Invoke regime config selector if present and return its compile flags."""
-    try:
-        with tempfile.TemporaryDirectory(prefix="tf_resolve_flags_") as tmp_dir:
-            tmp_file = Path(tmp_dir) / "module_src.py"
-            tmp_file.write_text(module_source, encoding="utf-8")
-            _, _, _, compile_flags, _, _ = _load_module_and_run_selector(
-                tmp_file, regime_spec, dims=dims
-            )
-            return tuple(compile_flags)
-    except (
-        SyntaxError,
-        AttributeError,
-        ImportError,
-        KeyError,
-        NameError,
-        OSError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-    ):
-        return ()
-
-
-def resolve_regime_config(
-    module_source_or_path: str | Path,
-    regime_spec: RegimeTargetSpec,
-    dims: Mapping[str, object] | None = None,
-) -> ResolvedRegimeConfig:
-    """Invoke regime config_selector_fn dynamically to resolve builder kwargs and flags."""
-    if isinstance(module_source_or_path, Path):
-        mod_path = module_source_or_path.resolve()
-        src_text = mod_path.read_text(encoding="utf-8")
-        is_existing_file = True
-    else:
-        raw_str = str(module_source_or_path)
-        is_existing_file = "\n" not in raw_str and Path(raw_str).is_file()
-        if is_existing_file:
-            mod_path = Path(raw_str).resolve()
-            src_text = mod_path.read_text(encoding="utf-8")
-        else:
-            mod_path = None
-            src_text = raw_str
-
-    def _load_and_resolve(file_path: Path) -> ResolvedRegimeConfig:
-        mod, context, pass_configs, compile_flags, selector_name, combine_kwargs = (
-            _load_module_and_run_selector(file_path, regime_spec, dims=dims)
-        )
-        builder_name = ""
-        for cand in regime_spec.builder_candidates:
-            if callable(getattr(mod, cand, None)):
-                builder_name = cand
-                break
-        if not builder_name:
-            for cand in regime_spec.editable_symbols:
-                if cand != selector_name and callable(getattr(mod, cand, None)):
-                    builder_name = cand
-                    break
-        if not builder_name:
-            raise ValueError(
-                f"No builder callable matching {regime_spec.builder_candidates} in module."
-            )
-        builder_fn = getattr(mod, builder_name)
-        builder_kwargs = _filter_callable_kwargs(builder_fn, context)
-        return ResolvedRegimeConfig(
-            builder_name=builder_name,
-            builder_kwargs=builder_kwargs,
-            pass_configs=pass_configs,
-            compile_flags=tuple(compile_flags),
-            selector_name=selector_name,
-            combine_kwargs=combine_kwargs,
-        )
-
-    if mod_path is not None and is_existing_file:
-        return _load_and_resolve(mod_path)
-    with tempfile.TemporaryDirectory(prefix="tf_resolve_cfg_") as tmp_dir:
-        tmp_file = Path(tmp_dir) / "module_src.py"
-        tmp_file.write_text(src_text, encoding="utf-8")
-        return _load_and_resolve(tmp_file)
-
-
-@dataclass(frozen=True)
-class _TopLevelSymbol:
-    name: str
-    kind: str
-    start: int
-    end: int
-
-
-def _stmt_line_span(node: ast.stmt) -> tuple[int, int]:
-    decs = getattr(node, "decorator_list", ())
-    start = min((dec.lineno for dec in decs), default=node.lineno)
-    end = node.end_lineno or node.lineno
-    return start, end
-
-
-def _collect_top_level_symbols(tree: ast.Module) -> list[_TopLevelSymbol]:
-    items: list[_TopLevelSymbol] = []
-    for node in tree.body:
-        start, end = _stmt_line_span(node)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            items.append(_TopLevelSymbol(node.name, "func", start, end))
-        elif isinstance(node, ast.Assign):
-            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                items.append(_TopLevelSymbol(node.targets[0].id, "assign", start, end))
-        elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name):
-                items.append(_TopLevelSymbol(node.target.id, "assign", start, end))
-    return items
-
-
-def _extract_trackb_cpp_source(
-    module_source: str,
-    regime_spec: RegimeTargetSpec,
-) -> tuple[str, str] | None:
-    """Return `(symbol_name, cpp_source)` for the first Track-B C++20 string constant."""
-    return extract_trackb_cpp_source(module_source, regime_spec.trackb_symbols)
-
-
-def _top_level_symbol_sources(module_source: str) -> dict[str, str]:
-    tree = ast.parse(module_source)
-    lines = module_source.splitlines(keepends=True)
-    return {
-        sym.name: "".join(lines[sym.start - 1 : sym.end]).strip()
-        for sym in _collect_top_level_symbols(tree)
-    }
-
-
-def _reject_trackb_context_markers(candidate_text: str, regime_tag: str) -> None:
-    """Reject a Track-B reply that echoes read-only sibling declaration markers."""
-    markers = ("READONLY_SIBLING_DECLARATION", "READ-ONLY SIBLING KERNEL", "READ-ONLY HELPER")
-    found = [marker for marker in markers if marker in candidate_text]
-    if found:
-        raise ValueError(
-            f"Track-B candidate for regime {regime_tag!r} echoes read-only markers {found}; "
-            "reply with a full symbol unit or SEARCH/REPLACE hunk instead"
-        )
-
-
-def _strip_trackb_patch_hunks(patch_text: str) -> str:
-    """Return *patch_text* with its SEARCH/REPLACE blocks removed."""
-    residual = patch_text
-    for pattern in _SEARCH_REPLACE_PATTERNS:
-        residual = pattern.sub("", residual)
-    return residual.strip()
-
-
-def _looks_like_bare_trackb_cpp(candidate_text: str) -> bool:
-    """Return True when a Track-B reply carries bare C++ units rather than Python."""
-    if _parses_as_python(candidate_text):
-        return False
-    if re.search(r"(?m)^\s*(?:async\s+)?def\s+", candidate_text):
-        return False
-    if "<<<<<<< SEARCH" in candidate_text or (
-        "=======" in candidate_text and ">>>>>>> REPLACE" in candidate_text
-    ):
-        return False
-    _, units = _split_cpp_units(candidate_text)
-    if any(unit.kind in ("kernel", "helper") and unit.name for unit in units):
-        return True
-    return bool(
-        re.search(r"(?m)^\s*#include\b", candidate_text)
-        or re.search(r"(?m)^\s*(?:static\s+inline|constexpr)\b", candidate_text)
-    )
-
-
-def _parses_as_python(candidate_text: str) -> bool:
-    """Return True when *candidate_text* is a syntactically valid Python snippet."""
-    try:
-        ast.parse(candidate_text)
-    except SyntaxError:
-        return False
-    return True
-
-
-def _render_trackb_tu_from_module(
-    module_source: str,
-    cpp_source: str,
-    regime_spec: RegimeTargetSpec,
-    *,
-    require_renderer: bool,
-    anchor_dims_override: Mapping[str, object] | None = None,
-) -> str:
-    """Render a module's Track-B launcher with the shared dimension merge.
-
-    The same sample, HIR, anchor, selector, and alias dimensions feed the
-    runner and the Stage-0 gate, so both compile the bytes a regime really
-    launches. A module without a renderer keeps its raw translation unit
-    unless *require_renderer* marks the cold-start ABI as mandatory.
-    """
-    tree = ast.parse(module_source)
-    if _find_top_level_func(tree, ("_render_trackb_tu",)) is None:
-        if require_renderer:
-            raise ValueError(
-                "Track-B seed must declare def _render_trackb_tu(**dims: object) -> str"
-            )
-        return cpp_source
-    dims: dict[str, object] = {
-        **regime_spec.sample_builder_kwargs,
-        **regime_spec.representative_hir_dims,
-        **regime_spec.representative_anchor_dims,
-    }
-    if anchor_dims_override:
-        dims.update(anchor_dims_override)
-    try:
-        resolved = resolve_regime_config(module_source, regime_spec, dims=dims)
-        alias_sources = {
-            target: source for source, target in _HIR_DIM_ALIASES.items()
-        }
-        for key, value in resolved.builder_kwargs.items():
-            source = alias_sources.get(key)
-            if source is not None and source in dims and dims[source] != value:
-                continue
-            dims.setdefault(key, value)
-    except (AttributeError, KeyError, TypeError, ValueError):
-        pass
-    dims["trackb_src"] = cpp_source
-    with tempfile.TemporaryDirectory(prefix="tf_trackb_inst_") as tmp_dir:
-        module_file = Path(tmp_dir) / "candidate_mod.py"
-        module_file.write_text(module_source, encoding="utf-8")
-        spec = importlib.util.spec_from_file_location("_tf_trackb_render", str(module_file))
-        if spec is None or spec.loader is None:
-            if require_renderer:
-                raise RuntimeError("cannot import the seed module to render its Track-B TU")
-            return cpp_source
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        render = getattr(module, "_render_trackb_tu", None)
-        if not callable(render):
-            if require_renderer:
-                raise ValueError(
-                    "Track-B seed must declare def _render_trackb_tu(**dims: object) -> str"
-                )
-            return cpp_source
-        rendered = render(**dims)
-    if not isinstance(rendered, str) or not rendered.strip():
-        if require_renderer:
-            raise ValueError("_render_trackb_tu returned an empty C++ translation unit")
-        return cpp_source
-    return rendered
-
-
-def _active_trackb_kernel(
-    instantiated_tu: str,
-    raw_cpp_source: str,
-    *,
-    regime_tag: str,
-    module_source: str | None = None,
-) -> str:
-    """Resolve the launched kernel from instantiation truth, never from name heuristics."""
-    resolved = resolve_instantiated_trackb_kernel(instantiated_tu, raw_cpp_source)
-    if resolved is not None:
-        return resolved
-    kernels = sorted(_trackb_kernel_names(raw_cpp_source))
-    if len(kernels) == 1:
-        return kernels[0]
-    if not kernels:
-        raise ValueError(
-            f"Track-B instantiation for regime {regime_tag!r} contains no __global__ kernel"
-        )
-    launched, primary = _launched_trackb_kernels(
-        instantiated_tu,
-        raw_cpp_source,
-        set(kernels),
-    )
-    if len(primary) == 1:
-        return next(iter(primary))
-    if module_source:
-        mod_selected = select_active_trackb_kernel(
-            raw_cpp_source,
-            regime_tag=regime_tag,
-            module_source=module_source,
-        )
-        if mod_selected is not None:
-            return mod_selected
-    if not launched:
-        raise ValueError(
-            f"Track-B instantiation for regime {regime_tag!r} contains multiple kernels "
-            f"{kernels} and no launcher stub; the instantiated translation unit must launch "
-            "exactly one primary kernel"
-        )
-    raise ValueError(
-        f"Track-B instantiation for regime {regime_tag!r} launches kernels {sorted(launched)} "
-        f"with no unique top-level launch target among {sorted(primary)}; the launcher stub must "
-        "launch exactly one primary kernel outside conditional branches"
-    )
-
-
-def _launched_trackb_kernels(
-    instantiated_tu: str,
-    raw_cpp_source: str,
-    kernels: set[str],
-) -> tuple[set[str], set[str]]:
-    """Return all launched kernels and those launched at the launcher's top level."""
-    masked = strip_cpp_comments_and_strings(instantiated_tu)
-    launch_region = (
-        masked[len(raw_cpp_source) :]
-        if instantiated_tu.startswith(raw_cpp_source)
-        else masked
-    )
-    launches: list[tuple[int, str]] = []
-    depth = 0
-    scanned = 0
-    for match in _LAUNCH_CONFIG_RE.finditer(launch_region):
-        depth += launch_region.count("{", scanned, match.start()) - launch_region.count(
-            "}", scanned, match.start()
-        )
-        scanned = match.start()
-        name = match.group(1)
-        if name in kernels:
-            launches.append((depth, name))
-    if not launches:
-        return set(), set()
-    shallowest = min(depth for depth, _name in launches)
-    return (
-        {name for _depth, name in launches},
-        {name for depth, name in launches if depth == shallowest},
-    )
-
-
-def _ordered_top_level_trackb_kernels(
-    instantiated_tu: str,
-    raw_cpp_source: str,
-    kernels: set[str],
-) -> tuple[str, ...]:
-    """Return distinct top-level launched ``__global__`` kernels in launch order."""
-    masked = strip_cpp_comments_and_strings(instantiated_tu)
-    regions = (
-        [masked[len(raw_cpp_source) :], masked]
-        if instantiated_tu.startswith(raw_cpp_source) and len(instantiated_tu) > len(raw_cpp_source)
-        else [masked]
-    )
-    for launch_region in regions:
-        launches: list[tuple[int, str]] = []
-        depth = 0
-        scanned = 0
-        for match in _LAUNCH_CONFIG_RE.finditer(launch_region):
-            depth += launch_region.count("{", scanned, match.start()) - launch_region.count(
-                "}", scanned, match.start()
-            )
-            scanned = match.start()
-            name = match.group(1)
-            if name in kernels:
-                launches.append((depth, name))
-        if launches:
-            shallowest = min(depth for depth, _name in launches)
-            ordered: list[str] = []
-            for depth, name in launches:
-                if depth == shallowest and name not in ordered:
-                    ordered.append(name)
-            return tuple(ordered)
-    return ()
-
-
-def _trackb_kernel_names(cpp_source: str) -> set[str]:
-    _, units = _split_cpp_units(cpp_source)
-    return {unit.name for unit in units if unit.kind == "kernel" and unit.name}
-
-
-def _trackb_units_by_name(cpp_source: str) -> dict[str, str]:
-    """Return named top-level Track-B unit text keyed by symbol name."""
-    _, units = _split_cpp_units(cpp_source)
-    return {unit.name: unit.text for unit in units if unit.name}
-
-
-def _normalized_trackb_unit(text: str) -> str:
-    """Collapse whitespace so pure reformatting is not treated as a unit edit."""
-    return " ".join(text.split())
-
-
-def _assert_trackb_replacement_scoped(
-    orig_cpp: str,
-    new_cpp: str,
-    regime_spec: RegimeTargetSpec,
-    *,
-    module_source: str,
-    active_kernel: str | None,
-    allowed_added_units: Collection[str] = (),
-) -> None:
-    """Reject a full-TU replacement that edits frozen siblings or shared helpers."""
-    orig_units = _trackb_units_by_name(orig_cpp)
-    new_units = _trackb_units_by_name(new_cpp)
-    if active_kernel is None:
-        active_kernel = select_active_trackb_kernel(
-            orig_cpp,
-            regime_tag=regime_spec.regime_tag,
-            module_source=module_source,
-        )
-    if active_kernel is None:
-        raise ValueError(
-            f"Track-B full replacement for regime {regime_spec.regime_tag!r} has no resolvable "
-            "active kernel; reply with SEARCH/REPLACE hunks or one bare C++ unit"
-        )
-    editable = {
-        unit.name
-        for unit in _scoped_editable_units(
-            orig_cpp,
-            active_kernel,
-            allow_exclusive_helpers=True,
-        )
-    }
-    dropped = sorted(set(orig_units) - set(new_units))
-    if dropped:
-        raise ValueError(
-            f"Track-B replacement for regime {regime_spec.regime_tag!r} drops units {dropped}; "
-            "reply with SEARCH/REPLACE hunks or one bare C++ unit per changed function"
-        )
-    allowed_added = set(allowed_added_units)
-    added = sorted(set(new_units) - set(orig_units) - allowed_added)
-    if added:
-        raise ValueError(
-            f"Track-B replacement for regime {regime_spec.regime_tag!r} adds units {added}; "
-            "reply with SEARCH/REPLACE hunks or one bare C++ unit per changed function"
-        )
-    changed = sorted(
-        name
-        for name in orig_units
-        if _normalized_trackb_unit(orig_units[name])
-        != _normalized_trackb_unit(new_units[name])
-    )
-    frozen = sorted(name for name in changed if name not in editable)
-    if frozen:
-        raise ValueError(
-            f"Track-B replacement for regime {regime_spec.regime_tag!r} edits frozen sibling "
-            f"kernels or shared helpers {frozen}; only active kernel {active_kernel!r} and its "
-            "exclusive helpers may change"
-        )
-
-
-def _case_ratio_predicate_entries(ratios: CasePhysicsRatios | None) -> dict[str, object]:
-    """Return collision-free dimensionless predicate keys for the representative case."""
-    if ratios is None:
-        return {}
-    return {
-        f"case_{key.removeprefix('case_')}": value for key, value in ratios.to_dict().items()
-    }
-
-
-def _detect_trackb_dead_code_edit(
-    parent_source: str,
-    candidate_source: str,
-    regime_spec: RegimeTargetSpec,
-) -> str | None:
-    """Reject candidates that edit only inactive TileLang fallbacks in a Track-B regime."""
-    if (
-        regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb")
-        or not regime_spec.trackb_symbols
-    ):
-        return None
-    parent_syms = _top_level_symbol_sources(parent_source)
-    cand_syms = _top_level_symbol_sources(candidate_source)
-    if not parent_syms or not cand_syms:
-        return None
-    changed = {
-        name
-        for name in (set(parent_syms) | set(cand_syms))
-        if parent_syms.get(name, "") != cand_syms.get(name, "")
-    }
-    if not changed:
-        return None
-    active_syms = set(regime_spec.trackb_symbols)
-    if regime_spec.config_selector_fn:
-        active_syms.add(regime_spec.config_selector_fn)
-    if not (changed & active_syms):
-        return (
-            f"DEAD_CODE_TRACKB_EDIT: regime {regime_spec.regime_tag!r} executes "
-            f"runtime_backend={regime_spec.runtime_backend} via {list(regime_spec.trackb_symbols)}; "
-            f"candidate modified only inactive fallback symbols {sorted(changed)}."
-        )
-    return None
-
-
-def _resolve_cann_root_from_env_file(env_file: str | Path | None) -> Path | None:
-    if env_file is None:
-        return None
-    p = Path(env_file)
-    if not p.is_file():
-        return None
-    vals = parse_simple_env_file(p)
-    setup_raw = vals.get("TILEFOUNDRY_NPU_CANN_SETUP", "").strip()
-    if not setup_raw:
-        return None
-    parent = Path(setup_raw).expanduser().parent
-    return parent if parent.is_dir() else None
-
-
-def _find_top_level_func(tree: ast.Module, names: Sequence[str]) -> ast.FunctionDef | None:
-    by_name = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-    }
-    for name in names:
-        if name in by_name:
-            return by_name[name]
-    return None
-
-
-def _func_line_span(node: ast.FunctionDef) -> tuple[int, int]:
-    start = min((dec.lineno for dec in node.decorator_list), default=node.lineno)
-    end = node.end_lineno or node.lineno
-    return start, end
-
-
-def _resolve_operator_entrypoint_safe(operator_name: str) -> str:
-    try:
-        return get_operator_entrypoint(operator_name)
-    except (KeyError, FileNotFoundError):
-        return str(operator_name).rsplit("/", 1)[-1].strip()
-
-
-def _other_regime_forbidden_symbols(
-    regime_spec: RegimeTargetSpec,
-    *,
-    operator_entrypoint: str = "",
-    sibling_specs: Sequence[RegimeTargetSpec] = (),
-    module_source: str = "",
-) -> set[str]:
-    return _derive_dynamic_protected_symbols(
-        module_source,
-        regime_spec,
-        operator_entrypoint=operator_entrypoint,
-        sibling_specs=sibling_specs,
-    )
-
-
-def extract_regime_snippet(
-    module_source: str,
-    regime_spec: RegimeTargetSpec,
-    *,
-    operator_entrypoint: str = "",
-    sibling_specs: Sequence[RegimeTargetSpec] = (),
-) -> tuple[str, str]:
-    """Extract target regime multi-symbol slice (selector, builders, helpers) cleanly."""
-    tree = ast.parse(module_source)
-    lines = module_source.splitlines(keepends=True)
-    symbols = _collect_top_level_symbols(tree)
-    ast_by_name = _collect_top_level_ast_nodes(tree)
-    editable_set = set(regime_spec.editable_symbols)
-    prefix = regime_spec.allowed_helper_prefix
-
-    seed_symbols: list[_TopLevelSymbol] = []
-    if editable_set:
-        seed_symbols = [
-            sym
-            for sym in symbols
-            if sym.name in editable_set or (prefix and sym.name.startswith(prefix))
-        ]
-    if not seed_symbols:
-        node = _find_top_level_func(tree, regime_spec.builder_candidates)
-        if node is None:
-            raise ValueError(
-                f"No builder function matching {regime_spec.builder_candidates} found in module."
-            )
-        seed_symbols = [sym for sym in symbols if sym.name == node.name]
-
-    seed_names = [sym.name for sym in seed_symbols]
-    seed_name_set = set(seed_names)
-    ws_planner_names = {"_plan_workspace_bytes", f"_{regime_spec.regime_tag}_plan_workspace_bytes"}
-    for sym in symbols:
-        if sym.name in ws_planner_names and sym.name not in seed_name_set:
-            seed_symbols.append(sym)
-            seed_names.append(sym.name)
-            seed_name_set.add(sym.name)
-    closure_helpers: set[str] = set()
-    if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
-        excluded = _other_regime_forbidden_symbols(
-            regime_spec,
-            operator_entrypoint=operator_entrypoint,
-            sibling_specs=sibling_specs,
-            module_source=module_source,
-        )
-        if editable_set:
-            for cand in regime_spec.builder_candidates:
-                if cand not in editable_set:
-                    excluded.add(cand)
-        private_func_candidates = {
-            sym.name
-            for sym in symbols
-            if sym.kind == "func"
-            and sym.name.startswith("_")
-            and sym.name not in excluded
-            and sym.name not in seed_name_set
-        }
-        closure_seed_names = [
-            name for name in seed_names if name != regime_spec.config_selector_fn
-        ] or seed_names
-        closure_helpers = _collect_referenced_helper_names(
-            ast_by_name,
-            helper_names=private_func_candidates,
-            seed_roots=closure_seed_names,
-        )
-    selected = [
-        sym
-        for sym in symbols
-        if sym.name in seed_name_set or sym.name in closure_helpers
-    ]
-    func_names = {sym.name for sym in selected if sym.kind == "func"}
-    primary = ""
-    for cand in regime_spec.builder_candidates:
-        if cand in func_names:
-            primary = cand
-            break
-    if not primary:
-        primary = next(
-            (sym.name for sym in selected if sym.kind == "func"),
-            selected[0].name,
-        )
-    blocks = [
-        "".join(lines[sym.start - 1 : sym.end]).rstrip()
-        for sym in selected
-    ]
-    return primary, "\n\n".join(blocks).rstrip() + "\n"
-
-
-def _is_prim_func_decorator(dec: ast.expr) -> bool:
-    if isinstance(dec, ast.Name):
-        return dec.id == "prim_func"
-    if isinstance(dec, ast.Attribute):
-        return dec.attr == "prim_func"
-    if isinstance(dec, ast.Call):
-        return _is_prim_func_decorator(dec.func)
-    return False
-
-
-def _has_prim_func_builder(
-    module_source: str,
-    builder_candidates: Sequence[str],
-) -> bool:
-    if not builder_candidates:
-        return False
-    try:
-        tree = ast.parse(module_source)
-    except SyntaxError:
-        return False
-    candidate_set = set(builder_candidates)
-    for node in tree.body:
-        if not isinstance(node, ast.FunctionDef) or node.name not in candidate_set:
-            continue
-        for sub in ast.walk(node):
-            if not isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) or sub is node:
-                continue
-            if any(_is_prim_func_decorator(dec) for dec in sub.decorator_list):
-                return True
-    return False
-
-
-def _extract_func_signature_header(lines: Sequence[str], node: ast.FunctionDef) -> str:
-    if node.body and node.body[0].lineno > node.lineno:
-        end_idx = node.body[0].lineno - 1
-        raw = "".join(lines[node.lineno - 1 : end_idx]).rstrip()
-    else:
-        raw = "".join(lines[node.lineno - 1 : node.lineno]).split(":", 1)[0].rstrip() + ":"
-    return textwrap.dedent(raw).strip()
-
-
-def _extract_regime_abi_context(
-    module_source: str,
-    regime_spec: RegimeTargetSpec,
-    *,
-    golden_abi_block: str = "",
-) -> str:
-    """Extract slice, helper builder, and @T.prim_func ABI signatures for the target regime."""
-    tree = ast.parse(module_source)
-    lines = module_source.splitlines(keepends=True)
-    top_funcs = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-    }
-    editable_set = set(regime_spec.editable_symbols)
-    prefix = regime_spec.allowed_helper_prefix
-    seed_names = [
-        node.name
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and (
-            node.name in editable_set
-            or (prefix and node.name.startswith(prefix))
-            or node.name in regime_spec.builder_candidates
-        )
-    ]
-    if not seed_names:
-        return golden_abi_block
-
-    visited: set[str] = set()
-    ordered_slice_funcs: list[ast.FunctionDef] = []
-    ordered_helper_funcs: list[ast.FunctionDef] = []
-    prim_func_sigs: list[str] = []
-    seen_prim_sigs: set[str] = set()
-    queue = list(seed_names)
-    while queue:
-        fname = queue.pop(0)
-        if fname in visited:
-            continue
-        visited.add(fname)
-        fnode = top_funcs.get(fname)
-        if fnode is None:
-            continue
-        is_prefix_helper = bool(prefix and fname.startswith(prefix))
-        if fname in editable_set or fname in regime_spec.builder_candidates:
-            ordered_slice_funcs.append(fnode)
-        elif not is_prefix_helper:
-            ordered_helper_funcs.append(fnode)
-        for sub in ast.walk(fnode):
-            if isinstance(sub, ast.FunctionDef) and sub is not fnode:
-                if any(_is_prim_func_decorator(dec) for dec in sub.decorator_list):
-                    sig = "@T.prim_func\n" + _extract_func_signature_header(lines, sub)
-                    if sig not in seen_prim_sigs:
-                        seen_prim_sigs.add(sig)
-                        prim_func_sigs.append(sig)
-            elif isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
-                callee = sub.func.id
-                if callee in top_funcs and callee not in visited:
-                    queue.append(callee)
-
-    blocks: list[str] = []
-    for hnode in ordered_helper_funcs:
-        blocks.append(_extract_func_signature_header(lines, hnode))
-    for snode in ordered_slice_funcs:
-        blocks.append(_extract_func_signature_header(lines, snode))
-    blocks.extend(prim_func_sigs)
-    if not blocks:
-        return golden_abi_block
-    sigs_text = "\n\n".join(blocks)
-    primfunc_abi = (
-        "### IMMUTABLE HOST / PRIMFUNC ABI CONTRACT\n"
-        f"```python\n{sigs_text}\n```\n"
-        "Any custom @T.prim_func returned for this slice MUST keep the exact tensor/scalar "
-        "parameter order, ranks, and dtypes above expected by _get_kernel (do NOT substitute "
-        "the PyTorch golden entrypoint parameter list, and do NOT import tilelang.language as T or use "
-        "T.Scope). _select_*_config() may return optional 'builder_kwargs': {...} forwarded to "
-        "custom builders for compile-time constexpr specialization.\n\n"
-    )
-    return f"{golden_abi_block}{primfunc_abi}"
-
-
-def apply_ast_patch(
-    module_source: str,
-    target_func: str,
-    candidate_dsl: str,
-) -> str:
-    """Robust SEARCH/REPLACE patcher using Python AST anchors."""
-    orig_tree = ast.parse(module_source)
-    cand_tree = ast.parse(candidate_dsl)
-
-    cand_node = _find_top_level_func(cand_tree, (target_func,))
-    if cand_node is None:
-        raise ValueError(f"Candidate source must define function {target_func!r}.")
-
-    cand_lines = candidate_dsl.splitlines(keepends=True)
-    c_start, c_end = _func_line_span(cand_node)
-    replacement = "".join(cand_lines[c_start - 1 : c_end])
-    if not replacement.endswith("\n"):
-        replacement += "\n"
-
-    orig_node = _find_top_level_func(orig_tree, (target_func,))
-    if orig_node is None:
-        raise ValueError(f"Original module missing target function {target_func!r}.")
-
-    o_start, o_end = _func_line_span(orig_node)
-    orig_lines = module_source.splitlines(keepends=True)
-
-    patched = "".join([*orig_lines[: o_start - 1], replacement, *orig_lines[o_end:]])
-    ast.parse(patched)
-    return patched
-
-
-def _collect_top_level_ast_nodes(tree: ast.Module) -> dict[str, ast.stmt]:
-    nodes: dict[str, ast.stmt] = {}
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            nodes[node.name] = node
-        elif isinstance(node, ast.Assign):
-            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                nodes[node.targets[0].id] = node
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            nodes[node.target.id] = node
-    return nodes
-
-
-def _collect_referenced_helper_names(
-    merged_ast_by_name: Mapping[str, ast.stmt],
-    *,
-    helper_names: set[str],
-    seed_roots: Sequence[str],
-) -> set[str]:
-    live: set[str] = set()
-    queue = list(seed_roots)
-    visited: set[str] = set()
-    while queue:
-        sym = queue.pop(0)
-        if sym in visited:
-            continue
-        visited.add(sym)
-        node = merged_ast_by_name.get(sym)
-        if node is None:
-            continue
-        for sub in ast.walk(node):
-            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                ref = sub.id
-                if ref in helper_names and ref not in live:
-                    live.add(ref)
-                    if ref not in visited:
-                        queue.append(ref)
-    return live
-
-
-def _ast_char_offset(lines: Sequence[str], lineno: int, col_offset: int) -> int:
-    prefix = sum(len(lines[idx]) for idx in range(lineno - 1))
-    line_bytes = lines[lineno - 1].encode("utf-8")
-    return prefix + len(line_bytes[:col_offset].decode("utf-8"))
-
-
-def _format_raw_cpp_literal(cpp_text: str) -> str:
-    if '"""' not in cpp_text and not cpp_text.endswith('"'):
-        return f'r"""{cpp_text}"""'
-    return repr(cpp_text)
-
-
-def _find_top_level_str_assign_span(
-    tree: ast.Module,
-    lines: Sequence[str],
-    target_names: set[str],
-) -> list[tuple[str, str, int, int]]:
-    hits: list[tuple[str, str, int, int]] = []
-    for node in tree.body:
-        name: str | None = None
-        val: ast.AST | None = None
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-        ):
-            name, val = node.targets[0].id, node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            name, val = node.target.id, node.value
-        if (
-            name in target_names
-            and isinstance(val, ast.Constant)
-            and isinstance(val.value, str)
-            and val.end_lineno is not None
-            and val.end_col_offset is not None
-        ):
-            start_pos = _ast_char_offset(lines, val.lineno, val.col_offset)
-            end_pos = _ast_char_offset(lines, val.end_lineno, val.end_col_offset)
-            hits.append((name, val.value, start_pos, end_pos))
-    return hits
-
-
-def _replace_trackb_constant(module_source: str, sym_name: str, cpp_source: str) -> str:
-    """Rewrite one top-level Track-B C++ string constant in *module_source*."""
-    orig_tree = ast.parse(module_source)
-    lines = module_source.splitlines(keepends=True)
-    hits = _find_top_level_str_assign_span(orig_tree, lines, {sym_name})
-    if not hits:
-        raise ValueError(f"Track-B symbol {sym_name!r} assignment not found in module_source.")
-    _, _, start_pos, end_pos = hits[0]
-    patched = (
-        module_source[:start_pos]
-        + _format_raw_cpp_literal(cpp_source)
-        + module_source[end_pos:]
-    )
-    ast.parse(patched)
-    return patched
-
-
-def _patch_anchor_miss_error_type() -> type[ValueError]:
-    """Resolve PatchAnchorMissError from cpp_slice_protocol when available."""
-    exc_cls = getattr(_cpp_slice_protocol_mod, "PatchAnchorMissError", None)
-    if isinstance(exc_cls, type) and issubclass(exc_cls, ValueError):
-        return exc_cls
-    return ValueError
-
-
-def _format_patch_anchor_miss_diagnostic(
-    module_source: str,
-    regime_spec: RegimeTargetSpec,
-    reason: str,
-    *,
-    active_kernel: str | None = None,
-) -> str:
-    """Format an objective PATCH_ANCHOR_MISS diagnostic with active unit anchor lines."""
-    extracted = _extract_trackb_cpp_source(module_source, regime_spec)
-    if extracted is None:
-        return f"PATCH_ANCHOR_MISS: {reason}"
-    _sym_name, orig_cpp = extracted
-    resolved_kernel = active_kernel or select_active_trackb_kernel(
-        orig_cpp,
-        regime_tag=regime_spec.regime_tag,
-        module_source=module_source,
-    )
-    editable_units = _scoped_editable_units(
-        orig_cpp, resolved_kernel, allow_exclusive_helpers=True
-    )
-    target_unit = next(
-        (u for u in editable_units if u.name == resolved_kernel),
-        editable_units[0] if editable_units else None,
-    )
-    if target_unit is None:
-        return f"PATCH_ANCHOR_MISS: {reason} (active_kernel={resolved_kernel})"
-    unit_lines = [ln.rstrip() for ln in target_unit.text.splitlines() if ln.strip()]
-    first_lines = " | ".join(unit_lines[:3])
-    last_lines = " | ".join(unit_lines[-3:])
-    return (
-        f"PATCH_ANCHOR_MISS: {reason} "
-        f"(active_kernel={resolved_kernel}; first_lines={first_lines!r}; last_lines={last_lines!r})"
-    )
-
-
-def _is_anchor_miss_value_error(exc: ValueError) -> bool:
-    miss_cls = _patch_anchor_miss_error_type()
-    if miss_cls is not ValueError and isinstance(exc, miss_cls):
-        return True
-    msg = str(exc).lower()
-    return any(
-        tok in msg
-        for tok in (
-            "did not match",
-            "ambiguous search",
-            "outside active kernel",
-            "outside the editable scope",
-            "not found in c++ source",
-            "must contain at least one valid",
-            "identical",
-            "applied == 0",
-        )
-    )
-
-
-def _apply_scoped_trackb_patch_to_module(
-    module_source: str,
-    regime_spec: RegimeTargetSpec,
-    patch_text: str,
-    *,
-    active_kernel: str | None = None,
-) -> str:
-    extracted = _extract_trackb_cpp_source(module_source, regime_spec)
-    if extracted is None:
-        raise ValueError(
-            f"Original module missing Track-B C++ constant in {regime_spec.trackb_symbols}."
-        )
-    sym_name, orig_cpp = extracted
-    resolved_kernel = active_kernel or select_active_trackb_kernel(
-        orig_cpp,
-        regime_tag=regime_spec.regime_tag,
-        module_source=module_source,
-    )
-    miss_cls = _patch_anchor_miss_error_type()
-    try:
-        updated_cpp, applied = apply_scoped_trackb_patch(
-            orig_cpp,
-            patch_text,
-            active_kernel=resolved_kernel,
-        )
-    except ValueError as exc:
-        if "PATCH_ANCHOR_MISS:" in str(exc):
-            raise
-        if _is_anchor_miss_value_error(exc):
-            diag = _format_patch_anchor_miss_diagnostic(
-                module_source,
-                regime_spec,
-                str(exc),
-                active_kernel=resolved_kernel,
-            )
-            raise miss_cls(diag) from exc
-        raise
-    if applied == 0 or updated_cpp.strip() == orig_cpp.strip():
-        diag = _format_patch_anchor_miss_diagnostic(
-            module_source,
-            regime_spec,
-            "Track-B SEARCH/REPLACE produced identical C++ source",
-            active_kernel=resolved_kernel,
-        )
-        raise miss_cls(diag)
-    return _replace_trackb_constant(module_source, sym_name, updated_cpp)
-
-
-def _apply_spliced_trackb_units_to_module(
-    module_source: str,
-    regime_spec: RegimeTargetSpec,
-    candidate_cpp: str,
-    *,
-    active_kernel: str | None = None,
-) -> str:
-    """Replace same-name bare C++ units of the active kernel without touching siblings."""
-    extracted = _extract_trackb_cpp_source(module_source, regime_spec)
-    if extracted is None:
-        raise ValueError(
-            f"Original module missing Track-B C++ constant in {regime_spec.trackb_symbols}."
-        )
-    sym_name, orig_cpp = extracted
-    resolved_kernel = active_kernel or select_active_trackb_kernel(
-        orig_cpp,
-        regime_tag=regime_spec.regime_tag,
-        module_source=module_source,
-    )
-    miss_cls = _patch_anchor_miss_error_type()
-    try:
-        updated_cpp, applied = splice_cpp_units_into_tu(
-            orig_cpp,
-            candidate_cpp,
-            active_kernel=resolved_kernel,
-        )
-    except ValueError as exc:
-        if "PATCH_ANCHOR_MISS:" in str(exc):
-            raise
-        if _is_anchor_miss_value_error(exc):
-            diag = _format_patch_anchor_miss_diagnostic(
-                module_source,
-                regime_spec,
-                str(exc),
-                active_kernel=resolved_kernel,
-            )
-            raise miss_cls(diag) from exc
-        raise
-    if applied == 0 or updated_cpp.strip() == orig_cpp.strip():
-        diag = _format_patch_anchor_miss_diagnostic(
-            module_source,
-            regime_spec,
-            "Track-B C++ unit splice produced identical C++ source",
-            active_kernel=resolved_kernel,
-        )
-        raise miss_cls(diag)
-    return _replace_trackb_constant(module_source, sym_name, updated_cpp)
-
-
-def _trackb_python_residual(patch_text: str) -> str:
-    """Return the valid Python snippet outside SEARCH/REPLACE blocks, else empty string."""
-    residual = _strip_trackb_patch_hunks(patch_text)
-    if not residual:
-        return ""
-    try:
-        ast.parse(residual)
-    except SyntaxError:
-        return ""
-    return residual
-
-
-def _extract_p2_focus_lines_and_diag(
-    p2_diag: Mapping[str, object] | None,
-) -> tuple[tuple[int, ...], str]:
-    """Extract sorted source focus line numbers and raw diagnostic text from p2_diag."""
-    if not p2_diag:
-        return (), ""
-    focus: set[int] = set()
-    diag_parts: list[str] = []
-    for key in ("diagnostic_text", "error_message", "compiler_diagnostic"):
-        raw_val = p2_diag.get(key)
-        if isinstance(raw_val, str) and raw_val.strip():
-            diag_parts.append(raw_val.strip())
-            focus.update(extract_cpp_diagnostic_lines(raw_val))
-    raw_hotspots = p2_diag.get("p2_hotspots") or p2_diag.get("source_line_hotspots") or ()
-    if isinstance(raw_hotspots, Sequence) and not isinstance(raw_hotspots, (str, bytes)):
-        for spot in list(raw_hotspots):
-            if isinstance(spot, Mapping):
-                loc = spot.get("source_location") or ""
-            elif hasattr(spot, "source_location"):
-                loc = getattr(spot, "source_location", "") or ""
-            else:
-                loc = spot
-            loc_str = str(loc).strip()
-            if not loc_str:
-                continue
-            for m in re.finditer(r":(\d+)(?::\d+)?\b", loc_str):
-                ln = int(m.group(1))
-                if ln > 0:
-                    focus.add(ln)
-    raw_lines = p2_diag.get("focus_lines")
-    if isinstance(raw_lines, Sequence) and not isinstance(raw_lines, (str, bytes)):
-        for item in raw_lines:
-            if isinstance(item, int) and not isinstance(item, bool) and item > 0:
-                focus.add(item)
-    return tuple(sorted(focus)), "\n".join(diag_parts)
-
-
-def _compact_trackb_snippet_source(
-    snippet_source: str,
-    regime_spec: RegimeTargetSpec,
-    *,
-    incumbent_source: str = "",
-    max_bytes: int = 14800,
-    cpp_max_bytes: int = 49152,
-    active_kernel: str | None = None,
-    focus_lines: Sequence[int] = (),
-    diagnostic_text: str = "",
-) -> str:
-    _ = max_bytes
-    if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
-        return snippet_source
-    if not regime_spec.trackb_symbols:
-        return snippet_source
-    try:
-        tree = ast.parse(snippet_source)
-    except SyntaxError:
-        return snippet_source
-    lines = snippet_source.splitlines(keepends=True)
-    hits = _find_top_level_str_assign_span(tree, lines, set(regime_spec.trackb_symbols))
-    cpp_budget = max(4096, int(cpp_max_bytes) // max(1, len(hits)))
-    replacements: list[tuple[int, int, str]] = []
-    for sym_name, cpp_text, start_pos, end_pos in hits:
-        if len(cpp_text.encode("utf-8")) <= cpp_budget:
-            continue
-        view = build_trackb_context_view(
-            cpp_text,
-            regime_tag=regime_spec.regime_tag,
-            module_source=incumbent_source or snippet_source,
-            trackb_symbol=sym_name,
-            max_bytes=cpp_budget,
-            active_kernel=active_kernel,
-            focus_lines=focus_lines,
-            diagnostic_text=diagnostic_text,
-        )
-        wrapped = view if view.startswith("\n") else f"\n{view}\n"
-        replacements.append((start_pos, end_pos, _format_raw_cpp_literal(wrapped)))
-    if not replacements:
-        return snippet_source
-    updated = snippet_source
-    for start_pos, end_pos, literal in reversed(replacements):
-        updated = updated[:start_pos] + literal + updated[end_pos:]
-    return updated
-
-
-def _is_real_tir_primfunc(obj: object) -> bool:
-    if obj is None or isinstance(obj, (tuple, list, dict, str, bytes, int, float, bool)):
-        return False
-    try:
-        import tilelang  # noqa: F401, PLC0415
-        import tvm  # noqa: PLC0415
-
-        tirx_mod = getattr(tvm, "tirx", None)
-        tir_mod = getattr(tvm, "tir", None)
-        prim_cls = getattr(tirx_mod, "PrimFunc", None) or getattr(tir_mod, "PrimFunc", None)
-        return isinstance(prim_cls, type) and isinstance(obj, prim_cls)
-    except ImportError:
-        return False
-
-
-def _cow_helper_name(regime_tag: str, helper_name: str) -> str:
-    """Return idempotent Copy-on-Write helper name scoped under regime_tag."""
-    cow_prefix = f"_{regime_tag}_"
-    if helper_name.startswith(cow_prefix):
-        return helper_name
-    return f"{cow_prefix}{helper_name.lstrip('_')}"
-
-
-class _CowHelperRenamer(ast.NodeTransformer):
-    """Rename CoW helper FunctionDefs and ast.Name references inside active symbols."""
-
-    def __init__(self, rename_map: Mapping[str, str]) -> None:
-        self._rename_map = dict(rename_map)
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
-        if node.name in self._rename_map:
-            node.name = self._rename_map[node.name]
-        return self.generic_visit(node)
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
-        if node.name in self._rename_map:
-            node.name = self._rename_map[node.name]
-        return self.generic_visit(node)
-
-    def visit_Name(self, node: ast.Name) -> ast.AST:
-        if node.id in self._rename_map:
-            node.id = self._rename_map[node.id]
-        return node
-
-
-def _ast_references_any(node: ast.AST, names: Collection[str]) -> bool:
-    """Return True if *node* contains any ast.Name referencing a symbol in *names*."""
-    if not names:
-        return False
-    target_set = set(names)
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Name) and sub.id in target_set:
-            return True
-    return False
-
-
-def _render_with_cow_renames(
-    node: ast.stmt,
-    raw_source: str,
-    rename_map: Mapping[str, str],
-    *,
-    force_rename_self: str = "",
-) -> tuple[str, ast.stmt]:
-    """Apply _CowHelperRenamer when needed, preserving raw_source when unchanged."""
-    needs_rename = bool(
-        rename_map
-        and (
-            (force_rename_self and force_rename_self in rename_map)
-            or _ast_references_any(node, rename_map)
-        )
-    )
-    if not needs_rename:
-        return raw_source, node
-    transformed = _CowHelperRenamer(rename_map).visit(copy.deepcopy(node))
-    ast.fix_missing_locations(transformed)
-    return ast.unparse(transformed).rstrip() + "\n", transformed
-
-
-def _collect_shared_non_active_symbols(
-    orig_symbols: Sequence[_TopLevelSymbol],
-    orig_ast_by_name: Mapping[str, ast.stmt],
-    *,
-    active_own_symbols: set[str],
-    forbidden: set[str],
-) -> set[str]:
-    """Find top-level symbols reachable from sibling regimes or non-active roots."""
-    called_by_any: set[str] = set()
-    for caller_name, caller_node in orig_ast_by_name.items():
-        for sub in ast.walk(caller_node):
-            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                ref = sub.id
-                if ref in orig_ast_by_name and ref != caller_name:
-                    called_by_any.add(ref)
-
-    non_active_roots = [
-        sym.name
-        for sym in orig_symbols
-        if sym.name not in active_own_symbols
-        and (
-            sym.name in forbidden
-            or not sym.name.startswith("_")
-            or sym.kind != "func"
-            or sym.name not in called_by_any
-        )
-    ]
-    shared_reachable: set[str] = set()
-    queue = list(non_active_roots)
-    visited: set[str] = set()
-    while queue:
-        cur = queue.pop(0)
-        if cur in visited:
-            continue
-        visited.add(cur)
-        if cur in active_own_symbols:
-            continue
-        node = orig_ast_by_name.get(cur)
-        if node is None:
-            continue
-        for sub in ast.walk(node):
-            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                ref = sub.id
-                if ref in orig_ast_by_name and ref not in active_own_symbols:
-                    shared_reachable.add(ref)
-                    if ref not in visited:
-                        queue.append(ref)
-    return shared_reachable
-
-
-def patch_regime_into_module(
-    module_source: str,
-    regime_or_func: RegimeTargetSpec | str,
-    candidate_raw_source: str,
-    *,
-    operator_entrypoint: str = "",
-    sibling_specs: Sequence[RegimeTargetSpec] = (),
-    active_kernel: str | None = None,
-) -> str:
-    """Merge a scoped or Python regime slice into module_source without losing siblings.
-
-    Track-B replies route by shape: SEARCH/REPLACE hunks patch the launched C++ kernel
-    and only the helpers it reaches, bare C++ units replace same-name units in place,
-    and a full tuple is only accepted from a parseable Python assignment that keeps
-    every sibling kernel. Any parseable Python beside patch hunks is merged by symbol.
-    """
-    candidate_dsl = extract_python_dsl(candidate_raw_source)
-    if isinstance(regime_or_func, str):
-        return apply_ast_patch(module_source, regime_or_func, candidate_dsl)
-
-    regime_spec = regime_or_func
-    python_snippet = candidate_dsl
-    if (
-        regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
-        and regime_spec.trackb_symbols
-    ):
-        _reject_trackb_context_markers(candidate_dsl, regime_spec.regime_tag)
-        search_replace_blocks = parse_scoped_search_replace_blocks(candidate_dsl)
-        if (
-            ("<<<<<<<" in candidate_dsl or ">>>>>>>" in candidate_dsl)
-            and not search_replace_blocks
-        ):
-            diag = _format_patch_anchor_miss_diagnostic(
-                module_source,
-                regime_spec,
-                "Malformed SEARCH/REPLACE block markers in Track-B candidate",
-                active_kernel=active_kernel,
-            )
-            raise _patch_anchor_miss_error_type()(diag)
-        if search_replace_blocks:
-            module_source = _apply_scoped_trackb_patch_to_module(
-                module_source,
-                regime_spec,
-                candidate_dsl,
-                active_kernel=active_kernel,
-            )
-            python_snippet = _trackb_python_residual(candidate_dsl)
-            if not python_snippet:
-                return module_source
-        elif not _parses_as_python(candidate_dsl) and _looks_like_bare_trackb_cpp(
-            candidate_dsl
-        ):
-            return _apply_spliced_trackb_units_to_module(
-                module_source,
-                regime_spec,
-                candidate_dsl,
-                active_kernel=active_kernel,
-            )
-    orig_tree = ast.parse(module_source)
-    orig_symbols = _collect_top_level_symbols(orig_tree)
-    orig_by_name = {sym.name: sym for sym in orig_symbols}
-    orig_ast_by_name = _collect_top_level_ast_nodes(orig_tree)
-
-    if regime_spec.editable_symbols:
-        required_symbols = [sym for sym in regime_spec.editable_symbols if sym in orig_by_name]
-        if required_symbols:
-            effective_editable = tuple(regime_spec.editable_symbols)
-        else:
-            orig_node = _find_top_level_func(orig_tree, regime_spec.builder_candidates)
-            if orig_node is None:
-                raise ValueError(
-                    f"Original module missing regime symbols {regime_spec.editable_symbols}."
-                )
-            effective_editable = (orig_node.name,)
-    else:
-        orig_node = _find_top_level_func(orig_tree, regime_spec.builder_candidates)
-        if orig_node is None:
-            raise ValueError(
-                f"Original module missing builder in {regime_spec.builder_candidates}."
-            )
-        effective_editable = (orig_node.name,)
-
-    editable_set = set(effective_editable)
-    prefix = regime_spec.allowed_helper_prefix
-    cow_prefix = f"_{regime_spec.regime_tag}_"
-
-    cand_tree = ast.parse(python_snippet)
-    cand_symbols: list[_TopLevelSymbol] = []
-    cand_ast_by_name: dict[str, ast.stmt] = {}
-    seen_cand: set[str] = set()
-    forbidden = _other_regime_forbidden_symbols(
-        regime_spec,
-        operator_entrypoint=operator_entrypoint,
-        sibling_specs=sibling_specs,
-    )
-    forbidden.difference_update(editable_set)
-
-    for node in cand_tree.body:
-        start, end = _stmt_line_span(node)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            name, kind = node.name, "func"
-        elif isinstance(node, ast.Assign):
-            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-                raise ValueError("Candidate assignment must target a single variable name.")
-            name, kind = node.targets[0].id, "assign"
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            name, kind = node.target.id, "assign"
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            continue
-        elif (
-            isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-        ):
-            continue
-        else:
-            raise ValueError(
-                f"Candidate snippet contains unsupported top-level {type(node).__name__}."
-            )
-
-        if name in seen_cand:
-            raise ValueError(f"Candidate snippet defines duplicate symbol {name!r}.")
-        seen_cand.add(name)
-        cand_symbols.append(_TopLevelSymbol(name, kind, start, end))
-        cand_ast_by_name[name] = node
-
-    if not cand_symbols:
-        raise ValueError(
-            "Candidate snippet must define at least one authorized regime symbol."
-        )
-
-    private_func_pool = {
-        sym.name
-        for sym in (*orig_symbols, *cand_symbols)
-        if sym.kind == "func"
-        and sym.name.startswith("_")
-        and sym.name not in forbidden
-        and sym.name not in editable_set
-    }
-    active_check_asts = {**orig_ast_by_name, **cand_ast_by_name}
-    active_seed_roots = [
-        name
-        for name in (
-            *effective_editable,
-            *(
-                sym.name
-                for sym in cand_symbols
-                if (prefix and sym.name.startswith(prefix))
-                or sym.name.startswith(cow_prefix)
-            ),
-        )
-        if name in active_check_asts
-    ]
-    referenced_private_funcs = _collect_referenced_helper_names(
-        active_check_asts,
-        helper_names=private_func_pool,
-        seed_roots=active_seed_roots,
-    )
-
-    ws_planner_names = {"_plan_workspace_bytes", f"_{regime_spec.regime_tag}_plan_workspace_bytes"}
-    for sym in cand_symbols:
-        name = sym.name
-        if name in forbidden:
-            raise ValueError(f"Candidate cannot define or modify protected symbol {name!r}.")
-        if name in editable_set or name in ws_planner_names:
-            continue
-        if (prefix and name.startswith(prefix)) or name.startswith(cow_prefix):
-            continue
-        is_referenced_private_func = (
-            sym.kind == "func"
-            and name.startswith("_")
-            and name in referenced_private_funcs
-        )
-        if name in orig_by_name:
-            if not is_referenced_private_func:
-                raise ValueError(f"Candidate cannot define or modify protected symbol {name!r}.")
-        elif not is_referenced_private_func:
-            raise ValueError(
-                f"Unauthorized top-level symbol {name!r}; expected {editable_set} "
-                f"or prefix {prefix!r}."
-            )
-
-    cand_lines = python_snippet.splitlines(keepends=True)
-    cand_slices = {
-        sym.name: "".join(cand_lines[sym.start - 1 : sym.end]).rstrip() + "\n"
-        for sym in cand_symbols
-    }
-
-    active_own_symbols = set(editable_set) | ws_planner_names | {
-        sym.name
-        for sym in orig_symbols
-        if (prefix and sym.name.startswith(prefix)) or sym.name.startswith(cow_prefix)
-    }
-    shared_reachable = _collect_shared_non_active_symbols(
-        orig_symbols,
-        orig_ast_by_name,
-        active_own_symbols=active_own_symbols,
-        forbidden=forbidden,
-    )
-
-    edited_cand_helpers = {
-        sym.name
-        for sym in cand_symbols
-        if sym.kind == "func"
-        and sym.name not in editable_set
-        and (
-            sym.name not in orig_ast_by_name
-            or ast.dump(cand_ast_by_name[sym.name]) != ast.dump(orig_ast_by_name[sym.name])
-        )
-    }
-    cow_targets = edited_cand_helpers & shared_reachable
-    if cow_targets:
-        changed_closure = True
-        while changed_closure:
-            changed_closure = False
-            for hname in list(shared_reachable):
-                if hname in cow_targets or hname in editable_set:
-                    continue
-                hnode = cand_ast_by_name.get(hname) or orig_ast_by_name.get(hname)
-                if hnode is not None and _ast_references_any(hnode, cow_targets):
-                    cow_targets.add(hname)
-                    changed_closure = True
-    rename_map = {
-        hname: _cow_helper_name(regime_spec.regime_tag, hname)
-        for hname in sorted(cow_targets)
-    }
-    rename_map = {k: v for k, v in rename_map.items() if k != v}
-
-    rendered_by_target: dict[str, str] = {}
-    rendered_ast_by_target: dict[str, ast.stmt] = {}
-    for sym in cand_symbols:
-        if (
-            sym.name in shared_reachable
-            and sym.name not in rename_map
-            and sym.name not in editable_set
-        ):
-            continue
-        target_name = rename_map.get(sym.name, sym.name)
-        rendered_src, rendered_node = _render_with_cow_renames(
-            cand_ast_by_name[sym.name],
-            cand_slices[sym.name],
-            rename_map,
-            force_rename_self=sym.name,
-        )
-        rendered_by_target[target_name] = rendered_src
-        rendered_ast_by_target[target_name] = rendered_node
-
-    orig_lines = module_source.splitlines(keepends=True)
-    if rename_map:
-        for ename in effective_editable:
-            if ename in orig_ast_by_name and ename not in cand_ast_by_name:
-                orig_sym = orig_by_name[ename]
-                orig_raw = "".join(orig_lines[orig_sym.start - 1 : orig_sym.end]).rstrip() + "\n"
-                rendered_src, rendered_node = _render_with_cow_renames(
-                    orig_ast_by_name[ename],
-                    orig_raw,
-                    rename_map,
-                )
-                if rendered_node is not orig_ast_by_name[ename]:
-                    rendered_by_target[ename] = rendered_src
-                    rendered_ast_by_target[ename] = rendered_node
-        for hname in referenced_private_funcs:
-            if (
-                hname in orig_ast_by_name
-                and hname not in cand_ast_by_name
-                and hname not in shared_reachable
-                and hname not in editable_set
-            ):
-                orig_sym = orig_by_name[hname]
-                orig_raw = "".join(orig_lines[orig_sym.start - 1 : orig_sym.end]).rstrip() + "\n"
-                rendered_src, rendered_node = _render_with_cow_renames(
-                    orig_ast_by_name[hname],
-                    orig_raw,
-                    rename_map,
-                )
-                if rendered_node is not orig_ast_by_name[hname]:
-                    rendered_by_target[hname] = rendered_src
-                    rendered_ast_by_target[hname] = rendered_node
-
-    merged_ast_by_name = dict(orig_ast_by_name)
-    merged_ast_by_name.update(rendered_ast_by_target)
-    prunable_orig_helpers = {
-        sym.name
-        for sym in orig_symbols
-        if sym.name not in editable_set
-        and sym.name not in shared_reachable
-        and ((prefix and sym.name.startswith(prefix)) or sym.name.startswith(cow_prefix))
-    }
-    prunable_cand_cow = {
-        name
-        for name in rendered_ast_by_target
-        if name not in editable_set and name.startswith(cow_prefix)
-    }
-    all_helper_names = (
-        prunable_orig_helpers
-        | {name for name in rendered_ast_by_target if name not in editable_set}
-    )
-    seed_roots = [
-        name
-        for name in merged_ast_by_name
-        if name not in prunable_orig_helpers and name not in prunable_cand_cow
-    ]
-    for ws_name in ws_planner_names:
-        if ws_name in merged_ast_by_name and ws_name not in seed_roots:
-            seed_roots.append(ws_name)
-    live_helpers = _collect_referenced_helper_names(
-        merged_ast_by_name,
-        helper_names=all_helper_names,
-        seed_roots=seed_roots,
-    )
-    live_helpers.update(ws_planner_names & set(merged_ast_by_name))
-
-    new_helper_names = [
-        name
-        for name in rendered_by_target
-        if name not in editable_set
-        and name not in orig_by_name
-        and (name not in prunable_cand_cow or name in live_helpers)
-    ]
-    insert_anchor = next(
-        (
-            sym.name
-            for sym in orig_symbols
-            if sym.name in editable_set
-            or (prefix and sym.name.startswith(prefix))
-            or sym.name.startswith(cow_prefix)
-        ),
-        orig_symbols[0].name,
-    )
-
-    for item in reversed(orig_symbols):
-        if item.name in rendered_by_target:
-            if item.name in prunable_cand_cow and item.name not in live_helpers:
-                del_end = item.end
-                while del_end < len(orig_lines) and orig_lines[del_end].strip() == "":
-                    del_end += 1
-                del orig_lines[item.start - 1 : del_end]
-            else:
-                orig_lines[item.start - 1 : item.end] = [rendered_by_target[item.name]]
-        elif item.name in prunable_orig_helpers and item.name not in live_helpers:
-            del_end = item.end
-            while del_end < len(orig_lines) and orig_lines[del_end].strip() == "":
-                del_end += 1
-            del orig_lines[item.start - 1 : del_end]
-        if item.name == insert_anchor and new_helper_names:
-            helper_block = "".join(rendered_by_target[hname] + "\n" for hname in new_helper_names)
-            orig_lines[item.start - 1 : item.start - 1] = [helper_block]
-
-    patched = "".join(orig_lines)
-    ast.parse(patched)
-    if set(cand_slices) & set(regime_spec.trackb_symbols):
-        orig_lines_raw = module_source.splitlines(keepends=True)
-        for sym_name in sorted(set(cand_slices) & set(regime_spec.trackb_symbols)):
-            orig_hits = _find_top_level_str_assign_span(orig_tree, orig_lines_raw, {sym_name})
-            patched_tree = ast.parse(patched)
-            patched_lines = patched.splitlines(keepends=True)
-            new_hits = _find_top_level_str_assign_span(patched_tree, patched_lines, {sym_name})
-            if not orig_hits or not new_hits:
-                raise ValueError(
-                    f"Track-B symbols {sorted(set(cand_slices) & set(regime_spec.trackb_symbols))} "
-                    "must be assigned a raw C++ string literal."
-                )
-            orig_cpp = orig_hits[0][1]
-            cand_cpp = new_hits[0][1]
-            orig_units = _trackb_units_by_name(orig_cpp)
-            cand_units = _trackb_units_by_name(cand_cpp)
-            allowed_added_units: set[str] = set()
-            if cand_units and (set(orig_units) - set(cand_units)):
-                kernel_name = active_kernel or select_active_trackb_kernel(
-                    orig_cpp,
-                    regime_tag=regime_spec.regime_tag,
-                    module_source=module_source,
-                )
-                merged_cpp, _applied = splice_cpp_units_into_tu(
-                    orig_cpp,
-                    cand_cpp,
-                    active_kernel=kernel_name,
-                )
-                allowed_added_units = set(_trackb_units_by_name(merged_cpp)) - set(orig_units)
-                patched = _replace_trackb_constant(patched, sym_name, merged_cpp)
-                cand_cpp = merged_cpp
-            _assert_trackb_replacement_scoped(
-                orig_cpp,
-                cand_cpp,
-                regime_spec,
-                module_source=module_source,
-                active_kernel=active_kernel,
-                allowed_added_units=allowed_added_units,
-            )
-    if "_render_trackb_tu" in cand_slices:
-        seen_tags: set[str] = set()
-        for spec in (regime_spec, *sibling_specs):
-            if spec.regime_tag in seen_tags or not spec.trackb_symbols:
-                continue
-            seen_tags.add(spec.regime_tag)
-            spec_tb = _extract_trackb_cpp_source(patched, spec)
-            if spec_tb is not None:
-                _render_trackb_tu_from_module(
-                    patched,
-                    spec_tb[1],
-                    spec,
-                    require_renderer=True,
-                )
-    return patched
-
-
 def _surrogate_rank_key(res: CandidateSurrogateResult) -> tuple[float, float, float]:
     return (res.surrogate_score, res.min_case_speedup, res.avg_speedup)
 
 
-def _format_anchor_telemetry(
-    result: CandidateSurrogateResult,
-    regime_tag: str,
-) -> str:
-    rows = []
-    for anchor in result.anchors:
-        rows.append(
-            {
-                "case_num": anchor.case_num,
-                "regime_tag": anchor.regime_tag,
-                "target_regime": anchor.regime_tag == regime_tag,
-                "accuracy_passed": anchor.accuracy_passed,
-                "cand_us": round(anchor.cand_us, 4),
-                "ref_perf_us": round(anchor.ref_perf_us, 4),
-                "t_hw_us": round(anchor.t_hw_us, 4),
-                "speedup": round(anchor.speedup, 4),
-                "roofline_eta": round(anchor.roofline_eta, 4),
-                "headroom": round(max(0.0, 1.0 - anchor.roofline_eta), 4),
-            }
-        )
-    return json.dumps(
-        {
-            "operator": result.operator_name,
-            "avg_speedup": round(result.avg_speedup, 4),
-            "min_case_speedup": round(result.min_case_speedup, 4),
-            "avg_roofline_eta": round(result.avg_roofline_eta, 4),
-            "surrogate_score": round(result.surrogate_score, 4),
-            "anchors": rows,
-        },
-        indent=2,
+def _derive_candidate_fault_info(chk: L0L1CandidateCheck) -> tuple[str, str]:
+    raw_fp = (
+        getattr(chk, "fault_plane", "")
+        or (getattr(chk.stage_b, "fault_plane", "") if chk.stage_b else "")
+        or (getattr(chk.stage_a, "fault_plane", "") if chk.stage_a else "")
     )
+    raw_fc = (
+        getattr(chk, "fault_code", "")
+        or (getattr(chk.stage_b, "fault_code", "") if chk.stage_b else "")
+        or (getattr(chk.stage_a, "fault_code", "") if chk.stage_a else "")
+    )
+    tier_low = str(chk.failed_tier or "").lower()
+    if raw_fp:
+        plane = coerce_fault_plane(raw_fp).value
+    elif "noop" in tier_low:
+        plane = FaultPlane.NOOP_IDENTICAL.value
+    elif "stage_b" in tier_low or "l1" in tier_low:
+        plane = FaultPlane.COMPILER_LOWERING.value
+    elif "stage_a" in tier_low or "l0" in tier_low or "ast" in tier_low:
+        plane = FaultPlane.SYNTAX_AST.value
+    else:
+        plane = FaultPlane.COMPILER_LOWERING.value
+    code = str(raw_fc or (chk.failed_tier or "L0_L1_FAILED").upper())
+    return plane, code
 
 
 class PerfTargetCampaignRunner:
-    """Host-CPU multi-round optimization controller driving L0->L1->L2->L3->L4 pyramid."""
+    """Host-CPU multi-round optimization controller delegating to focused coordinators."""
 
     def __init__(
         self,
@@ -2724,11 +475,9 @@ class PerfTargetCampaignRunner:
     ) -> None:
         self._config = config
         self._l4_device_pool = _resolve_l4_device_pool(config)
-        retry_device_id = config.retry_device_id.strip()
+        retry_id = config.retry_device_id.strip()
         self._retry_device_id = (
-            _canonical_device_id(retry_device_id, field="retry_device_id")
-            if retry_device_id
-            else ""
+            _canonical_device_id(retry_id, field="retry_device_id") if retry_id else ""
         )
         self._source_root = (
             Path(source_root).resolve() if source_root is not None else default_source_root()
@@ -2739,7 +488,9 @@ class PerfTargetCampaignRunner:
             else (self._source_root / get_operator_module_relpath(config.operator_name)).resolve()
         )
         self._env_file = Path(env_file).resolve() if env_file is not None else None
-        self._cannbench_repo = Path(cannbench_repo).resolve() if cannbench_repo is not None else None
+        self._cannbench_repo = (
+            Path(cannbench_repo).resolve() if cannbench_repo is not None else None
+        )
         self._perf_target = perf_target or get_default_perf_target(config.operator_name)
         self._initial_anchors = tuple(
             anchors
@@ -2755,27 +506,26 @@ class PerfTargetCampaignRunner:
             if regime_specs is not None
             else get_default_regime_specs(config.operator_name)
         )
-        known_regime_tags = {spec.regime_tag for spec in self._regime_specs}
+        known_tags = {spec.regime_tag for spec in self._regime_specs}
         for forced_tag in config.round_regime_tags:
-            if forced_tag not in known_regime_tags:
+            if forced_tag not in known_tags:
                 raise ValueError(
                     f"round regime tag {forced_tag!r} is not configured; "
-                    f"available regimes: {sorted(known_regime_tags)}"
+                    f"available regimes: {sorted(known_tags)}"
                 )
         self._backend = llm_backend
         self._tracker = tracker or BayesianRuleTracker.from_seed_yaml()
         base_ew = beam.exploit_width if beam is not None else 2
         base_sw = beam.stepping_stone_width if beam is not None else 2
         self._beam_widths = (base_ew, base_sw)
-        self._beams: dict[str, TwoLaneBeamSearch] = {}
-        for idx, rspec in enumerate(self._regime_specs):
-            if idx == 0 and beam is not None:
-                self._beams[rspec.regime_tag] = beam
-            else:
-                self._beams[rspec.regime_tag] = TwoLaneBeamSearch(
-                    exploit_width=base_ew,
-                    stepping_stone_width=base_sw,
-                )
+        self._beams: dict[str, TwoLaneBeamSearch] = {
+            rspec.regime_tag: (
+                beam
+                if idx == 0 and beam is not None
+                else TwoLaneBeamSearch(exploit_width=base_ew, stepping_stone_width=base_sw)
+            )
+            for idx, rspec in enumerate(self._regime_specs)
+        }
         self._active_regime_tag: str | None = (
             self._regime_specs[0].regime_tag if self._regime_specs else None
         )
@@ -2797,8 +547,18 @@ class PerfTargetCampaignRunner:
             ) = msprof_collector
         elif l2_batch_evaluator is None:
             self._msprof_collector = (
-                lambda op_name, cand_path, anc_seq: self._invoke_with_optional_kwargs(
+                lambda op_name, cand_path, anc_seq: L3L4RecoveryCoordinator._invoke(
                     collect_bottleneck_msprof_via_agent_gates,
+                    op_name,
+                    cand_path,
+                    anc_seq,
+                    source_root=self._source_root,
+                    env_file=self._env_file,
+                    device_id=self._config.device_id,
+                    device_pool=self._l4_device_pool,
+                )
+                if hasattr(L3L4RecoveryCoordinator, "_invoke")
+                else collect_bottleneck_msprof_via_agent_gates(
                     op_name,
                     cand_path,
                     anc_seq,
@@ -2810,15 +570,13 @@ class PerfTargetCampaignRunner:
             )
         else:
             self._msprof_collector = None
-        self._msprof_cache: dict[tuple[str, str], dict[str, float]] = {}
         if p2_deep_dive_collector is not None:
             self._p2_deep_dive_collector: (
                 Callable[[str, str, Sequence[AnchorCaseSpec]], Mapping[str, object]] | None
             ) = p2_deep_dive_collector
         elif l2_batch_evaluator is None and self._env_file is not None:
             self._p2_deep_dive_collector = (
-                lambda op_name, cand_path, anc_seq: self._invoke_with_optional_kwargs(
-                    collect_p2_deep_dive_via_agent_gates,
+                lambda op_name, cand_path, anc_seq: collect_p2_deep_dive_via_agent_gates(
                     op_name,
                     cand_path,
                     anc_seq,
@@ -2830,6 +588,8 @@ class PerfTargetCampaignRunner:
             )
         else:
             self._p2_deep_dive_collector = None
+        self._msprof_cache: dict[tuple[str, str], dict[str, float]] = {}
+        self._msprof_by_case: dict[tuple[str, int], dict[str, float]] = {}
         self._p2_cache: dict[tuple[str, str], dict[str, object]] = {}
         self._checkpoint_path = Path(checkpoint_path).resolve() if checkpoint_path else None
         self._campaign_kb_path = Path(campaign_kb_path).resolve() if campaign_kb_path else None
@@ -2896,26 +656,11 @@ class PerfTargetCampaignRunner:
         self._guardrail_cases: list[GuardrailCaseSpec] = []
         self._last_guardrail_metrics_by_cid: dict[str, dict[int, AnchorEvalMetrics]] = {}
         self._calibrated_dispatch_floor_us: float = 0.0
+        self._null_launch_us: float | None = None
         self._flywheel_coordinator = FlywheelCoordinator(flywheel=self._flywheel)
-        self._promotion_coordinator = PromotionCoordinator(
-            target_module_path=self._target_module_path,
-            write_and_verify_fn=self._write_source_and_verify,
-        )
         self._last_round_promoted: bool = True
         self._last_round_promoted_by_regime: dict[str, bool] = {}
         self._last_l2_timing_meta: dict[str, object] = {}
-
-        self._golden_abi_block_cache: str | None = None
-        self._blueprint_provenance: dict[str, object] = {}
-        self._update_blueprint_provenance(None)
-        self._regime_blueprints: dict[str, HirBlueprintPacket] = (
-            self._validated_regime_blueprints(regime_blueprints)
-        )
-        self._l1_summary_cache: dict[tuple[str, str], BishengResourceSummary | None] = {}
-        self._active_kernel_cache: dict[tuple[str, str], str | None] = {}
-        self._operator_semantics_cache: PyTorchOpSemantics | None = None
-        self._operator_proto_cache: Mapping[str, object] | None = None
-        self._operator_semantics_loaded: bool = False
         self._active_incumbent_source: str = ""
         self._pending_promotion: PendingPromotion | None = None
         self._active_promotion: PendingPromotion | None = None
@@ -2925,6 +670,14 @@ class PerfTargetCampaignRunner:
         self._incumbent_anchor_us_by_case: dict[int, float] = {}
         self._stagnation_by_regime: dict[str, int] = {}
         self._compile_wall_streak_by_regime: dict[str, int] = {}
+        self._l1_summary_cache: dict[tuple[str, str], BishengResourceSummary | None] = {}
+        self._active_kernel_cache: dict[tuple[str, str], str | None] = {}
+        self._operator_semantics_cache: PyTorchOpSemantics | None = None
+        self._operator_proto_cache: Mapping[str, object] | None = None
+        self._operator_semantics_loaded: bool = False
+        self._live_stag_by_regime: dict[str, int] = {}
+        self._stagnation_discount: float = 0.45
+
         if (
             self._flywheel is not None
             and self._flywheel._probe_runner is None
@@ -2943,6 +696,314 @@ class PerfTargetCampaignRunner:
                 device_pool=self._l4_device_pool,
             )
 
+        self._stage_gate_coordinator = StageGateCoordinator(
+            operator_name=config.operator_name,
+            target_module_path=self._target_module_path,
+            regime_specs=self._regime_specs,
+            initial_anchors=self._initial_anchors,
+            scoreboard_anchors=self._scoreboard_anchors,
+            guardrail_cases=self._guardrail_cases,
+            backend=self._backend,
+            tracker=self._tracker,
+            cost_advisor=self._cost_advisor,
+            boundary_ledger=self._boundary_ledger,
+            target=self._target,
+            source_root=self._source_root,
+            env_file=self._env_file,
+            cannbench_repo=self._cannbench_repo,
+            checkpoint_path=self._checkpoint_path,
+            experience_lake_dir=self._experience_lake_dir,
+            run_id=self._run_id,
+            device_id=self._config.device_id,
+            l4_device_pool=self._l4_device_pool,
+            warmup=self._config.warmup,
+            repeat=self._config.repeat,
+            max_syntax_repairs=self._config.max_syntax_repairs,
+            cost_prescreen_top_k=self._config.cost_prescreen_top_k,
+            pure_golden=self._config.pure_golden,
+            enable_track_router=self._enable_track_router,
+            sil_advisory=self._sil_advisory,
+            topology_axes=self._topology_axes,
+            semantic_topology_axes=self._semantic_topology_axes,
+            l0_checker=self._l0_checker,
+            l1_compiler=self._l1_compiler,
+            l2_batch_evaluator=self._l2_batch_evaluator,
+            config=self._config,
+            active_incumbent_source=self._active_incumbent_source,
+            owner=self,
+        )
+        self._stage_gate_coordinator._guardrail_cases = self._guardrail_cases
+        self._stage_gate_coordinator._freedom_masks = self._freedom_masks
+        self._stage_gate_coordinator._incumbent_anchor_us_by_case = (
+            self._incumbent_anchor_us_by_case
+        )
+        self._stage_gate_coordinator._last_guardrail_metrics_by_cid = (
+            self._last_guardrail_metrics_by_cid
+        )
+        self._stage_gate_coordinator._active_kernel_cache = self._active_kernel_cache
+        self._stage_gate_coordinator._l1_summary_cache = self._l1_summary_cache
+        self._stage_gate_coordinator._case_dims_cache = self._case_dims_cache
+
+        self._regime_blueprints: dict[str, HirBlueprintPacket] = {}
+        self._round_context_builder = RoundContextBuilder(
+            config=self._config,
+            regime_specs=self._regime_specs,
+            target=self._target,
+            tracker=self._tracker,
+            cost_advisor=self._cost_advisor,
+            regime_solver=self._regime_solver,
+            source_root=self._source_root,
+            perf_target=self._perf_target,
+            env_file=self._env_file,
+            cannbench_repo=self._cannbench_repo,
+            enable_track_router=self._enable_track_router,
+            run_id=self._run_id,
+            experience_lake=self._experience_lake,
+            experience_lake_dir=self._experience_lake_dir,
+            sil_advisory=self._sil_advisory,
+            topology_axes=self._topology_axes,
+            regime_blueprints=regime_blueprints,
+            freedom_masks=self._freedom_masks,
+            boundary_ledger=self._boundary_ledger,
+            run_l0_fn=self._run_l0,
+            l1_summary_fn=self._l1_summary_for_first_round,
+            collect_msprof_fn=self._collect_msprof_for_regimes,
+            collect_p2_fn=self._collect_p2_deep_dive_for_regime,
+            resolve_op_semantics_fn=self._resolve_operator_semantics_for_gates,
+            resolve_active_trackb_kernel_fn=self._resolve_active_trackb_kernel,
+            lookup_case_dims_fn=self._lookup_case_dims_safe,
+            resolve_trackb_freedom_mask_fn=self._resolve_trackb_freedom_mask,
+        )
+        cur_repo_fn = globals()["resolve_cannbench_repo"]
+        if cur_repo_fn is not _ORIG_HOOKS["resolve_cannbench_repo"]:
+            self._round_context_builder._hook_resolve_cannbench_repo = cur_repo_fn
+        if regime_blueprints is None:
+            self._round_context_builder._regime_blueprints = (
+                self._round_context_builder._build_semantic_first_regime_blueprints()
+            )
+        else:
+            self._round_context_builder._regime_blueprints = (
+                self._round_context_builder._validated_regime_blueprints(regime_blueprints)
+            )
+        self._regime_blueprints = self._round_context_builder._regime_blueprints
+        self._blueprint_provenance = self._round_context_builder._blueprint_provenance
+        self._golden_abi_block_cache = self._round_context_builder._golden_abi_block_cache
+        self._round_context_builder._case_dims_cache = self._case_dims_cache
+        self._round_context_builder._active_kernel_cache = self._active_kernel_cache
+
+        self._telemetry_writer = TelemetryLedgerWriter(
+            operator_name=config.operator_name, run_id=self._run_id,
+            device_id=self._config.device_id,
+            allow_unreviewed_distilled_rules=self._config.allow_unreviewed_distilled_rules,
+            target_module_path=self._target_module_path, checkpoint_path=self._checkpoint_path,
+            campaign_kb_path=self._campaign_kb_path, experience_lake_dir=self._experience_lake_dir,
+            experience_lake=self._experience_lake, cost_advisor=self._cost_advisor,
+            target=self._target, perf_target=self._perf_target, regime_specs=self._regime_specs,
+            regime_blueprints=self._regime_blueprints, tracker=self._tracker,
+            flywheel_coordinator=self._flywheel_coordinator, flywheel=self._flywheel,
+            boundary_ledger=self._boundary_ledger, beams=self._beams,
+            msprof_cache=self._msprof_cache, case_dims_cache=self._case_dims_cache,
+            regime_diag_stats=self._regime_diag_stats, scoreboard_anchors=self._scoreboard_anchors,
+            guardrail_cases=self._guardrail_cases,
+            calibrated_dispatch_floor_us=self._calibrated_dispatch_floor_us,
+            cannbench_repo=self._cannbench_repo, env_file=self._env_file,
+            enable_track_router=self._enable_track_router, topology_axes=self._topology_axes,
+            sil_advisory=self._sil_advisory, real_npu_path_fn=self._is_real_npu_path,
+            l0_runner=self._run_l0, l2_batch_runner=self._run_l2_batch,
+            derive_topology_axes_fn=self._stage_gate_coordinator._derive_topology_axes,
+            has_l2_executor_fn=lambda: (
+                self._l2_batch_evaluator is not None or self._is_real_npu_path()
+            ),
+        )
+        self._telemetry_writer.guardrail_cases = self._guardrail_cases
+
+        self._l3_l4_recovery = L3L4RecoveryCoordinator(
+            operator_name=config.operator_name, target_module_path=self._target_module_path,
+            source_root=self._source_root, device_id=self._config.device_id,
+            retry_device_id=self._retry_device_id, device_ids=self._config.device_ids,
+            l4_device_pool=self._l4_device_pool,
+            l4_blocked_env_max_retries=self._config.l4_blocked_env_max_retries,
+            l4_retry_backoff_sec=self._config.l4_retry_backoff_sec,
+            env_file=self._env_file, cannbench_repo=self._cannbench_repo,
+            checkpoint_path=self._checkpoint_path, experience_lake_dir=self._experience_lake_dir,
+            run_id=self._run_id, l3_contract_runner=self._l3_contract_runner,
+            l4_cannbench_runner=self._l4_cannbench_runner, l2_batch_runner=self._run_l2_batch,
+            lookup_case_dims_fn=self._lookup_case_dims_safe,
+            resolve_regime_config_fn=lambda mod_src, spec, dims=None: resolve_regime_config(
+                mod_src, spec, dims=dims
+            ),
+            persist_state_fn=self._persist_runtime_state,
+            write_and_verify_fn=self._write_source_and_verify,
+            scoreboard_anchors=self._scoreboard_anchors, regime_specs=self._regime_specs,
+            regime_blueprints=self._regime_blueprints, topology_axes=self._topology_axes,
+            guardrail_cases=self._guardrail_cases,
+            last_guardrail_metrics_by_cid=self._last_guardrail_metrics_by_cid,
+            case_dims_cache=self._case_dims_cache,
+        )
+
+        self._promotion_coordinator = PromotionCoordinator(
+            target_module_path=self._target_module_path,
+            write_and_verify_fn=self._write_source_and_verify,
+        )
+
+        self._calibration_service = CalibrationService(
+            operator_name=config.operator_name, target_module_path=self._target_module_path,
+            run_l2_batch_fn=self._run_l2_batch, msprof_collector=self._msprof_collector,
+            p2_deep_dive_collector=self._p2_deep_dive_collector, run_l0_fn=self._run_l0,
+            derive_topology_axes_fn=self._stage_gate_coordinator._derive_topology_axes,
+            predict_candidate_us_fn=lambda feat: self._cost_advisor.predict_candidate_us(feat),
+            underlying_cost_model=self._cost_advisor.underlying_cost_model,
+            cost_advisor_target=self._target, select_active_regime_fn=self._select_active_regime,
+            evaluate_tail_guard_fn=self._evaluate_dual_layer_tail_guard,
+            run_l3_contract_fn=self._run_l3_contract,
+            write_and_verify_fn=self._write_source_and_verify,
+            refresh_guardrail_refs_fn=self._refresh_guardrail_incumbent_refs,
+            on_warmstart_promoted_fn=self._on_warmstart_promoted,
+            regime_blueprints=self._regime_blueprints, live_regime_plans=self._live_regime_plans,
+            sil_advisory=self._sil_advisory,
+            enable_phase0_lattice_sweep=self._config.enable_phase0_lattice_sweep,
+            regime_specs=self._regime_specs, msprof_by_case=self._msprof_by_case,
+            p2_cache=self._p2_cache,
+        )
+
+    def _sync_coordinators(self) -> None:
+        g = globals()
+        sgc = self._stage_gate_coordinator
+        sgc._backend = self._backend
+        sgc._l0_checker = self._l0_checker
+        sgc._l1_compiler = self._l1_compiler
+        sgc._l2_batch_evaluator = self._l2_batch_evaluator
+        sgc._regime_specs = tuple(self._regime_specs)
+        sgc._scoreboard_anchors = tuple(self._scoreboard_anchors)
+        sgc._guardrail_cases = self._guardrail_cases
+        sgc._incumbent_anchor_us_by_case = self._incumbent_anchor_us_by_case
+        sgc._active_incumbent_source = self._active_incumbent_source
+        sgc._topology_axes = self._topology_axes
+        sgc._semantic_topology_axes = self._semantic_topology_axes
+        sgc._sil_advisory = self._sil_advisory
+
+        rcb = self._round_context_builder
+        rcb._regime_specs = tuple(self._regime_specs)
+        rcb._perf_target = self._perf_target
+        rcb._topology_axes = self._topology_axes
+        rcb._semantic_topology_axes = self._semantic_topology_axes
+        rcb._regime_blueprints = self._regime_blueprints
+        rcb._sil_advisory = self._sil_advisory
+        rcb._calibrated_dispatch_floor_us = self._calibrated_dispatch_floor_us
+        rcb._stagnation_by_regime = self._stagnation_by_regime
+        rcb._compile_wall_streak_by_regime = self._compile_wall_streak_by_regime
+        rcb._last_round_promoted = self._last_round_promoted
+        rcb._last_round_promoted_by_regime = self._last_round_promoted_by_regime
+        rcb._run_l0_fn = self._run_l0
+        rcb._l1_summary_fn = self._l1_summary_for_first_round
+        rcb._collect_msprof_fn = self._collect_msprof_for_regimes
+        rcb._collect_p2_fn = self._collect_p2_deep_dive_for_regime
+        rcb._resolve_op_semantics_fn = self._resolve_operator_semantics_for_gates
+        rcb._resolve_active_trackb_kernel_fn = self._resolve_active_trackb_kernel
+        rcb._lookup_case_dims_fn = self._lookup_case_dims_safe
+        rcb._resolve_cannbench_tasks_root_fn = self.__dict__.get("_resolve_cannbench_tasks_root")
+        rcb._resolve_trackb_freedom_mask_fn = self._resolve_trackb_freedom_mask
+
+        for hook_name, rcb_attr in (
+            ("resolve_cannbench_repo", "_hook_resolve_cannbench_repo"),
+            ("lookup_case_dims", "_hook_lookup_case_dims"),
+            ("resolve_regime_config", "_hook_resolve_regime_config"),
+            ("rank_symptom_families", "_hook_rank_symptom_families"),
+            ("evaluate_ascendc_candidate", "_hook_evaluate_ascendc_candidate"),
+            ("run_stage_a_static", "_hook_run_stage_a_static"),
+            ("build_prescreen_summary_from_kwargs", "_hook_build_prescreen_summary_from_kwargs"),
+            ("scan_tilelang_pipe_gaps", "_hook_scan_tilelang_pipe_gaps"),
+        ):
+            cur_fn = g[hook_name]
+            setattr(rcb, rcb_attr, cur_fn if cur_fn is not _ORIG_HOOKS[hook_name] else None)
+
+        for mod, names in (
+            (
+                _stage_gate_coordinator_mod,
+                (
+                    "resolve_cannbench_repo",
+                    "lookup_case_dims",
+                    "resolve_regime_for_case",
+                    "resolve_regime_config",
+                    "run_l0_l1_round_filter",
+                    "run_surrogate_batch_via_agent_gates",
+                    "evaluate_ascendc_candidate",
+                    "run_stage_a_static",
+                    "run_stage_b_ascendc_compile",
+                    "rank_stage_a_candidates_with_cost_model",
+                    "run_l1_compile_check",
+                ),
+            ),
+            (
+                _l3_l4_recovery_mod,
+                (
+                    "lookup_case_dims",
+                    "lookup_case_metadata",
+                    "resolve_regime_for_case",
+                    "run_l3_full_contract_via_agent_gates",
+                    "run_l4_official_cannbench_via_agent_gates",
+                ),
+            ),
+            (
+                _telemetry_ledger_writer_mod,
+                (
+                    "lookup_case_dims",
+                    "lookup_case_metadata",
+                ),
+            ),
+        ):
+            for name in names:
+                cur_fn = g[name]
+                orig_fn = _ORIG_HOOKS[name]
+                if cur_fn is not orig_fn:
+                    setattr(mod, name, cur_fn)
+                    _PROPAGATED_HOOKS.add((mod, name))
+                elif (mod, name) in _PROPAGATED_HOOKS:
+                    setattr(mod, name, orig_fn)
+                    _PROPAGATED_HOOKS.discard((mod, name))
+
+        tlw = self._telemetry_writer
+        tlw._regime_specs = tuple(self._regime_specs)
+        tlw._perf_target = self._perf_target
+        tlw.scoreboard_anchors = tuple(self._scoreboard_anchors)
+        tlw.guardrail_cases = self._guardrail_cases
+        tlw.calibrated_dispatch_floor_us = float(self._calibrated_dispatch_floor_us)
+        tlw.active_regime_tag = self._active_regime_tag
+        tlw._topology_axes = self._topology_axes
+        tlw.active_promotion = self._active_promotion
+        tlw.pending_promotion = self._pending_promotion
+        tlw.pending_l4 = self._pending_l4
+        tlw._regime_blueprints = self._regime_blueprints
+        tlw._flywheel = self._flywheel
+        tlw._flywheel_coordinator = self._flywheel_coordinator
+        tlw.stagnation_by_regime = self._stagnation_by_regime
+        tlw.compile_wall_streak_by_regime = self._compile_wall_streak_by_regime
+        tlw.last_round_promoted_by_regime = self._last_round_promoted_by_regime
+        tlw.last_local_rel_gain_by_regime = self._last_local_rel_gain_by_regime
+
+        rec = self._l3_l4_recovery
+        rec._l3_contract_runner = self._l3_contract_runner
+        rec._l4_cannbench_runner = self._l4_cannbench_runner
+        rec.scoreboard_anchors = tuple(self._scoreboard_anchors)
+        rec.regime_specs = tuple(self._regime_specs)
+        rec.regime_blueprints = self._regime_blueprints
+        rec.topology_axes = self._topology_axes
+        rec.guardrail_cases = self._guardrail_cases
+        rec.pending_l4 = self._pending_l4
+        rec._lookup_case_dims_fn = self._lookup_case_dims_safe
+        rec.last_guardrail_metrics_by_cid = sgc._last_guardrail_metrics_by_cid
+        rec._sleep_fn = time.sleep
+
+        cal = self._calibration_service
+        cal._msprof_collector = self._msprof_collector
+        cal._p2_deep_dive_collector = self._p2_deep_dive_collector
+        cal._regime_specs = tuple(self._regime_specs)
+        cal._regime_blueprints = self._regime_blueprints
+        cal._enable_phase0_lattice_sweep = bool(self._config.enable_phase0_lattice_sweep)
+        cal._underlying_cost_model = self._cost_advisor.underlying_cost_model
+        cal._live_regime_plans = self._live_regime_plans
+        cal._sil_advisory = self._sil_advisory
+
     @property
     def _beam(self) -> TwoLaneBeamSearch:
         if self._active_regime_tag and self._active_regime_tag in self._beams:
@@ -2952,148 +1013,17 @@ class PerfTargetCampaignRunner:
         return self._fallback_beam
 
     def beam_for_regime(self, regime_tag: str) -> TwoLaneBeamSearch:
-        """Return the isolated TwoLaneBeamSearch instance for regime_tag."""
+        """Return the dedicated TwoLaneBeamSearch owned by ``regime_tag``."""
         if regime_tag not in self._beams:
-            ew, sw = self._beam_widths
             self._beams[regime_tag] = TwoLaneBeamSearch(
-                exploit_width=ew,
-                stepping_stone_width=sw,
+                exploit_width=self._beam_widths[0],
+                stepping_stone_width=self._beam_widths[1],
             )
         return self._beams[regime_tag]
 
     @staticmethod
     def _source_sha256(source: str) -> str:
-        return hashlib.sha256(source.encode("utf-8")).hexdigest()
-
-    def _write_source_and_verify(
-        self,
-        path: Path,
-        source: str,
-        *,
-        expected_sha256: str | None = None,
-    ) -> str:
-        """Atomically write source and prove the restored bytes have the expected identity."""
-        expected = expected_sha256 or self._source_sha256(source)
-        _atomic_write_text(path, source)
-        try:
-            actual = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError as exc:
-            return f"restored module {path} cannot be read back: {exc}"
-        if actual != expected:
-            return (
-                f"restored module {path} digest {actual} does not match expected {expected}"
-            )
-        return ""
-
-    def _ensure_candidate_bytes(
-        self,
-        *,
-        path: Path,
-        source: str,
-        expected_sha256: str,
-    ) -> str:
-        """Leave the exact submitted candidate at its path, even after a crash.
-
-        An active worker may still be testing this path; restoring the incumbent
-        here would swap the code under it. If the bytes drifted, put the original
-        candidate back and prove the digest before any resume.
-        """
-        expected = expected_sha256 or self._source_sha256(source)
-        try:
-            current = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
-            current = ""
-        if current == expected:
-            return ""
-        error = self._write_source_and_verify(path, source, expected_sha256=expected)
-        if error:
-            return error
-        return ""
-
-    def _persist_runtime_state(
-        self,
-        key: str,
-        value: Mapping[str, object] | None,
-    ) -> None:
-        """Upsert a recoverable execution record before a long AgentGates wait starts.
-
-        The campaign checkpoint also carries round state; this read-modify-write
-        adds only ``key`` so a process killed during submit/wait still leaves the
-        exact execution and candidate identity on disk.
-        """
-        if self._checkpoint_path is None:
-            return
-        payload: dict[str, object] = {}
-        if self._checkpoint_path.is_file():
-            try:
-                loaded = json.loads(self._checkpoint_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, Mapping):
-                    payload = dict(loaded)
-            except (OSError, ValueError):
-                payload = {}
-        payload[key] = dict(value) if value is not None else None
-        _atomic_write_text(
-            self._checkpoint_path,
-            json.dumps(payload, indent=2) + "\n",
-        )
-
-    def _round_candidate_artifact_dir(self) -> Path | None:
-        """Return the checkpoint-adjacent candidates directory for audit artifacts."""
-        if self._checkpoint_path is None:
-            return None
-        return self._checkpoint_path.parent / "candidates"
-
-    def _persist_round_candidate_artifact(
-        self,
-        check: L0L1CandidateCheck,
-        *,
-        round_idx: int,
-    ) -> None:
-        """Write generated source and untruncated L0/L1 diagnostics beside the checkpoint."""
-        artifact_dir = self._round_candidate_artifact_dir()
-        if artifact_dir is None:
-            return
-        stem = f"r{round_idx}_{check.candidate_id.removeprefix(f'r{round_idx}_')}"
-        _atomic_write_text(
-            artifact_dir / f"{stem}.py",
-            check.patched_module_source or check.snippet_source,
-        )
-        diag_lines = [
-            f"candidate_id: {check.candidate_id}",
-            f"round: {round_idx}",
-            f"passed: {check.passed}",
-            f"failed_tier: {check.failed_tier or ''}",
-            f"repaired: {check.repaired}",
-            f"error_message: {check.error_message}",
-        ]
-        if check.stage_a is not None:
-            diag_lines.extend(
-                [
-                    f"stage_a_passed: {check.stage_a.passed}",
-                    f"stage_a_backend_kind: {check.stage_a.backend_kind}",
-                    f"stage_a_error: {check.stage_a.error_message}",
-                ]
-            )
-        if check.stage_b is not None:
-            diag_lines.extend(
-                [
-                    f"stage_b_passed: {check.stage_b.passed}",
-                    f"stage_b_error: {check.stage_b.error_message}",
-                    f"stage_b_spill_bytes: {check.stage_b.spill_bytes}",
-                    f"stage_b_vloopv2_hit: {check.stage_b.vloopv2_hit}",
-                ]
-            )
-            if check.stage_b.full_diagnostic:
-                diag_lines.extend(
-                    [
-                        "stage_b_full_diagnostic:",
-                        check.stage_b.full_diagnostic,
-                    ]
-                )
-        _atomic_write_text(
-            artifact_dir / f"{stem}.diag.txt",
-            "\n".join(diag_lines) + "\n",
-        )
+        return source_sha256(source)
 
     @staticmethod
     def _invoke_with_optional_kwargs(
@@ -3101,390 +1031,47 @@ class PerfTargetCampaignRunner:
         *args: object,
         **kwargs: object,
     ) -> _T:
-        """Pass only the optional keywords an injected runner actually accepts."""
-        try:
-            signature = inspect.signature(runner)
-        except (TypeError, ValueError):
-            return runner(*args)
-        accepts_any = any(
-            param.kind is inspect.Parameter.VAR_KEYWORD
-            for param in signature.parameters.values()
-        )
-        accepted = {
-            name: value
-            for name, value in kwargs.items()
-            if accepts_any or name in signature.parameters
-        }
-        return runner(*args, **accepted)
-
-    def _derive_topology_axes(
-        self,
-        ledger: ObjectivePhysicalLedger | None,
-        *,
-        features: object | None = None,
-        route: object | None = None,
-    ) -> TopologyAxes:
-        if self._topology_axes is not None:
-            return self._topology_axes
-        if self._semantic_topology_axes is not None:
-            return self._semantic_topology_axes
-        if self._sil_advisory is not None:
-            return resolve_canonical_topology_axes(self._sil_advisory, features=features)
-        if route is not None:
-            r_axes = (
-                route.get("topology_axes")
-                if isinstance(route, Mapping)
-                else getattr(route, "topology_axes", None)
-            )
-            if isinstance(r_axes, TopologyAxes):
-                return r_axes
-            if isinstance(r_axes, Mapping) and all(
-                k in r_axes for k in ("compute_engine", "memory_ring", "iteration_regularity")
-            ):
-                return TopologyAxes.from_dict(r_axes)
-        uses_cube = bool(
-            ledger is not None
-            and (
-                ledger.pipe_cycles.get("AIC.PIPE_M", 0) > 0
-                or ledger.pipe_cycles.get("AIC.CUBE", 0) > 0
-            )
-        )
-        return resolve_canonical_topology_axes(
-            {"op_name": self._config.operator_name, "uses_cube": uses_cube},
-            features=features,
-        )
-
-    def _collect_msprof_for_regimes(
-        self,
-        source: str,
-        result: CandidateSurrogateResult,
-        active_anchors: Sequence[AnchorCaseSpec],
-        target_regimes: Sequence[RegimeTargetSpec],
-    ) -> None:
-        if self._msprof_collector is None:
-            return
-        sha = self._source_sha256(source)
-        by_case_and_tag = {(int(a.case_num), a.regime_tag): a for a in active_anchors}
-        by_case = {int(a.case_num): a for a in active_anchors}
-        anchors_to_collect: list[AnchorCaseSpec] = []
-        for rspec in target_regimes:
-            if (sha, rspec.regime_tag) in self._msprof_cache:
-                continue
-            bn = bottleneck_anchor_for_regime(result, rspec.regime_tag)
-            if bn is None:
-                continue
-            spec = by_case_and_tag.get((int(bn.case_num), rspec.regime_tag)) or by_case.get(
-                int(bn.case_num)
-            )
-            if spec is None:
-                continue
-            if spec.regime_tag != rspec.regime_tag:
-                spec = AnchorCaseSpec(
-                    spec.task,
-                    spec.case_num,
-                    rspec.regime_tag,
-                    spec.ref_perf_us,
-                    spec.t_hw_us,
-                )
-            anchors_to_collect.append(spec)
-        if not anchors_to_collect:
-            return
-
-        try:
-            with tempfile.TemporaryDirectory(prefix="tf_msprof_cand_") as tmp_dir:
-                cand_path = Path(tmp_dir) / "candidate.py"
-                cand_path.write_text(source, encoding="utf-8")
-                collected = self._msprof_collector(
-                    self._config.operator_name,
-                    str(cand_path),
-                    anchors_to_collect,
-                )
-        except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
-            logger.warning("On-demand msprof collection failed: %s", exc)
-            return
-
-        if isinstance(collected, Mapping):
-            for tag, raw_metrics in collected.items():
-                if not isinstance(raw_metrics, Mapping):
-                    continue
-                clean = {
-                    str(k): float(v)
-                    for k, v in raw_metrics.items()
-                    if isinstance(v, (int, float)) and not isinstance(v, bool)
-                }
-                if clean:
-                    self._msprof_cache[(sha, str(tag))] = clean
-
-    def _resolve_cannbench_tasks_root(self) -> Path | None:
-        """Resolve the cann-bench tasks root, falling back to the in-repo mirror."""
-        try:
-            repo = resolve_cannbench_repo(
-                cannbench_repo=self._cannbench_repo,
-                env_file=self._env_file,
-            )
-        except FileNotFoundError:
-            repo = None
-        if repo is not None:
-            return resolve_cannbench_tasks_root(repo)
-        in_repo = self._source_root / "tests" / "ascend" / "benchmarks"
-        if _has_flat_operator_layout(in_repo):
-            return in_repo
-        return None
-
-    def _collect_p2_deep_dive_for_regime(
-        self,
-        source: str,
-        result: CandidateSurrogateResult,
-        active_anchors: Sequence[AnchorCaseSpec],
-        regime_spec: RegimeTargetSpec,
-    ) -> dict[str, object] | None:
-        sha = self._source_sha256(source)
-        cache_key = (sha, regime_spec.regime_tag)
-        if cache_key in self._p2_cache:
-            return self._p2_cache[cache_key]
-        if self._p2_deep_dive_collector is None:
-            return None
-        by_case_and_tag = {(int(a.case_num), a.regime_tag): a for a in active_anchors}
-        by_case = {int(a.case_num): a for a in active_anchors}
-        bn = bottleneck_anchor_for_regime(result, regime_spec.regime_tag)
-        spec: AnchorCaseSpec | None = None
-        if bn is not None:
-            spec = by_case_and_tag.get((int(bn.case_num), regime_spec.regime_tag)) or by_case.get(
-                int(bn.case_num)
-            )
-        if spec is None:
-            for anc in active_anchors:
-                if anc.regime_tag == regime_spec.regime_tag:
-                    spec = anc
-                    break
-        if spec is None and active_anchors:
-            spec = active_anchors[0]
-        if spec is None:
-            return None
-        if spec.regime_tag != regime_spec.regime_tag:
-            spec = AnchorCaseSpec(
-                spec.task,
-                spec.case_num,
-                regime_spec.regime_tag,
-                spec.ref_perf_us,
-                spec.t_hw_us,
-            )
-        try:
-            with tempfile.TemporaryDirectory(prefix="tf_p2_cand_") as tmp_dir:
-                cand_path = Path(tmp_dir) / "candidate.py"
-                cand_path.write_text(source, encoding="utf-8")
-                collected = self._p2_deep_dive_collector(
-                    self._config.operator_name,
-                    str(cand_path),
-                    [spec],
-                )
-        except (
-            OSError,
-            subprocess.SubprocessError,
-            TimeoutError,
-            json.JSONDecodeError,
-            RuntimeError,
-            ValueError,
-        ) as exc:
-            logger.warning("On-demand P2 deep-dive collection failed: %s", exc)
-            return None
-        if not isinstance(collected, Mapping) or not collected:
-            return None
-        raw_payload = collected.get(regime_spec.regime_tag)
-        if not isinstance(raw_payload, Mapping):
-            raw_payload = next(iter(collected.values()), None)
-        if not isinstance(raw_payload, Mapping) or not raw_payload:
-            return None
-        clean_payload = {str(k): v for k, v in raw_payload.items()}
-        self._p2_cache[cache_key] = clean_payload
-        return clean_payload
-
-    def _update_blueprint_provenance(self, spec: CannbenchOpSpec | None) -> None:
-        pure_mode = bool(self._config.pure_golden)
-        self._blueprint_provenance = {
-            "pure_golden_mode": pure_mode,
-            "operator_name": self._config.operator_name,
-            "golden_path": str(spec.golden_path) if spec is not None else "",
-            "source_mode": "pure_golden",
-        }
-
-    def _validated_regime_blueprints(
-        self,
-        provided: Mapping[str, HirBlueprintPacket] | None,
-    ) -> dict[str, HirBlueprintPacket]:
-        """Validate caller-supplied per-regime blueprints or build semantic-first packets."""
-        if provided is None:
-            return self._build_semantic_first_regime_blueprints()
-        missing = sorted(
-            spec.regime_tag for spec in self._regime_specs if spec.regime_tag not in provided
-        )
-        if missing:
-            raise ValueError(
-                f"regime_blueprints missing regime tags {missing}; "
-                f"got {sorted(provided)}"
-            )
-        try:
-            spec = self._resolve_operator_spec()
-        except (FileNotFoundError, OSError, ValueError, KeyError, RuntimeError):
-            spec = None
-        self._update_blueprint_provenance(spec)
-        return dict(provided)
-
-    def _resolve_operator_spec(self) -> CannbenchOpSpec | None:
-        """Resolve the official cann-bench task spec for the campaign operator."""
-        tasks_root = self._resolve_cannbench_tasks_root()
-        if tasks_root is None:
-            return None
-        registry = CannbenchOpsRegistry(
-            tasks_root=tasks_root,
-            source_root=self._source_root,
-            pure_golden=bool(self._config.pure_golden),
-        )
-        if not registry.has_operator(self._config.operator_name):
-            return None
-        return registry.resolve(self._config.operator_name)
-
-    def _build_golden_entrypoint_abi_block(self) -> str:
-        """Resolve and cache the ParamBuilder-checked golden entrypoint ABI prompt block."""
-        if self._golden_abi_block_cache is not None:
-            return self._golden_abi_block_cache
-        try:
-            spec = self._resolve_operator_spec()
-        except (FileNotFoundError, OSError, ValueError, KeyError, RuntimeError):
-            spec = None
-        if spec is None or not spec.golden_path.is_file():
-            self._golden_abi_block_cache = ""
-            return ""
-        try:
-            golden_source = spec.golden_path.read_text(encoding="utf-8")
-            desc_text = (
-                spec.desc_path.read_text(encoding="utf-8") if spec.desc_path.is_file() else ""
-            )
-            contract = extract_golden_entrypoint_contract(
-                golden_source,
-                spec.entrypoint,
-                proto=spec.proto,
-                desc_text=desc_text,
-            )
-            block = format_golden_entrypoint_prompt_block(contract)
-        except (OSError, SyntaxError, ValueError, KeyError, TypeError):
-            block = ""
-        self._golden_abi_block_cache = block
-        return block
-
-    def _build_semantic_first_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
-        """Build per-regime blueprints from PyTorch golden semantics and anchor dims."""
-        spec = self._resolve_operator_spec()
-        self._update_blueprint_provenance(spec)
-        if spec is None:
-            return {}
-        if not spec.golden_path.is_file():
-            raise FileNotFoundError(
-                f"official PyTorch golden reference missing for {spec.op_id} at "
-                f"{spec.golden_path}"
-            )
-        try:
-            golden_source = spec.golden_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise RuntimeError(
-                f"cannot read PyTorch golden reference for {spec.op_id} at "
-                f"{spec.golden_path}: {exc}"
-            ) from exc
-        analyzer = PyTorchSemanticAnalyzer(self._target)
-        try:
-            semantics = analyzer.analyze_source(
-                golden_source,
-                entry_name=spec.entrypoint,
-                proto=spec.proto,
-            )
-        except (SyntaxError, ValueError) as exc:
-            raise RuntimeError(
-                f"cannot analyze PyTorch golden semantics for {spec.op_id}: {exc}"
-            ) from exc
-        self._semantic_topology_axes = semantics.base_axes
-        packets: dict[str, HirBlueprintPacket] = {}
-        for regime_spec in self._regime_specs:
-            anchor_dims = (
-                regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-            )
-            rep_case = (
-                RepresentativeCase.from_case_entry(
-                    regime_spec.representative_case_entry,
-                    proto=spec.proto,
-                )
-                if regime_spec.representative_case_entry
-                else None
-            )
-            try:
-                packets[regime_spec.regime_tag] = analyzer.build_universal_blueprint(
-                    semantics,
-                    anchor_dims,
-                    representative_case=rep_case,
-                )
-            except (FileNotFoundError, OSError, SyntaxError, ValueError, KeyError) as exc:
-                raise RuntimeError(
-                    f"failed to synthesize semantic-first blueprint for {spec.op_id} "
-                    f"regime {regime_spec.regime_tag}: {type(exc).__name__}: {exc}"
-                ) from exc
-        assert set(packets) == {regime.regime_tag for regime in self._regime_specs}
-        return packets
-
-    def _synthesize_universal_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
-        """Delegate to the semantic-first per-regime blueprint builder."""
-        return self._build_semantic_first_regime_blueprints()
-
-    def _compile_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
-        """Delegate to the semantic-first per-regime blueprint builder."""
-        return self._build_semantic_first_regime_blueprints()
-
-    def _compute_residual_with_roofline(
-        self,
-        ledger: ObjectivePhysicalLedger,
-        telemetry: Mapping[str, object],
-        *,
-        compiler_summary: BishengResourceSummary | None = None,
-        roofline: HirRooflineSummary | None = None,
-    ) -> StaticDynamicResidual:
-        """Compute StaticDynamicResidual while forwarding blueprint Roofline."""
-        return compute_static_dynamic_residual(
-            ledger,
-            telemetry,
-            compiler_summary=compiler_summary,
-            roofline=roofline,
-        )
-
-    def _observation_with_roofline(
-        self,
-        ledger: ObjectivePhysicalLedger,
-        *,
-        compiler_summary: BishengResourceSummary | None = None,
-        telemetry: Mapping[str, object] | None = None,
-        roofline: HirRooflineSummary | None = None,
-    ) -> ObservationVector5D:
-        """Build ObservationVector5D while forwarding blueprint Roofline."""
-        return ledger.to_observation_5d(
-            compiler_summary=compiler_summary,
-            telemetry=telemetry,
-            roofline=roofline,
-        )
-
-    def _roofline_arg_for_solver(
-        self,
-        roofline: HirRooflineSummary | None,
-    ) -> HirRooflineSummary | None:
-        """Forward HirRooflineSummary directly to the regime solver."""
-        return roofline
-
-    def _get_backend(self) -> KernelLLMBackend:
-        if self._backend is None:
-            self._backend = create_llm_backend_from_env()
-        return self._backend
+        return _cal_invoke_with_optional_kwargs(runner, *args, **kwargs)
 
     @staticmethod
-    def _function_ast_dump(module_source: str, func_name: str) -> str:
-        tree = ast.parse(module_source)
-        node = _find_top_level_func(tree, (func_name,))
-        return ast.dump(node) if node is not None else ""
+    def _write_source_and_verify(path: Path, source: str) -> str:
+        return write_source_and_verify(path, source)
+
+    def _persist_runtime_state(self, key: str, value: object) -> None:
+        self._telemetry_writer.persist_runtime_state(key, value)
+
+    def _is_real_npu_path(self) -> bool:
+        if self._l2_batch_evaluator is not None:
+            return bool(getattr(self._l2_batch_evaluator, "is_real_npu", False))
+        return bool(
+            self._env_file is not None
+            or os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip()
+            or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
+        )
+
+    def _resolve_cannbench_tasks_root(self) -> Path | None:
+        rcb = self._round_context_builder
+        cur_repo_fn = globals()["resolve_cannbench_repo"]
+        rcb._hook_resolve_cannbench_repo = (
+            cur_repo_fn if cur_repo_fn is not _ORIG_HOOKS["resolve_cannbench_repo"] else None
+        )
+        rcb._resolve_cannbench_tasks_root_fn = self.__dict__.get("_resolve_cannbench_tasks_root")
+        return rcb._resolve_cannbench_tasks_root()
+
+    def _resolve_operator_semantics_for_gates(self) -> PyTorchOpSemantics | None:
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._resolve_operator_semantics_for_gates()
+
+    def _lookup_case_dims_safe(self, case_num: int, regime_tag: str = "") -> dict[str, object]:
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._lookup_case_dims_safe(case_num, regime_tag)
+
+    def _has_vf_stack_overflow(self, stage_b: StageBResult) -> bool:
+        return StageGateCoordinator._has_vf_stack_overflow(stage_b)
+
+    def _resolve_max_row_width_dims(self, regime_spec: RegimeTargetSpec) -> dict[str, object]:
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._resolve_max_row_width_dims(regime_spec)
 
     def _resolve_combine_gate_spec(
         self,
@@ -3492,53 +1079,23 @@ class PerfTargetCampaignRunner:
         regime_spec: RegimeTargetSpec,
         resolved: ResolvedRegimeConfig,
     ) -> tuple[str, dict[str, object]] | None:
-        combine_fn = next(
-            (
-                sym
-                for sym in regime_spec.editable_symbols
-                if sym.startswith("_build_") and "combine" in sym
-            ),
-            "",
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._resolve_combine_gate_spec(
+            module_source,
+            regime_spec,
+            resolved,
         )
-        if not combine_fn:
-            return None
-        cand_dump = self._function_ast_dump(module_source, combine_fn)
-        if not cand_dump:
-            return None
-        splits = int(resolved.builder_kwargs.get("num_kv_splits", 1) or 1)
-        modified = False
-        baseline_src = self._active_incumbent_source
-        if not baseline_src and self._target_module_path.is_file():
-            try:
-                baseline_src = self._target_module_path.read_text(encoding="utf-8")
-            except OSError:
-                baseline_src = ""
-        if not baseline_src:
-            modified = True
-        else:
-            base_dump = self._function_ast_dump(baseline_src, combine_fn)
-            modified = cand_dump != base_dump
-        if splits <= 1 and not modified:
-            return None
-        combine_splits = splits if splits > 1 else 4
-        merged_kwargs: dict[str, object] = {
-            **regime_spec.sample_builder_kwargs,
-            **resolved.builder_kwargs,
-            "num_kv_splits": combine_splits,
-            **resolved.combine_kwargs,
-        }
-        mod_tree = ast.parse(module_source)
-        fn_node = _find_top_level_func(mod_tree, (combine_fn,))
-        if fn_node is not None and fn_node.args.kwarg is None:
-            accepted = {
-                *(a.arg for a in fn_node.args.posonlyargs),
-                *(a.arg for a in fn_node.args.args),
-                *(a.arg for a in fn_node.args.kwonlyargs),
-            }
-            combine_kwargs = {k: v for k, v in merged_kwargs.items() if k in accepted}
-        else:
-            combine_kwargs = merged_kwargs
-        return combine_fn, combine_kwargs
+
+    def _compile_trackb_stage_b(
+        self,
+        cpp_source: str,
+        selector_flags: Sequence[str] | str | None = None,
+    ) -> StageBResult:
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._compile_trackb_stage_b(
+            cpp_source,
+            selector_flags,
+        )
 
     def _instantiate_trackb_tu(
         self,
@@ -3548,13 +1105,22 @@ class PerfTargetCampaignRunner:
         *,
         anchor_dims_override: Mapping[str, object] | None = None,
     ) -> str:
-        """Instantiate Track-B C++20 TU via module _render_trackb_tu if present."""
-        return _render_trackb_tu_from_module(
+        return self._stage_gate_coordinator._instantiate_trackb_tu(
             module_source,
             cpp_source,
             regime_spec,
-            require_renderer=False,
             anchor_dims_override=anchor_dims_override,
+        )
+
+    def _resolve_active_trackb_kernel(
+        self,
+        module_source: str,
+        regime_spec: RegimeTargetSpec,
+    ) -> str | None:
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._resolve_active_trackb_kernel(
+            module_source,
+            regime_spec,
         )
 
     def _resolve_active_trackb_kernels(
@@ -3562,210 +1128,18 @@ class PerfTargetCampaignRunner:
         module_source: str,
         regime_spec: RegimeTargetSpec,
     ) -> tuple[str, ...]:
-        """Resolve ordered active Track-B ``__global__`` kernels for single or multi-stage TUs."""
-        if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
-            return ()
-        extracted = _extract_trackb_cpp_source(module_source, regime_spec)
-        if extracted is None:
-            return ()
-        rendered = self._instantiate_trackb_tu(module_source, extracted[1], regime_spec)
-        kernels = _trackb_kernel_names(extracted[1])
-        ordered = _ordered_top_level_trackb_kernels(rendered, extracted[1], kernels)
-        if ordered:
-            return ordered
-        single = self._resolve_active_trackb_kernel(module_source, regime_spec)
-        return (single,) if single else ()
-
-    def _resolve_active_trackb_kernel(
-        self,
-        module_source: str,
-        regime_spec: RegimeTargetSpec,
-    ) -> str | None:
-        """Resolve the launched Track-B kernel from instantiation truth, else the raw TU.
-
-        Supports ordered dual-stage/multi-stage ``__global__`` launches without
-        breaking single-stage resolution.
-        """
-        if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
-            return None
-        extracted = _extract_trackb_cpp_source(module_source, regime_spec)
-        if extracted is None:
-            return None
-        cache_key = (self._source_sha256(module_source), regime_spec.regime_tag)
-        if cache_key not in self._active_kernel_cache:
-            rendered = self._instantiate_trackb_tu(module_source, extracted[1], regime_spec)
-            if rendered == extracted[1]:
-                fallback = select_active_trackb_kernel(
-                    extracted[1],
-                    regime_tag=regime_spec.regime_tag,
-                    module_source=module_source,
-                )
-                if fallback is None:
-                    raise ValueError(
-                        f"Track-B source for regime {regime_spec.regime_tag!r} "
-                        "contains no __global__ kernel"
-                    )
-                self._active_kernel_cache[cache_key] = fallback
-            else:
-                try:
-                    self._active_kernel_cache[cache_key] = _active_trackb_kernel(
-                        rendered,
-                        extracted[1],
-                        regime_tag=regime_spec.regime_tag,
-                        module_source=module_source,
-                    )
-                except ValueError as exc:
-                    if "no unique top-level launch target" not in str(exc):
-                        raise
-                    kernels = _trackb_kernel_names(extracted[1])
-                    ordered = _ordered_top_level_trackb_kernels(rendered, extracted[1], kernels)
-                    if not ordered:
-                        raise
-                    tagged = select_active_trackb_kernel(
-                        extracted[1],
-                        regime_tag=regime_spec.regime_tag,
-                        module_source=module_source,
-                    )
-                    self._active_kernel_cache[cache_key] = (
-                        tagged if tagged in ordered else ordered[0]
-                    )
-        return self._active_kernel_cache[cache_key]
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._resolve_active_trackb_kernels(
+            module_source,
+            regime_spec,
+        )
 
     def _resolve_trackb_freedom_mask(
         self,
         regime_spec: RegimeTargetSpec,
     ) -> ConstraintRelaxationMask:
-        """Return active 7-facet mask for *regime_spec*, seeding Track-B baseline facets once."""
-        existing = self._freedom_masks.get(regime_spec.regime_tag)
-        if existing is not None:
-            return existing
-        baseline_src = self._active_incumbent_source
-        if not baseline_src and self._target_module_path.is_file():
-            baseline_src = self._target_module_path.read_text(encoding="utf-8")
-        if baseline_src and regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb"):
-            base_tb = _extract_trackb_cpp_source(baseline_src, regime_spec)
-            if base_tb is not None:
-                base_tu = self._instantiate_trackb_tu(baseline_src, base_tb[1], regime_spec)
-                rep = verify_source_against_facets(base_tu, ConstraintRelaxationMask.bottom())
-                fixes = rep.suggested_fixes
-                if not rep.passed and fixes:
-                    return ConstraintRelaxationMask(
-                        alg_compute_and_monoid=True,
-                        tile_and_stage_knobs=True,
-                        exec_mode_and_spr=bool(fixes.get("unlock_exec_mode_and_spr", False)),
-                        sram_layout_and_aliasing=bool(
-                            fixes.get("unlock_sram_layout_and_aliasing", False)
-                        ),
-                        dma_and_cache_hierarchy=bool(
-                            fixes.get("unlock_dma_and_cache_hierarchy", False)
-                        ),
-                        pipeline_and_sync_graph=bool(
-                            fixes.get("unlock_pipeline_and_sync_graph", False)
-                        ),
-                        grid_and_workspace_topology=bool(
-                            fixes.get("unlock_grid_and_workspace_topology", False)
-                        ),
-                    )
-        return ConstraintRelaxationMask.bottom()
-
-    def _resolve_trackb_baseline_tu(
-        self,
-        regime_spec: RegimeTargetSpec,
-    ) -> str | None:
-        """Return baseline Track-B TU for differential forbidden-token checks."""
-        if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
-            return None
-        baseline_src = self._active_incumbent_source
-        if not baseline_src and self._target_module_path.is_file():
-            try:
-                baseline_src = self._target_module_path.read_text(encoding="utf-8")
-            except OSError:
-                baseline_src = ""
-        if not baseline_src:
-            return None
-        base_tb = _extract_trackb_cpp_source(baseline_src, regime_spec)
-        if base_tb is None:
-            return None
-        return self._instantiate_trackb_tu(baseline_src, base_tb[1], regime_spec)
-
-    def _compile_trackb_stage_b(
-        self,
-        cpp_source: str,
-        selector_flags: Sequence[str] | str | None = None,
-    ) -> StageBResult:
-        cann_root = _resolve_cann_root_from_env_file(self._env_file)
-        bisheng_bin: str | None = None
-        flags = list(resolve_trackb_compile_flags(cpp_source, selector_flags))
-        if cann_root is not None:
-            cand_bin = cann_root / "bin" / "bisheng"
-            if cand_bin.is_file():
-                bisheng_bin = str(cand_bin)
-            if (cann_root / "include").is_dir():
-                flags.append(f"-I{cann_root / 'include'}")
-        return run_stage_b_ascendc_compile(
-            cpp_source,
-            compile_flags=flags,
-            bisheng_bin=bisheng_bin,
-            cann_root=cann_root,
-        )
-
-    def _resolve_trackb_selector_flags(
-        self,
-        module_source: str,
-        regime_spec: RegimeTargetSpec,
-    ) -> tuple[str, ...]:
-        anchor_dims = (
-            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-        )
-        return _resolve_selector_compile_flags(module_source, regime_spec, dims=anchor_dims)
-
-    @staticmethod
-    def _ledger_has_cube_engine(ledger: ObjectivePhysicalLedger | None) -> bool:
-        if ledger is None:
-            return False
-        return (
-            int(ledger.pipe_cycles.get("AIC.PIPE_M", 0))
-            + int(ledger.pipe_cycles.get("AIC.CUBE", 0))
-        ) > 0
-
-    @staticmethod
-    def _ledger_has_hardware_dma(ledger: ObjectivePhysicalLedger | None) -> bool:
-        if ledger is None:
-            return False
-        return (
-            int(ledger.pipe_cycles.get("AIV0.PIPE_MTE2", 0))
-            + int(ledger.pipe_cycles.get("AIV1.PIPE_MTE2", 0))
-            + int(ledger.pipe_cycles.get("AIC.PIPE_MTE2", 0))
-        ) > 0
-
-    def _resolve_operator_semantics_for_gates(self) -> PyTorchOpSemantics | None:
-        if self._operator_semantics_loaded:
-            return self._operator_semantics_cache
-        self._operator_semantics_loaded = True
-        tasks_root = self._resolve_cannbench_tasks_root()
-        if tasks_root is None:
-            return None
-        try:
-            spec = CannbenchOpsRegistry(
-                tasks_root=tasks_root,
-                source_root=self._source_root,
-                pure_golden=bool(self._config.pure_golden),
-            ).resolve(self._config.operator_name)
-        except (FileNotFoundError, KeyError, ValueError):
-            return None
-        self._operator_proto_cache = spec.proto if isinstance(spec.proto, Mapping) else None
-        if not spec.golden_path.is_file():
-            return None
-        try:
-            golden_src = spec.golden_path.read_text(encoding="utf-8")
-            self._operator_semantics_cache = PyTorchSemanticAnalyzer().analyze_source(
-                golden_src,
-                entry_name=spec.entrypoint,
-                proto=spec.proto,
-            )
-        except (OSError, SyntaxError, ValueError):
-            self._operator_semantics_cache = None
-        return self._operator_semantics_cache
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._resolve_trackb_freedom_mask(regime_spec)
 
     def _default_l0_checker(
         self,
@@ -3774,197 +1148,12 @@ class PerfTargetCampaignRunner:
         *,
         anchor_dims_override: Mapping[str, object] | None = None,
     ) -> StageAResult:
-        op_semantics = self._resolve_operator_semantics_for_gates()
-        req_dma = bool(op_semantics is not None and not op_semantics.has_indirect_index)
-        req_cube = bool(op_semantics is not None and op_semantics.has_gemm_contraction)
-        is_hybrid = regime_spec.runtime_backend == "hybrid_trackb"
-        has_prim_func = _has_prim_func_builder(module_source, regime_spec.builder_candidates)
-        tb_extracted = (
-            _extract_trackb_cpp_source(module_source, regime_spec)
-            if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
-            else None
-        )
-        baseline_tb_tu = (
-            self._resolve_trackb_baseline_tu(regime_spec) if tb_extracted is not None else None
-        )
-        if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
-            active_mask = self._resolve_trackb_freedom_mask(regime_spec)
-            instantiated_tu = self._invoke_with_optional_kwargs(
-                self._instantiate_trackb_tu,
-                module_source,
-                tb_extracted[1],
-                regime_spec,
-                anchor_dims_override=anchor_dims_override,
-            )
-            return evaluate_ascendc_candidate(
-                instantiated_tu,
-                freedom_mask=active_mask,
-                target=self._target,
-                enable_track_router=self._enable_track_router,
-                case_ratios=regime_spec.representative_case_ratios,
-                baseline_cpp_source=baseline_tb_tu,
-                require_hardware_dma=req_dma,
-                require_cube_engine=req_cube,
-                module_source=module_source,
-                regime_tag=regime_spec.regime_tag,
-            )
-
-        anchor_dims = dict(
-            anchor_dims_override
-            or regime_spec.representative_anchor_dims
-            or regime_spec.representative_hir_dims
-        )
-        try:
-            resolved = resolve_regime_config(module_source, regime_spec, dims=anchor_dims)
-        except (
-            SyntaxError,
-            AttributeError,
-            ImportError,
-            KeyError,
-            NameError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            return StageAResult(
-                passed=False,
-                prim_func=None,
-                ledger=None,
-                error_message=f"stage_a_config_resolve_error: {type(exc).__name__}: {exc}",
-            )
-        var_bindings = build_anchor_var_bindings(
-            anchor_dims,
-            kwargs=resolved.builder_kwargs,
-        )
-        ordered_tensor_shapes = extract_ordered_tensor_shapes(
-            case_entry=regime_spec.representative_case_entry,
-            dims=anchor_dims,
-            proto=self._operator_proto_cache,
-        )
-        primary_res = run_stage_a_static(
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._default_l0_checker(
             module_source,
-            factory_name=resolved.builder_name,
-            factory_kwargs=resolved.builder_kwargs,
-            pass_configs=resolved.pass_configs or None,
-            compile_flags=resolved.compile_flags or None,
-            target=self._target,
-            var_bindings=var_bindings or None,
-            enable_track_router=self._enable_track_router,
-            case_ratios=regime_spec.representative_case_ratios,
-            require_hardware_dma=req_dma,
-            require_cube_engine=bool(req_cube and not (is_hybrid and tb_extracted is not None)),
-            ordered_tensor_shapes=ordered_tensor_shapes,
+            regime_spec,
+            anchor_dims_override=anchor_dims_override,
         )
-        if not primary_res.passed:
-            if is_hybrid and tb_extracted is not None and not has_prim_func:
-                active_mask = self._resolve_trackb_freedom_mask(regime_spec)
-                instantiated_tu = self._invoke_with_optional_kwargs(
-                    self._instantiate_trackb_tu,
-                    module_source,
-                    tb_extracted[1],
-                    regime_spec,
-                    anchor_dims_override=anchor_dims_override,
-                )
-                return evaluate_ascendc_candidate(
-                    instantiated_tu,
-                    freedom_mask=active_mask,
-                    target=self._target,
-                    enable_track_router=self._enable_track_router,
-                    case_ratios=regime_spec.representative_case_ratios,
-                    baseline_cpp_source=baseline_tb_tu,
-                    require_hardware_dma=req_dma,
-                    require_cube_engine=req_cube,
-                    module_source=module_source,
-                    regime_tag=regime_spec.regime_tag,
-                )
-            return primary_res
-        combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
-        if combine_spec is not None:
-            combine_fn, combine_kwargs = combine_spec
-            combine_res = run_stage_a_static(
-                module_source,
-                factory_name=combine_fn,
-                factory_kwargs=combine_kwargs,
-                pass_configs=resolved.pass_configs or None,
-                compile_flags=resolved.compile_flags or None,
-                target=self._target,
-                var_bindings=var_bindings or None,
-                enable_track_router=self._enable_track_router,
-                case_ratios=regime_spec.representative_case_ratios,
-                require_hardware_dma=req_dma,
-                require_cube_engine=False,
-                ordered_tensor_shapes=ordered_tensor_shapes,
-            )
-            if not combine_res.passed:
-                return StageAResult(
-                    passed=False,
-                    prim_func=primary_res.prim_func,
-                    ledger=primary_res.ledger,
-                    features=primary_res.features,
-                    route=primary_res.route,
-                    error_message=f"combine_kernel({combine_fn}): {combine_res.error_message}",
-                    elapsed_ms=primary_res.elapsed_ms + combine_res.elapsed_ms,
-                )
-        if is_hybrid and tb_extracted is not None:
-            tb_sym, tb_cpp = tb_extracted
-            active_mask = self._resolve_trackb_freedom_mask(regime_spec)
-            instantiated_tu = self._invoke_with_optional_kwargs(
-                self._instantiate_trackb_tu,
-                module_source,
-                tb_cpp,
-                regime_spec,
-                anchor_dims_override=anchor_dims_override,
-            )
-            tb_res = evaluate_ascendc_candidate(
-                instantiated_tu,
-                freedom_mask=active_mask,
-                target=self._target,
-                enable_track_router=self._enable_track_router,
-                case_ratios=regime_spec.representative_case_ratios,
-                baseline_cpp_source=baseline_tb_tu,
-                require_hardware_dma=req_dma,
-                require_cube_engine=False,
-                module_source=module_source,
-                regime_tag=regime_spec.regime_tag,
-            )
-            total_ms = primary_res.elapsed_ms + tb_res.elapsed_ms
-            if not tb_res.passed:
-                return replace(
-                    tb_res,
-                    error_message=f"trackb_ascendc({tb_sym}): {tb_res.error_message}",
-                    elapsed_ms=total_ms,
-                )
-            if req_cube and not (
-                self._ledger_has_cube_engine(primary_res.ledger)
-                or self._ledger_has_cube_engine(tb_res.ledger)
-            ):
-                return replace(
-                    tb_res,
-                    passed=False,
-                    error_message=(
-                        f"trackb_ascendc({tb_sym}): missing_cube_engine_primitives: "
-                        "aggregate hybrid_trackb candidate has zero AIC.PIPE_M cycles"
-                    ),
-                    elapsed_ms=total_ms,
-                )
-            if req_dma and not (
-                self._ledger_has_hardware_dma(primary_res.ledger)
-                or self._ledger_has_hardware_dma(tb_res.ledger)
-            ):
-                return replace(
-                    tb_res,
-                    passed=False,
-                    error_message=(
-                        f"trackb_ascendc({tb_sym}): missing_hardware_dma_staging: "
-                        "aggregate hybrid_trackb candidate has zero PIPE_MTE2 cycles"
-                    ),
-                    elapsed_ms=total_ms,
-                )
-            return replace(
-                tb_res,
-                elapsed_ms=total_ms,
-            )
-        return primary_res
 
     def _run_l0(
         self,
@@ -3973,446 +1162,38 @@ class PerfTargetCampaignRunner:
         *,
         anchor_dims_override: Mapping[str, object] | None = None,
     ) -> StageAResult:
-        if self._l0_checker is not None:
-            return self._invoke_with_optional_kwargs(
-                self._l0_checker,
-                module_source,
-                regime_spec,
-                anchor_dims_override=anchor_dims_override,
-            )
-        return self._default_l0_checker(
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._run_l0(
             module_source,
             regime_spec,
             anchor_dims_override=anchor_dims_override,
         )
 
-    def _belongs_to_regime(
-        self,
-        dims: Mapping[str, object],
-        regime_spec: RegimeTargetSpec,
-    ) -> bool:
-        if len(self._regime_specs) <= 1:
-            return True
-        try:
-            matched = resolve_regime_for_case(
-                self._config.operator_name,
-                dims,
-                self._regime_specs,
-            )
-            return matched.regime_tag == regime_spec.regime_tag
-        except (KeyError, ValueError, TypeError):
-            return False
-
-    def _resolve_max_row_width_dims(
-        self,
-        regime_spec: RegimeTargetSpec,
-    ) -> dict[str, object] | None:
-        """Return the largest-row-width case dims routed to ``regime_spec``."""
-        candidates: list[dict[str, object]] = []
-        tasks_root = self._resolve_cannbench_tasks_root()
-        if tasks_root is not None:
-            try:
-                task = get_operator_task(self._config.operator_name)
-                cases_path = tasks_root / task / "cases.yaml"
-                if cases_path.is_file():
-                    parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
-                    for row in parsed.get("cases") or ():
-                        if isinstance(row, Mapping) and row.get("case_id") is not None:
-                            cnum = int(row["case_id"])
-                            dims = self._lookup_case_dims_safe(cnum, regime_spec.regime_tag)
-                            if dims and self._belongs_to_regime(dims, regime_spec):
-                                candidates.append(dict(dims))
-            except (FileNotFoundError, KeyError, OSError, ValueError, TypeError):
-                pass
-        for anc in self._initial_anchors:
-            if len(self._regime_specs) > 1 and anc.regime_tag != regime_spec.regime_tag:
-                continue
-            dims = self._lookup_case_dims_safe(int(anc.case_num), anc.regime_tag)
-            if dims and self._belongs_to_regime(dims, regime_spec):
-                candidates.append(dict(dims))
-        own_rep = regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-        if own_rep:
-            candidates.append(dict(own_rep))
-        if not candidates:
-            return None
-
-        row_width_keys = (
-            "D",
-            "d_dim",
-            "K",
-            "N",
-            "hidden_dim",
-            "d_nope",
-            "d_rope",
-            "inner",
-            "inner_dim",
-            "S",
-            "s_dim",
-            "seq_len",
-        )
-
-        def _row_width_score(dims: Mapping[str, object]) -> tuple[int, int]:
-            width = 1
-            has_width_key = False
-            for key in row_width_keys:
-                val = dims.get(key)
-                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
-                    width *= val
-                    has_width_key = True
-            total_prod = 1
-            for val in dims.values():
-                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
-                    total_prod *= val
-            return (width if has_width_key else total_prod, total_prod)
-
-        return max(candidates, key=_row_width_score)
-
-    def _resolve_tail_anchor_dims(
-        self,
-        regime_spec: RegimeTargetSpec,
-    ) -> dict[str, object] | None:
-        """Return the smallest-element case dims routed to ``regime_spec`` when distinct."""
-        primary_dims = dict(
-            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-        )
-        candidates: list[dict[str, object]] = []
-        tasks_root = self._resolve_cannbench_tasks_root()
-        if tasks_root is not None:
-            try:
-                task = get_operator_task(self._config.operator_name)
-                cases_path = tasks_root / task / "cases.yaml"
-                if cases_path.is_file():
-                    parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
-                    for row in parsed.get("cases") or ():
-                        if isinstance(row, Mapping) and row.get("case_id") is not None:
-                            cnum = int(row["case_id"])
-                            dims = self._lookup_case_dims_safe(cnum, regime_spec.regime_tag)
-                            if dims and self._belongs_to_regime(dims, regime_spec):
-                                candidates.append(dict(dims))
-            except (FileNotFoundError, KeyError, OSError, ValueError, TypeError):
-                pass
-        for anc in self._scoreboard_anchors:
-            if len(self._regime_specs) > 1 and anc.regime_tag != regime_spec.regime_tag:
-                continue
-            dims = self._lookup_case_dims_safe(int(anc.case_num), anc.regime_tag)
-            if dims and self._belongs_to_regime(dims, regime_spec):
-                candidates.append(dict(dims))
-        if regime_spec.representative_hir_dims:
-            candidates.append(dict(regime_spec.representative_hir_dims))
-        if not candidates:
-            return None
-
-        def _elem_score(dims: Mapping[str, object]) -> tuple[int, int]:
-            prod = 1
-            count = 0
-            for val in dims.values():
-                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
-                    prod *= val
-                    count += 1
-            return (prod if count > 0 else 0, len(dims))
-
-        smallest = min(candidates, key=_elem_score)
-        if smallest == primary_dims:
-            return None
-        return smallest
-
-    @staticmethod
-    def _has_vf_stack_overflow(stage_b: StageBResult) -> bool:
-        if not stage_b.passed:
-            diag = f"{stage_b.error_message}\n{stage_b.full_diagnostic}".lower()
-            if (
-                "exceeded vf stack size" in diag
-                or "vf_stack" in diag
-                or "stack frame size" in diag
-                or "stack overflow" in diag
-            ):
-                return True
-        if stage_b.compiler_summary is not None and int(stage_b.compiler_summary.stack_bytes) > 0:
-            return True
-        return False
-
     def _run_l1(self, module_source: str, regime_spec: RegimeTargetSpec) -> StageBResult:
-        tail_anchor_dims = self._resolve_tail_anchor_dims(regime_spec)
-        if self._l1_compiler is not None:
-            return self._invoke_with_optional_kwargs(
-                self._l1_compiler,
-                module_source,
-                regime_spec,
-                tail_anchor_dims=tail_anchor_dims,
-            )
-        tb_extracted = (
-            _extract_trackb_cpp_source(module_source, regime_spec)
-            if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
-            else None
-        )
-        if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
-            instantiated_tu = self._instantiate_trackb_tu(
-                module_source, tb_extracted[1], regime_spec
-            )
-            sel_flags = self._resolve_trackb_selector_flags(module_source, regime_spec)
-            effective_flags = resolve_trackb_compile_flags(instantiated_tu, sel_flags)
-            tb_res = (
-                self._compile_trackb_stage_b(instantiated_tu, selector_flags=sel_flags)
-                if sel_flags
-                else self._compile_trackb_stage_b(instantiated_tu)
-            )
-            uses_unreserved_ubuf = any(
-                "--cce-disable-vf-stack-reserved-ubuf" in str(fl) for fl in effective_flags
-            )
-            if tb_res.passed and uses_unreserved_ubuf:
-                max_dims = self._resolve_max_row_width_dims(regime_spec)
-                anchor_dims = (
-                    regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-                )
-                if max_dims and max_dims != dict(anchor_dims or {}):
-                    max_spec = replace(regime_spec, representative_anchor_dims=dict(max_dims))
-                    max_tu = self._instantiate_trackb_tu(module_source, tb_extracted[1], max_spec)
-                    max_flags = self._resolve_trackb_selector_flags(module_source, max_spec)
-                    max_eff_flags = resolve_trackb_compile_flags(max_tu, max_flags)
-                    if max_tu != instantiated_tu or max_eff_flags != effective_flags:
-                        max_b = (
-                            self._compile_trackb_stage_b(max_tu, selector_flags=max_flags)
-                            if max_flags
-                            else self._compile_trackb_stage_b(max_tu)
-                        )
-                    if (max_tu != instantiated_tu or max_eff_flags != effective_flags) and (
-                        not max_b.passed or self._has_vf_stack_overflow(max_b)
-                    ):
-                        if self._has_vf_stack_overflow(max_b):
-                            stack_bytes = (
-                                int(max_b.compiler_summary.stack_bytes)
-                                if max_b.compiler_summary is not None
-                                else 0
-                            )
-                            err_msg = (
-                                f"stage_b_max_row_width_vf_stack_overflow: stack_bytes={stack_bytes} "
-                                f"({max_b.error_message})"
-                            )
-                        else:
-                            err_msg = f"stage_b_max_row_width_compile_failed: {max_b.error_message}"
-                        return StageBResult(
-                            passed=False,
-                            error_message=err_msg,
-                            full_diagnostic=max_b.full_diagnostic,
-                            compiler_summary=max_b.compiler_summary,
-                            elapsed_sec=tb_res.elapsed_sec + max_b.elapsed_sec,
-                        )
-            return tb_res
-
-        anchor_dims = (
-            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-        )
-        try:
-            resolved = resolve_regime_config(module_source, regime_spec, dims=anchor_dims)
-        except (
-            SyntaxError,
-            AttributeError,
-            ImportError,
-            KeyError,
-            NameError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            return StageBResult(
-                passed=False,
-                error_message=f"l1_config_resolve_error: {type(exc).__name__}: {exc}",
-            )
-        primary_b = self._invoke_with_optional_kwargs(
-            run_l1_compile_check,
-            module_source,
-            builder_name=resolved.builder_name,
-            builder_kwargs=resolved.builder_kwargs,
-            config_selector_name=regime_spec.config_selector_fn or None,
-            pass_configs=resolved.pass_configs or None,
-            compile_flags=resolved.compile_flags or None,
-            source_root=self._source_root,
-            env_file=self._env_file,
-            tail_anchor_dims=tail_anchor_dims,
-        )
-        if not primary_b.passed:
-            if (
-                regime_spec.runtime_backend == "hybrid_trackb"
-                and tb_extracted is not None
-                and not _has_prim_func_builder(module_source, regime_spec.builder_candidates)
-            ):
-                instantiated_tu = self._instantiate_trackb_tu(
-                    module_source, tb_extracted[1], regime_spec
-                )
-                if resolved.compile_flags:
-                    return self._compile_trackb_stage_b(
-                        instantiated_tu,
-                        selector_flags=resolved.compile_flags,
-                    )
-                return self._compile_trackb_stage_b(instantiated_tu)
-            return primary_b
-        final_b = primary_b
-        uses_unreserved_ubuf = any(
-            "--cce-disable-vf-stack-reserved-ubuf" in str(fl) for fl in resolved.compile_flags
-        )
-        if uses_unreserved_ubuf:
-            max_dims = self._resolve_max_row_width_dims(regime_spec)
-            if max_dims and max_dims != dict(anchor_dims or {}):
-                try:
-                    max_resolved = resolve_regime_config(module_source, regime_spec, dims=max_dims)
-                except (
-                    SyntaxError,
-                    AttributeError,
-                    ImportError,
-                    KeyError,
-                    NameError,
-                    RuntimeError,
-                    TypeError,
-                    ValueError,
-                ):
-                    max_resolved = resolved
-                if max_resolved != resolved:
-                    max_b = run_l1_compile_check(
-                        module_source,
-                        builder_name=max_resolved.builder_name,
-                        builder_kwargs=max_resolved.builder_kwargs,
-                        config_selector_name=regime_spec.config_selector_fn or None,
-                        pass_configs=max_resolved.pass_configs or None,
-                        compile_flags=max_resolved.compile_flags or None,
-                        dims=max_dims,
-                        source_root=self._source_root,
-                        env_file=self._env_file,
-                    )
-                    if not max_b.passed or self._has_vf_stack_overflow(max_b):
-                        if self._has_vf_stack_overflow(max_b):
-                            stack_bytes = (
-                                int(max_b.compiler_summary.stack_bytes)
-                                if max_b.compiler_summary is not None
-                                else 0
-                            )
-                            err_msg = (
-                                f"stage_b_max_row_width_vf_stack_overflow: stack_bytes={stack_bytes} "
-                                f"({max_b.error_message})"
-                            )
-                        else:
-                            err_msg = f"stage_b_max_row_width_compile_failed: {max_b.error_message}"
-                        return StageBResult(
-                            passed=False,
-                            error_message=err_msg,
-                            full_diagnostic=max_b.full_diagnostic,
-                            compiler_summary=max_b.compiler_summary,
-                            elapsed_sec=final_b.elapsed_sec + max_b.elapsed_sec,
-                        )
-        combine_elapsed_sec = 0.0
-        combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
-        if combine_spec is not None:
-            combine_fn, combine_kwargs = combine_spec
-            combine_b = run_l1_compile_check(
-                module_source,
-                builder_name=combine_fn,
-                builder_kwargs=combine_kwargs,
-                config_selector_name=None,
-                pass_configs=resolved.pass_configs or None,
-                compile_flags=resolved.compile_flags or None,
-                source_root=self._source_root,
-                env_file=self._env_file,
-            )
-            if not combine_b.passed:
-                return StageBResult(
-                    passed=False,
-                    error_message=f"combine_kernel({combine_fn}): {combine_b.error_message}",
-                    full_diagnostic=combine_b.full_diagnostic,
-                    elapsed_sec=primary_b.elapsed_sec + combine_b.elapsed_sec,
-                )
-            combine_elapsed_sec = combine_b.elapsed_sec
-        if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
-            tb_sym, tb_cpp = tb_extracted
-            instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
-            tb_b = (
-                self._compile_trackb_stage_b(
-                    instantiated_tu,
-                    selector_flags=resolved.compile_flags,
-                )
-                if resolved.compile_flags
-                else self._compile_trackb_stage_b(instantiated_tu)
-            )
-            total_elapsed_sec = final_b.elapsed_sec + combine_elapsed_sec + tb_b.elapsed_sec
-            if not tb_b.passed:
-                return replace(
-                    tb_b,
-                    error_message=f"trackb_ascendc({tb_sym}): {tb_b.error_message}",
-                    elapsed_sec=total_elapsed_sec,
-                )
-            return replace(tb_b, elapsed_sec=total_elapsed_sec)
-        return final_b
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._run_l1(module_source, regime_spec)
 
     def _l1_summary_for_first_round(
         self,
         module_source: str,
         regime_spec: RegimeTargetSpec,
     ) -> BishengResourceSummary | None:
-        """Compile the parent once per source when no promoted stone carries L1 data."""
-        cache_key = (self._source_sha256(module_source), regime_spec.regime_tag)
-        if cache_key not in self._l1_summary_cache:
-            result = self._run_l1(module_source, regime_spec)
-            if not result.passed:
-                logger.warning(
-                    "First-round parent L1 for regime %s failed: %s",
-                    regime_spec.regime_tag,
-                    result.error_message,
-                )
-            self._l1_summary_cache[cache_key] = (
-                result.compiler_summary if result.passed else None
-            )
-        return self._l1_summary_cache[cache_key]
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._l1_summary_for_first_round(
+            module_source,
+            regime_spec,
+        )
 
     def _normalize_paired_l2_results(
         self,
         raw_results: Mapping[str, CandidateSurrogateResult],
         incumbent_slot_result: CandidateSurrogateResult | None,
     ) -> dict[str, CandidateSurrogateResult]:
-        """Re-anchor candidate latencies via paired_speedup_vs_incumbent when available."""
-        inc_slot_by_case = (
-            {int(a.case_num): float(a.cand_us) for a in incumbent_slot_result.anchors if a.cand_us > 0.0}
-            if incumbent_slot_result is not None
-            else {}
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._normalize_paired_l2_results(
+            raw_results,
+            incumbent_slot_result,
         )
-        normalized: dict[str, CandidateSurrogateResult] = {}
-        for cid, cand_res in raw_results.items():
-            changed = False
-            updated_anchors: list[AnchorEvalMetrics] = []
-            for anc in cand_res.anchors:
-                paired_sp = float(getattr(anc, "paired_speedup_vs_incumbent", 0.0) or 0.0)
-                inc_base_us = self._incumbent_anchor_us_by_case.get(
-                    int(anc.case_num),
-                    inc_slot_by_case.get(int(anc.case_num), 0.0),
-                )
-                if paired_sp > 0.0 and inc_base_us > 0.0 and anc.accuracy_passed:
-                    eff_us = inc_base_us / paired_sp
-                    eff_speedup = (
-                        (anc.ref_perf_us / eff_us) if anc.ref_perf_us > 0.0 else anc.speedup
-                    )
-                    eff_eta = (
-                        (anc.t_hw_us / eff_us) if anc.t_hw_us > 0.0 else anc.roofline_eta
-                    )
-                    eff_eq3 = compute_case_eq3_score(anc.ref_perf_us, eff_us, anc.t_hw_us)
-                    updated_anchors.append(
-                        replace(
-                            anc,
-                            cand_us=eff_us,
-                            speedup=eff_speedup,
-                            roofline_eta=eff_eta,
-                            eq3_score=eff_eq3,
-                        )
-                    )
-                    changed = True
-                else:
-                    updated_anchors.append(anc)
-            if changed:
-                normalized[cid] = aggregate_surrogate_result(
-                    cand_res.candidate_id,
-                    cand_res.operator_name,
-                    tuple(updated_anchors),
-                    error_message=cand_res.error_message,
-                )
-            else:
-                normalized[cid] = cand_res
-        return normalized
 
     def _run_l2_batch(
         self,
@@ -4421,179 +1202,14 @@ class PerfTargetCampaignRunner:
         *,
         include_guardrails: bool = True,
     ) -> tuple[dict[str, CandidateSurrogateResult], dict[str, str]]:
-        """Evaluate one batch and return results plus each measured candidate's AgentGates run id.
-
-        Legacy injected evaluators return a plain mapping; their results keep working and
-        carry no run ids rather than borrowing an id from a different execution.
-        """
-        eff_inc_src = self._active_incumbent_source
-        if (
-            not eff_inc_src
-            and self._l2_batch_evaluator is None
-            and self._target_module_path.is_file()
-        ):
-            try:
-                eff_inc_src = self._target_module_path.read_text(encoding="utf-8")
-            except OSError:
-                eff_inc_src = ""
-        cand_ids = {cid for cid, _path in candidates}
-        should_prepend_incumbent = bool(
-            len(candidates) >= 1
-            and eff_inc_src.strip()
-            and "incumbent_slot" not in cand_ids
-            and "__incumbent__" not in cand_ids
-            and "incumbent_baseline" not in cand_ids
+        self._sync_coordinators()
+        res = self._stage_gate_coordinator._run_l2_batch(
+            candidates,
+            active_anchors,
+            include_guardrails=include_guardrails,
         )
-
-        scoreboard_case_nums = {int(a.case_num) for a in active_anchors}
-        extra_guardrails: list[AnchorCaseSpec] = []
-        guardrail_case_nums: set[int] = set()
-        if include_guardrails and self._guardrail_cases and active_anchors:
-            for g in self._guardrail_cases:
-                g_cnum = int(g.case_num)
-                if g_cnum not in scoreboard_case_nums and g_cnum not in guardrail_case_nums:
-                    extra_guardrails.append(g.to_anchor_spec())
-                    guardrail_case_nums.add(g_cnum)
-        eval_anchors = [*active_anchors, *extra_guardrails] if extra_guardrails else list(active_anchors)
-
-        l2_meta: dict[str, object] = {
-            "prewarm_stats": {},
-            "l2_prewarm_sec": 0.0,
-            "l2_npu_sec": None,
-        }
-
-        def _capture_l2_meta(evaluated: object) -> None:
-            raw_prewarm = getattr(evaluated, "prewarm_stats", None)
-            if isinstance(raw_prewarm, Mapping):
-                l2_meta["prewarm_stats"] = {
-                    str(k): int(v)
-                    for k, v in raw_prewarm.items()
-                    if isinstance(v, (int, float)) and not isinstance(v, bool)
-                }
-            raw_pw_sec = getattr(evaluated, "l2_prewarm_sec", None)
-            if isinstance(raw_pw_sec, (int, float)) and not isinstance(raw_pw_sec, bool):
-                l2_meta["l2_prewarm_sec"] = float(raw_pw_sec)
-            raw_npu_sec = getattr(evaluated, "l2_npu_sec", None)
-            if isinstance(raw_npu_sec, (int, float)) and not isinstance(raw_npu_sec, bool):
-                l2_meta["l2_npu_sec"] = float(raw_npu_sec)
-
-        def _dispatch(
-            batch_cands: Sequence[tuple[str, Path]],
-        ) -> tuple[dict[str, CandidateSurrogateResult], dict[str, str]]:
-            if self._l2_batch_evaluator is not None:
-                evaluated = self._l2_batch_evaluator(batch_cands, eval_anchors)
-                _capture_l2_meta(evaluated)
-                if isinstance(evaluated, L2BatchResults):
-                    return dict(evaluated), dict(evaluated.run_ids)
-                return dict(evaluated), {}
-            results, run_id, _receipt = self._invoke_with_optional_kwargs(
-                run_surrogate_batch_via_agent_gates,
-                self._config.operator_name,
-                batch_cands,
-                eval_anchors,
-                source_root=self._source_root,
-                env_file=self._env_file,
-                device_id=self._config.device_id,
-                device_pool=self._l4_device_pool,
-                warmup=self._config.warmup,
-                repeat=self._config.repeat,
-                require_all_passed=False,
-            )
-            _capture_l2_meta(results)
-            return results, {candidate_id: run_id for candidate_id in results}
-
-        if should_prepend_incumbent:
-            with tempfile.TemporaryDirectory(prefix="tf_camp_inc_") as inc_dir:
-                inc_path = Path(inc_dir) / "incumbent_slot.py"
-                inc_path.write_text(eff_inc_src, encoding="utf-8")
-                results, run_ids = _dispatch([("incumbent_slot", inc_path), *candidates])
-        else:
-            results, run_ids = _dispatch(candidates)
-
-        self._last_l2_timing_meta = l2_meta
-        inc_slot_result = results.pop("incumbent_slot", None)
-        run_ids.pop("incumbent_slot", None)
-        normalized = self._normalize_paired_l2_results(results, inc_slot_result)
-        if guardrail_case_nums:
-            stripped_results: dict[str, CandidateSurrogateResult] = {}
-            for cid, cand_res in normalized.items():
-                kept_anchors = tuple(
-                    a for a in cand_res.anchors if int(a.case_num) not in guardrail_case_nums
-                )
-                self._last_guardrail_metrics_by_cid[cid] = {
-                    int(a.case_num): a
-                    for a in cand_res.anchors
-                    if int(a.case_num) in guardrail_case_nums
-                }
-                if kept_anchors:
-                    stripped_results[cid] = aggregate_surrogate_result(
-                        cand_res.candidate_id,
-                        cand_res.operator_name,
-                        kept_anchors,
-                        error_message=cand_res.error_message,
-                    )
-                else:
-                    stripped_results[cid] = replace(cand_res, anchors=())
-            return stripped_results, run_ids
-        return normalized, run_ids
-
-    def _recheck_single_sibling_anchor(
-        self,
-        candidate_id: str,
-        candidate_source: str,
-        dipped_anchor: AnchorCaseSpec,
-    ) -> CandidateSurrogateResult | None:
-        """Re-evaluate one candidate on a single dipped sibling anchor."""
-        with tempfile.TemporaryDirectory(prefix="tf_camp_recheck_") as tmp_dir:
-            cand_file = Path(tmp_dir) / f"{candidate_id}.py"
-            cand_file.write_text(candidate_source, encoding="utf-8")
-            try:
-                l2_results, _ = self._run_l2_batch(
-                    [(candidate_id, cand_file)],
-                    [dipped_anchor],
-                    include_guardrails=False,
-                )
-            except (
-                OSError,
-                subprocess.SubprocessError,
-                TimeoutError,
-                json.JSONDecodeError,
-                RuntimeError,
-            ) as exc:
-                logger.warning(
-                    "Single-point sibling recheck failed for %s case %d: %s",
-                    candidate_id,
-                    dipped_anchor.case_num,
-                    exc,
-                )
-                return None
-        return l2_results.get(candidate_id)
-
-    @staticmethod
-    def _regime_closure_ast_hash(
-        module_source: str,
-        spec: RegimeTargetSpec,
-        *,
-        operator_entrypoint: str = "",
-        sibling_specs: Sequence[RegimeTargetSpec] = (),
-    ) -> str | None:
-        """Compute canonical AST+Track-B-TU hash for one regime's reachable closure."""
-        try:
-            _primary, snippet = extract_regime_snippet(
-                module_source,
-                spec,
-                operator_entrypoint=operator_entrypoint,
-                sibling_specs=sibling_specs,
-            )
-            tree = ast.parse(snippet)
-        except (SyntaxError, ValueError):
-            return None
-        from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-            _normalized_module_ast_signature,
-        )  # noqa: PLC0415
-
-        _ = tree
-        return _normalized_module_ast_signature(snippet)
+        self._last_l2_timing_meta = dict(self._stage_gate_coordinator._last_l2_timing_meta)
+        return res
 
     def _unchanged_sibling_regimes(
         self,
@@ -4601,1217 +1217,22 @@ class PerfTargetCampaignRunner:
         candidate_src: str,
         active_regime_spec: RegimeTargetSpec,
     ) -> set[str]:
-        """Return sibling regime tags whose Python AST + Track-B TU closure is unchanged."""
-        if not incumbent_src.strip() or not candidate_src.strip():
-            return set()
-        op_entry = _resolve_operator_entrypoint_safe(self._config.operator_name)
-        unchanged: set[str] = set()
-        for spec in self._regime_specs:
-            if spec.regime_tag == active_regime_spec.regime_tag:
-                continue
-            inc_hash = self._regime_closure_ast_hash(
-                incumbent_src,
-                spec,
-                operator_entrypoint=op_entry,
-                sibling_specs=self._regime_specs,
-            )
-            cand_hash = self._regime_closure_ast_hash(
-                candidate_src,
-                spec,
-                operator_entrypoint=op_entry,
-                sibling_specs=self._regime_specs,
-            )
-            if inc_hash is not None and cand_hash is not None and inc_hash == cand_hash:
-                unchanged.add(spec.regime_tag)
-        return unchanged
-
-    def _retest_noisy_tail_anchors(
-        self,
-        *,
-        candidate_id: str,
-        candidate_source: str,
-        cur_res: CandidateSurrogateResult,
-        regressed_anchors: Sequence[AnchorEvalMetrics],
-        active_anchors: Sequence[AnchorCaseSpec],
-    ) -> CandidateSurrogateResult | None:
-        """Re-evaluate noisy regressed tail anchors once and merge into CandidateSurrogateResult."""
-        anchor_spec_by_case = {int(a.case_num): a for a in active_anchors}
-        retest_specs: list[AnchorCaseSpec] = []
-        seen_cases: set[int] = set()
-        for anc in regressed_anchors:
-            cnum = int(anc.case_num)
-            if cnum in seen_cases:
-                continue
-            seen_cases.add(cnum)
-            spec = anchor_spec_by_case.get(cnum)
-            if spec is None:
-                spec = AnchorCaseSpec(
-                    task=f"operator/{cur_res.operator_name}",
-                    case_num=cnum,
-                    regime_tag=anc.regime_tag,
-                    ref_perf_us=anc.ref_perf_us,
-                    t_hw_us=anc.t_hw_us,
-                )
-            retest_specs.append(spec)
-        if not retest_specs:
-            return None
-        with tempfile.TemporaryDirectory(prefix="tf_camp_tail_retest_") as tmp_dir:
-            cand_file = Path(tmp_dir) / f"{candidate_id}.py"
-            cand_file.write_text(candidate_source, encoding="utf-8")
-            try:
-                l2_results, _ = self._run_l2_batch(
-                    [(candidate_id, cand_file)],
-                    retest_specs,
-                    include_guardrails=False,
-                )
-            except (
-                OSError,
-                subprocess.SubprocessError,
-                TimeoutError,
-                json.JSONDecodeError,
-                RuntimeError,
-            ) as exc:
-                logger.warning(
-                    "Noisy tail retest failed for %s: %s",
-                    candidate_id,
-                    exc,
-                )
-                return None
-        retest_res = l2_results.get(candidate_id)
-        if retest_res is None or not retest_res.anchors:
-            return None
-        retest_by_case = {int(a.case_num): a for a in retest_res.anchors}
-        merged_anchors = tuple(
-            retest_by_case.get(int(a.case_num), a) for a in cur_res.anchors
+        self._sync_coordinators()
+        return self._stage_gate_coordinator._unchanged_sibling_regimes(
+            incumbent_src,
+            candidate_src,
+            active_regime_spec,
         )
-        return aggregate_surrogate_result(
-            cur_res.candidate_id,
-            cur_res.operator_name,
-            merged_anchors,
-            error_message=cur_res.error_message,
-        )
-
-    def _is_real_npu_path(self) -> bool:
-        """Return True when evaluations execute on real leased NPU hardware."""
-        if self._l2_batch_evaluator is not None:
-            return bool(getattr(self._l2_batch_evaluator, "is_real_npu", False))
-        return bool(
-            self._env_file is not None
-            or os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip()
-            or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
-        )
-
-    def _evaluate_dual_layer_tail_guard(
-        self,
-        *,
-        candidate_id: str,
-        candidate_source: str,
-        top_res: CandidateSurrogateResult,
-        best_result: CandidateSurrogateResult,
-        regime_spec: RegimeTargetSpec,
-        active_anchors: Sequence[AnchorCaseSpec],
-        incumbent_source: str = "",
-    ) -> tuple[bool, CandidateSurrogateResult]:
-        """Delegate CEGAR guardrails, 3-sigma non-regression, and 2-sigma gain checks."""
-        eff_incumbent = incumbent_source or self._active_incumbent_source
-        unchanged_siblings = (
-            self._unchanged_sibling_regimes(eff_incumbent, candidate_source, regime_spec)
-            if eff_incumbent and eff_incumbent != candidate_source
-            else set()
-        )
-        ok, updated_res, reject_reason = evaluate_promotion_gate(
-            candidate_id=candidate_id,
-            cur_res=top_res,
-            best_result=best_result,
-            regime_spec=regime_spec,
-            guardrail_cases=self._guardrail_cases,
-            cand_guardrail_metrics=self._last_guardrail_metrics_by_cid.get(candidate_id, {}),
-            unchanged_siblings=unchanged_siblings,
-            active_anchors=active_anchors,
-            retest_noisy_fn=lambda regressed, cur: self._retest_noisy_tail_anchors(
-                candidate_id=candidate_id,
-                candidate_source=candidate_source,
-                cur_res=cur,
-                regressed_anchors=regressed,
-                active_anchors=active_anchors,
-            ),
-            recheck_single_sibling_fn=lambda spec: self._recheck_single_sibling_anchor(
-                candidate_id,
-                candidate_source,
-                spec,
-            ),
-        )
-        self._last_tail_guard_reject_reason = reject_reason
-        return ok, updated_res
-
-    def _refresh_guardrail_incumbent_refs(self, winner_candidate_id: str) -> None:
-        """Update guardrail incumbent reference latencies from a newly promoted winner."""
-        if not self._guardrail_cases:
-            return
-        metrics_by_case = self._last_guardrail_metrics_by_cid.get(winner_candidate_id)
-        if not metrics_by_case:
-            return
-        refreshed: list[GuardrailCaseSpec] = []
-        for guardrail in self._guardrail_cases:
-            metric = metrics_by_case.get(int(guardrail.case_num))
-            if metric is not None and metric.accuracy_passed and metric.cand_us > 0.0:
-                refreshed.append(replace(guardrail, incumbent_ref_us=float(metric.cand_us)))
-            else:
-                refreshed.append(guardrail)
-        self._guardrail_cases = refreshed
-
-    def _run_l3_contract(
-        self,
-        module_path: Path,
-        *,
-        device_id: str | None = None,
-        on_execution_started: Callable[[str, str], None] | None = None,
-    ) -> L3AcceptanceResult:
-        requested_device = str(device_id or self._config.device_id)
-        if self._l3_contract_runner is not None:
-            return self._invoke_with_optional_kwargs(
-                self._l3_contract_runner,
-                module_path,
-                device_id=requested_device,
-                device_pool=self._l4_device_pool,
-                on_execution_started=on_execution_started,
-            )
-        return self._invoke_with_optional_kwargs(
-            run_l3_full_contract_via_agent_gates,
-            operator_name=self._config.operator_name,
-            candidate_module_path=module_path,
-            source_root=self._source_root,
-            env_file=self._env_file,
-            device_id=requested_device,
-            device_pool=self._l4_device_pool,
-            on_execution_started=on_execution_started,
-        )
-
-    def _resume_l3_contract(
-        self,
-        module_path: Path,
-        pending: PendingPromotion,
-        *,
-        on_execution_started: Callable[[str, str], None] | None = None,
-    ) -> L3AcceptanceResult:
-        """Continue the saved L3 execution instead of submitting a duplicate."""
-        if self._l3_contract_runner is not None:
-            return self._invoke_with_optional_kwargs(
-                self._l3_contract_runner,
-                module_path,
-                resume_execution_id=pending.execution_id,
-                resume_run_id=pending.run_id,
-                device_id=pending.device_id or self._config.device_id,
-                on_execution_started=on_execution_started,
-            )
-        return self._invoke_with_optional_kwargs(
-            run_l3_full_contract_via_agent_gates,
-            operator_name=self._config.operator_name,
-            candidate_module_path=module_path,
-            source_root=self._source_root,
-            env_file=self._env_file,
-            device_id=pending.device_id or self._config.device_id,
-            resume_execution_id=pending.execution_id,
-            resume_run_id=pending.run_id,
-            on_execution_started=on_execution_started,
-        )
-
-    def _run_l4_cannbench(
-        self,
-        module_path: Path,
-        *,
-        resume_execution_id: str = "",
-        resume_run_id: str = "",
-        device_id: str | None = None,
-        on_execution_started: Callable[[str, str], None] | None = None,
-    ) -> L4CannbenchResult:
-        requested_device = str(device_id or self._config.device_id)
-        if self._l4_cannbench_runner is not None:
-            return self._invoke_with_optional_kwargs(
-                self._l4_cannbench_runner,
-                module_path,
-                resume_execution_id=resume_execution_id,
-                resume_run_id=resume_run_id,
-                device_id=requested_device,
-                on_execution_started=on_execution_started,
-            )
-        return self._invoke_with_optional_kwargs(
-            run_l4_official_cannbench_via_agent_gates,
-            operator_name=self._config.operator_name,
-            candidate_module_path=module_path,
-            source_root=self._source_root,
-            env_file=self._env_file,
-            device_id=requested_device,
-            resume_execution_id=resume_execution_id,
-            resume_run_id=resume_run_id,
-            on_execution_started=on_execution_started,
-        )
-
-    def _is_regime_satisfied(
-        self,
-        regime_spec: RegimeTargetSpec,
-        best_result: CandidateSurrogateResult,
-        active_anchors: Sequence[AnchorCaseSpec],
-    ) -> bool:
-        anchor_nums = {
-            a.case_num for a in active_anchors if a.regime_tag == regime_spec.regime_tag
-        }
-        matched = [a for a in best_result.anchors if a.case_num in anchor_nums]
-        if not matched:
-            return False
-        for metric in matched:
-            if not metric.accuracy_passed:
-                return False
-            if metric.roofline_eta < self._perf_target.target_roofline_eta:
-                return False
-            if metric.speedup < self._perf_target.target_min_case_speedup:
-                return False
-            max_us = self._perf_target.per_anchor_max_us.get(metric.case_num)
-            if max_us is not None and metric.cand_us > max_us:
-                return False
-        return True
-
-    def _allow_early_stop(self, rounds_completed: int) -> bool:
-        if self._config.disable_early_goal_stop:
-            return False
-        return rounds_completed > 0 and rounds_completed >= self._perf_target.min_optimization_rounds
-
-    def _round_regime_override(self, round_idx: int) -> RegimeTargetSpec | None:
-        """Return the configured regime for *round_idx*, or None for adaptive rotation."""
-        if round_idx > len(self._config.round_regime_tags):
-            return None
-        tag = self._config.round_regime_tags[round_idx - 1]
-        if not tag:
-            return None
-        return next(spec for spec in self._regime_specs if spec.regime_tag == tag)
-
-    def _regime_mean_recoverable_excess_us(
-        self,
-        best_result: CandidateSurrogateResult,
-        regime_spec: RegimeTargetSpec,
-    ) -> float | None:
-        """Compute mean recoverable silicon excess (us) above calibrated dispatch floor."""
-        matched = [
-            a
-            for a in best_result.anchors
-            if a.regime_tag == regime_spec.regime_tag and a.cand_us > 0.0
-        ]
-        if not matched:
-            return None
-        floor_us = float(getattr(self, "_calibrated_dispatch_floor_us", 0.0) or 0.0)
-        excesses = [
-            to_conservation_point(a, a).recoverable_sched_us(floor_us)
-            for a in matched
-        ]
-        return sum(excesses) / len(excesses)
-
-    def _select_active_regime(
-        self,
-        current_regime: str | None,
-        frozen_regimes: set[str],
-        best_result: CandidateSurrogateResult,
-        active_anchors: Sequence[AnchorCaseSpec],
-        *,
-        allow_satisfied_fallback: bool = False,
-        exclude_regime: str | None = None,
-        stagnation_by_regime: Mapping[str, int] | None = None,
-        last_round_promoted: bool | None = None,
-    ) -> RegimeTargetSpec | None:
-        by_tag = {r.regime_tag: r for r in self._regime_specs}
-        wall_map = getattr(self, "_compile_wall_streak_by_regime", {})
-        stag_map = (
-            stagnation_by_regime
-            if stagnation_by_regime is not None
-            else getattr(self, "_stagnation_by_regime", {})
-        )
-        active_unfrozen_count = sum(
-            1 for spec in self._regime_specs if spec.regime_tag not in frozen_regimes
-        )
-        candidates = [
-            spec
-            for spec in self._regime_specs
-            if spec.regime_tag not in frozen_regimes
-            and (active_unfrozen_count <= 1 or int(wall_map.get(spec.regime_tag, 0) or 0) < 3)
-            and not self._is_regime_satisfied(spec, best_result, active_anchors)
-        ]
-        if not candidates and allow_satisfied_fallback:
-            candidates = [
-                spec
-                for spec in self._regime_specs
-                if spec.regime_tag not in frozen_regimes
-                and (active_unfrozen_count <= 1 or int(wall_map.get(spec.regime_tag, 0) or 0) < 3)
-            ]
-        if not candidates:
-            return None
-        if exclude_regime and any(spec.regime_tag != exclude_regime for spec in candidates):
-            candidates = [spec for spec in candidates if spec.regime_tag != exclude_regime]
-
-        dispatch_floor = float(getattr(self, "_calibrated_dispatch_floor_us", 0.0) or 0.0)
-        regime_points_map: dict[str, list[AnchorConservationPoint]] = {}
-        floor_saturated_map: dict[str, bool] = {}
-        has_unsat_other_map: dict[str, bool] = {}
-        for spec in candidates:
-            sb_nums = {
-                int(a.case_num)
-                for a in active_anchors
-                if a.regime_tag == spec.regime_tag
-            }
-            if sb_nums:
-                matched = [
-                    a
-                    for a in best_result.anchors
-                    if int(a.case_num) in sb_nums and a.cand_us > 0.0
-                ]
-            else:
-                matched = [
-                    a
-                    for a in best_result.anchors
-                    if a.regime_tag == spec.regime_tag and a.cand_us > 0.0
-                ]
-            pts = [to_conservation_point(a, a) for a in matched]
-            regime_points_map[spec.regime_tag] = pts
-            floor_saturated_map[spec.regime_tag] = is_regime_saturated(
-                pts, dispatch_floor, sigma_mult=2.0
-            )
-            has_unsat_other_map[spec.regime_tag] = bool(pts) and not floor_saturated_map[spec.regime_tag]
-
-        def _is_floor_deprioritized(spec: RegimeTargetSpec) -> int:
-            if not floor_saturated_map.get(spec.regime_tag, False):
-                return 0
-            other_unsat = any(
-                other_tag != spec.regime_tag and is_unsat
-                for other_tag, is_unsat in has_unsat_other_map.items()
-            )
-            return 1 if other_unsat else 0
-
-        def _urgency_key(
-            spec: RegimeTargetSpec,
-        ) -> tuple[int, int, int, float, float, float, str]:
-            pts = regime_points_map.get(spec.regime_tag, ())
-            stag = max(0, int(stag_map.get(spec.regime_tag, 0) or 0))
-            rec = self._regime_mean_recoverable_excess_us(best_result, spec)
-            has_excess = 1 if (rec is None or rec > 0.0) else 0
-            rec_val = float(rec) if rec is not None else 0.0
-            headroom = max(0.0, float(best_result.regime_headroom(spec.regime_tag)))
-            bandit_score = (
-                regime_bandit_ucb_us(pts, dispatch_floor, stag)
-                if pts
-                else (headroom / math.sqrt(1.0 + float(stag)))
-            )
-            wall_yield = 1 if int(wall_map.get(spec.regime_tag, 0) or 0) >= 2 else 0
-            floor_dep = _is_floor_deprioritized(spec)
-            return (
-                wall_yield,
-                floor_dep,
-                -has_excess,
-                -bandit_score,
-                -headroom,
-                -rec_val,
-                spec.regime_tag,
-            )
-
-        candidates.sort(key=_urgency_key)
-        top_spec = candidates[0]
-        candidate_tags = {spec.regime_tag for spec in candidates}
-        promoted_map = getattr(self, "_last_round_promoted_by_regime", {})
-        was_promoted = (
-            promoted_map.get(
-                current_regime, getattr(self, "_last_round_promoted", True)
-            )
-            if (current_regime and last_round_promoted is None)
-            else bool(last_round_promoted)
-        )
-        if (
-            current_regime
-            and current_regime in candidate_tags
-            and current_regime in by_tag
-            and int(wall_map.get(current_regime, 0) or 0) < 2
-            and was_promoted
-            and _is_floor_deprioritized(by_tag[current_regime]) == 0
-        ):
-            top_pts = regime_points_map.get(top_spec.regime_tag, ())
-            cur_pts = regime_points_map.get(current_regime, ())
-            if top_pts and cur_pts:
-                top_ucb = regime_bandit_ucb_us(top_pts, dispatch_floor, 0)
-                cur_ucb = regime_bandit_ucb_us(cur_pts, dispatch_floor, 0)
-                cur_sigma = math.sqrt(sum(p.sigma_paired_us() ** 2 for p in cur_pts))
-                if top_ucb - cur_ucb <= 2.0 * cur_sigma:
-                    return by_tag[current_regime]
-        return top_spec
-
-    @staticmethod
-    def _slice_contract_instruction(
-        func_name: str,
-        regime_spec: RegimeTargetSpec,
-        *,
-        operator_entrypoint: str = "",
-    ) -> str:
-        kernel_name_warning = ""
-        if operator_entrypoint == "kernel":
-            kernel_name_warning = (
-                " CRITICAL: the public operator entrypoint is named 'kernel', so you MUST NOT "
-                "define a top-level '@T.prim_func def kernel' or 'def kernel'; name any inner "
-                "prim_func differently (e.g., '_ar_kernel_impl') and return it from the builder."
-            )
-        if not regime_spec.editable_symbols:
-            return f"function '{func_name}'{kernel_name_warning}"
-        syms = ", ".join(regime_spec.editable_symbols)
-        helper_note = (
-            f" or '{regime_spec.allowed_helper_prefix}*' helpers"
-            if regime_spec.allowed_helper_prefix
-            else ""
-        )
-        return (
-            f"authorized slice symbols ({syms}){helper_note} for entrypoint '{func_name}'. "
-            "You may output ONLY the subset of functions or prefixed macros you modified "
-            "(e.g., just _select_*_config, a single helper macro, or one builder); omitted "
-            "sibling symbols in this regime automatically inherit their parent implementation. "
-            f"Preserve exact public entrypoint '{func_name}' and `kernel = {func_name}` without "
-            f"renaming or modifying symbols from other regimes{kernel_name_warning}"
-        )
-
-    @staticmethod
-    def _format_msprof_section(
-        residual: StaticDynamicResidual | None,
-        *,
-        p2_diag: Mapping[str, object] | None = None,
-    ) -> str:
-        has_pmu = bool(
-            residual is not None
-            and (
-                residual.measured_aic_mac_ratio > 0.0
-                or residual.measured_aiv_vec_ratio > 0.0
-                or residual.measured_mte2_wait_ratio > 0.0
-                or residual.measured_sync_stall_ratio > 0.0
-            )
-        )
-        has_compiler_hazard = bool(
-            residual is not None
-            and (
-                residual.spill_bytes > 0
-                or residual.stack_bytes > 0
-                or (not residual.vloopv2_hit)
-                or residual.vf_fusion_breaks > 0
-                or residual.alias_serialized_buffers > 0
-                or residual.dual_issue_ipc_collapse > 0.0
-                or residual.dcache_dcci_flushes > 0
-                or bool(residual.has_local_membar_in_vf_call)
-                or residual.scalar_compute_loop_fallback > 0.0
-                or residual.dcache_bypass_narrow_store > 0.0
-            )
-        )
-        p2_lines: list[str] = []
-        if p2_diag:
-            raw_hotspots = p2_diag.get("p2_hotspots") or p2_diag.get("source_line_hotspots") or ()
-            if isinstance(raw_hotspots, Sequence) and not isinstance(raw_hotspots, (str, bytes)):
-                formatted_spots: list[str] = []
-                for spot in list(raw_hotspots)[:3]:
-                    if isinstance(spot, Mapping):
-                        loc = str(spot.get("source_location") or "?")
-                        cnt = spot.get("instruction_count", 0)
-                        share = spot.get("instruction_share")
-                        if isinstance(share, (int, float)) and not isinstance(share, bool):
-                            formatted_spots.append(
-                                f"{loc} (instrs={cnt}, share={float(share):.3f})"
-                            )
-                        else:
-                            formatted_spots.append(f"{loc} (instrs={cnt})")
-                    elif hasattr(spot, "source_location"):
-                        loc = str(getattr(spot, "source_location", "?"))
-                        cnt = getattr(spot, "instruction_count", 0)
-                        share = getattr(spot, "instruction_share", None)
-                        if isinstance(share, (int, float)) and not isinstance(share, bool):
-                            formatted_spots.append(
-                                f"{loc} (instrs={cnt}, share={float(share):.3f})"
-                            )
-                        else:
-                            formatted_spots.append(f"{loc} (instrs={cnt})")
-                    else:
-                        formatted_spots.append(str(spot))
-                if formatted_spots:
-                    p2_lines.append("p2_top_hotspots: " + "; ".join(formatted_spots))
-            raw_waitflag = p2_diag.get("p2_mte_waitflag_share")
-            if raw_waitflag is None:
-                raw_waitflag = p2_diag.get("mte_waitflag_share")
-            if isinstance(raw_waitflag, (int, float)) and not isinstance(raw_waitflag, bool):
-                p2_lines.append(f"p2_mte_waitflag_share: {float(raw_waitflag):.4f}")
-            raw_issue = p2_diag.get("p2_issue_interval_us")
-            if raw_issue is None:
-                raw_issue = p2_diag.get("issue_interval_us")
-            if isinstance(raw_issue, Mapping) and raw_issue:
-                parts: list[str] = []
-                for pipe in sorted(raw_issue):
-                    stats = raw_issue[pipe]
-                    if isinstance(stats, Mapping):
-                        p50 = float(stats.get("p50_us", 0.0) or 0.0)
-                        p90 = float(stats.get("p90_us", 0.0) or 0.0)
-                        parts.append(f"{pipe}(p50={p50:.3f}us, p90={p90:.3f}us)")
-                    elif hasattr(stats, "p50_us") and hasattr(stats, "p90_us"):
-                        p50 = float(getattr(stats, "p50_us", 0.0) or 0.0)
-                        p90 = float(getattr(stats, "p90_us", 0.0) or 0.0)
-                        parts.append(f"{pipe}(p50={p50:.3f}us, p90={p90:.3f}us)")
-                    elif isinstance(stats, (int, float)) and not isinstance(stats, bool):
-                        parts.append(f"{pipe}={float(stats):.4f}us")
-                if parts:
-                    p2_lines.append("p2_issue_interval_us: " + ", ".join(parts))
-            elif isinstance(raw_issue, (int, float)) and not isinstance(raw_issue, bool):
-                p2_lines.append(f"p2_issue_interval_us: {float(raw_issue):.4f}")
-        has_p2 = bool(p2_lines)
-        if not has_pmu and not has_compiler_hazard and not has_p2:
-            return ""
-        lines = ["### HARDWARE MSPROF TELEMETRY"]
-        if has_pmu and residual is not None:
-            res_map = residual.to_dict()
-            lines.extend(
-                [
-                    f"aic_mac_ratio: {residual.measured_aic_mac_ratio:.4f}",
-                    f"aiv_vec_ratio: {residual.measured_aiv_vec_ratio:.4f}",
-                    f"mte2_wait_ratio: {residual.measured_mte2_wait_ratio:.4f}",
-                    f"sync_stall_ratio: {residual.measured_sync_stall_ratio:.4f}",
-                    f"unexplained_gap_ratio: {residual.unexplained_gap_ratio:.4f}",
-                ]
-            )
-            raw_infl = res_map.get("transfer_inflation_ratio")
-            if isinstance(raw_infl, (int, float)) and not isinstance(raw_infl, bool):
-                lines.append(f"transfer_inflation_ratio: {float(raw_infl):.4f}")
-            raw_eta = res_map.get("effective_compute_eta")
-            if isinstance(raw_eta, (int, float)) and not isinstance(raw_eta, bool):
-                lines.append(f"effective_compute_eta: {float(raw_eta):.4f}")
-        if has_compiler_hazard and residual is not None:
-            lines.extend(
-                [
-                    f"spill_bytes: {residual.spill_bytes}",
-                    f"stack_bytes: {residual.stack_bytes}",
-                    f"vloopv2_hit: {residual.vloopv2_hit}",
-                    f"vf_fusion_breaks: {residual.vf_fusion_breaks}",
-                    f"alias_serialized_buffers: {residual.alias_serialized_buffers}",
-                    f"dual_issue_ipc_collapse: {residual.dual_issue_ipc_collapse:.4f}",
-                    f"dcache_dcci_flushes: {residual.dcache_dcci_flushes}",
-                    f"has_local_membar_in_vf_call: {residual.has_local_membar_in_vf_call}",
-                    f"scalar_compute_loop_fallback: {residual.scalar_compute_loop_fallback:.1f}",
-                    f"dcache_bypass_narrow_store: {residual.dcache_bypass_narrow_store:.1f}",
-                ]
-            )
-        if p2_lines:
-            lines.extend(p2_lines)
-        return "\n".join(lines) + "\n\n"
-
-    def _format_sil_live_policy_section(
-        self,
-        *,
-        live_plan: RegimePlanResult | None,
-        active_mask: ConstraintRelaxationMask | None,
-        escalation: object | None = None,
-        pipe_gaps: object | None = None,
-        cost_pred: object | None = None,
-        escalated_trackb_tu: str = "",
-        parent_ledger: ObjectivePhysicalLedger | None = None,
-        parent_residual: StaticDynamicResidual | None = None,
-    ) -> str:
-        if live_plan is None and active_mask is None:
-            return ""
-        lines = ["### SIL LIVE POLICY & 7-FACET CONSTRAINT ENVELOPE"]
-        if live_plan is not None:
-            pol = live_plan.policy
-            lines.append(
-                f"- topology_axes: {live_plan.topology_axes.key()} "
-                f"(solver_mode={live_plan.solver_mode}, backend_tier={pol.get('backend_tier', 'tilelang_dsl')})"
-            )
-            lines.append(
-                f"- live_solved_knobs: tile_mnk={pol.get('tile_mnk')}, "
-                f"row_pack_factor={pol.get('row_pack_factor', 1)}, "
-                f"l1_stages={pol.get('l1_stages', 1)}, "
-                f"ub_bytes={pol.get('ub_estimated_bytes', 0)}, "
-                f"l1_bytes={pol.get('l1_estimated_bytes', 0)}"
-            )
-            if live_plan.notes:
-                lines.append(f"- solver_note: {live_plan.notes[-1]}")
-        if active_mask is not None:
-            lines.append(f"- unlocked_facets: {', '.join(active_mask.unlocked_facets())}")
-            locked = active_mask.locked_facets()
-            lines.append(f"- locked_facets: {', '.join(locked) if locked else 'none (top)'}")
-        resolved_bound = ""
-        if parent_ledger is not None or parent_residual is not None or cost_pred is not None:
-            resolved_bound = str(
-                self._cost_advisor.resolve_dominant_bound(
-                    parent_ledger,
-                    parent_residual,
-                    fallback_cost_pred=cost_pred,
-                )
-                or ""
-            )
-        if cost_pred is not None:
-            pred_val = (
-                float(cost_pred)
-                if isinstance(cost_pred, (int, float)) and not isinstance(cost_pred, bool)
-                else float(getattr(cost_pred, "pred_us", 0.0) or 0.0)
-            )
-            bound_val = resolved_bound or str(getattr(cost_pred, "dominant_bound", "") or "")
-            penalty_val = float(getattr(cost_pred, "tier1_penalty_us", 0.0) or 0.0)
-            lines.append(
-                f"- cost_model_pred_us: {pred_val:.2f} "
-                f"(dominant_bound={bound_val}, "
-                f"tier1_penalty_us={penalty_val:.2f})"
-            )
-        elif resolved_bound:
-            lines.append(f"- dominant_bound: {resolved_bound}")
-        if escalation is not None:
-            should_esc = bool(getattr(escalation, "should_escalate", False))
-            to_tier = getattr(escalation, "to_tier", "")
-            reasons = tuple(getattr(escalation, "trigger_reasons", ()) or ())
-            lines.append(
-                f"- track_escalation: should_escalate={should_esc}, to_tier={to_tier}, "
-                f"reasons={list(reasons)}"
-            )
-        if escalated_trackb_tu.strip():
-            lines.append("- escalated_trackb_seed_cpp:")
-            lines.append("```cpp")
-            lines.append(escalated_trackb_tu.strip())
-            lines.append("```")
-        if pipe_gaps is not None:
-            cov = float(getattr(pipe_gaps, "coverage_ratio", 1.0))
-            missing = tuple(getattr(pipe_gaps, "missing_primitives", ()) or ())
-            lines.append(
-                f"- tilelang_7pipe_isa_coverage: {cov:.2%}, missing_count={len(missing)}, "
-                f"sample_gaps={list(missing[:6])}"
-            )
-        return "\n".join(lines) + "\n\n"
-
-    def _build_cost_workload(
-        self,
-        ledger: ObjectivePhysicalLedger,
-        *,
-        live_plan: RegimePlanResult | None = None,
-        axes: TopologyAxes | None = None,
-        blueprint: HirBlueprintPacket | None = None,
-        stage_b_profile: Mapping[str, object] | None = None,
-    ) -> CostFeatures:
-        return build_cost_features_from_ledger(
-            ledger,
-            live_plan=live_plan,
-            axes=axes,
-            blueprint=blueprint,
-            sil_advisory=self._sil_advisory,
-            target=self._target,
-            stage_b_profile=stage_b_profile,
-        )
-
-    def _lookup_case_dims_safe(
-        self,
-        case_num: int,
-        regime_tag: str = "",
-    ) -> dict[str, object]:
-        cnum = int(case_num)
-        if cnum in self._case_dims_cache:
-            return dict(self._case_dims_cache[cnum])
-        dims: dict[str, object] = {}
-        try:
-            dims = dict(
-                lookup_case_dims(
-                    self._config.operator_name,
-                    cnum,
-                    cannbench_repo=self._cannbench_repo,
-                    env_file=self._env_file,
-                )
-            )
-        except (FileNotFoundError, OSError, KeyError, ValueError):
-            for spec in self._regime_specs:
-                if regime_tag and spec.regime_tag == regime_tag:
-                    dims = dict(spec.representative_anchor_dims or spec.representative_hir_dims)
-                    break
-            if not dims and self._regime_specs:
-                first = self._regime_specs[0]
-                dims = dict(first.representative_anchor_dims or first.representative_hir_dims)
-        self._case_dims_cache[cnum] = dict(dims)
-        return dims
-
-    def _record_kb_event(
-        self,
-        *,
-        rule_id: str,
-        postcondition_realized: bool,
-        speed_gain: float = 0.0,
-        topology_axes: object | None = None,
-        round_idx: int = 0,
-    ) -> None:
-        if self._experience_lake_dir is None:
-            return
-        try:
-            append_kb_event_shard(
-                self._experience_lake_dir,
-                run_id=self._run_id,
-                rule_id=rule_id,
-                postcondition_realized=postcondition_realized,
-                speed_gain=speed_gain,
-                topology_axes=topology_axes,
-                operator_name=self._config.operator_name,
-                round_idx=round_idx,
-            )
-        except (OSError, ValueError) as exc:
-            logger.debug("KB event shard append skipped: %s", exc)
-
-    def _resolve_case_roofline_metrics(
-        self,
-        regime_tag: str,
-        ledger: ObjectivePhysicalLedger | None,
-        telemetry: Mapping[str, object],
-    ) -> tuple[float, float, float]:
-        bp = self._regime_blueprints.get(regime_tag)
-        if bp is None:
-            return 0.0, 0.0, 0.0
-        roofline = bp.roofline
-        min_gm = float(roofline.min_gm_bytes)
-        comp_floor = float(roofline.compute_floor_us)
-        if ledger is not None and min_gm > 0.0:
-            inflation = compute_transfer_inflation_ratio(
-                ledger,
-                telemetry=telemetry,
-                roofline=roofline,
-            )
-        else:
-            inflation = 0.0
-        return min_gm, comp_floor, inflation
-
-    def _record_surrogate_observations(
-        self,
-        *,
-        source: str,
-        result: CandidateSurrogateResult,
-        active_anchors: Sequence[AnchorCaseSpec],
-        eval_tier_override: str | None = None,
-        parent_source: str = "",
-        parent_result: CandidateSurrogateResult | None = None,
-        parent_ledger: ObjectivePhysicalLedger | None = None,
-        parent_bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
-        parent_stage_b_profile: Mapping[str, object] | None = None,
-        parent_axes: TopologyAxes | None = None,
-        ledger: ObjectivePhysicalLedger | None = None,
-        bisheng_summary: BishengResourceSummary | Mapping[str, object] | None = None,
-        stage_b_profile: Mapping[str, object] | None = None,
-        axes: TopologyAxes | None = None,
-        policy: Mapping[str, object] | None = None,
-        parent_policy: Mapping[str, object] | None = None,
-        worker_kind: str = "",
-        rule_id: str | None = None,
-        backend_track: str = "tilelang_dsl",
-        regime_tag: str = "",
-    ) -> None:
-        cand_sha = compute_source_sha256(source)
-        parent_sha = compute_source_sha256(parent_source) if parent_source else ""
-        stage_a_prof = getattr(ledger, "microarch_profile", None) if ledger is not None else None
-        merged_prof = merge_microarch_profiles(stage_a_prof, stage_b_profile)
-        prof_dict = merged_prof.to_dict() if not merged_prof.is_empty else {}
-        ledger_dict = ledger.to_dict() if ledger is not None else {}
-        if hasattr(bisheng_summary, "to_dict"):
-            bsum_dict = dict(bisheng_summary.to_dict())
-        elif isinstance(bisheng_summary, Mapping):
-            bsum_dict = dict(bisheng_summary)
-        else:
-            bsum_dict = {}
-        if axes is not None and hasattr(axes, "to_dict"):
-            axes_dict = dict(axes.to_dict())
-        elif axes is not None:
-            axes_dict = {
-                "compute_engine": axes.compute_engine,
-                "memory_ring": axes.memory_ring,
-                "iteration_regularity": axes.iteration_regularity,
-            }
-        else:
-            axes_dict = {}
-        pol_dict = dict(policy or {})
-        eff_regime = regime_tag or (result.anchors[0].regime_tag if result.anchors else "")
-
-        if self._experience_lake is not None:
-            try:
-                self._experience_lake.register_candidate(
-                    CandidateArtifactRecord(
-                        cand_sha=cand_sha,
-                        operator=self._config.operator_name,
-                        regime_tag=eff_regime,
-                        backend_track=backend_track,
-                        parent_sha=parent_sha,
-                        worker_kind=worker_kind,
-                        rule_id=rule_id,
-                        config_knobs=pol_dict,
-                        topology_axes=axes_dict,
-                        base_ledger=ledger_dict,
-                        microarch_profile=prof_dict,
-                        bisheng_summary=bsum_dict,
-                        dsl_line_count=len(source.splitlines()),
-                        subkernel_count=max(1, merged_prof.subkernel_count),
-                    )
-                )
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                logger.debug("ExperienceLake register_candidate skipped: %s", exc)
-
-        parent_by_case = (
-            {int(a.case_num): a for a in parent_result.anchors}
-            if parent_result is not None
-            else {}
-        )
-        parent_prof = (
-            merge_microarch_profiles(
-                getattr(parent_ledger, "microarch_profile", None) if parent_ledger is not None else None,
-                parent_stage_b_profile,
-            )
-            if (parent_ledger is not None or parent_stage_b_profile is not None)
-            else None
-        )
-        bn_by_regime: dict[str, int] = {}
-        for anc in result.anchors:
-            if anc.regime_tag not in bn_by_regime:
-                bn = bottleneck_anchor_for_regime(result, anc.regime_tag)
-                bn_by_regime[anc.regime_tag] = int(bn.case_num) if bn is not None else -1
-
-        observations_batch: list[dict[str, object]] = []
-        msprof_batch: list[dict[str, object]] = []
-        pair_deltas_batch: list[dict[str, object]] = []
-        for anc in result.anchors:
-            if anc.cand_us <= 0.0:
-                continue
-            eval_tier = (
-                eval_tier_override
-                if eval_tier_override is not None
-                else ("l2_pass" if anc.accuracy_passed else "l2_acc_fail")
-            )
-            dims = self._lookup_case_dims_safe(anc.case_num, anc.regime_tag)
-            proj_wl = project_case_workload(
-                ledger_dict,
-                microarch_profile=prof_dict,
-                case_dims=dims,
-                policy=pol_dict,
-                t_hw_us=anc.t_hw_us,
-                axes=axes,
-                target=self._target,
-            )
-            cand_msprof = self._msprof_cache.get((cand_sha, anc.regime_tag))
-            bn_case = bn_by_regime.get(anc.regime_tag, -1)
-            attach_msprof = (
-                dict(cand_msprof)
-                if (cand_msprof and (bn_case < 0 or int(anc.case_num) == bn_case))
-                else {}
-            )
-            raw_ana = 0.0
-            analytical_pred_us = 0.0
-            try:
-                pred_res = self._cost_advisor.predict_candidate_us(
-                    proj_wl,
-                    bisheng_res=bisheng_summary,
-                )
-                if isinstance(pred_res, (int, float)) and not isinstance(pred_res, bool):
-                    raw_ana = float(pred_res)
-                    analytical_pred_us = raw_ana
-                elif pred_res is not None:
-                    raw_ana = float(getattr(pred_res, "tier0_physics_us", 0.0) or 0.0) + float(
-                        getattr(pred_res, "tier1_penalty_us", 0.0) or 0.0
-                    )
-                    calibrated_pred_us = float(getattr(pred_res, "pred_us", 0.0) or 0.0)
-                    analytical_pred_us = calibrated_pred_us if calibrated_pred_us > 0.0 else raw_ana
-            except (TypeError, ValueError):
-                analytical_pred_us = 0.0
-            ring_burst_k = max(1, int(getattr(anc, "ring_burst_k", 1) or 1))
-            burst_batch_cv = max(0.0, float(getattr(anc, "burst_batch_cv", 0.0) or 0.0))
-            spike_retries = max(0, int(getattr(anc, "spike_retries", 0) or 0))
-            card_ext_hbm_mb = max(0, int(getattr(anc, "card_ext_hbm_mb", 0) or 0))
-            if self._experience_lake is not None:
-                bp_tag = anc.regime_tag if anc.regime_tag in self._regime_blueprints else eff_regime
-                obs_tel: dict[str, object] = {
-                    "dur_us": float(anc.cand_us),
-                    "measured_latency_us": float(anc.cand_us),
-                    "tier01_pred_us": float(raw_ana),
-                    **attach_msprof,
-                }
-                min_gm_bytes, compute_floor_us, transfer_inflation = (
-                    self._resolve_case_roofline_metrics(bp_tag, ledger, obs_tel)
-                )
-                try:
-                    self._experience_lake.append_observation(
-                        CaseObservationRecord(
-                            run_id=self._run_id,
-                            operator=self._config.operator_name,
-                            regime_tag=anc.regime_tag,
-                            cand_sha=cand_sha,
-                            eval_tier=eval_tier,
-                            case_num=int(anc.case_num),
-                            measured_us=float(anc.cand_us),
-                            accuracy_passed=bool(anc.accuracy_passed),
-                            parent_sha=parent_sha,
-                            device_id=str(self._config.device_id),
-                            case_dims=dims,
-                            t_hw_us=float(anc.t_hw_us),
-                            ref_perf_us=float(anc.ref_perf_us),
-                            speedup=float(anc.speedup),
-                            eq3_score=float(anc.eq3_score),
-                            msprof_pmu=attach_msprof,
-                            projected_tiles=int(proj_wl.get("total_tiles", 0) or 0),
-                            projected_gm_bytes=float(proj_wl.get("gm_bytes", 0.0) or 0.0),
-                            projected_contig_bytes=int(proj_wl.get("contig_burst_bytes", 32768) or 32768),
-                            min_gm_bytes=min_gm_bytes,
-                            compute_floor_us=compute_floor_us,
-                            transfer_inflation_ratio=transfer_inflation,
-                            analytical_pred_us=analytical_pred_us,
-                            ring_burst_k=ring_burst_k,
-                            burst_batch_cv=burst_batch_cv,
-                            spike_retries=spike_retries,
-                            card_ext_hbm_mb=card_ext_hbm_mb,
-                            is_real_npu=self._is_real_npu_path(),
-                        )
-                    )
-                except (OSError, ValueError, json.JSONDecodeError) as exc:
-                    logger.debug("ExperienceLake append_observation skipped: %s", exc)
-
-            if not is_clean_calibration_sample(burst_batch_cv):
-                continue
-
-            if (
-                self._checkpoint_path is not None
-                and analytical_pred_us > 0.0
-                and anc.cand_us > 0.0
-                and abs(math.log(float(anc.cand_us) / float(analytical_pred_us)))
-                > ANOMALY_LOG_ERROR_THRESHOLD
-            ):
-                anomaly_path = self._checkpoint_path.parent / "unmodeled_anomalies.jsonl"
-                anomaly_record = {
-                    "run_id": self._run_id,
-                    "operator": self._config.operator_name,
-                    "regime_tag": anc.regime_tag,
-                    "cand_sha": cand_sha,
-                    "case_num": int(anc.case_num),
-                    "measured_us": float(anc.cand_us),
-                    "analytical_pred_us": float(analytical_pred_us),
-                    "log_error": abs(math.log(float(anc.cand_us) / float(analytical_pred_us))),
-                    "burst_batch_cv": burst_batch_cv,
-                }
-                try:
-                    anomaly_path.parent.mkdir(parents=True, exist_ok=True)
-                    with anomaly_path.open("a", encoding="utf-8") as fh:
-                        fh.write(json.dumps(anomaly_record, sort_keys=True) + "\n")
-                except OSError as exc:
-                    logger.debug("Appending unmodeled anomaly skipped: %s", exc)
-
-            if attach_msprof:
-                msprof_batch.append(
-                    {
-                        "workload": proj_wl,
-                        "msprof_pmu": attach_msprof,
-                        "measured_us": float(anc.cand_us),
-                        "bisheng_res": bisheng_summary,
-                    }
-                )
-            observations_batch.append(
-                {
-                    "workload": proj_wl,
-                    "measured_us": float(anc.cand_us),
-                    "bisheng_res": bisheng_summary,
-                    "cand_sha": cand_sha,
-                    "operator": self._config.operator_name,
-                    "regime_tag": anc.regime_tag,
-                    "case_num": int(anc.case_num),
-                    "eval_tier": eval_tier,
-                }
-            )
-            p_anc = parent_by_case.get(int(anc.case_num))
-            if (
-                p_anc is not None
-                and p_anc.cand_us > 0.0
-                and parent_sha
-                and parent_sha != cand_sha
-            ):
-                parent_proj = project_case_workload(
-                    parent_ledger.to_dict() if parent_ledger is not None else ledger_dict,
-                    microarch_profile=(
-                        parent_prof.to_dict()
-                        if parent_prof is not None and not parent_prof.is_empty
-                        else prof_dict
-                    ),
-                    case_dims=dims,
-                    policy=(dict(parent_policy) if parent_policy is not None else pol_dict),
-                    t_hw_us=p_anc.t_hw_us,
-                    axes=parent_axes or axes,
-                    target=self._target,
-                )
-                pair_deltas_batch.append(
-                    {
-                        "cand_workload": proj_wl,
-                        "cand_us": float(anc.cand_us),
-                        "parent_workload": parent_proj,
-                        "parent_us": float(p_anc.cand_us),
-                        "cand_bisheng_res": bisheng_summary,
-                        "parent_bisheng_res": parent_bisheng_res,
-                        "cand_sha": cand_sha,
-                        "parent_sha": parent_sha,
-                        "operator": self._config.operator_name,
-                        "regime_tag": anc.regime_tag,
-                        "case_num": int(anc.case_num),
-                    }
-                )
-
-        if observations_batch or msprof_batch or pair_deltas_batch:
-            try:
-                self._cost_advisor.observe_surrogate_batch(
-                    observations=observations_batch,
-                    msprof_records=msprof_batch,
-                    pair_deltas=pair_deltas_batch,
-                    refit=True,
-                )
-            except (OSError, ValueError, TypeError) as exc:
-                logger.debug("Cost advisor online observation skipped: %s", exc)
-
-    def _record_l4_observations(
-        self,
-        *,
-        source: str,
-        l4_result: L4CannbenchResult,
-        active_anchors: Sequence[AnchorCaseSpec],
-    ) -> None:
-        if not l4_result.per_case_elapsed_us:
-            return
-        cand_sha = compute_source_sha256(source)
-        stage_a = None
-        if self._regime_specs:
-            try:
-                stage_a = self._run_l0(source, self._regime_specs[0])
-            except (SyntaxError, RuntimeError, ValueError, TypeError, OSError):
-                stage_a = None
-        ledger = stage_a.ledger if stage_a is not None else None
-        axes = self._derive_topology_axes(
-            ledger,
-            features=stage_a.features if stage_a is not None else None,
-            route=stage_a.route if stage_a is not None else None,
-        )
-        prof_dict = dict(getattr(ledger, "microarch_profile", None) or {})
-        ledger_dict = ledger.to_dict() if ledger is not None else {}
-        axes_dict = axes.to_dict() if hasattr(axes, "to_dict") else {}
-        first_reg = self._regime_specs[0].regime_tag if self._regime_specs else ""
-        if self._experience_lake is not None:
-            try:
-                self._experience_lake.register_candidate(
-                    CandidateArtifactRecord(
-                        cand_sha=cand_sha,
-                        operator=self._config.operator_name,
-                        regime_tag=first_reg,
-                        backend_track=(
-                            stage_a.route.track
-                            if self._enable_track_router and stage_a is not None and stage_a.route is not None
-                            else "tilelang_dsl"
-                        ),
-                        topology_axes=axes_dict,
-                        base_ledger=ledger_dict,
-                        microarch_profile=prof_dict,
-                        dsl_line_count=len(source.splitlines()),
-                    )
-                )
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                logger.debug("ExperienceLake register L4 candidate skipped: %s", exc)
-
-        by_case_anchor = {int(a.case_num): a for a in active_anchors}
-        l4_observations: list[dict[str, object]] = []
-        for cnum_raw, elapsed_raw in sorted(l4_result.per_case_elapsed_us.items()):
-            cnum = int(cnum_raw)
-            elapsed_us = float(elapsed_raw or 0.0)
-            if elapsed_us <= 0.0:
-                continue
-            anc = by_case_anchor.get(cnum)
-            rtag = anc.regime_tag if anc is not None else first_reg
-            dims = self._lookup_case_dims_safe(cnum, rtag)
-            if anc is not None:
-                t_hw = anc.t_hw_us
-                ref_perf = anc.ref_perf_us
-            else:
-                try:
-                    ref_perf, t_hw = lookup_case_metadata(
-                        self._config.operator_name,
-                        cnum,
-                        cannbench_repo=self._cannbench_repo,
-                        env_file=self._env_file,
-                    )
-                except (FileNotFoundError, OSError, KeyError, ValueError):
-                    ref_perf, t_hw = 0.0, 0.0
-            sp = float(l4_result.per_case_speedups.get(cnum, 0.0) or 0.0)
-            if sp <= 0.0 and ref_perf > 0.0 and elapsed_us > 0.0:
-                sp = ref_perf / elapsed_us
-            eq3 = (
-                compute_case_eq3_score(ref_perf, elapsed_us, t_hw)
-                if (ref_perf > 0.0 and t_hw > 0.0)
-                else 0.0
-            )
-            proj_wl = project_case_workload(
-                ledger_dict,
-                microarch_profile=prof_dict,
-                case_dims=dims,
-                t_hw_us=t_hw,
-                axes=axes,
-                target=self._target,
-            )
-            if self._experience_lake is not None:
-                l4_tel: dict[str, object] = {
-                    "dur_us": elapsed_us,
-                    "measured_latency_us": elapsed_us,
-                }
-                min_gm_bytes, compute_floor_us, transfer_inflation = (
-                    self._resolve_case_roofline_metrics(rtag, ledger, l4_tel)
-                )
-                try:
-                    self._experience_lake.append_observation(
-                        CaseObservationRecord(
-                            run_id=self._run_id,
-                            operator=self._config.operator_name,
-                            regime_tag=rtag,
-                            cand_sha=cand_sha,
-                            eval_tier="l4_official",
-                            case_num=cnum,
-                            measured_us=elapsed_us,
-                            accuracy_passed=bool(l4_result.passed),
-                            device_id=str(self._config.device_id),
-                            case_dims=dims,
-                            t_hw_us=t_hw,
-                            ref_perf_us=ref_perf,
-                            speedup=sp,
-                            eq3_score=eq3,
-                            projected_tiles=int(proj_wl.get("total_tiles", 0) or 0),
-                            projected_gm_bytes=float(proj_wl.get("gm_bytes", 0.0) or 0.0),
-                            projected_contig_bytes=int(proj_wl.get("contig_burst_bytes", 32768) or 32768),
-                            min_gm_bytes=min_gm_bytes,
-                            compute_floor_us=compute_floor_us,
-                            transfer_inflation_ratio=transfer_inflation,
-                        )
-                    )
-                except (OSError, ValueError, json.JSONDecodeError) as exc:
-                    logger.debug("ExperienceLake L4 append skipped: %s", exc)
-            l4_observations.append(
-                {
-                    "workload": proj_wl,
-                    "measured_us": elapsed_us,
-                    "cand_sha": cand_sha,
-                    "operator": self._config.operator_name,
-                    "regime_tag": rtag,
-                    "case_num": cnum,
-                    "eval_tier": "l4_official",
-                }
-            )
-        if l4_observations:
-            try:
-                self._cost_advisor.observe_surrogate_batch(
-                    observations=l4_observations,
-                    msprof_records=[],
-                    pair_deltas=[],
-                    refit=True,
-                )
-            except (OSError, ValueError, TypeError) as exc:
-                logger.debug("Cost advisor L4 observe skipped: %s", exc)
 
     @staticmethod
     def _touched_symbols_for_regime_snippet(
         regime_spec: RegimeTargetSpec,
-        snippet_source: str,
+        dsl_text: str,
     ) -> set[str]:
-        """Resolve top-level symbol names touched by a promoted or candidate snippet."""
-        dsl_text = extract_python_dsl(snippet_source)
-        if (
-            regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
-            and regime_spec.trackb_symbols
-        ):
-            if parse_scoped_search_replace_blocks(dsl_text):
+        if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb"):
+            if "<<<<<<< SEARCH" in dsl_text or (
+                "=======" in dsl_text and ">>>>>>> REPLACE" in dsl_text
+            ):
                 touched = set(regime_spec.trackb_symbols)
                 residual = _trackb_python_residual(dsl_text)
                 if residual:
@@ -5855,54 +1276,181 @@ class PerfTargetCampaignRunner:
                     kept_stones.append(stone)
             other_beam.stepping_stone_beam = kept_stones
 
-    @staticmethod
-    def _format_trackb_hotpath_section(
+    def _evaluate_dual_layer_tail_guard(
+        self,
+        *,
+        candidate_id: str,
+        candidate_source: str,
+        top_res: CandidateSurrogateResult,
+        best_result: CandidateSurrogateResult,
         regime_spec: RegimeTargetSpec,
-        active_kernel: str | None = None,
-    ) -> tuple[str, str]:
-        """Return `(escalation_tier, hotpath_prompt_section)` for *regime_spec*."""
-        backend = normalize_runtime_backend(regime_spec.runtime_backend)
-        esc_tier = (
-            "ascendc_template"
-            if backend in ("ascendc_trackb", "hybrid_trackb")
-            else "tilelang_dsl"
+        active_anchors: Sequence[AnchorCaseSpec],
+        incumbent_source: str = "",
+    ) -> tuple[bool, CandidateSurrogateResult]:
+        self._sync_coordinators()
+        ok, updated = self._stage_gate_coordinator._evaluate_dual_layer_tail_guard(
+            candidate_id=candidate_id,
+            candidate_source=candidate_source,
+            top_res=top_res,
+            best_result=best_result,
+            regime_spec=regime_spec,
+            active_anchors=active_anchors,
+            incumbent_source=incumbent_source,
         )
-        if not regime_spec.trackb_symbols:
-            return esc_tier, ""
-        active_line = f"- active_kernel: {active_kernel}\n" if active_kernel else ""
-        if "_render_trackb_tu" in regime_spec.editable_symbols:
-            signature_rule = (
-                "- _render_trackb_tu is editable: keep its callable ABI ``_render_trackb_tu(**dims)`` "
-                "and the launcher dims it receives consistent with the launched kernel.\n"
-            )
-        else:
-            signature_rule = (
-                "- _render_trackb_tu is immutable: keep the launched kernel's ``template <...>`` "
-                "and parameter signature unchanged so instantiation still binds.\n"
-            )
-        section = (
-            "### ACTIVE RUNTIME HOT PATH\n"
-            f"- runtime_backend: {regime_spec.runtime_backend}\n"
-            f"- active_trackb_symbols: {list(regime_spec.trackb_symbols)}\n"
-            f"{active_line}"
-            "- CRITICAL: On NPU this regime executes the Track-B CCE (C++20) kernel string "
-            "and config selector shown in TARGET FUNCTION SNIPPET, NOT dead TileLang fallback "
-            "builders. Edit the active Track-B CCE (C++20) kernel string / selector directly.\n\n"
-            "### TRACK-B REPLY CONTRACT\n"
-            "- Reply with exactly one fenced block in one of these forms:\n"
-            "  1. Complete bare C++ unit per changed function (preferred): either the ``__global__`` "
-            "kernel or one ``__simd_vf__`` helper, keeping its exact name and signature.\n"
-            "  2. SEARCH/REPLACE hunks with ``<<<<<<< SEARCH [Lstart-Lend]`` line anchors against "
-            "the launched kernel and the helpers it calls.\n"
-            "  3. A Python slice that reassigns one authorized Track-B C++ constant in full.\n"
-            "- Never echo ``[READONLY_SIBLING_DECLARATION]`` or read-only helper markers.\n"
-            "- A full C++ constant must still contain every sibling ``__global__`` kernel "
-            "present in the original string; a replacement that drops one is rejected.\n"
-            f"{signature_rule}"
-            "- Put any selector change outside the hunks as a Python ``_select_*_config`` "
-            "definition in the same fenced block.\n\n"
+        self._last_tail_guard_reject_reason = (
+            self._stage_gate_coordinator._last_tail_guard_reject_reason
         )
-        return esc_tier, section
+        return ok, updated
+
+    def _refresh_guardrail_incumbent_refs(self, winner_candidate_id: str) -> None:
+        self._sync_coordinators()
+        self._l3_l4_recovery.refresh_guardrail_incumbent_refs(winner_candidate_id)
+
+    def _record_l3_guardrail_cases(
+        self,
+        l3_res: L3AcceptanceResult,
+        incumbent_source: str,
+        regime_spec: RegimeTargetSpec,
+        *,
+        topology_axes: TopologyAxes | None = None,
+    ) -> list[GuardrailCaseSpec]:
+        self._sync_coordinators()
+        return self._l3_l4_recovery.record_l3_guardrail_cases(
+            l3_res,
+            incumbent_source,
+            regime_spec,
+            topology_axes=topology_axes if topology_axes is not None else self._topology_axes,
+        )
+
+    def _is_regime_satisfied(
+        self,
+        regime_tag: str | RegimeTargetSpec,
+        best_result: CandidateSurrogateResult,
+        active_anchors: Sequence[AnchorCaseSpec],
+    ) -> bool:
+        tag = regime_tag if isinstance(regime_tag, str) else regime_tag.regime_tag
+        rcb = getattr(self, "_round_context_builder", None)
+        if rcb is not None:
+            self._sync_coordinators()
+            return rcb._is_regime_satisfied(tag, best_result, active_anchors)
+        regime_res = best_result.for_regime(tag)
+        if not regime_res.anchors:
+            return False
+        return (
+            regime_res.all_passed
+            and regime_res.min_case_speedup >= self._perf_target.target_min_case_speedup
+            and regime_res.avg_roofline_eta >= self._perf_target.target_roofline_eta
+        )
+
+    def _regime_mean_recoverable_excess_us(
+        self,
+        best_result: CandidateSurrogateResult,
+        regime_spec: RegimeTargetSpec | str,
+    ) -> float | None:
+        rcb = getattr(self, "_round_context_builder", None)
+        if rcb is not None:
+            self._sync_coordinators()
+            return rcb._regime_mean_recoverable_excess_us(best_result, regime_spec)
+        return None
+
+    def _select_active_regime(
+        self,
+        current_regime: str | None,
+        frozen_regimes: set[str],
+        best_result: CandidateSurrogateResult,
+        active_anchors: Sequence[AnchorCaseSpec],
+        *,
+        allow_satisfied_fallback: bool = False,
+        exclude_regime: str | None = None,
+        stagnation_by_regime: Mapping[str, int] | None = None,
+        last_round_promoted: bool | None = None,
+        **_extra: object,
+    ) -> RegimeTargetSpec | None:
+        rcb = getattr(self, "_round_context_builder", None)
+        eff_stag = (
+            stagnation_by_regime
+            if stagnation_by_regime is not None
+            else getattr(self, "_live_stag_by_regime", {})
+        )
+        if rcb is not None:
+            self._sync_coordinators()
+            return rcb._select_active_regime(
+                current_regime,
+                frozen_regimes,
+                best_result,
+                active_anchors,
+                allow_satisfied_fallback=allow_satisfied_fallback,
+                exclude_regime=exclude_regime,
+                stagnation_by_regime=eff_stag,
+                last_round_promoted=last_round_promoted,
+                regime_specs=self._regime_specs,
+            )
+        candidates = [
+            s
+            for s in self._regime_specs
+            if s.regime_tag not in frozen_regimes and s.regime_tag != exclude_regime
+        ]
+        if not candidates:
+            return None
+        unsatisfied = [
+            s
+            for s in candidates
+            if not self._is_regime_satisfied(s.regime_tag, best_result, active_anchors)
+        ]
+        pool = unsatisfied if unsatisfied else (candidates if allow_satisfied_fallback else [])
+        if not pool:
+            return None
+        discount = float(getattr(self, "_stagnation_discount", 0.45))
+
+        def _score(spec: RegimeTargetSpec) -> tuple[float, int, str]:
+            r_res = best_result.for_regime(spec.regime_tag)
+            gap = max(
+                0.0,
+                float(self._perf_target.target_min_case_speedup) - float(r_res.min_case_speedup),
+            )
+            stag = int(eff_stag.get(spec.regime_tag, 0))
+            return (-(gap * (discount**stag)), stag, spec.regime_tag)
+
+        return min(pool, key=_score)
+
+    def _allow_early_stop(self, rounds_completed: int) -> bool:
+        if self._config.disable_early_goal_stop:
+            return False
+        return (
+            rounds_completed > 0
+            and rounds_completed >= self._perf_target.min_optimization_rounds
+        )
+
+    def _round_regime_override(self, round_idx: int) -> RegimeTargetSpec | None:
+        tags = self._config.round_regime_tags
+        if not tags or round_idx < 1 or round_idx > len(tags):
+            return None
+        target_tag = tags[round_idx - 1]
+        for spec in self._regime_specs:
+            if spec.regime_tag == target_tag:
+                return spec
+        raise ValueError(f"Unknown forced round regime tag {target_tag!r} for round {round_idx}")
+
+    @staticmethod
+    def _slice_contract_instruction(
+        func_name: str,
+        regime_spec: RegimeTargetSpec,
+        *,
+        operator_entrypoint: str = "",
+    ) -> str:
+        return RoundContextBuilder._slice_contract_instruction(
+            func_name,
+            regime_spec,
+            operator_entrypoint=operator_entrypoint,
+        )
+
+    @staticmethod
+    def _format_msprof_section(
+        residual: object,
+        *,
+        p2_diag: Mapping[str, object] | None = None,
+    ) -> str:
+        return RoundContextBuilder._format_msprof_section(residual, p2_diag=p2_diag)
 
     def _build_exploit_regime_request(
         self,
@@ -5913,127 +1461,30 @@ class PerfTargetCampaignRunner:
         rule: AscendCausalRule,
         best_result: CandidateSurrogateResult,
         blueprint: HirBlueprintPacket | None = None,
-        parent_ledger: ObjectivePhysicalLedger | None = None,
-        parent_residual: StaticDynamicResidual | None = None,
+        parent_ledger: object | None = None,
+        parent_residual: object | None = None,
         track: str = "unconstrained",
         incumbent_source: str = "",
         sil_policy_section: str = "",
         effort: str | None = None,
         p2_diag: Mapping[str, object] | None = None,
+        **_extra: object,
     ) -> GenerationRequest:
-        module_source = incumbent_source or snippet_source
-        active_kernel = self._resolve_active_trackb_kernel(module_source, regime_spec)
-        focus_lines, diag_text = _extract_p2_focus_lines_and_diag(p2_diag)
-        snippet_source = _compact_trackb_snippet_source(
-            snippet_source,
-            regime_spec,
-            incumbent_source=incumbent_source,
-            max_bytes=14800,
-            active_kernel=active_kernel,
-            focus_lines=focus_lines,
-            diagnostic_text=diag_text,
-        )
-        op_entry = _resolve_operator_entrypoint_safe(
-            str(getattr(getattr(self, "_config", None), "operator_name", "") or "")
-        )
-        slice_desc = self._slice_contract_instruction(
-            func_name,
-            regime_spec,
-            operator_entrypoint=op_entry,
-        )
-        esc_tier, hotpath_section = self._format_trackb_hotpath_section(
-            regime_spec,
-            active_kernel=active_kernel,
-        )
-        if regime_spec.trackb_symbols:
-            sys_prompt = (
-                "You are an Ascend 950PR kernel performance engineer. Apply the selected causal "
-                "optimization rule cleanly while preserving exact numerical semantics, dynamic shape "
-                f"compatibility, and {slice_desc}. Output ONLY the reply form required by the "
-                "TRACK-B REPLY CONTRACT."
-            )
-        else:
-            sys_prompt = (
-                "You are an Ascend 950PR kernel performance engineer. Apply the selected causal "
-                f"optimization rule cleanly while preserving exact numerical semantics, dynamic shape "
-                f"compatibility, and {slice_desc}. Output ONLY Python code for this regime slice."
-            )
-        constraint_text = build_progressive_llm_constraints(
-            escalation_tier=esc_tier,
-            track=track,
-            enable_track_router=bool(self._enable_track_router),
-            sil_advisory=getattr(self, "_sil_advisory", None),
-            freedom_mask=self._freedom_masks.get(regime_spec.regime_tag),
-            ub_256kb_unlock=bool(parent_ledger.uses_unreserved_ubuf) if parent_ledger else False,
+        self._sync_coordinators()
+        return self._round_context_builder._build_exploit_regime_request(
+            snippet_source=snippet_source,
+            func_name=func_name,
+            regime_spec=regime_spec,
+            rule=rule,
+            best_result=best_result,
             blueprint=blueprint,
-            current_ledger=parent_ledger,
-            topology_axes=self._derive_topology_axes(parent_ledger),
-            active_symptom=(
-                rule.symptom_family.value
-                if hasattr(rule.symptom_family, "value")
-                else str(rule.symptom_family)
-            ),
-        )
-        track_section = f"{constraint_text}\n\n"
-        nav_section = ""
-        msprof_section = self._format_msprof_section(parent_residual, p2_diag=p2_diag)
-        cfg_obj = getattr(self, "_config", None)
-        op_name = str(
-            getattr(cfg_obj, "operator_name", "") or getattr(cfg_obj, "operator", "") or ""
-        )
-        domain_env = get_input_domain_envelope(op_name)
-        domain_section = (
-            f"{domain_env.format_prompt_block()}\n\n" if domain_env is not None else ""
-        )
-        golden_abi_block = self._build_golden_entrypoint_abi_block()
-        abi_section = (
-            _extract_regime_abi_context(
-                incumbent_source,
-                regime_spec,
-                golden_abi_block=golden_abi_block,
-            )
-            if incumbent_source
-            else golden_abi_block
-        )
-        eff_rule = (
-            rule.render_for_backend(regime_spec.runtime_backend)
-            if hasattr(rule, "render_for_backend")
-            else rule
-        )
-        boundary_ledger = getattr(self, "_boundary_ledger", None)
-        boundary_block = (
-            boundary_ledger.format_regime_boundary_prompt(regime_spec.regime_tag)
-            if boundary_ledger is not None
-            else ""
-        )
-        boundary_section = f"{boundary_block}\n\n" if boundary_block else ""
-        user_prompt = (
-            f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
-            f"{hotpath_section}"
-            f"{track_section}"
-            f"{sil_policy_section}"
-            f"{boundary_section}"
-            f"{nav_section}"
-            f"### SELECTED CAUSAL RULE\n"
-            f"Rule ID: {eff_rule.rule_id}\n"
-            f"Precondition: {eff_rule.precondition}\n"
-            f"Transform Template:\n{eff_rule.transform_template.strip()}\n"
-            f"Expected Postcondition: {eff_rule.expected_postcondition}\n\n"
-            f"{msprof_section}"
-            f"{domain_section}"
-            f"### SURROGATE ANCHOR TELEMETRY\n"
-            f"{_format_anchor_telemetry(best_result, regime_spec.regime_tag)}\n\n"
-            f"{abi_section}"
-            f"### TARGET FUNCTION SNIPPET\n```python\n{snippet_source}\n```\n"
-        )
-        cfg_effort = getattr(getattr(self, "_config", None), "exploit_effort", "medium")
-        eff = sanitize_effort(effort if effort is not None else cfg_effort, default="medium")
-        return GenerationRequest(
-            role="exploit_rule",
-            system_prompt=sys_prompt,
-            user_prompt=user_prompt,
-            json_schema=None,
-            effort=eff,
+            parent_ledger=parent_ledger,
+            parent_residual=parent_residual,
+            track=track,
+            incumbent_source=incumbent_source,
+            sil_policy_section=sil_policy_section,
+            effort=effort,
+            p2_diag=p2_diag,
         )
 
     def _build_creative_regime_request(
@@ -6048,150 +1499,74 @@ class PerfTargetCampaignRunner:
         focus_hint: str = "",
         prescreen_summary: str = "",
         blueprint: HirBlueprintPacket | None = None,
-        parent_ledger: ObjectivePhysicalLedger | None = None,
-        parent_residual: StaticDynamicResidual | None = None,
+        parent_ledger: object | None = None,
+        parent_residual: object | None = None,
         track: str = "unconstrained",
         incumbent_source: str = "",
         parent_hypothesis: str = "",
         sil_policy_section: str = "",
         p2_diag: Mapping[str, object] | None = None,
         paradigm_shift: bool = False,
+        **_extra: object,
     ) -> GenerationRequest:
-        module_source = incumbent_source or snippet_source
-        active_kernel = self._resolve_active_trackb_kernel(module_source, regime_spec)
-        focus_lines, diag_text = _extract_p2_focus_lines_and_diag(p2_diag)
-        snippet_source = _compact_trackb_snippet_source(
-            snippet_source,
-            regime_spec,
-            incumbent_source=incumbent_source,
-            max_bytes=14800,
-            active_kernel=active_kernel,
-            focus_lines=focus_lines,
-            diagnostic_text=diag_text,
-        )
-        op_entry = _resolve_operator_entrypoint_safe(
-            str(getattr(getattr(self, "_config", None), "operator_name", "") or "")
-        )
-        slice_desc = self._slice_contract_instruction(
-            func_name,
-            regime_spec,
-            operator_entrypoint=op_entry,
-        )
-        esc_tier, hotpath_section = self._format_trackb_hotpath_section(
-            regime_spec,
-            active_kernel=active_kernel,
-        )
-        if regime_spec.trackb_symbols:
-            reply_desc = (
-                'the TRACK-B REPLY CONTRACT form (SEARCH/REPLACE hunks, one bare C++ unit per '
-                "changed function, or a Python slice reassigning one authorized constant)"
-            )
-        else:
-            reply_desc = "Python code for this regime slice only"
-        sys_prompt = (
-            "You are an Ascend 950PR (dav-3510) systems architect. Propose an architectural "
-            f"optimization grounded in Roofline limits (56 AIV / 28 MixCore blocks, 3 KiB SSBUF, "
-            "L0C->UB direct path, UB->L1 direct path, 64-elem UB alignment, Split-KV parallelism). "
-            f"Preserve exact numerical semantics, signatures, and {slice_desc}. Return ONLY a "
-            'raw JSON object with exact keys "physical_hypothesis" (string), '
-            '"target_local_metric" (string), and "dsl_source" (string containing '
-            f"{reply_desc}; no prose outside JSON)."
-        )
-        if excluded_mechanisms:
-            constraint_lines = "\n".join(f"- {item}" for item in excluded_mechanisms)
-        else:
-            constraint_lines = "- None recorded yet; explore any high-impact structural axis."
-        neg_section = (
-            "### NEGATIVE CONSTRAINTS (ALREADY EXPLORED BY PARALLEL WORKERS)\n"
-            f"{constraint_lines}\n"
-            "Propose a structurally orthogonal transformation that does NOT duplicate the "
-            "mechanisms listed above.\n\n"
-        )
-        constraint_text = build_progressive_llm_constraints(
-            escalation_tier=esc_tier,
-            track=track,
-            enable_track_router=bool(self._enable_track_router),
-            sil_advisory=getattr(self, "_sil_advisory", None),
-            freedom_mask=self._freedom_masks.get(regime_spec.regime_tag),
-            ub_256kb_unlock=bool(parent_ledger.uses_unreserved_ubuf) if parent_ledger else False,
-            blueprint=blueprint,
-            current_ledger=parent_ledger,
-            excluded_mechanisms=excluded_mechanisms,
-            topology_axes=self._derive_topology_axes(parent_ledger),
-        )
-        track_section = f"{constraint_text}\n\n"
-        nav_section = ""
-        focus_section = f"### ARCHITECTURAL FOCUS HINT\n{focus_hint}\n\n" if focus_hint else ""
-        parent_hyp_section = (
-            f"### STEPPING-STONE PARENT HYPOTHESIS\n{parent_hypothesis}\n\n"
-            if parent_hypothesis
-            else ""
-        )
-        prescreen_section = (
-            f"### TILE PRESCREEN GUIDANCE\n{prescreen_summary}\n\n"
-            if prescreen_summary
-            else ""
-        )
-        msprof_section = self._format_msprof_section(parent_residual, p2_diag=p2_diag)
-        cfg_obj = getattr(self, "_config", None)
-        op_name = str(
-            getattr(cfg_obj, "operator_name", "") or getattr(cfg_obj, "operator", "") or ""
-        )
-        domain_env = get_input_domain_envelope(op_name)
-        domain_section = (
-            f"{domain_env.format_prompt_block()}\n\n" if domain_env is not None else ""
-        )
-        golden_abi_block = self._build_golden_entrypoint_abi_block()
-        abi_section = (
-            _extract_regime_abi_context(
-                incumbent_source,
-                regime_spec,
-                golden_abi_block=golden_abi_block,
-            )
-            if incumbent_source
-            else golden_abi_block
-        )
-        shift_section = (
-            "### PARADIGM SHIFT CROSS-TOPOLOGY UNLOCK\n"
-            "Cross-topology paradigm shift active (full_slice_rewrite authorized): "
-            "CostModel prescreen is disengaged; explore coupled_1c2v AIC+AIV chunked "
-            "GEMM, multi-stage GM workspace, or multi-core tiling across the regime slice.\n\n"
-            if paradigm_shift
-            else ""
-        )
-        boundary_ledger = getattr(self, "_boundary_ledger", None)
-        boundary_block = (
-            boundary_ledger.format_regime_boundary_prompt(regime_spec.regime_tag)
-            if boundary_ledger is not None
-            else ""
-        )
-        boundary_section = f"{boundary_block}\n\n" if boundary_block else ""
-        user_prompt = (
-            f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
-            f"{shift_section}"
-            f"{hotpath_section}"
-            f"{track_section}"
-            f"{sil_policy_section}"
-            f"{boundary_section}"
-            f"{nav_section}"
-            f"{focus_section}"
-            f"{parent_hyp_section}"
-            f"{neg_section}"
-            f"{prescreen_section}"
-            f"{msprof_section}"
-            f"{domain_section}"
-            f"### SURROGATE ANCHOR TELEMETRY\n"
-            f"{_format_anchor_telemetry(best_result, regime_spec.regime_tag)}\n\n"
-            f"{abi_section}"
-            f"### TARGET FUNCTION SNIPPET\n```python\n{snippet_source}\n```\n"
-        )
-        return GenerationRequest(
-            role="explore_creative",
-            system_prompt=sys_prompt,
-            user_prompt=user_prompt,
-            json_schema=None,
+        self._sync_coordinators()
+        return self._round_context_builder._build_creative_regime_request(
+            snippet_source=snippet_source,
+            func_name=func_name,
+            regime_spec=regime_spec,
+            best_result=best_result,
             effort=effort,
-            paradigm_shift=bool(paradigm_shift),
+            excluded_mechanisms=excluded_mechanisms,
+            focus_hint=focus_hint,
+            prescreen_summary=prescreen_summary,
+            blueprint=blueprint,
+            parent_ledger=parent_ledger,
+            parent_residual=parent_residual,
+            track=track,
+            incumbent_source=incumbent_source,
+            parent_hypothesis=parent_hypothesis,
+            sil_policy_section=sil_policy_section,
+            p2_diag=p2_diag,
+            paradigm_shift=paradigm_shift,
+        )
+
+    def _collect_msprof_for_regimes(
+        self,
+        source: str,
+        result: CandidateSurrogateResult,
+        active_anchors: Sequence[AnchorCaseSpec],
+        target_regimes: Sequence[RegimeTargetSpec],
+    ) -> dict[tuple[str, int], dict[str, float]]:
+        self._sync_coordinators()
+        collected = self._calibration_service.collect_msprof_by_case(
+            source,
+            result,
+            active_anchors,
+            target_regimes,
+        )
+        sha = self._source_sha256(source)
+        for (_csha, cnum), metrics in collected.items():
+            for anc in active_anchors:
+                if int(anc.case_num) == int(cnum):
+                    self._msprof_cache[(sha, anc.regime_tag)] = dict(metrics)
+            for spec in target_regimes:
+                if (sha, spec.regime_tag) not in self._msprof_cache:
+                    self._msprof_cache[(sha, spec.regime_tag)] = dict(metrics)
+        return collected
+
+    def _collect_p2_deep_dive_for_regime(
+        self,
+        source: str,
+        result: CandidateSurrogateResult,
+        active_anchors: Sequence[AnchorCaseSpec],
+        regime_spec: RegimeTargetSpec,
+    ) -> dict[str, object] | None:
+        self._sync_coordinators()
+        return self._calibration_service.collect_p2_deep_dive_for_regime(
+            source,
+            result,
+            active_anchors,
+            regime_spec,
         )
 
     def _evaluate_single_baseline(
@@ -6199,655 +1574,202 @@ class PerfTargetCampaignRunner:
         incumbent_source: str,
         active_anchors: Sequence[AnchorCaseSpec],
     ) -> CandidateSurrogateResult:
-        with tempfile.TemporaryDirectory(prefix="tf_camp_base_") as tmp_dir:
-            mod_path = Path(tmp_dir) / "incumbent.py"
-            mod_path.write_text(incumbent_source, encoding="utf-8")
-            results, _run_ids = self._run_l2_batch(
-                [("incumbent_baseline", mod_path)],
-                active_anchors,
-                include_guardrails=False,
-            )
-        if "incumbent_baseline" not in results:
-            raise RuntimeError("Baseline evaluation missing incumbent_baseline result.")
-        return results["incumbent_baseline"]
+        self._sync_coordinators()
+        base_res, null_launch_us = self._calibration_service.evaluate_baseline(
+            incumbent_source,
+            active_anchors,
+        )
+        self._null_launch_us = null_launch_us
+        return base_res
 
-    def _save_checkpoint(
+    def _on_warmstart_promoted(self, src: str, res: CandidateSurrogateResult) -> None:
+        self._active_incumbent_source = src
+        self._incumbent_anchor_us_by_case = {
+            int(a.case_num): float(a.cand_us) for a in res.anchors if a.cand_us > 0.0
+        }
+        self._stage_gate_coordinator._incumbent_anchor_us_by_case = (
+            self._incumbent_anchor_us_by_case
+        )
+        self._stage_gate_coordinator._active_incumbent_source = src
+
+    def _run_phase0_lattice_warmstart(
         self,
-        *,
         incumbent_source: str,
-        baseline_result: CandidateSurrogateResult,
         best_result: CandidateSurrogateResult,
         active_anchors: Sequence[AnchorCaseSpec],
-        frozen_regimes: set[str],
-        current_regime: str | None,
-        stagnation_rounds: int,
-        rounds: Sequence[CampaignRoundRecord],
-        promoted_rounds: Sequence[int],
-        rolled_back_rounds: Sequence[int],
-        escalated_rounds: Sequence[int],
-        admitted_rule_ids: Sequence[str],
-        stop_reason: str,
-        l4_result: L4CannbenchResult | None,
-        stagnation_by_regime: Mapping[str, int] | None = None,
-        last_unpromoted_regime: str | None = None,
-        pending_promotion: PendingPromotion | None = None,
-        pending_l4: PendingL4 | None = None,
-    ) -> None:
-        if self._checkpoint_path is None:
-            return
-        active_promotion = self._active_promotion
-        promotion = active_promotion or pending_promotion or self._pending_promotion
-        pending_l4_record = pending_l4 or self._pending_l4
-        payload = {
-            "version": 1,
-            "run_id": self._run_id,
-            "operator_name": self._config.operator_name,
-            "target_module_path": str(self._target_module_path),
-            "incumbent_source": incumbent_source,
-            "baseline_result": baseline_result.to_dict(),
-            "best_result": best_result.to_dict(),
-            "active_anchors": [a.to_dict() for a in active_anchors],
-            "scoreboard_anchors": [a.to_dict() for a in self._scoreboard_anchors],
-            "guardrail_cases": [g.to_dict() for g in self._guardrail_cases],
-            "calibrated_dispatch_floor_us": float(self._calibrated_dispatch_floor_us),
-            "last_distilled_lat_by_regime": self._flywheel_coordinator.serialize_latencies(),
-            "last_distilled_ckpt_by_regime": self._flywheel_coordinator.serialize_checkpoints(),
-            "last_round_promoted_by_regime": {
-                str(k): bool(v)
-                for k, v in sorted(self._last_round_promoted_by_regime.items())
-            },
-            "frozen_regimes": sorted(frozen_regimes),
-            "current_regime": current_regime,
-            "stagnation_rounds": stagnation_rounds,
-            "stagnation_by_regime": {
-                str(k): int(v) for k, v in sorted((stagnation_by_regime or {}).items())
-            },
-            "compile_wall_streak_by_regime": {
-                str(k): int(v)
-                for k, v in sorted(getattr(self, "_compile_wall_streak_by_regime", {}).items())
-            },
-            "last_unpromoted_regime": last_unpromoted_regime,
-            "rounds": [r.to_dict() for r in rounds],
-            "promoted_rounds": list(promoted_rounds),
-            "rolled_back_rounds": list(rolled_back_rounds),
-            "escalated_rounds": list(escalated_rounds),
-            "admitted_rule_ids": list(admitted_rule_ids),
-            "tracker_state": self._tracker.to_dict(),
-            "beam_state": self._beam.to_dict(),
-            "beam_states": {tag: b.to_dict() for tag, b in sorted(self._beams.items())},
-            "msprof_cache": {
-                f"{sha}:{tag}": dict(metrics)
-                for (sha, tag), metrics in sorted(self._msprof_cache.items())
-            },
-            "stagnation_diagnosis_stats": self._serialize_diag_stats(),
-            "search_boundary_ledger": self._boundary_ledger.to_dict(),
-            "stop_reason": stop_reason,
-            "l4_result": l4_result.to_dict() if l4_result else None,
-            "pending_promotion": promotion.to_dict() if promotion is not None else None,
-            "active_promotion": (
-                active_promotion.to_dict() if active_promotion is not None else None
-            ),
-            "pending_l4": (
-                pending_l4_record.to_dict() if pending_l4_record is not None else None
-            ),
-        }
-        _atomic_write_text(
-            self._checkpoint_path,
-            json.dumps(payload, indent=2) + "\n",
-        )
-
-    def _restore_from_checkpoint(
-        self,
-    ) -> tuple[
-        str,
-        CandidateSurrogateResult,
-        CandidateSurrogateResult,
-        list[AnchorCaseSpec],
-        set[str],
-        str | None,
-        int,
-        list[CampaignRoundRecord],
-        list[int],
-        list[int],
-        list[int],
-        list[str],
-        dict[str, int],
-        str | None,
-        PendingPromotion | None,
-        PendingL4 | None,
-    ]:
-        """Rehydrate campaign state and re-prove the bytes a live execution owns.
-
-        An ``active_promotion`` record was persisted by the submission callback
-        and owns the live execution identity even when the round-level pending
-        record still describes an earlier attempt. A non-terminal execution
-        keeps exactly the source it was submitted against; replacing it with
-        the incumbent would silently change the code under a queued or running
-        worker.
-        """
-        assert self._checkpoint_path is not None
-        payload = json.loads(self._checkpoint_path.read_text(encoding="utf-8"))
-        saved_run_id = payload.get("run_id")
-        if isinstance(saved_run_id, str) and saved_run_id.strip():
-            self._run_id = saved_run_id.strip()
-        incumbent_source = str(payload["incumbent_source"])
-        if (
-            self._config.allow_unreviewed_distilled_rules
-            and self._campaign_kb_path is not None
-            and self._campaign_kb_path.is_file()
-        ):
-            for rule in load_seed_rules(self._campaign_kb_path):
-                self._tracker.admit_rule(rule)
-        if isinstance(payload.get("tracker_state"), Mapping):
-            self._tracker.load_posteriors_dict(payload["tracker_state"])
-        current_regime = payload.get("current_regime")
-        if current_regime and str(current_regime) in self._beams:
-            self._active_regime_tag = str(current_regime)
-        if isinstance(payload.get("beam_states"), Mapping):
-            for tag, raw_beam in payload["beam_states"].items():
-                if isinstance(raw_beam, Mapping):
-                    self._beams[str(tag)] = TwoLaneBeamSearch.from_dict(raw_beam)
-        elif isinstance(payload.get("beam_state"), Mapping):
-            target_tag = self._active_regime_tag or (
-                self._regime_specs[0].regime_tag if self._regime_specs else "default"
-            )
-            self._beams[target_tag] = TwoLaneBeamSearch.from_dict(payload["beam_state"])
-        self._msprof_cache = {}
-        raw_msprof_cache = payload.get("msprof_cache")
-        if isinstance(raw_msprof_cache, Mapping):
-            for raw_key, raw_metrics in raw_msprof_cache.items():
-                key_str = str(raw_key)
-                if ":" not in key_str or not isinstance(raw_metrics, Mapping):
-                    continue
-                sha, tag = key_str.split(":", 1)
-                self._msprof_cache[(sha, tag)] = {
-                    str(k): float(v)
-                    for k, v in raw_metrics.items()
-                    if isinstance(v, (int, float)) and not isinstance(v, bool)
-                }
-        self._restore_diag_stats(payload.get("stagnation_diagnosis_stats"))
-        self._boundary_ledger = DeterministicSearchBoundaryLedger.from_dict(
-            payload.get("search_boundary_ledger")
-        )
-        raw_sb = payload.get("scoreboard_anchors")
-        if isinstance(raw_sb, Sequence) and not isinstance(raw_sb, (str, bytes)) and raw_sb:
-            self._scoreboard_anchors = tuple(
-                AnchorCaseSpec.from_dict(item)
-                for item in raw_sb
-                if isinstance(item, Mapping)
-            )
-        raw_gr = payload.get("guardrail_cases")
-        self._guardrail_cases = (
-            [
-                GuardrailCaseSpec.from_dict(item)
-                for item in raw_gr
-                if isinstance(item, Mapping)
-            ]
-            if isinstance(raw_gr, Sequence) and not isinstance(raw_gr, (str, bytes))
-            else []
-        )
-        self._calibrated_dispatch_floor_us = float(
-            payload.get("calibrated_dispatch_floor_us", 0.0) or 0.0
-        )
-        self._flywheel_coordinator.restore_checkpoints(
-            payload.get("last_distilled_ckpt_by_regime"),
-            raw_latencies=payload.get("last_distilled_lat_by_regime"),
-            fallback_source=incumbent_source,
-        )
-        raw_promoted_map = payload.get("last_round_promoted_by_regime")
-        self._last_round_promoted_by_regime = (
-            {str(k): bool(v) for k, v in raw_promoted_map.items()}
-            if isinstance(raw_promoted_map, Mapping)
-            else {}
-        )
-        rounds = [CampaignRoundRecord.from_dict(r) for r in payload.get("rounds", ())]
-        self._last_local_rel_gain_by_regime = {}
-        for rec in rounds:
-            self._last_local_rel_gain_by_regime[rec.regime_tag] = float(rec.local_rel_gain)
-        raw_stag_map = payload.get("stagnation_by_regime")
-        if isinstance(raw_stag_map, Mapping):
-            stagnation_by_regime = {str(k): int(v) for k, v in raw_stag_map.items()}
-        else:
-            stagnation_by_regime = {}
-            legacy_stag = int(payload.get("stagnation_rounds", 0))
-            if legacy_stag > 0:
-                fallback_tag = str(current_regime or (rounds[-1].regime_tag if rounds else ""))
-                if fallback_tag:
-                    stagnation_by_regime[fallback_tag] = legacy_stag
-        self._stagnation_by_regime = dict(stagnation_by_regime)
-        raw_wall_map = payload.get("compile_wall_streak_by_regime")
-        self._compile_wall_streak_by_regime = (
-            {str(k): int(v) for k, v in raw_wall_map.items()}
-            if isinstance(raw_wall_map, Mapping)
-            else {}
-        )
-        raw_last_unpromoted = payload.get("last_unpromoted_regime")
-        last_unpromoted_regime = str(raw_last_unpromoted) if raw_last_unpromoted else None
-        raw_pending = payload.get("pending_promotion")
-        pending_promotion = (
-            PendingPromotion.from_dict(raw_pending)
-            if isinstance(raw_pending, Mapping)
-            else None
-        )
-        raw_active = payload.get("active_promotion")
-        active_promotion = (
-            PendingPromotion.from_dict(raw_active)
-            if isinstance(raw_active, Mapping)
-            else None
-        )
-        if active_promotion is not None:
-            pending_promotion = active_promotion
-        raw_pending_l4 = payload.get("pending_l4")
-        pending_l4 = (
-            PendingL4.from_dict(raw_pending_l4)
-            if isinstance(raw_pending_l4, Mapping)
-            else None
-        )
-        if pending_promotion is not None and not pending_promotion.execution_terminal:
-            restore_error = self._ensure_candidate_bytes(
-                path=self._target_module_path,
-                source=pending_promotion.candidate_source,
-                expected_sha256=pending_promotion.candidate_sha256,
-            )
-        elif pending_l4 is not None and not pending_l4.execution_terminal:
-            restore_error = self._ensure_candidate_bytes(
-                path=self._target_module_path,
-                source=incumbent_source,
-                expected_sha256=pending_l4.candidate_sha256,
-            )
-        else:
-            restore_error = self._write_source_and_verify(
-                self._target_module_path, incumbent_source
-            )
-        if restore_error:
-            raise RuntimeError(restore_error)
-        return (
+    ) -> tuple[str, CandidateSurrogateResult]:
+        self._sync_coordinators()
+        return self._calibration_service.run_phase0_lattice_warmstart(
             incumbent_source,
-            CandidateSurrogateResult.from_dict(payload["baseline_result"]),
-            CandidateSurrogateResult.from_dict(payload["best_result"]),
-            list(self._scoreboard_anchors),
-            set(str(x) for x in payload.get("frozen_regimes", ())),
-            current_regime,
-            int(payload.get("stagnation_rounds", 0)),
-            rounds,
-            [int(x) for x in payload.get("promoted_rounds", ())],
-            [int(x) for x in payload.get("rolled_back_rounds", ())],
-            [int(x) for x in payload.get("escalated_rounds", ())],
-            [str(x) for x in payload.get("admitted_rule_ids", ())],
-            stagnation_by_regime,
-            last_unpromoted_regime,
-            pending_promotion,
-            pending_l4,
+            best_result,
+            active_anchors,
         )
-
-    def _ensure_regime_diag_entry(self, regime_tag: str) -> dict[str, object]:
-        entry = self._regime_diag_stats.get(regime_tag)
-        if entry is None:
-            entry = {
-                "rule_starvation_rounds": 0,
-                "cost_prescreen_filtered_count": 0,
-                "l0_reject_reasons": {},
-                "l1_compiler_penalty_rejects": 0,
-                "l2_no_gain_rounds": 0,
-                "l3_rollback_count": 0,
-                "top_symptom_families": [],
-            }
-            self._regime_diag_stats[regime_tag] = entry
-        return entry
-
-    def _serialize_diag_stats(self) -> dict[str, dict[str, object]]:
-        out: dict[str, dict[str, object]] = {}
-        for rtag, raw in sorted(self._regime_diag_stats.items()):
-            reasons = raw.get("l0_reject_reasons")
-            clean_reasons = (
-                {str(k): int(v) for k, v in sorted(reasons.items())}
-                if isinstance(reasons, Mapping)
-                else {}
-            )
-            top_fams = raw.get("top_symptom_families")
-            clean_fams = list(top_fams) if isinstance(top_fams, list) else []
-            out[str(rtag)] = {
-                "rule_starvation_rounds": int(raw.get("rule_starvation_rounds", 0) or 0),
-                "cost_prescreen_filtered_count": int(
-                    raw.get("cost_prescreen_filtered_count", 0) or 0
-                ),
-                "l0_reject_reasons": clean_reasons,
-                "l1_compiler_penalty_rejects": int(
-                    raw.get("l1_compiler_penalty_rejects", 0) or 0
-                ),
-                "l2_no_gain_rounds": int(raw.get("l2_no_gain_rounds", 0) or 0),
-                "l3_rollback_count": int(raw.get("l3_rollback_count", 0) or 0),
-                "top_symptom_families": clean_fams,
-            }
-        return out
-
-    def _restore_diag_stats(self, raw_stats: object) -> None:
-        self._regime_diag_stats = {}
-        if not isinstance(raw_stats, Mapping):
-            return
-        for rtag, raw in raw_stats.items():
-            if not isinstance(raw, Mapping):
-                continue
-            reasons_raw = raw.get("l0_reject_reasons")
-            reasons = (
-                {
-                    str(k): int(v)
-                    for k, v in reasons_raw.items()
-                    if isinstance(v, (int, float)) and not isinstance(v, bool)
-                }
-                if isinstance(reasons_raw, Mapping)
-                else {}
-            )
-            top_raw = raw.get("top_symptom_families")
-            top_fams: list[dict[str, object]] = []
-            if isinstance(top_raw, list):
-                for item in top_raw:
-                    if isinstance(item, Mapping):
-                        top_fams.append({str(k): v for k, v in item.items()})
-                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                        top_fams.append(
-                            {
-                                "symptom_family": str(item[0]),
-                                "severity": float(item[1]),
-                            }
-                        )
-            self._regime_diag_stats[str(rtag)] = {
-                "rule_starvation_rounds": int(raw.get("rule_starvation_rounds", 0) or 0),
-                "cost_prescreen_filtered_count": int(
-                    raw.get("cost_prescreen_filtered_count", 0) or 0
-                ),
-                "l0_reject_reasons": reasons,
-                "l1_compiler_penalty_rejects": int(
-                    raw.get("l1_compiler_penalty_rejects", 0) or 0
-                ),
-                "l2_no_gain_rounds": int(raw.get("l2_no_gain_rounds", 0) or 0),
-                "l3_rollback_count": int(raw.get("l3_rollback_count", 0) or 0),
-                "top_symptom_families": top_fams,
-            }
-
-    @staticmethod
-    def _classify_primary_stagnation_cause(
-        *,
-        rule_starvation_rounds: int,
-        cost_prescreen_filtered_count: int,
-        l0_rejects: int,
-        l1_rejects: int,
-        l2_no_gain_rounds: int,
-        l3_rollback_count: int,
-        final_roofline_eta: float,
-        target_roofline_eta: float,
-        stop_reason: str = "",
-    ) -> str:
-        compile_rejects = l0_rejects + l1_rejects
-        if stop_reason == "roofline_saturated" or (
-            target_roofline_eta > 0.0 and final_roofline_eta >= target_roofline_eta
-        ):
-            return "roofline_saturated"
-        if l3_rollback_count > 0 and l3_rollback_count >= max(1, l2_no_gain_rounds // 2):
-            return "l3_accuracy_instability"
-        if (
-            cost_prescreen_filtered_count > 0
-            and cost_prescreen_filtered_count >= compile_rejects
-            and (l2_no_gain_rounds > 0 or cost_prescreen_filtered_count >= 2)
-        ):
-            return "cost_prescreen_mismatch"
-        if compile_rejects > 0 and compile_rejects >= max(
-            rule_starvation_rounds, l2_no_gain_rounds
-        ):
-            return "l0_l1_compile_wall"
-        if rule_starvation_rounds > 0 and rule_starvation_rounds >= l2_no_gain_rounds:
-            return "rule_starvation"
-        if l2_no_gain_rounds > 0:
-            return "hardware_unmodeled_stall"
-        if cost_prescreen_filtered_count > 0:
-            return "cost_prescreen_mismatch"
-        return "hardware_unmodeled_stall"
-
-    def _build_stagnation_diagnosis(
-        self,
-        *,
-        best_result: CandidateSurrogateResult,
-        stop_reason: str,
-    ) -> dict[str, object]:
-        target_eta = float(self._perf_target.target_roofline_eta)
-        all_tags = sorted(
-            set(self._regime_diag_stats.keys())
-            | {spec.regime_tag for spec in self._regime_specs}
-        )
-        regimes_payload: dict[str, dict[str, object]] = {}
-        tot_starv = 0
-        tot_prescreen = 0
-        tot_l0 = 0
-        tot_l1 = 0
-        tot_l2_nogain = 0
-        tot_l3_rb = 0
-        for rtag in all_tags:
-            raw = self._regime_diag_stats.get(rtag) or {}
-            reasons_raw = raw.get("l0_reject_reasons")
-            reasons = (
-                {str(k): int(v) for k, v in sorted(reasons_raw.items())}
-                if isinstance(reasons_raw, Mapping)
-                else {}
-            )
-            starv = int(raw.get("rule_starvation_rounds", 0) or 0)
-            prescreen = int(raw.get("cost_prescreen_filtered_count", 0) or 0)
-            l0_count = sum(reasons.values())
-            l1_count = int(raw.get("l1_compiler_penalty_rejects", 0) or 0)
-            l2_nogain = int(raw.get("l2_no_gain_rounds", 0) or 0)
-            l3_rb = int(raw.get("l3_rollback_count", 0) or 0)
-            top_fams_raw = raw.get("top_symptom_families")
-            top_fams = list(top_fams_raw) if isinstance(top_fams_raw, list) else []
-            reg_res = best_result.for_regime(rtag)
-            reg_eta = float(
-                reg_res.avg_roofline_eta if reg_res.anchors else best_result.avg_roofline_eta
-            )
-            cause = self._classify_primary_stagnation_cause(
-                rule_starvation_rounds=starv,
-                cost_prescreen_filtered_count=prescreen,
-                l0_rejects=l0_count,
-                l1_rejects=l1_count,
-                l2_no_gain_rounds=l2_nogain,
-                l3_rollback_count=l3_rb,
-                final_roofline_eta=reg_eta,
-                target_roofline_eta=target_eta,
-                stop_reason=(stop_reason if len(all_tags) <= 1 else ""),
-            )
-            regimes_payload[rtag] = {
-                "rule_starvation_rounds": starv,
-                "cost_prescreen_filtered_count": prescreen,
-                "l0_reject_reasons": reasons,
-                "l1_compiler_penalty_rejects": l1_count,
-                "l2_no_gain_rounds": l2_nogain,
-                "l3_rollback_count": l3_rb,
-                "top_symptom_families": top_fams,
-                "final_roofline_eta": round(reg_eta, 6),
-                "primary_stagnation_cause": cause,
-            }
-            tot_starv += starv
-            tot_prescreen += prescreen
-            tot_l0 += l0_count
-            tot_l1 += l1_count
-            tot_l2_nogain += l2_nogain
-            tot_l3_rb += l3_rb
-        overall_eta = float(best_result.avg_roofline_eta)
-        overall_cause = self._classify_primary_stagnation_cause(
-            rule_starvation_rounds=tot_starv,
-            cost_prescreen_filtered_count=tot_prescreen,
-            l0_rejects=tot_l0,
-            l1_rejects=tot_l1,
-            l2_no_gain_rounds=tot_l2_nogain,
-            l3_rollback_count=tot_l3_rb,
-            final_roofline_eta=overall_eta,
-            target_roofline_eta=target_eta,
-            stop_reason=stop_reason,
-        )
-        return {
-            "primary_stagnation_cause": overall_cause,
-            "final_roofline_eta": round(overall_eta, 6),
-            "regimes": regimes_payload,
-        }
-
-    def _resolve_round_parent(
-        self,
-        *,
-        incumbent_source: str,
-        regime_spec: RegimeTargetSpec,
-        regime_beam: TwoLaneBeamSearch,
-        escalated: bool,
-    ) -> tuple[str, str, str, BeamCandidate | None, str]:
-        """Select parent module, full slice snippet, lane, and stepping stone cleanly."""
-        _, default_snippet = extract_regime_snippet(
-            incumbent_source,
-            regime_spec,
-            operator_entrypoint=_resolve_operator_entrypoint_safe(
-                self._config.operator_name
-            ),
-            sibling_specs=self._regime_specs,
-        )
-        if not escalated:
-            return incumbent_source, default_snippet, "exploit", None, ""
-        for stone in regime_beam.stepping_stone_beam:
-            try:
-                stone_patched = patch_regime_into_module(
-                    incumbent_source,
-                    regime_spec,
-                    stone.dsl_source,
-                    operator_entrypoint=_resolve_operator_entrypoint_safe(
-                        self._config.operator_name
-                    ),
-                    sibling_specs=self._regime_specs,
-                    active_kernel=self._resolve_active_trackb_kernel(
-                        incumbent_source,
-                        regime_spec,
-                    ),
-                )
-                l0_probe = self._run_l0(stone_patched, regime_spec)
-                if not l0_probe.passed:
-                    logger.warning(
-                        "Skipping invalid stepping-stone %s for regime %s: %s",
-                        stone.candidate_id,
-                        regime_spec.regime_tag,
-                        l0_probe.error_message[:160],
-                    )
-                    continue
-                _, hydrated_snippet = extract_regime_snippet(
-                    stone_patched,
-                    regime_spec,
-                    operator_entrypoint=_resolve_operator_entrypoint_safe(
-                        self._config.operator_name
-                    ),
-                    sibling_specs=self._regime_specs,
-                )
-                regime_beam.mark_parent_selected(stone)
-                hyp = stone.hypothesis if stone.worker_kind == "creative_explore" else ""
-                return stone_patched, hydrated_snippet, "stepping_stone", stone, hyp
-            except (SyntaxError, ValueError, KeyError) as exc:
-                logger.warning(
-                    "Failed to patch stepping-stone slice %s for regime %s: %s",
-                    stone.candidate_id,
-                    regime_spec.regime_tag,
-                    exc,
-                )
-        return incumbent_source, default_snippet, "stepping_stone", None, ""
 
     @staticmethod
     def _evaluate_causal_rule_outcome(
         *,
-        rule: AscendCausalRule,
-        res_all_passed: bool,
-        rolled_back: bool,
-        ledger: ObjectivePhysicalLedger,
-        features: object,
-        cand_residual: StaticDynamicResidual,
-        cand_lat_us: float,
-        cand_obj_score: float,
-        parent_ledger: ObjectivePhysicalLedger,
-        parent_residual: StaticDynamicResidual,
-        parent_lat_us: float,
-        parent_obj_score: float,
-        has_cand_msprof: bool,
+        rule: AscendCausalRule | None = None,
+        res_all_passed: bool = True,
+        rolled_back: bool = False,
+        ledger: ObjectivePhysicalLedger | None = None,
+        features: object = None,
+        cand_residual: StaticDynamicResidual | None = None,
+        cand_lat_us: float = 0.0,
+        cand_obj_score: float = 0.0,
+        parent_ledger: ObjectivePhysicalLedger | None = None,
+        parent_residual: StaticDynamicResidual | None = None,
+        parent_lat_us: float = 0.0,
+        parent_obj_score: float = 0.0,
+        has_cand_msprof: bool = False,
         cand_global_score: float | None = None,
         parent_global_score: float | None = None,
         min_speedup_gain: float = 0.01,
         min_score_gain: float = 0.05,
         cand_compiler_summary: BishengResourceSummary | None = None,
         roofline: HirRooflineSummary | None = None,
+        **extra: object,
     ) -> tuple[bool, float]:
-        """Evaluate whether a causal postcondition materialized with non-regressive gain."""
-        if not res_all_passed or not ledger.is_legal or rolled_back:
-            return False, 0.0
         if (
-            cand_global_score is not None
-            and parent_global_score is not None
-            and cand_global_score < parent_global_score - 1e-6
+            rule is not None
+            and ledger is not None
+            and cand_residual is not None
+            and parent_ledger is not None
+            and parent_residual is not None
         ):
+            return TelemetryLedgerWriter.evaluate_causal_rule_outcome(
+                rule=rule,
+                res_all_passed=res_all_passed,
+                rolled_back=rolled_back,
+                ledger=ledger,
+                features=features,
+                cand_residual=cand_residual,
+                cand_lat_us=cand_lat_us,
+                cand_obj_score=cand_obj_score,
+                parent_ledger=parent_ledger,
+                parent_residual=parent_residual,
+                parent_lat_us=parent_lat_us,
+                parent_obj_score=parent_obj_score,
+                has_cand_msprof=has_cand_msprof,
+                cand_global_score=cand_global_score,
+                parent_global_score=parent_global_score,
+                min_speedup_gain=min_speedup_gain,
+                min_score_gain=min_score_gain,
+                cand_compiler_summary=cand_compiler_summary,
+                roofline=roofline,
+            )
+        _ = extra
+        if not res_all_passed or rolled_back:
             return False, 0.0
         if parent_lat_us > 0.0 and cand_lat_us > 0.0 and cand_lat_us >= parent_lat_us:
             return False, 0.0
         if cand_obj_score < parent_obj_score - 1e-6:
             return False, 0.0
-
-        rel_lat_gain = (
+        rel_gain = (
             (parent_lat_us - cand_lat_us) / max(parent_lat_us, 1e-6)
             if (parent_lat_us > 0.0 and cand_lat_us > 0.0)
             else 0.0
         )
-        local_score_gain = cand_obj_score - parent_obj_score
-        has_real_gain = (
-            rel_lat_gain >= float(min_speedup_gain)
-            or (
-                local_score_gain >= float(min_score_gain)
-                and (parent_lat_us <= 0.0 or cand_lat_us <= 0.0 or cand_lat_us < parent_lat_us)
-            )
+        ok = rel_gain >= float(min_speedup_gain) or (
+            cand_obj_score - parent_obj_score >= float(min_score_gain)
+            and (parent_lat_us <= 0.0 or cand_lat_us <= 0.0 or cand_lat_us < parent_lat_us)
         )
-        if not has_real_gain:
-            return False, 0.0
+        return bool(ok), (rel_gain if ok else 0.0)
 
-        resolved_comp = (
-            cand_compiler_summary
-            if cand_compiler_summary is not None
-            else compiler_summary_from_residual(cand_residual)
+    def _record_surrogate_observations(
+        self,
+        *,
+        source: str,
+        result: CandidateSurrogateResult,
+        active_anchors: Sequence[AnchorCaseSpec],
+        eval_tier_override: str | None = None,
+        parent_source: str = "",
+        parent_result: CandidateSurrogateResult | None = None,
+        parent_ledger: object | None = None,
+        parent_bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
+        parent_stage_b_profile: Mapping[str, object] | None = None,
+        parent_axes: TopologyAxes | None = None,
+        ledger: object | None = None,
+        bisheng_summary: BishengResourceSummary | Mapping[str, object] | None = None,
+        stage_b_profile: Mapping[str, object] | None = None,
+        axes: TopologyAxes | None = None,
+        policy: Mapping[str, object] | None = None,
+        parent_policy: Mapping[str, object] | None = None,
+        worker_kind: str = "",
+        rule_id: str | None = None,
+        backend_track: str = "tilelang_dsl",
+        regime_tag: str = "",
+    ) -> None:
+        self._sync_coordinators()
+        self._telemetry_writer.record_surrogate_observations(
+            source=source,
+            result=result,
+            active_anchors=active_anchors,
+            eval_tier_override=eval_tier_override,
+            parent_source=parent_source,
+            parent_result=parent_result,
+            parent_ledger=parent_ledger,
+            parent_bisheng_res=parent_bisheng_res,
+            parent_stage_b_profile=parent_stage_b_profile,
+            parent_axes=parent_axes,
+            ledger=ledger,
+            bisheng_summary=bisheng_summary,
+            stage_b_profile=stage_b_profile,
+            axes=axes,
+            policy=policy,
+            parent_policy=parent_policy,
+            worker_kind=worker_kind,
+            rule_id=rule_id,
+            backend_track=backend_track,
+            regime_tag=regime_tag,
         )
-        post_ctx = build_predicate_context(
-            ledger,
-            features=features,
-            residual=cand_residual,
-            compiler_summary=resolved_comp,
-            prev_ledger=parent_ledger,
-            prev_residual=parent_residual,
-            prev_compiler_summary=compiler_summary_from_residual(parent_residual),
-            roofline=roofline,
-        )
-        prev_ns = post_ctx.setdefault("prev", {})
-        if isinstance(prev_ns, dict):
-            prev_ns.update(parent_residual.to_dict())
-            prev_ns["measured_latency_us"] = float(parent_lat_us)
-        if not has_cand_msprof:
-            for ratio_key in (
-                "measured_aic_mac_ratio",
-                "measured_aiv_vec_ratio",
-                "measured_mte2_wait_ratio",
-                "measured_sync_stall_ratio",
-                "unexplained_gap_ratio",
-            ):
-                post_ctx[ratio_key] = getattr(parent_residual, ratio_key)
 
-        causal_ok = rule.postcondition_realized(post_ctx)
-        if not causal_ok and not has_cand_msprof:
-            pmu_fields = (
-                "measured_mte2_wait_ratio",
-                "measured_sync_stall_ratio",
-                "unexplained_gap_ratio",
-                "measured_aiv_vec_ratio",
-                "measured_aic_mac_ratio",
-            )
-            if any(k in rule.expected_postcondition for k in pmu_fields):
-                causal_ok = bool(
-                    parent_lat_us > 0.0
-                    and cand_lat_us < 0.98 * parent_lat_us
-                    and cand_obj_score > parent_obj_score + 0.02
-                )
-        return bool(causal_ok), (rel_lat_gain if causal_ok else 0.0)
+    def _record_l4_observations(
+        self,
+        *,
+        source: str,
+        l4_result: L4CannbenchResult,
+        best_result: CandidateSurrogateResult | None = None,
+        active_anchors: Sequence[AnchorCaseSpec],
+    ) -> None:
+        _ = best_result
+        self._sync_coordinators()
+        self._telemetry_writer.record_l4_observations(
+            source=source,
+            l4_result=l4_result,
+            active_anchors=active_anchors,
+        )
+
+    def _collect_trackb_round_evidence(
+        self,
+        *,
+        round_idx: int,
+        regime_spec: RegimeTargetSpec,
+        blueprint: HirBlueprintPacket | None,
+        live_plan: RegimePlanResult | None,
+        active_mask: ConstraintRelaxationMask,
+        checks: Sequence[L0L1CandidateCheck],
+        l2_results: Mapping[str, CandidateSurrogateResult],
+        active_kernel: str,
+        l2_run_ids: Mapping[str, str],
+        parent_sha256: str,
+        parent_l1_summary: BishengResourceSummary | None,
+        parent_l1_summary_source: str,
+    ) -> tuple[dict[str, object], ...]:
+        self._sync_coordinators()
+        return self._telemetry_writer.collect_trackb_round_evidence(
+            round_idx=round_idx,
+            regime_spec=regime_spec,
+            blueprint=blueprint,
+            live_plan=live_plan,
+            active_mask=active_mask,
+            checks=checks,
+            l2_results=l2_results,
+            active_kernel=active_kernel,
+            l2_run_ids=l2_run_ids,
+            parent_sha256=parent_sha256,
+            parent_l1_summary=parent_l1_summary,
+            parent_l1_summary_source=parent_l1_summary_source,
+        )
 
     def _run_flywheel_distillation(
         self,
@@ -6868,193 +1790,138 @@ class PerfTargetCampaignRunner:
         symptom_family: str = "",
         sigma_paired_us: float = 0.0,
     ) -> list[str]:
-        """Distill counterfactual causal rules via FlywheelCoordinator."""
-        _ = local_rel_gain
-        if self._flywheel is None:
-            return []
-        regime_anchors = [
-            a for a in active_anchors if a.regime_tag == regime_spec.regime_tag
-        ] or list(active_anchors)
-        anchor_dims = (
-            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-        )
-
-        def _batch_chunk_latencies(chunk_pairs: Sequence[tuple[str, str]]) -> dict[str, float]:
-            if not chunk_pairs or not regime_anchors:
-                return {}
-            with tempfile.TemporaryDirectory(prefix="tf_fly_batch_") as tmp_dir:
-                cand_files: list[tuple[str, Path]] = []
-                for chunk_id, ablated_src in chunk_pairs:
-                    cpath = Path(tmp_dir) / f"{chunk_id}.py"
-                    cpath.write_text(ablated_src, encoding="utf-8")
-                    cand_files.append((chunk_id, cpath))
-                try:
-                    batch_res, _run_ids = self._run_l2_batch(
-                        cand_files,
-                        regime_anchors,
-                        include_guardrails=False,
-                    )
-                except (
-                    OSError,
-                    subprocess.SubprocessError,
-                    TimeoutError,
-                    json.JSONDecodeError,
-                    RuntimeError,
-                ) as exc:
-                    logger.debug("Flywheel batched ablation timing skipped: %s", exc)
-                    return {}
-            out: dict[str, float] = {}
-            for cid, res in batch_res.items():
-                if res.all_passed and res.mean_latency_us() > 0.0:
-                    out[cid] = res.mean_latency_us()
-            return out
-
-        has_agent_gates_env = bool(
-            self._env_file is not None
-            or getattr(self, "_agent_gates_bin", None) is not None
-            or os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip()
-            or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
-        )
-        has_l2_executor = bool(self._l2_batch_evaluator is not None or has_agent_gates_env)
-        distill_shapes = extract_ordered_tensor_shapes(
-            case_entry=regime_spec.representative_case_entry,
-            dims=anchor_dims or None,
-            proto=self._operator_proto_cache,
-        )
-        return self._flywheel_coordinator.run_distillation(
-            operator_name=self._config.operator_name,
-            run_id=self._run_id,
-            tracker=self._tracker,
+        self._sync_coordinators()
+        return self._telemetry_writer.run_flywheel_distillation(
             baseline_source=baseline_source,
             winner_source=winner_source,
             baseline_latency_us=baseline_latency_us,
             winner_latency_us=winner_latency_us,
-            sigma_paired_us=sigma_paired_us,
             func_name=func_name,
             regime_spec=regime_spec,
+            active_anchors=active_anchors,
             topology_axes=topology_axes,
-            batch_latency_evaluator=_batch_chunk_latencies,
-            campaign_kb_path=self._campaign_kb_path,
-            experience_lake_dir=self._experience_lake_dir,
-            allow_unreviewed=bool(self._config.allow_unreviewed_distilled_rules),
-            has_l2_executor=has_l2_executor,
-            real_npu_path=self._is_real_npu_path(),
-            source_sha256_fn=self._source_sha256,
-            write_text_fn=_atomic_write_text,
-            distill_shapes=distill_shapes,
             rel_gain=rel_gain,
+            local_rel_gain=local_rel_gain,
             worker_kind=worker_kind,
             round_idx=round_idx,
             rule_id=rule_id,
             symptom_family=symptom_family,
-            proto_dims=anchor_dims or None,
+            sigma_paired_us=sigma_paired_us,
+            tracker=self._tracker,
         )
 
-    def _next_l3_alt_card(self, pending: PendingPromotion, attempted_device: str) -> str:
-        tried = {
-            str(item.get("device_id", "")).strip()
-            for item in pending.attempts
-            if str(item.get("device_id", "")).strip()
-        }
-        if attempted_device.strip():
-            tried.add(attempted_device.strip())
-        if pending.device_id.strip():
-            tried.add(pending.device_id.strip())
-        untried = [dev for dev in self._l4_device_pool if dev not in tried]
-        if not untried:
-            return ""
-        if len(untried) > 1 and untried[0] == self._l4_device_pool[0]:
-            return untried[1]
-        return untried[0]
-
-    def _can_retry_on_alt_card(self, pending: PendingPromotion, attempted_device: str) -> bool:
-        return bool(self._next_l3_alt_card(pending, attempted_device))
-
-    @staticmethod
-    def _promotion_attempt(
-        result: L3AcceptanceResult,
-        device_id: str,
-        *,
-        candidate_sha256: str = "",
-    ) -> dict[str, str]:
-        """One auditable L3 attempt, including the card and candidate identity."""
-        return {
-            "execution_id": result.execution_id,
-            "run_id": result.run_id,
-            "receipt_path": result.receipt_path,
-            "error_message": result.error_message,
-            "failure_kind": result.failure_kind,
-            "failure_category": result.failure_category,
-            "pending": str(
-                result.pending
-                or result.failure_kind != FAILURE_KIND_CANDIDATE
-                or not result.execution_terminal
-            ).lower(),
-            "device_id": result.device_id or device_id,
-            "state": result.state,
-            "candidate_sha256": result.candidate_sha256 or candidate_sha256,
-            "execution_terminal": str(result.execution_terminal).lower(),
-        }
-
-    def _retry_l3_on_alt_card(
+    def _build_stagnation_diagnosis(
         self,
-        pending: PendingPromotion,
-        attempts: tuple[dict[str, str], ...],
-    ) -> L3AcceptanceResult:
-        """Start one fresh L3 execution on the next untried authorized pool card."""
-        retry_device = self._next_l3_alt_card(pending, pending.device_id)
-        assert retry_device
-        retry_pending = replace(
-            pending,
-            execution_id="",
-            run_id="",
-            receipt_path="",
-            error_message="",
-            attempts=attempts,
-            device_id=retry_device,
-            execution_terminal=False,
-            retry_used=True,
-        )
-
-        def _record_started(execution_id: str, device: str) -> None:
-            started = replace(
-                retry_pending,
-                execution_id=execution_id,
-                device_id=device,
-                execution_terminal=False,
-            )
-            self._active_promotion = started
-            self._pending_promotion = started
-            self._persist_runtime_state("active_promotion", started.to_dict())
-
-        result = self._run_l3_contract(
-            self._target_module_path,
-            device_id=retry_device,
-            on_execution_started=_record_started,
-        )
-        self._active_promotion = None
-        return result
-
-    @staticmethod
-    def _record_promotion_attempts(
-        rounds: list[CampaignRoundRecord],
-        pending: PendingPromotion,
-        attempts: tuple[dict[str, str], ...],
         *,
-        promoted: bool,
-        l3_resolution: str,
-        stagnation_after: int,
+        best_result: CandidateSurrogateResult,
+        stop_reason: str,
+    ) -> dict[str, object]:
+        self._sync_coordinators()
+        return self._telemetry_writer.build_stagnation_diagnosis(
+            best_result=best_result,
+            stop_reason=stop_reason,
+        )
+
+    def _save_checkpoint(
+        self,
+        *,
+        incumbent_source: str,
+        baseline_result: CandidateSurrogateResult,
+        best_result: CandidateSurrogateResult,
+        active_anchors: Sequence[AnchorCaseSpec],
+        frozen_regimes: set[str],
+        current_regime: str | None,
+        stagnation_rounds: int,
+        rounds: Sequence[CampaignRoundRecord],
+        promoted_rounds: Sequence[int],
+        rolled_back_rounds: Sequence[int],
+        escalated_rounds: Sequence[int],
+        admitted_rule_ids: Sequence[str],
+        stop_reason: str,
+        l4_result: L4CannbenchResult | None,
+        stagnation_by_regime: Mapping[str, int] | None = None,
+        last_unpromoted_regime: str | None = None,
     ) -> None:
-        for idx, record in enumerate(rounds):
-            if record.round_idx == pending.round_idx:
-                rounds[idx] = replace(
-                    record,
-                    promoted=promoted,
-                    l3_resolution=l3_resolution,
-                    stagnation_rounds_after=stagnation_after,
-                    promotion_attempts=attempts,
-                )
-                break
+        self._sync_coordinators()
+        self._telemetry_writer.save_checkpoint(
+            incumbent_source=incumbent_source,
+            baseline_result=baseline_result,
+            best_result=best_result,
+            active_anchors=active_anchors,
+            frozen_regimes=frozen_regimes,
+            current_regime=current_regime,
+            stagnation_rounds=stagnation_rounds,
+            rounds=rounds,
+            promoted_rounds=promoted_rounds,
+            rolled_back_rounds=rolled_back_rounds,
+            escalated_rounds=escalated_rounds,
+            admitted_rule_ids=admitted_rule_ids,
+            stop_reason=stop_reason,
+            l4_result=l4_result,
+            stagnation_by_regime=stagnation_by_regime,
+            last_unpromoted_regime=last_unpromoted_regime,
+            pending_promotion=self._pending_promotion,
+            pending_l4=self._pending_l4,
+            active_promotion=self._active_promotion,
+            scoreboard_anchors=self._scoreboard_anchors,
+            guardrail_cases=self._guardrail_cases,
+            calibrated_dispatch_floor_us=self._calibrated_dispatch_floor_us,
+            last_round_promoted_by_regime=self._last_round_promoted_by_regime,
+            compile_wall_streak_by_regime=self._compile_wall_streak_by_regime,
+        )
+
+    def _restore_from_checkpoint(self):
+        self._sync_coordinators()
+        restored = self._telemetry_writer.restore_from_checkpoint(
+            round_record_from_dict=CampaignRoundRecord.from_dict,
+            pending_l4_from_dict=PendingL4.from_dict,
+        )
+        tlw = self._telemetry_writer
+        self._run_id = tlw.run_id
+        self._active_regime_tag = tlw.active_regime_tag
+        self._scoreboard_anchors = tlw.scoreboard_anchors
+        self._guardrail_cases = tlw.guardrail_cases
+        self._calibrated_dispatch_floor_us = tlw.calibrated_dispatch_floor_us
+        self._stagnation_by_regime = tlw.stagnation_by_regime
+        self._compile_wall_streak_by_regime = tlw.compile_wall_streak_by_regime
+        self._last_round_promoted_by_regime = tlw.last_round_promoted_by_regime
+        self._last_local_rel_gain_by_regime = tlw.last_local_rel_gain_by_regime
+        self._active_promotion = tlw.active_promotion
+        self._pending_promotion = tlw.pending_promotion
+        self._pending_l4 = tlw.pending_l4
+        return restored
+
+    def _run_l3_contract(
+        self,
+        module_path: Path,
+        *,
+        resume_execution_id: str | None = None,
+        resume_run_id: str | None = None,
+        device_id: str | None = None,
+        on_execution_started: Callable[..., None] | None = None,
+    ) -> L3AcceptanceResult:
+        self._sync_coordinators()
+        if resume_execution_id and self._l3_contract_runner is not None:
+            return self._invoke_with_optional_kwargs(
+                self._l3_contract_runner,
+                module_path,
+                resume_execution_id=resume_execution_id,
+                resume_run_id=resume_run_id,
+                device_id=device_id,
+                on_execution_started=on_execution_started,
+            )
+        return self._l3_l4_recovery.run_l3_contract(
+            module_path,
+            device_id=device_id,
+            on_execution_started=on_execution_started,
+        )
+
+    def _resume_l3_contract(self, pending: PendingPromotion) -> L3AcceptanceResult:
+        self._sync_coordinators()
+        return self._l3_l4_recovery.resume_l3_contract(
+            self._target_module_path,
+            pending,
+        )
 
     def _resolve_pending_promotion(
         self,
@@ -7067,759 +1934,54 @@ class PerfTargetCampaignRunner:
         promoted_rounds: list[int],
         rolled_back_rounds: list[int],
         active_anchors: Sequence[AnchorCaseSpec],
-    ) -> tuple[
-        str,
-        CandidateSurrogateResult,
-        dict[str, int],
-        PendingPromotion | None,
-        bool,
-    ]:
-        """Resume, retry once on another card, or return a recoverable pending L3.
-
-        Candidate bytes are re-proved first. A live execution has no run id and a
-        terminal one with a run id can have its receipt re-read; neither path
-        submits again. A wait timeout keeps the candidate and continues the same
-        execution. Only a proven-terminal infrastructure failure restores the
-        incumbent, and only then may one fresh retry start on an explicitly
-        authorized other card. Numeric/assertion candidate failures never retry.
-        """
-        _ = active_anchors
-        ensure_error = self._ensure_candidate_bytes(
-            path=self._target_module_path,
-            source=pending.candidate_source,
-            expected_sha256=pending.candidate_sha256,
-        )
-        if ensure_error:
-            updated = replace(pending, error_message=ensure_error)
-            self._pending_promotion = updated
-            self._active_promotion = updated if not updated.execution_terminal else None
-            return incumbent_source, best_result, stagnation_by_regime, updated, True
-
-        attempts = list(pending.attempts)
-        current = pending
-
-        def _keep_pending(result: L3AcceptanceResult, *, terminal: bool) -> tuple[
-            str,
-            CandidateSurrogateResult,
-            dict[str, int],
-            PendingPromotion | None,
-            bool,
-        ]:
-            nonlocal current
-            attempt = self._promotion_attempt(result, current.device_id)
-            attempts.append(attempt)
-            current = replace(
-                current,
-                execution_id=result.execution_id or current.execution_id,
-                run_id=result.run_id or current.run_id,
-                receipt_path=result.receipt_path or current.receipt_path,
-                error_message=result.error_message or current.error_message,
-                attempts=tuple(attempts),
-                device_id=result.device_id or current.device_id,
-                execution_terminal=terminal,
-            )
-            if terminal:
-                restore_error = self._write_source_and_verify(
-                    self._target_module_path, incumbent_source
-                )
-                if restore_error:
-                    raise RuntimeError(restore_error)
-                self._active_promotion = None
-                self._persist_runtime_state("active_promotion", None)
-            else:
-                self._active_promotion = current
-                self._persist_runtime_state("active_promotion", current.to_dict())
-            self._pending_promotion = current
-            self._persist_runtime_state("pending_promotion", current.to_dict())
-            self._record_promotion_attempts(
-                rounds,
-                current,
-                tuple(attempts),
-                promoted=False,
-                l3_resolution=L3Resolution.INFRA_DEFERRED.value,
-                stagnation_after=stagnation_by_regime.get(current.regime_tag, 0),
-            )
-            return incumbent_source, best_result, stagnation_by_regime, current, True
-
-        def _promote() -> tuple[
-            str,
-            CandidateSurrogateResult,
-            dict[str, int],
-            PendingPromotion | None,
-            bool,
-        ]:
-            nonlocal current
-            self._record_promotion_attempts(
-                rounds,
-                current,
-                tuple(attempts),
-                promoted=True,
-                l3_resolution=L3Resolution.PROMOTED.value,
-                stagnation_after=0,
-            )
-            if current.round_idx in rolled_back_rounds:
-                rolled_back_rounds.remove(current.round_idx)
-            if current.round_idx not in promoted_rounds:
-                promoted_rounds.append(current.round_idx)
-            stagnation_by_regime[current.regime_tag] = 0
-            self._refresh_guardrail_incumbent_refs(current.candidate_id)
-            self._pending_promotion = None
-            self._active_promotion = None
-            self._persist_runtime_state("active_promotion", None)
-            self._persist_runtime_state("pending_promotion", None)
-            return (
-                current.candidate_source,
-                current.candidate_result,
-                stagnation_by_regime,
-                None,
-                False,
-            )
-
-        def _candidate_failure(result: L3AcceptanceResult) -> tuple[
-            str,
-            CandidateSurrogateResult,
-            dict[str, int],
-            PendingPromotion | None,
-            bool,
-        ]:
-            nonlocal current
-            attempts.append(self._promotion_attempt(result, current.device_id))
-            restore_error = self._write_source_and_verify(
-                self._target_module_path, incumbent_source
-            )
-            if restore_error:
-                raise RuntimeError(restore_error)
-            stagnation_by_regime[current.regime_tag] = (
-                stagnation_by_regime.get(current.regime_tag, 0) + 1
-            )
-            self._record_promotion_attempts(
-                rounds,
-                current,
-                tuple(attempts),
-                promoted=False,
-                l3_resolution=L3Resolution.CANDIDATE_REJECTED.value,
-                stagnation_after=stagnation_by_regime[current.regime_tag],
-            )
-            self._pending_promotion = None
-            self._active_promotion = None
-            self._persist_runtime_state("active_promotion", None)
-            self._persist_runtime_state("pending_promotion", None)
-            return incumbent_source, best_result, stagnation_by_regime, None, False
-
-        def _retry_alt_cards(
-            start_result: L3AcceptanceResult | None,
-            last_device: str,
-        ) -> tuple[
-            str,
-            CandidateSurrogateResult,
-            dict[str, int],
-            PendingPromotion | None,
-            bool,
-        ]:
-            nonlocal current
-            tried_alt_cards: set[str] = set()
-            latest_result = start_result
-            while self._can_retry_on_alt_card(current, last_device):
-                target_dev = self._next_l3_alt_card(current, last_device)
-                if not target_dev or target_dev in tried_alt_cards:
-                    break
-                tried_alt_cards.add(target_dev)
-                retry_result = self._retry_l3_on_alt_card(current, tuple(attempts))
-                attempts.append(
-                    self._promotion_attempt(
-                        retry_result,
-                        target_dev or current.device_id,
-                        candidate_sha256=current.candidate_sha256,
-                    )
-                )
-                current = replace(
-                    current,
-                    execution_id=retry_result.execution_id or current.execution_id,
-                    run_id=retry_result.run_id or current.run_id,
-                    receipt_path=retry_result.receipt_path or current.receipt_path,
-                    error_message=retry_result.error_message or current.error_message,
-                    attempts=tuple(attempts),
-                    device_id=target_dev or retry_result.device_id or current.device_id,
-                    execution_terminal=retry_result.execution_terminal,
-                    retry_used=True,
-                )
-                if retry_result.passed:
-                    return _promote()
-                if not retry_result.execution_terminal:
-                    return _keep_pending(retry_result, terminal=False)
-                if retry_result.failure_kind == FAILURE_KIND_CANDIDATE:
-                    return _candidate_failure(retry_result)
-                latest_result = retry_result
-                last_device = retry_result.device_id or target_dev
-            if latest_result is not None:
-                return _keep_pending(latest_result, terminal=latest_result.execution_terminal)
-            self._pending_promotion = pending
-            self._active_promotion = pending if not pending.execution_terminal else None
-            return incumbent_source, best_result, stagnation_by_regime, pending, True
-
-        result: L3AcceptanceResult | None = None
-        if pending.execution_id and (not pending.execution_terminal or pending.run_id):
-            result = self._resume_l3_contract(self._target_module_path, pending)
-            attempts.append(
-                self._promotion_attempt(
-                    result,
-                    pending.device_id,
-                    candidate_sha256=pending.candidate_sha256,
-                )
-            )
-            current = replace(
-                pending,
-                execution_id=result.execution_id or pending.execution_id,
-                run_id=result.run_id or pending.run_id,
-                receipt_path=result.receipt_path or pending.receipt_path,
-                error_message=result.error_message or pending.error_message,
-                attempts=tuple(attempts),
-                device_id=result.device_id or pending.device_id,
-                execution_terminal=result.execution_terminal,
-            )
-            if result.passed:
-                return _promote()
-            if not result.execution_terminal:
-                return _keep_pending(result, terminal=False)
-            if result.failure_kind == FAILURE_KIND_CANDIDATE:
-                return _candidate_failure(result)
-            if self._can_retry_on_alt_card(current, result.device_id):
-                return _retry_alt_cards(result, result.device_id)
-            return _keep_pending(result, terminal=True)
-
-        if self._can_retry_on_alt_card(current, current.device_id):
-            return _retry_alt_cards(None, current.device_id)
-        self._pending_promotion = pending
-        self._active_promotion = pending if not pending.execution_terminal else None
-        return incumbent_source, best_result, stagnation_by_regime, pending, True
-
-    @staticmethod
-    def _l4_attempt(result: L4CannbenchResult) -> dict[str, str]:
-        """One auditable L4 attempt, including the card and official coverage."""
-        return {
-            "execution_id": result.execution_id,
-            "run_id": result.run_id,
-            "receipt_path": result.receipt_path,
-            "error_message": result.error_message,
-            "failure_kind": result.failure_kind,
-            "device_id": result.device_id,
-            "state": result.state,
-            "execution_terminal": str(result.execution_terminal).lower(),
-            "blocked_env_category": result.blocked_env_category,
-            "device_rejected": str(result.device_rejected).lower(),
-            "official_report_valid": str(result.official_report_valid).lower(),
-            "all_cases_passed": str(result.all_cases_passed).lower(),
-            "all_timings_valid": str(result.all_timings_valid).lower(),
-            "case_count": str(result.case_count),
-            "passed_cases": str(result.passed_cases),
-        }
-
-    def _can_retry_l4_on_alt_card(
-        self,
-        pending: PendingL4,
-        attempted_device: str,
-    ) -> bool:
-        retry_device = self._retry_device_id
-        attempted = attempted_device or pending.device_id
-        return bool(
-            retry_device
-            and not pending.retry_used
-            and retry_device != attempted
-            and retry_device not in self._l4_round_attempted_devices(pending)
-        )
-
-    @staticmethod
-    def _l4_round_attempted_devices(pending: PendingL4) -> tuple[str, ...]:
-        """Cards already tried in the current blocked-env round.
-
-        Checkpoints written before the pool existed have no explicit round
-        list; their current card is the same-card attempt that record describes.
-        """
-        if pending.blocked_env_round_attempted_device_ids:
-            return pending.blocked_env_round_attempted_device_ids
-        return (pending.device_id,) if pending.device_id else ()
-
-    def _effective_l4_round_limit(self, pending: PendingL4) -> int:
-        """Return the stored quota, or the current config for legacy records."""
-        if pending.blocked_env_round_limit is not None:
-            return max(0, pending.blocked_env_round_limit)
-        return max(0, self._config.l4_blocked_env_max_retries)
-
-    def _effective_l4_pool(self, pending: PendingL4) -> tuple[str, ...]:
-        """Intersect a saved pool with the pool the current config authorizes."""
-        if not pending.device_pool:
-            return self._l4_device_pool
-        allowed = set(self._l4_device_pool)
-        narrowed = tuple(device for device in pending.device_pool if device in allowed)
-        return narrowed or self._l4_device_pool
-
-    def _advance_l4_card_failure(
-        self,
-        pending: PendingL4,
-        result: L4CannbenchResult,
-        attempts: list[dict[str, str]],
-    ) -> tuple[L4CannbenchResult, PendingL4]:
-        """Move a terminal L4 run across the configured card pool.
-
-        An occupancy-blocked card or an unauthorized-card refusal advances immediately
-        to the next untried card: the complete official L4 restarts there for the same
-        candidate SHA, and no timings are stitched. Rejected cards stay excluded later;
-        only an all-blocked pool spends one bounded linear backoff, and a rejected-only
-        sweep terminates without a round. A candidate verdict, live execution, or
-        exhausted rounds leave the loop, and each submission intent is persisted before
-        its long wait so a restart continues on the next untried card.
-        """
-        pool = self._effective_l4_pool(pending)
-        limit = self._effective_l4_round_limit(pending)
-        current = replace(
-            self._pending_l4_after(
-                pending,
-                result,
-                tuple(attempts),
-                retry_used=pending.retry_used,
-            ),
-            device_pool=pool,
-            blocked_env_round_limit=limit,
-        )
-
-        def _record_started(execution_id: str, device: str) -> None:
-            nonlocal current
-            current = replace(
-                current,
-                execution_id=execution_id or current.execution_id,
-                device_id=device or current.device_id,
-                state="SUBMITTED",
-                execution_terminal=False,
-            )
-            self._pending_l4 = current
-            self._persist_runtime_state("pending_l4", current.to_dict())
-
-        while result.execution_terminal and (
-            _is_occupancy_blocked_env(
-                result.failure_kind,
-                result.blocked_env_category,
-            )
-            or self._is_rejected_card_l4(result)
-        ):
-            rejected = self._is_rejected_card_l4(result)
-            attempted = self._l4_round_attempted_devices(current)
-            eligible = tuple(
-                device for device in pool if device not in current.rejected_device_ids
-            )
-            untried = tuple(device for device in eligible if device not in attempted)
-            if untried:
-                next_device = untried[0]
-                next_rounds = current.blocked_env_rounds_used
-                next_attempted = (*attempted, next_device)
-                delay = 0.0
-            elif (
-                rejected
-                or not eligible
-                or current.blocked_env_rounds_used >= limit
-            ):
-                break
-            else:
-                next_rounds = current.blocked_env_rounds_used + 1
-                next_device = eligible[0]
-                next_attempted = (next_device,)
-                delay = max(0.0, self._config.l4_retry_backoff_sec) * next_rounds
-            current = replace(
-                current,
-                execution_id="",
-                run_id="",
-                receipt_path="",
-                device_id=next_device,
-                state="SUBMITTED",
-                error_message=result.error_message,
-                failure_kind=FAILURE_KIND_INFRASTRUCTURE,
-                execution_terminal=False,
-                blocked_env_rounds_used=next_rounds,
-                blocked_env_round_attempted_device_ids=next_attempted,
-                blocked_env_category="",
-                device_rejected=False,
-            )
-            self._pending_l4 = current
-            self._persist_runtime_state("pending_l4", current.to_dict())
-            if delay > 0.0:
-                time.sleep(delay)
-            result = self._run_l4_cannbench(
-                self._target_module_path,
-                device_id=next_device,
-                on_execution_started=_record_started,
-            )
-            attempts.append(self._l4_attempt(result))
-            current = self._pending_l4_after(
-                current,
-                result,
-                tuple(attempts),
-                retry_used=current.retry_used,
-            )
-            self._pending_l4 = current
-            self._persist_runtime_state("pending_l4", current.to_dict())
-        return result, current
-
-    @staticmethod
-    def _merge_l4_identity(
-        result: L4CannbenchResult,
-        pending: PendingL4,
-    ) -> L4CannbenchResult:
-        return replace(
-            result,
-            target_path=result.target_path or pending.target_path,
-            candidate_sha256=result.candidate_sha256 or pending.candidate_sha256,
-            device_id=result.device_id or pending.device_id,
-            blocked_env_category=result.blocked_env_category or pending.blocked_env_category,
-            attempts=pending.attempts or result.attempts,
-        )
-
-    @staticmethod
-    def _pending_l4_after(
-        pending: PendingL4,
-        result: L4CannbenchResult,
-        attempts: tuple[dict[str, str], ...],
-        *,
-        retry_used: bool,
-    ) -> PendingL4:
-        rejected_device_ids = pending.rejected_device_ids
-        if (
-            result.device_rejected
-            and result.device_id
-            and result.device_id not in rejected_device_ids
-        ):
-            rejected_device_ids = (*rejected_device_ids, result.device_id)
-        attempted_device_ids = pending.blocked_env_round_attempted_device_ids
-        if (
-            result.device_id
-            and (
-                result.device_rejected
-                or _is_occupancy_blocked_env(
-                    result.failure_kind,
-                    result.blocked_env_category,
-                )
-            )
-            and result.device_id not in attempted_device_ids
-        ):
-            attempted_device_ids = (*attempted_device_ids, result.device_id)
-        return replace(
+    ):
+        self._sync_coordinators()
+        out = self._l3_l4_recovery.resolve_pending_promotion(
             pending,
-            target_path=result.target_path or pending.target_path,
-            candidate_sha256=result.candidate_sha256 or pending.candidate_sha256,
-            execution_id=result.execution_id or pending.execution_id,
-            run_id=result.run_id or pending.run_id,
-            receipt_path=result.receipt_path or pending.receipt_path,
-            device_id=result.device_id or pending.device_id,
-            state=result.state or pending.state,
-            error_message=result.error_message or pending.error_message,
-            failure_kind=result.failure_kind or pending.failure_kind,
-            execution_terminal=result.execution_terminal,
-            retry_used=retry_used,
-            blocked_env_category=result.blocked_env_category,
-            device_rejected=result.device_rejected,
-            rejected_device_ids=rejected_device_ids,
-            blocked_env_round_attempted_device_ids=attempted_device_ids,
-            attempts=attempts,
+            incumbent_source=incumbent_source,
+            best_result=best_result,
+            stagnation_by_regime=stagnation_by_regime,
+            rounds=rounds,
+            promoted_rounds=promoted_rounds,
+            rolled_back_rounds=rolled_back_rounds,
+            active_anchors=active_anchors,
+        )
+        self._active_promotion = out[3]
+        self._pending_promotion = out[3]
+        return out
+
+    def _run_l4_cannbench(
+        self,
+        module_path: Path,
+        *,
+        resume_execution_id: str | None = None,
+        resume_run_id: str | None = None,
+        device_id: str | None = None,
+        on_execution_started: Callable[..., None] | None = None,
+    ) -> L4CannbenchResult:
+        self._sync_coordinators()
+        return self._l3_l4_recovery.run_l4_cannbench(
+            module_path,
+            resume_execution_id=resume_execution_id or "",
+            resume_run_id=resume_run_id or "",
+            device_id=device_id,
+            on_execution_started=on_execution_started,
         )
 
     def _resolve_pending_l4(
         self,
         pending: PendingL4,
         *,
-        incumbent_source: str,
+        incumbent_source: str = "",
     ) -> tuple[L4CannbenchResult, PendingL4 | None]:
-        """Continue the saved L4 execution, or move the complete run to another card.
-
-        A live execution or a terminal one with a signed receipt is re-read, never
-        resubmitted; an expired bounded wait polls the same execution on the original
-        card. A terminal BLOCKED_ENV preemption continues on the next untried card of
-        the saved pool before any bounded round backoff, while another proven-terminal
-        infrastructure failure may start one complete L4 run on the explicitly
-        authorized alternate card. Numeric and official-validation failures are
-        verdicts and never retry; timings are never stitched.
-        """
-        expected = pending.candidate_sha256 or self._source_sha256(incumbent_source)
-        digest_error = ""
-        try:
-            current_digest = hashlib.sha256(
-                self._target_module_path.read_bytes()
-            ).hexdigest()
-        except OSError as exc:
-            digest_error = (
-                f"pending L4 candidate {self._target_module_path} cannot be read: {exc}"
-            )
-        else:
-            if current_digest != expected:
-                digest_error = (
-                    f"pending L4 candidate {self._target_module_path} digest "
-                    f"{current_digest} does not match submitted {expected}; "
-                    "refusing to resume or replace it"
-                )
-        if digest_error:
-            failed = L4CannbenchResult(
-                passed=False,
-                error_message=digest_error,
-                failure_kind=FAILURE_KIND_INFRASTRUCTURE,
-                execution_id=pending.execution_id,
-                run_id=pending.run_id,
-                receipt_path=pending.receipt_path,
-                device_id=pending.device_id,
-                state=pending.state,
-                execution_terminal=pending.execution_terminal,
-                target_path=pending.target_path,
-                candidate_sha256=expected,
-                attempts=pending.attempts,
-            )
-            updated = replace(
-                pending,
-                candidate_sha256=expected,
-                error_message=digest_error,
-            )
-            self._pending_l4 = updated
-            return failed, updated
-
-        attempts = list(pending.attempts)
-        effective_pool = self._effective_l4_pool(pending)
-        effective_limit = self._effective_l4_round_limit(pending)
-        current = replace(
+        self._sync_coordinators()
+        eff_inc = incumbent_source or self._active_incumbent_source
+        res, new_pending = self._l3_l4_recovery.resolve_pending_l4(
             pending,
-            device_pool=effective_pool,
-            blocked_env_round_limit=effective_limit,
+            incumbent_source=eff_inc,
         )
-
-        def _record_started(execution_id: str, device: str) -> None:
-            nonlocal current
-            current = replace(
-                current,
-                execution_id=execution_id or current.execution_id,
-                device_id=device or current.device_id,
-                state="SUBMITTED",
-                execution_terminal=False,
-            )
-            self._pending_l4 = current
-            self._persist_runtime_state("pending_l4", current.to_dict())
-
-        def _keep(
-            result: L4CannbenchResult,
-            *,
-            retry_used: bool,
-        ) -> tuple[L4CannbenchResult, PendingL4 | None]:
-            nonlocal current
-            updated = self._pending_l4_after(
-                current,
-                result,
-                tuple(attempts),
-                retry_used=retry_used,
-            )
-            self._pending_l4 = updated
-            self._persist_runtime_state("pending_l4", updated.to_dict())
-            return self._merge_l4_identity(result, updated), updated
-
-        def _finish(
-            result: L4CannbenchResult,
-        ) -> tuple[L4CannbenchResult, PendingL4 | None]:
-            self._pending_l4 = None
-            self._persist_runtime_state("pending_l4", None)
-            return self._merge_l4_identity(result, current), None
-
-        def _retry_whole_l4() -> tuple[L4CannbenchResult, PendingL4 | None]:
-            nonlocal current
-            retry_device = self._retry_device_id
-            assert retry_device
-            current = replace(
-                current,
-                execution_id="",
-                run_id="",
-                receipt_path="",
-                device_id=retry_device,
-                state="SUBMITTED",
-                error_message="",
-                failure_kind=FAILURE_KIND_INFRASTRUCTURE,
-                execution_terminal=False,
-                retry_used=True,
-                blocked_env_category="",
-                device_rejected=False,
-            )
-            retry_result = self._run_l4_cannbench(
-                self._target_module_path,
-                device_id=retry_device,
-                on_execution_started=_record_started,
-            )
-            attempts.append(self._l4_attempt(retry_result))
-            current = replace(
-                current,
-                execution_id=retry_result.execution_id or current.execution_id,
-                run_id=retry_result.run_id or current.run_id,
-                receipt_path=retry_result.receipt_path or current.receipt_path,
-                device_id=retry_result.device_id or current.device_id,
-                state=retry_result.state or current.state,
-                error_message=retry_result.error_message or current.error_message,
-                failure_kind=retry_result.failure_kind or current.failure_kind,
-                execution_terminal=retry_result.execution_terminal,
-                attempts=tuple(attempts),
-            )
-            if retry_result.passed:
-                return _finish(retry_result)
-            if retry_result.failure_kind == FAILURE_KIND_CANDIDATE:
-                return _finish(retry_result)
-            return _keep(retry_result, retry_used=True)
-
-        def _after_infrastructure(
-            result: L4CannbenchResult,
-        ) -> tuple[L4CannbenchResult, PendingL4 | None]:
-            nonlocal current
-            if (
-                _is_occupancy_blocked_env(
-                    result.failure_kind,
-                    result.blocked_env_category,
-                )
-                or self._is_rejected_card_l4(result)
-            ):
-                result, current = self._advance_l4_card_failure(
-                    current,
-                    result,
-                    attempts,
-                )
-            if result.passed or result.failure_kind == FAILURE_KIND_CANDIDATE:
-                return _finish(result)
-            if not result.execution_terminal:
-                return _keep(result, retry_used=current.retry_used)
-            if self._can_retry_l4_on_alt_card(current, result.device_id):
-                return _retry_whole_l4()
-            return _keep(result, retry_used=current.retry_used)
-
-        if pending.execution_id and (not pending.execution_terminal or pending.run_id):
-            result = self._run_l4_cannbench(
-                self._target_module_path,
-                resume_execution_id=pending.execution_id,
-                resume_run_id=pending.run_id,
-                device_id=pending.device_id or self._config.device_id,
-                on_execution_started=_record_started,
-            )
-            attempts.append(self._l4_attempt(result))
-            current = self._pending_l4_after(
-                current,
-                result,
-                tuple(attempts),
-                retry_used=current.retry_used,
-            )
-            self._pending_l4 = current
-            self._persist_runtime_state("pending_l4", current.to_dict())
-            return _after_infrastructure(result)
-
-        blocked_env_pending = _is_occupancy_blocked_env(
-            pending.failure_kind,
-            pending.blocked_env_category,
-        )
-        rejected_pending = (
-            pending.device_rejected
-            and pending.failure_kind == FAILURE_KIND_INFRASTRUCTURE
-        )
-        interrupted_submission = (
-            not pending.execution_terminal
-            and not pending.execution_id
-            and not pending.run_id
-            and pending.state == "SUBMITTED"
-        )
-        if (
-            (blocked_env_pending and pending.execution_terminal)
-            or rejected_pending
-            or (
-                interrupted_submission
-                and current.blocked_env_rounds_used <= effective_limit
-            )
-        ):
-            if interrupted_submission:
-                interrupted_device = (
-                    current.device_id
-                    if current.device_id in effective_pool
-                    else effective_pool[0]
-                )
-                current = replace(current, device_id=interrupted_device)
-                result = self._run_l4_cannbench(
-                    self._target_module_path,
-                    device_id=interrupted_device,
-                    on_execution_started=_record_started,
-                )
-                attempts.append(self._l4_attempt(result))
-                current = self._pending_l4_after(
-                    current,
-                    result,
-                    tuple(attempts),
-                    retry_used=current.retry_used,
-                )
-                self._pending_l4 = current
-                self._persist_runtime_state("pending_l4", current.to_dict())
-            else:
-                result = L4CannbenchResult(
-                    passed=False,
-                    error_message=pending.error_message,
-                    failure_kind=pending.failure_kind,
-                    execution_id=pending.execution_id,
-                    run_id=pending.run_id,
-                    receipt_path=pending.receipt_path,
-                    device_id=pending.device_id,
-                    state=pending.state,
-                    execution_terminal=pending.execution_terminal,
-                    blocked_env_category=pending.blocked_env_category,
-                    device_rejected=pending.device_rejected,
-                    target_path=pending.target_path,
-                    candidate_sha256=expected,
-                    attempts=pending.attempts,
-                )
-            return _after_infrastructure(result)
-
-        if self._can_retry_l4_on_alt_card(pending, pending.device_id):
-            return _retry_whole_l4()
-        self._pending_l4 = pending
-        failed = L4CannbenchResult(
-            passed=False,
-            error_message=(
-                pending.error_message
-                or "L4 infrastructure failure has no resumable execution and no "
-                "other authorized card is configured"
-            ),
-            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
-            execution_id=pending.execution_id,
-            run_id=pending.run_id,
-            receipt_path=pending.receipt_path,
-            device_id=pending.device_id,
-            state=pending.state,
-            execution_terminal=pending.execution_terminal,
-            blocked_env_category=pending.blocked_env_category,
-            device_rejected=pending.device_rejected,
-            target_path=pending.target_path,
-            candidate_sha256=expected,
-            attempts=pending.attempts,
-        )
-        return failed, pending
-
-    def _l4_candidate_relative(self) -> str:
-        try:
-            return self._target_module_path.resolve().relative_to(
-                Path(self._source_root).resolve()
-            ).as_posix()
-        except (OSError, ValueError):
-            return self._target_module_path.name
-
-    @staticmethod
-    def _is_blocked_env_l4(result: L4CannbenchResult) -> bool:
-        """Return True only for an occupancy-classified BLOCKED_ENV receipt."""
-        return _is_occupancy_blocked_env(
-            result.failure_kind,
-            result.blocked_env_category,
-        )
-
-    @staticmethod
-    def _is_rejected_card_l4(result: L4CannbenchResult) -> bool:
-        """Return True when AgentGates refused the submitted card as unauthorized.
-
-        Submit is the sole authorization authority. A refusal proves only that
-        this card is outside the current allowlist, so the pool keeps moving;
-        it never widens authorization and never hides a usable card.
-        """
-        return (
-            result.device_rejected
-            and result.failure_kind == FAILURE_KIND_INFRASTRUCTURE
-        )
+        self._pending_l4 = new_pending
+        return res, new_pending
 
     def _run_final_l4_tracked(
         self,
@@ -7827,792 +1989,108 @@ class PerfTargetCampaignRunner:
         incumbent_source: str,
         prior_stop_reason: str,
     ) -> L4CannbenchResult:
-        """Submit the official L4 run and persist its identity before waiting.
-
-        The first submission uses the first configured pool card. A terminal
-        BLOCKED_ENV preemption advances through the remaining pool cards with a
-        complete run on each; a candidate verdict ends the gate, and any other
-        infrastructure failure stays pending for the next invocation. No other
-        terminal failure is retried here, so a fresh failure is never re-spent
-        before its saved identity has been examined.
-        """
-        candidate_sha = self._source_sha256(incumbent_source)
-        candidate_relative = self._l4_candidate_relative()
-        pool = self._l4_device_pool
-        attempts: list[dict[str, str]] = []
-        current = PendingL4(
-            target_path=str(self._target_module_path),
-            candidate_relative=candidate_relative,
-            candidate_sha256=candidate_sha,
-            device_id=pool[0],
-            state="SUBMITTED",
-            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
-            execution_terminal=False,
-            device_pool=pool,
-            blocked_env_round_attempted_device_ids=(pool[0],),
-            blocked_env_round_limit=max(0, self._config.l4_blocked_env_max_retries),
+        self._sync_coordinators()
+        res = self._l3_l4_recovery.run_final_l4_tracked(
+            incumbent_source=incumbent_source,
             prior_stop_reason=prior_stop_reason,
         )
+        self._pending_l4 = self._l3_l4_recovery.pending_l4
+        return res
 
-        def _record_started(execution_id: str, device: str) -> None:
-            nonlocal current
-            current = replace(
-                current,
-                execution_id=execution_id or current.execution_id,
-                device_id=device or current.device_id,
-                state="SUBMITTED",
+    def _run_l3_with_card_retry(
+        self,
+        *,
+        cand: RankedL2Candidate,
+        round_idx: int,
+        regime_tag: str,
+        attempts: list[dict[str, str]],
+    ) -> L3AcceptanceResult:
+        self._sync_coordinators()
+        attempted_devices: set[str] = set()
+        pending_stub = PendingPromotion(
+            candidate_source=cand.candidate_source,
+            candidate_sha256=cand.candidate_sha256,
+            target_path=str(self._target_module_path),
+            round_idx=round_idx,
+            regime_tag=regime_tag,
+            candidate_result=cand.candidate_result,
+            candidate_id=cand.candidate_id,
+            builder_name=cand.builder_name,
+            parent_lane=cand.parent_lane,
+            creative_effort=cand.creative_effort,
+        )
+
+        def _on_started(*args: str) -> None:
+            exec_id = args[0] if len(args) > 0 else ""
+            run_id = args[2] if len(args) > 3 else ""
+            receipt_path = args[3] if len(args) > 3 else ""
+            dev_id = (args[1] if len(args) == 2 else (args[3] if len(args) > 3 else ""))
+            if len(args) == 4:
+                run_id, receipt_path, dev_id = args[1], args[2], args[3]
+            active = replace(
+                pending_stub,
+                execution_id=exec_id,
+                run_id=run_id,
+                receipt_path=receipt_path,
+                device_id=dev_id,
                 execution_terminal=False,
             )
-            self._pending_l4 = current
-            self._persist_runtime_state("pending_l4", current.to_dict())
+            self._active_promotion = active
+            self._pending_promotion = active
+            self._persist_runtime_state("active_promotion", active.to_dict())
 
-        result = self._run_l4_cannbench(
-            self._target_module_path,
-            device_id=pool[0],
-            on_execution_started=_record_started,
+        device_id = self._l4_device_pool[0] if self._l4_device_pool else self._config.device_id
+        extra_pool = (
+            (*self._l4_device_pool, self._retry_device_id)
+            if self._retry_device_id
+            else tuple(self._l4_device_pool)
         )
-        attempts.append(self._l4_attempt(result))
-        current = self._pending_l4_after(
-            current,
-            result,
-            tuple(attempts),
-            retry_used=False,
-        )
-        if self._is_blocked_env_l4(result) or self._is_rejected_card_l4(result):
-            result, current = self._advance_l4_card_failure(current, result, attempts)
-        if result.passed or result.failure_kind == FAILURE_KIND_CANDIDATE:
-            self._pending_l4 = None
-            self._persist_runtime_state("pending_l4", None)
-            return self._merge_l4_identity(result, current)
-        self._pending_l4 = current
-        self._persist_runtime_state("pending_l4", current.to_dict())
-        return self._merge_l4_identity(result, current)
-
-    def _collect_trackb_round_evidence(
-        self,
-        *,
-        round_idx: int,
-        regime_spec: RegimeTargetSpec,
-        blueprint: HirBlueprintPacket | None,
-        live_plan: RegimePlanResult | None,
-        active_mask: ConstraintRelaxationMask,
-        checks: Sequence[L0L1CandidateCheck],
-        l2_results: Mapping[str, CandidateSurrogateResult],
-        active_kernel: str,
-        l2_run_ids: Mapping[str, str],
-        parent_sha256: str,
-        parent_l1_summary: BishengResourceSummary | None,
-        parent_l1_summary_source: str,
-    ) -> tuple[dict[str, object], ...]:
-        """Record per-candidate Track-B blueprint, 5D observation, residual, and provenance."""
-        if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
-            return ()
-        if blueprint is None:
-            return ()
-        policy = live_plan.policy if live_plan is not None else {}
-        solver_backend_tier = str(policy.get("backend_tier", ""))
-        case_entry = regime_spec.representative_case_entry
-        raw_case_id = case_entry.get("case_id", 0)
-        representative_case_id = (
-            raw_case_id
-            if isinstance(raw_case_id, int) and not isinstance(raw_case_id, bool)
-            else 0
-        )
-        raw_dtype = case_entry.get("dtype", "")
-        representative_input_dtype: str | list[str]
-        if isinstance(raw_dtype, str):
-            representative_input_dtype = raw_dtype
-        elif isinstance(raw_dtype, (list, tuple)):
-            representative_input_dtype = [str(item) for item in raw_dtype]
-        else:
-            representative_input_dtype = ""
-        parent_summary_payload = (
-            parent_l1_summary.to_dict() if parent_l1_summary is not None else None
-        )
-        roofline = blueprint.roofline
-        blueprint_summary: dict[str, object] = {
-            "entry_name": blueprint.entry_name,
-            "ideal_roofline_us": float(roofline.ideal_roofline_us),
-            "compute_floor_us": float(roofline.compute_floor_us),
-            "memory_floor_us": float(roofline.memory_floor_us),
-            "dominant_bound": roofline.dominant_bound,
-            "anchor_dims": {str(k): int(v) for k, v in roofline.anchor_dims.items()},
-            "requested_anchor_dims": {
-                str(k): int(v) for k, v in roofline.requested_anchor_dims.items()
-            },
-            "resolved_hir_dims": {
-                str(k): int(v) for k, v in roofline.resolved_hir_dims.items()
-            },
-            "shape_exact_match": bool(roofline.shape_exact_match),
-            "fallback_reason": roofline.fallback_reason,
-        }
-        active_unlocked = active_mask.unlocked_facets()
-        evidence: list[dict[str, object]] = []
-        for chk in checks:
-            stage_a = chk.stage_a
-            ledger = stage_a.ledger if stage_a is not None else None
-            if ledger is None:
-                continue
-            l2_result = l2_results.get(chk.candidate_id)
-            local = (
-                l2_result.for_regime(regime_spec.regime_tag)
-                if l2_result is not None
-                else None
+        while True:
+            attempted_devices.add(device_id)
+            l3_res = self._run_l3_contract(
+                self._target_module_path,
+                device_id=device_id,
+                on_execution_started=_on_started,
             )
-            has_latency = local is not None and bool(local.anchors)
-            latency_us = local.mean_latency_us() if has_latency else 0.0
-            cand_sha = self._source_sha256(chk.patched_module_source)
-            telemetry: dict[str, object] = {
-                "dur_us": latency_us,
-                "roofline_eta": local.avg_roofline_eta if has_latency else 0.0,
-            }
-            msprof = self._msprof_cache.get((cand_sha, regime_spec.regime_tag))
-            if msprof:
-                telemetry.update(msprof)
-            else:
-                telemetry["measured_latency_us"] = latency_us
-                telemetry["is_analytical_proxy"] = True
-            compiler_summary = (
-                chk.stage_b.compiler_summary if chk.stage_b is not None else None
-            )
-            observation = self._observation_with_roofline(
-                ledger,
-                compiler_summary=compiler_summary,
-                telemetry=telemetry,
-                roofline=roofline,
-            )
-            residual = observation.compute_axis_residuals()
-            unlocked = tuple(
-                facet
-                for facet in residual.unlock_causal_facets(active_mask).unlocked_facets()
-                if facet not in active_unlocked
-            )
-            route = stage_a.route if stage_a is not None else None
-            evidence.append(
-                {
-                    "round_idx": round_idx,
-                    "regime_tag": regime_spec.regime_tag,
-                    "candidate_id": chk.candidate_id,
-                    "candidate_sha256": cand_sha,
-                    "active_kernel": active_kernel,
-                    "l2_run_id": (
-                        l2_run_ids.get(chk.candidate_id, "")
-                        if l2_result is not None
-                        else ""
-                    ),
-                    "parent_candidate_sha256": parent_sha256,
-                    "parent_compiler_summary": (
-                        dict(parent_summary_payload)
-                        if parent_summary_payload is not None
-                        else None
-                    ),
-                    "parent_compiler_summary_source": parent_l1_summary_source,
-                    "representative_case_id": representative_case_id,
-                    "representative_input_dtype": representative_input_dtype,
-                    "runtime_backend": regime_spec.runtime_backend,
-                    "backend_tier": "ascendc_template",
-                    "solver_backend_tier": solver_backend_tier,
-                    "track": (
-                        route.track
-                        if self._enable_track_router and route is not None
-                        else "unconstrained"
-                    ),
-                    "stage_a_backend_kind": stage_a.backend_kind,
-                    "l0_l1_passed": chk.passed,
-                    "l1_compiler_passed": bool(chk.stage_b.passed) if chk.stage_b else False,
-                    "l2_evaluated": l2_result is not None,
-                    "l2_all_passed": bool(l2_result.all_passed) if l2_result is not None else False,
-                    "latency_us": float(latency_us),
-                    "blueprint": dict(blueprint_summary),
-                    "observation": observation.to_dict(),
-                    "axis_residual": {
-                        "compute_issue_gap": residual.compute_issue_gap,
-                        "offchip_dma_gap": residual.offchip_dma_gap,
-                        "onchip_sram_reg_gap": residual.onchip_sram_reg_gap,
-                        "pipeline_sync_gap": residual.pipeline_sync_gap,
-                        "grid_wave_gap": residual.grid_wave_gap,
-                    },
-                    "dominant_axis": residual.dominant_axis,
-                    "unlocked_facets": list(unlocked),
-                    "active_unlocked_facets": list(active_unlocked),
-                    "field_provenance": {
-                        "has_l1_compiler_summary": observation.has_l1_compiler_summary,
-                        "has_l2_telemetry": observation.has_l2_telemetry,
-                        "measured_l2_fields": list(observation.measured_l2_fields),
-                        "latency_source": "l2_batch_mean" if has_latency else "none",
-                        "observation_source": (
-                            "msprof_l2"
-                            if msprof
-                            else ("l2_batch" if has_latency else "roofline_static")
-                        ),
-                        "compiler_summary_source": (
-                            "bisheng_l1" if compiler_summary is not None else "absent"
-                        ),
-                    },
-                }
-            )
-        return tuple(evidence)
-
-    @staticmethod
-    def _extract_l3_failed_case_nums(l3_res: L3AcceptanceResult) -> list[int]:
-        raw_cases = getattr(l3_res, "failed_case_nums", ()) or ()
-        case_nums: list[int] = []
-        seen: set[int] = set()
-        for item in raw_cases:
-            if isinstance(item, int) and not isinstance(item, bool):
-                cnum = int(item)
-                if cnum not in seen:
-                    seen.add(cnum)
-                    case_nums.append(cnum)
-        if not case_nums and l3_res.error_message:
-            for match in _L3_CASE_NUM_RE.finditer(l3_res.error_message):
-                cnum = int(match.group(1))
-                if cnum not in seen:
-                    seen.add(cnum)
-                    case_nums.append(cnum)
-        return case_nums
-
-    _SHAPE_DIM_KEYS: frozenset[str] = frozenset(
-        {
-            "b", "b_dim", "batch", "s", "s_dim", "s_q", "seq_len", "s_kv",
-            "d", "d_dim", "d_nope", "d_rope", "m", "m_dim", "m_rows",
-            "n", "n_dim", "n_depth", "n_q", "n_kv", "k", "k_dim",
-            "half_dim", "q_rows", "q_total_rows", "v_rows", "epsilon",
-            "tl_dtype", "dtype", "input_layout", "is_causal",
-        }
-    )
-
-    _NON_TAIL_DIM_KEYS: frozenset[str] = frozenset(
-        {
-            "total_elements", "rank", "num_inputs", "dtype_bytes", "case_id", "case_num",
-            "group_count", "b", "b_dim", "batch", "n", "n_depth", "n_q", "n_kv",
-            "numheads", "numkvheads",
-        }
-    )
-
-    @staticmethod
-    def _extract_knob_signature(
-        mod_src: str,
-        regime_spec: RegimeTargetSpec,
-    ) -> str:
-        """Extract canonical sorted knob signature for deterministic boundary ledger."""
-        if not mod_src.strip():
-            return ""
-        anchor_dims = (
-            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-        )
-        try:
-            resolved = resolve_regime_config(mod_src, regime_spec, dims=anchor_dims)
-        except (
-            SyntaxError,
-            AttributeError,
-            ImportError,
-            KeyError,
-            NameError,
-            OSError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ):
-            return ""
-        parts: list[str] = []
-        if resolved.selector_name:
-            for key in sorted(resolved.builder_kwargs):
-                if str(key).lower() in PerfTargetCampaignRunner._SHAPE_DIM_KEYS:
-                    continue
-                parts.append(f"{key}={resolved.builder_kwargs[key]!r}")
-        for key in sorted(resolved.pass_configs):
-            parts.append(f"pc.{key}={resolved.pass_configs[key]!r}")
-        if resolved.compile_flags:
-            parts.append(
-                f"flags={' '.join(sorted(str(flag) for flag in resolved.compile_flags))}"
-            )
-        return ",".join(parts)
-
-    @staticmethod
-    def _is_prime_gt2(value: int) -> bool:
-        if value < 3 or value % 2 == 0:
-            return False
-        divisor = 3
-        while divisor * divisor <= value:
-            if value % divisor == 0:
-                return False
-            divisor += 2
-        return True
-
-    @classmethod
-    def _case_dim_alignment_flags(
-        cls,
-        case_dims: Mapping[str, object],
-    ) -> dict[str, bool]:
-        """Compute odd, prime, and non-32B-aligned flags for counterexample dimensions."""
-        tail_vals: list[int] = []
-        for raw_key, raw_val in case_dims.items():
-            key_norm = str(raw_key).strip().lower()
-            if key_norm in cls._NON_TAIL_DIM_KEYS:
-                continue
-            if isinstance(raw_val, int) and not isinstance(raw_val, bool) and raw_val > 1:
-                tail_vals.append(int(raw_val))
-        dtype_name = str(case_dims.get("tl_dtype") or case_dims.get("dtype") or "float16").lower()
-        elem_bytes = 4 if "32" in dtype_name else 2
-        has_odd = any(v % 2 == 1 for v in tail_vals)
-        has_prime = any(cls._is_prime_gt2(v) for v in tail_vals)
-        non_32b = any((v * elem_bytes) % 32 != 0 for v in tail_vals)
-        is_unaligned = has_odd or has_prime or non_32b or any(v % 32 != 0 for v in tail_vals)
-        return {
-            "has_odd_dim": has_odd,
-            "has_prime_dim": has_prime,
-            "non_32b_aligned": non_32b,
-            "odd_or_prime_tail": bool(has_odd or has_prime),
-            "has_unaligned_dim": is_unaligned,
-            "is_unaligned": is_unaligned,
-        }
-
-    def _evaluate_incumbent_on_new_anchors(
-        self,
-        incumbent_source: str,
-        new_specs: Sequence[AnchorCaseSpec],
-    ) -> list[AnchorEvalMetrics]:
-        """Measure incumbent AnchorEvalMetrics on newly added probe cases."""
-        if not new_specs or not incumbent_source.strip():
-            return []
-        try:
-            with tempfile.TemporaryDirectory(prefix="tf_inc_dyn_anchor_") as tmp_dir:
-                inc_file = Path(tmp_dir) / "incumbent.py"
-                inc_file.write_text(incumbent_source, encoding="utf-8")
-                l2_probe, _ = self._run_l2_batch(
-                    [("incumbent", inc_file)],
-                    list(new_specs),
-                    include_guardrails=False,
-                )
-            inc_res = l2_probe.get("incumbent")
-            if inc_res is not None and inc_res.anchors:
-                return list(inc_res.anchors)
-        except (
-            OSError,
-            subprocess.SubprocessError,
-            TimeoutError,
-            json.JSONDecodeError,
-            RuntimeError,
-            FileNotFoundError,
-            KeyError,
-            ValueError,
-        ):
-            pass
-        return []
-
-    def _record_l3_guardrail_cases(
-        self,
-        l3_res: L3AcceptanceResult,
-        incumbent_source: str,
-        regime_spec: RegimeTargetSpec,
-        *,
-        topology_axes: TopologyAxes | None = None,
-    ) -> list[GuardrailCaseSpec]:
-        """Record all unseen non-scoreboard L3 failure probe cases monotonically."""
-        case_nums = self._extract_l3_failed_case_nums(l3_res)
-        scoreboard_cases = {int(a.case_num) for a in self._scoreboard_anchors}
-        existing_guardrails = {int(g.case_num) for g in self._guardrail_cases}
-        target_cases = [
-            c
-            for c in case_nums
-            if c not in scoreboard_cases and c not in existing_guardrails
-        ]
-        if not target_cases:
-            return []
-        try:
-            task_name = get_operator_task(self._config.operator_name)
-        except (FileNotFoundError, KeyError, ValueError):
-            task_name = f"operator/{self._config.operator_name}"
-        bp = self._regime_blueprints.get(regime_spec.regime_tag)
-        default_t_hw = (
-            float(bp.roofline.ideal_roofline_us)
-            if bp is not None and bp.roofline.ideal_roofline_us > 0.0
-            else 1.0
-        )
-        axes_dict = (
-            topology_axes.to_dict()
-            if topology_axes is not None
-            else (self._topology_axes.to_dict() if self._topology_axes is not None else {})
-        )
-        failure_stage = str(getattr(l3_res, "failure_stage", "") or "")
-        probe_specs: list[AnchorCaseSpec] = []
-        pending_specs: list[tuple[int, str, float, float]] = []
-        for cnum in target_cases:
-            dims: dict[str, object] = {}
-            try:
-                dims = dict(
-                    lookup_case_dims(
-                        self._config.operator_name,
-                        cnum,
-                        cannbench_repo=self._cannbench_repo,
-                        env_file=self._env_file,
-                    )
-                )
-            except (FileNotFoundError, OSError, KeyError, ValueError, TypeError):
-                if cnum in self._case_dims_cache:
-                    dims = dict(self._case_dims_cache[cnum])
-                elif (
-                    getattr(self._lookup_case_dims_safe, "__func__", None)
-                    is not PerfTargetCampaignRunner._lookup_case_dims_safe
-                ):
-                    dims = self._lookup_case_dims_safe(cnum, regime_spec.regime_tag)
-            true_regime_tag = regime_spec.regime_tag
-            if dims and self._regime_specs:
-                try:
-                    true_regime_tag = resolve_regime_for_case(
-                        self._config.operator_name,
-                        dims,
-                        self._regime_specs,
-                    ).regime_tag
-                except (KeyError, ValueError, TypeError):
-                    pass
-            ref_perf_us = 1.0
-            t_hw_us = default_t_hw
-            try:
-                meta_ref, meta_hw = lookup_case_metadata(
-                    self._config.operator_name,
-                    cnum,
-                    cannbench_repo=self._cannbench_repo,
-                    env_file=self._env_file,
-                )
-                if meta_ref > 0.0:
-                    ref_perf_us = float(meta_ref)
-                if meta_hw > 0.0:
-                    t_hw_us = float(meta_hw)
-            except (FileNotFoundError, OSError, KeyError, ValueError, json.JSONDecodeError):
-                pass
-            probe_specs.append(
-                AnchorCaseSpec(
-                    task=task_name,
-                    case_num=cnum,
-                    regime_tag=true_regime_tag,
-                    ref_perf_us=ref_perf_us,
-                    t_hw_us=t_hw_us,
-                )
-            )
-            pending_specs.append((cnum, true_regime_tag, ref_perf_us, t_hw_us))
-            if self._experience_lake_dir is not None:
-                eff_dims = dims or self._lookup_case_dims_safe(cnum, true_regime_tag)
-                align_flags = self._case_dim_alignment_flags(eff_dims)
-                try:
-                    append_counterexample_boundary(
-                        self._experience_lake_dir,
-                        {
-                            "run_id": self._run_id,
-                            "operator": self._config.operator_name,
-                            "regime_tag": true_regime_tag,
-                            "topology_axes": axes_dict,
-                            "case_num": int(cnum),
-                            "case_dims": eff_dims,
-                            "failure_stage": failure_stage,
-                            "ref_perf_us": float(ref_perf_us),
-                            "t_hw_us": float(t_hw_us),
-                            **align_flags,
-                        },
-                    )
-                except (OSError, ValueError) as exc:
-                    logger.debug("Appending counterexample boundary skipped: %s", exc)
-
-        inc_metrics = self._evaluate_incumbent_on_new_anchors(incumbent_source, probe_specs)
-        inc_us_by_case = {
-            int(m.case_num): float(m.cand_us) for m in inc_metrics if m.cand_us > 0.0
-        }
-        added: list[GuardrailCaseSpec] = []
-        for cnum, true_regime_tag, ref_perf_us, t_hw_us in pending_specs:
-            inc_ref = inc_us_by_case.get(cnum, 0.0)
-            if inc_ref <= 0.0 and ref_perf_us > 1.0:
-                inc_ref = ref_perf_us
-            spec = GuardrailCaseSpec(
-                task=task_name,
-                case_num=cnum,
-                regime_tag=true_regime_tag,
-                incumbent_ref_us=inc_ref,
-                t_hw_us=t_hw_us,
-            )
-            self._guardrail_cases.append(spec)
-            added.append(spec)
-        return added
-
-    async def _attempt_l3_counterexample_repair(
-        self,
-        *,
-        backend: KernelLLMBackend,
-        top_chk: L0L1CandidateCheck,
-        l3_res: L3AcceptanceResult,
-        incumbent_source: str,
-        best_result: CandidateSurrogateResult,
-        regime_spec: RegimeTargetSpec,
-        active_anchors: Sequence[AnchorCaseSpec],
-        active_mask: ConstraintRelaxationMask,
-        bn_dims: Mapping[str, int] | None,
-        round_idx: int,
-        func_name: str,
-        parent_lane: str,
-        creative_effort: str,
-    ) -> tuple[L0L1CandidateCheck, CandidateSurrogateResult, L3AcceptanceResult] | None:
-        """Perform one-shot unfolded repair on a candidate that failed L3 validation."""
-        cand_mod_src = top_chk.patched_module_source
-        op_entry = _resolve_operator_entrypoint_safe(self._config.operator_name)
-        try:
-            _, unfolded_dsl = extract_regime_snippet(
-                cand_mod_src,
-                regime_spec,
-                operator_entrypoint=op_entry,
-                sibling_specs=self._regime_specs,
-            )
-        except (SyntaxError, ValueError):
-            unfolded_dsl = top_chk.snippet_source
-        unfolded_cpp = ""
-        is_trackb = regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
-        if is_trackb and regime_spec.trackb_symbols:
-            tb_extracted = _extract_trackb_cpp_source(cand_mod_src, regime_spec)
-            if tb_extracted is not None:
-                _entry_k, unfolded_cpp = extract_reachable_trackb_source(
-                    tb_extracted[1],
-                    module_source=cand_mod_src,
-                    regime_tag=regime_spec.regime_tag,
-                )
-        failed_cases = self._extract_l3_failed_case_nums(l3_res)
-        case_dims_payload: dict[str, dict[str, object]] = {}
-        for cnum in failed_cases:
-            case_dims_payload[str(cnum)] = self._lookup_case_dims_safe(
-                cnum, regime_spec.regime_tag
-            )
-        slice_desc = self._slice_contract_instruction(
-            func_name,
-            regime_spec,
-            operator_entrypoint=op_entry,
-        )
-        g5_lock = format_g5_parent_monotonicity_lock()
-        sys_prompt = (
-            "You are an Ascend 950PR kernel correctness repair engineer. Fix ONLY the tail, "
-            "boundary, NaN/numerical precision, or idempotence defect that caused the L3 "
-            "counterexample failure below while preserving the fast main-loop tiling and "
-            f"pipelining structure and {slice_desc}."
-        )
-        cpp_section = (
-            "### UNFOLDED TRACK-B REACHABLE CLOSURE (NO OMITTED HELPERS)\n"
-            f"```cpp\n{unfolded_cpp}\n```\n\n"
-            if unfolded_cpp.strip()
-            else ""
-        )
-        user_prompt = (
-            f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
-            "### L3 COUNTEREXAMPLE FAILURE\n"
-            f"- failed_case_nums: {failed_cases}\n"
-            f"- error_message: {l3_res.error_message}\n\n"
-            f"### COUNTEREXAMPLE CASE DIMS\n{json.dumps(case_dims_payload, indent=2)}\n\n"
-            "### COUNTEREXAMPLE REPAIR CONSTRAINTS\n"
-            "- Keep the fast main-loop tiling, pipelining, and execution domain intact.\n"
-            "- Fix ONLY tail/boundary predicates, numerical overflow/NaN handling, or "
-            "idempotence bugs.\n\n"
-            f"{g5_lock}\n\n"
-            f"{cpp_section}"
-            f"### UNFOLDED CANDIDATE SLICE\n```python\n{unfolded_dsl}\n```\n"
-        )
-        req = GenerationRequest(
-            role="syntax_repair",
-            role_hint="l3_counterexample_repair",
-            regime_tag=regime_spec.regime_tag,
-            system_prompt=sys_prompt,
-            user_prompt=user_prompt,
-            json_schema=None,
-            effort="high",
-        )
-        try:
-            raw_reply = await backend.generate(req)
-            repaired_snippet = extract_python_dsl(raw_reply)
-        except (
-            OSError,
-            subprocess.SubprocessError,
-            TimeoutError,
-            RuntimeError,
-            ConnectionError,
-            json.JSONDecodeError,
-            KeyError,
-            TypeError,
-            ValueError,
-        ):
-            return None
-        if not repaired_snippet.strip():
-            return None
-
-        active_kernel = (
-            self._resolve_active_trackb_kernel(cand_mod_src, regime_spec) or ""
-        )
-        repair_cand_id = f"{top_chk.candidate_id}_l3fix"
-
-        def _patch_cand(snip: str) -> str:
-            return patch_regime_into_module(
-                cand_mod_src,
-                regime_spec,
-                snip,
-                operator_entrypoint=op_entry,
-                sibling_specs=self._regime_specs,
-                active_kernel=active_kernel,
-            )
-
-        def _repair_l0(mod_src: str) -> StageAResult:
-            dead_err = _detect_trackb_dead_code_edit(cand_mod_src, mod_src, regime_spec)
-            if dead_err is not None:
-                return StageAResult(
-                    passed=False,
-                    prim_func=None,
-                    ledger=None,
-                    error_message=dead_err,
-                    backend_kind="ascendc",
-                )
-            return self._run_l0(
-                mod_src,
-                regime_spec,
-                anchor_dims_override=bn_dims or None,
-            )
-
-        checks = await run_l0_l1_round_filter(
-            [(repair_cand_id, repaired_snippet)],
-            patch_fn=_patch_cand,
-            l0_checker=_repair_l0,
-            l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),
-            repair_backend=None,
-            max_syntax_repairs=0,
-            slice_hint=slice_desc,
-            backend_kind=regime_spec.runtime_backend,
-            parent_source=unfolded_dsl,
-            parent_module_source=cand_mod_src,
-            freedom_mask=active_mask,
-        )
-        if not checks or not checks[0].passed:
-            return None
-        repaired_chk = checks[0]
-        try:
-            with tempfile.TemporaryDirectory(prefix="tf_l3_cx_repair_") as tmp_dir:
-                cand_file = Path(tmp_dir) / f"{repaired_chk.candidate_id}.py"
-                cand_file.write_text(repaired_chk.patched_module_source, encoding="utf-8")
-                l2_res, _ = self._run_l2_batch(
-                    [(repaired_chk.candidate_id, cand_file)], active_anchors
-                )
-        except (
-            OSError,
-            subprocess.SubprocessError,
-            TimeoutError,
-            json.JSONDecodeError,
-            RuntimeError,
-        ):
-            return None
-        repaired_res = l2_res.get(repaired_chk.candidate_id)
-        if repaired_res is None or not repaired_res.all_passed:
-            return None
-        tail_ok, repaired_res = self._evaluate_dual_layer_tail_guard(
-            candidate_id=repaired_chk.candidate_id,
-            candidate_source=repaired_chk.patched_module_source,
-            top_res=repaired_res,
-            best_result=best_result,
-            regime_spec=regime_spec,
-            active_anchors=active_anchors,
-            incumbent_source=incumbent_source,
-        )
-        if not tail_ok:
-            return None
-
-        _atomic_write_text(self._target_module_path, repaired_chk.patched_module_source)
-        repaired_sha = self._source_sha256(repaired_chk.patched_module_source)
-
-        def _record_repair_l3_started(execution_id: str, device: str) -> None:
-            provisional = PendingPromotion(
-                candidate_source=repaired_chk.patched_module_source,
-                candidate_sha256=repaired_sha,
-                target_path=str(self._target_module_path),
-                round_idx=round_idx,
-                regime_tag=regime_spec.regime_tag,
-                candidate_result=repaired_res,
-                candidate_id=repaired_chk.candidate_id,
-                builder_name=func_name,
-                parent_lane=parent_lane,
-                creative_effort=creative_effort,
-                execution_id=execution_id,
-                device_id=device,
-                execution_terminal=False,
-            )
-            self._active_promotion = provisional
-            self._pending_promotion = provisional
-            self._persist_runtime_state("active_promotion", provisional.to_dict())
-
-        repaired_l3 = self._run_l3_contract(
-            self._target_module_path,
-            on_execution_started=_record_repair_l3_started,
-        )
-        self._active_promotion = None
-        if (
-            not repaired_l3.passed
-            and repaired_l3.execution_terminal
-            and repaired_l3.failure_kind == FAILURE_KIND_INFRASTRUCTURE
-            and (
-                getattr(repaired_l3, "blocked_env_category", "") == "occupancy"
-                or repaired_l3.failure_category == "occupancy"
-            )
-            and len(self._l4_device_pool) > 1
-        ):
-            repair_attempts: list[dict[str, str]] = [
-                self._promotion_attempt(
-                    repaired_l3,
-                    repaired_l3.device_id or self._config.device_id,
-                    candidate_sha256=repaired_sha,
-                )
-            ]
-            pool_pending = PendingPromotion(
-                candidate_source=repaired_chk.patched_module_source,
-                candidate_sha256=repaired_l3.candidate_sha256 or repaired_sha,
-                target_path=repaired_l3.target_path or str(self._target_module_path),
-                round_idx=round_idx,
-                regime_tag=regime_spec.regime_tag,
-                candidate_result=repaired_res,
-                candidate_id=repaired_chk.candidate_id,
-                builder_name=func_name,
-                parent_lane=parent_lane,
-                creative_effort=creative_effort,
-                execution_id=repaired_l3.execution_id,
-                run_id=repaired_l3.run_id,
-                receipt_path=repaired_l3.receipt_path,
-                error_message=repaired_l3.error_message,
-                attempts=tuple(repair_attempts),
-                device_id=repaired_l3.device_id or self._config.device_id,
-                execution_terminal=repaired_l3.execution_terminal,
-            )
-            tried_repair_cards: set[str] = set()
-            while self._can_retry_on_alt_card(pool_pending, pool_pending.device_id):
-                next_dev = self._next_l3_alt_card(pool_pending, pool_pending.device_id)
-                if not next_dev or next_dev in tried_repair_cards:
-                    break
-                tried_repair_cards.add(next_dev)
-                repaired_l3 = self._retry_l3_on_alt_card(
-                    pool_pending, tuple(repair_attempts)
-                )
-                repair_attempts.append(
-                    self._promotion_attempt(
-                        repaired_l3,
-                        next_dev or repaired_l3.device_id or self._config.device_id,
-                        candidate_sha256=repaired_sha,
-                    )
-                )
-                pool_pending = replace(
-                    pool_pending,
-                    execution_id=repaired_l3.execution_id or pool_pending.execution_id,
-                    run_id=repaired_l3.run_id or pool_pending.run_id,
-                    receipt_path=repaired_l3.receipt_path or pool_pending.receipt_path,
-                    error_message=repaired_l3.error_message or pool_pending.error_message,
-                    attempts=tuple(repair_attempts),
-                    device_id=next_dev or repaired_l3.device_id or pool_pending.device_id,
-                    execution_terminal=repaired_l3.execution_terminal,
-                    retry_used=True,
-                )
+            for busy_backoff_sec in (2.0, 5.0, 10.0):
                 if (
-                    repaired_l3.passed
-                    or not repaired_l3.execution_terminal
-                    or repaired_l3.failure_kind == FAILURE_KIND_CANDIDATE
+                    l3_res.passed
+                    or l3_res.failure_kind == FAILURE_KIND_CANDIDATE
+                    or "resource busy:" not in (l3_res.error_message or "").lower()
                 ):
                     break
-        return repaired_chk, repaired_res, repaired_l3
+                logger.warning(
+                    "Round %d L3 hit transient resource busy (%s); retrying after %.1fs",
+                    round_idx,
+                    (l3_res.error_message or "")[:160],
+                    busy_backoff_sec,
+                )
+                time.sleep(busy_backoff_sec)
+                l3_res = self._run_l3_contract(
+                    self._target_module_path,
+                    device_id=device_id,
+                    on_execution_started=_on_started,
+                )
+            if l3_res.execution_terminal:
+                self._active_promotion = None
+            attempts.append(
+                self._l3_l4_recovery.promotion_attempt(
+                    l3_res,
+                    l3_res.device_id or device_id,
+                    candidate_sha256=cand.candidate_sha256,
+                )
+            )
+            if l3_res.passed or l3_res.failure_kind == FAILURE_KIND_CANDIDATE:
+                return l3_res
+            if not l3_res.execution_terminal:
+                return l3_res
+            alt = next(
+                (d for d in extra_pool if d and d not in attempted_devices),
+                "",
+            )
+            if not alt:
+                return l3_res
+            device_id = alt
 
     async def _execute_single_round(
         self,
@@ -8634,1950 +2112,633 @@ class PerfTargetCampaignRunner:
         bool,
         bool,
     ]:
-        """Run one optimisation round and promote the best candidate through L3.
-
-        The execution identity is persisted at submission, before the potentially
-        long wait, so a killed process can recover the same run. A terminal
-        infrastructure fault restores the incumbent and blocks promotion without
-        counting stagnation; a live or queued execution keeps the exact candidate
-        bytes because replacing them would silently change the code under test.
-        """
-        working_anchors = list(self._scoreboard_anchors) if self._scoreboard_anchors else list(active_anchors)
-        start_advisor_preds = int(getattr(self._cost_advisor, "predictions_invoked", 0) or 0)
-        llm_gen_sec = 0.0
-        l0_l1_sec = 0.0
-        syntax_repair_sec = 0.0
-        l2_prewarm_sec = 0.0
-        l2_npu_sec = 0.0
-        l3_sec = 0.0
-        post_l3_sec = 0.0
-        round_prewarm_stats: dict[str, int] = {
-            "total_tasks": 0,
-            "cache_hits": 0,
-            "compiled_tasks": 0,
-            "failed_candidates": 0,
-        }
-        backend = self._get_backend()
+        """Execute one optimization round across context synthesis, gates, L3, and telemetry."""
+        self._sync_coordinators()
         self._active_incumbent_source = incumbent_source
+        self._active_regime_tag = regime_spec.regime_tag
+        self._stage_gate_coordinator._active_incumbent_source = incumbent_source
         self._incumbent_anchor_us_by_case = {
             int(a.case_num): float(a.cand_us)
             for a in best_result.anchors
             if a.cand_us > 0.0
         }
-        self._active_regime_tag = regime_spec.regime_tag
-        regime_beam = self.beam_for_regime(regime_spec.regime_tag)
-        func_name, _default_snippet = extract_regime_snippet(
-            incumbent_source,
-            regime_spec,
-            operator_entrypoint=_resolve_operator_entrypoint_safe(
-                self._config.operator_name
-            ),
-            sibling_specs=self._regime_specs,
+        self._stage_gate_coordinator._incumbent_anchor_us_by_case = (
+            self._incumbent_anchor_us_by_case
         )
 
-        escalated = stagnation_rounds >= self._config.stagnation_escalate_rounds
+        stagnation_map = dict(self._stagnation_by_regime)
+        stagnation_map[regime_spec.regime_tag] = stagnation_rounds
         creative_effort = "high"
-        (
-            parent_module_source,
-            parent_snippet,
-            parent_lane,
-            selected_stone,
-            selected_stone_hypothesis,
-        ) = self._resolve_round_parent(
-            incumbent_source=incumbent_source,
-            regime_spec=regime_spec,
-            regime_beam=regime_beam,
-            escalated=escalated,
+        merged_msprof_by_case = TelemetryLedgerWriter.fold_regime_msprof_cache(
+            self._msprof_by_case, self._msprof_cache, active_anchors,
+            active_regime_tag=regime_spec.regime_tag,
+            single_regime=len(self._regime_specs) <= 1,
         )
-        stone_ledger = selected_stone.ledger if selected_stone is not None else None
-        stone_track = selected_stone.track if selected_stone is not None else None
-        selected_stone_id = selected_stone.candidate_id if selected_stone is not None else None
-
-        active_parent_id = (
-            selected_stone_id
-            if selected_stone_id
-            else (
-                regime_beam.exploit_beam[0].candidate_id
-                if regime_beam.exploit_beam
-                else f"incumbent_r{max(0, round_idx - 1)}"
-            )
+        state = ChampionState(
+            incumbent_source=incumbent_source, best_result=best_result,
+            active_anchors=tuple(active_anchors), regime_specs=self._regime_specs or (regime_spec,),
+            stagnation_rounds=stagnation_rounds, stagnation_by_regime=stagnation_map,
+            compile_wall_streak_by_regime=self._compile_wall_streak_by_regime,
+            last_round_promoted_by_regime=self._last_round_promoted_by_regime,
+            last_round_promoted=self._last_round_promoted,
+            last_local_rel_gain_by_regime=self._last_local_rel_gain_by_regime,
+            freedom_masks=self._freedom_masks, msprof_by_case=merged_msprof_by_case,
+            p2_cache=self._p2_cache,
+            calibrated_dispatch_floor_us=self._calibrated_dispatch_floor_us,
+            boundary_ledger=self._boundary_ledger, beams=self._beams,
+            current_regime=regime_spec.regime_tag, active_kernel_cache=self._active_kernel_cache,
+            live_regime_plans=self._live_regime_plans,
+            operator_proto_cache=self._operator_proto_cache,
+            sil_advisory=self._sil_advisory, topology_axes=self._topology_axes,
+            semantic_topology_axes=self._semantic_topology_axes,
+            regime_blueprints=self._regime_blueprints,
         )
+        bundle = self._round_context_builder.build_round_bundle(
+            state, round_idx=round_idx, regime_spec=regime_spec,
+            working_anchors=active_anchors, creative_effort=creative_effort,
+        )
+        self._freedom_masks.update(self._round_context_builder._freedom_masks)
+        self._blueprint_provenance = dict(self._round_context_builder._blueprint_provenance)
+        self._msprof_by_case.update(self._calibration_service.msprof_by_case)
 
         bn_anchor = bottleneck_anchor_for_regime(best_result, regime_spec.regime_tag)
         bn_dims: dict[str, int] | None = None
         if bn_anchor is not None:
-            resolved_bn = self._lookup_case_dims_safe(
-                bn_anchor.case_num, regime_spec.regime_tag
-            )
+            resolved_bn = self._lookup_case_dims_safe(bn_anchor.case_num, regime_spec.regime_tag)
             if resolved_bn:
                 bn_dims = {
-                    str(k): int(v)
-                    for k, v in resolved_bn.items()
+                    str(k): int(v) for k, v in resolved_bn.items()
                     if isinstance(v, int) and not isinstance(v, bool)
                 }
-        base_stage_a = self._invoke_with_optional_kwargs(
-            self._run_l0,
-            parent_module_source,
-            regime_spec,
-            anchor_dims_override=bn_dims or None,
-        )
-        parent_ledger = (
-            base_stage_a.ledger if base_stage_a.ledger is not None else stone_ledger
-        )
-        if parent_ledger is None:
-            raise RuntimeError(
-                f"Stage-A L0 produced no ledger for regime {regime_spec.regime_tag!r}: "
-                f"{base_stage_a.error_message}"
-            )
-        if self._enable_track_router:
-            parent_track = (
-                stone_track
-                if stone_track is not None
-                else (
-                    base_stage_a.route.track
-                    if base_stage_a.route is not None
-                    else "unconstrained"
-                )
-            )
-            parent_features = base_stage_a.features
-        else:
-            parent_track = "unconstrained"
-            parent_features = None
 
-        regime_best = best_result.for_regime(regime_spec.regime_tag)
-        local_best = regime_best if regime_best.anchors else best_result
-        prev_local_rel_gain = self._last_local_rel_gain_by_regime.get(regime_spec.regime_tag)
-        mean_recoverable_excess_us = self._regime_mean_recoverable_excess_us(
-            best_result, regime_spec
+        batch = CandidateBatch(
+            round_idx=round_idx, regime_spec=regime_spec, worker_specs=bundle.worker_specs,
+            parent_module_source=bundle.parent_module_source, parent_snippet=bundle.parent_snippet,
+            parent_ledger=bundle.parent_ledger, parent_axes=bundle.parent_axes,
+            active_mask=bundle.active_mask, bn_dims=bn_dims, live_plan=bundle.live_plan,
+            blueprint=bundle.blueprint, gate_decision=bundle.gate_decision,
+            parent_p2_diag=bundle.parent_p2_diag, func_name=bundle.func_name,
         )
-        parent_axes = self._derive_topology_axes(
-            parent_ledger,
-            features=parent_features,
-            route=base_stage_a.route,
-        )
-        bucket_key = f"{regime_spec.regime_tag}:{parent_axes.key()}"
-        spearman_hist = self._boundary_ledger.spearman_history.get(bucket_key) or []
-        latest_rho = spearman_hist[-1] if spearman_hist else None
-        clean_samples = 0
-        if self._experience_lake is not None:
-            try:
-                _cands, all_obs = self._experience_lake.load_records()
-                clean_samples = sum(
-                    1
-                    for obs in all_obs
-                    if obs.operator == self._config.operator_name
-                    and obs.regime_tag == regime_spec.regime_tag
-                    and obs.accuracy_passed
-                    and is_clean_calibration_sample(obs.burst_batch_cv)
-                )
-            except (OSError, ValueError):
-                clean_samples = 0
-        gate_decision = self._invoke_with_optional_kwargs(
-            self._cost_advisor.evaluate_round_policy,
-            enable_prescreen_flag=bool(self._config.enable_tilesize_prescreen),
-            bucket_clean_samples=clean_samples,
-            out_of_sample_spearman_rho=latest_rho,
-        )
-        if self._boundary_ledger.is_cost_prescreen_quarantined(bucket_key):
-            gate_decision = replace(
-                gate_decision,
-                allow_candidate_pruning=False,
-                reason="spearman_rank_inverted",
-            )
-        rep_dims = {
-            str(k): int(v)
-            for k, v in (
-                regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-            ).items()
-            if isinstance(v, int) and not isinstance(v, bool)
-        }
-        blueprint = self._regime_blueprints.get(regime_spec.regime_tag)
-        blueprint_roofline = blueprint.roofline if blueprint is not None else None
-        sil_regime = None
-        if self._sil_advisory is not None:
-            for reg in getattr(self._sil_advisory, "regimes", ()) or ():
-                if getattr(reg, "regime_tag", None) == regime_spec.regime_tag:
-                    sil_regime = reg
-                    break
-        if sil_regime is None:
-            sil_regime = RegimeSlice(
-                regime_tag=regime_spec.regime_tag,
-                case_nums=(),
-                representative_dims=rep_dims,
-                has_unaligned_tail=(
-                    "unaligned" in regime_spec.regime_tag or "tail" in regime_spec.regime_tag
-                ),
-            )
-        adv_dtypes = tuple(getattr(self._sil_advisory, "input_dtypes", ()) or ())
-        if not adv_dtypes:
-            raw_case_dtype = regime_spec.representative_case_entry.get("dtype")
-            if isinstance(raw_case_dtype, str) and raw_case_dtype.strip():
-                adv_dtypes = (raw_case_dtype.strip(),)
-            elif isinstance(raw_case_dtype, (list, tuple)):
-                adv_dtypes = tuple(
-                    str(item).strip() for item in raw_case_dtype if str(item).strip()
-                )
-        adv_nan_inf = bool(getattr(self._sil_advisory, "has_nan_inf_cases", False))
-        live_plan = recompute_regime_for_live_buffers(
-            self._regime_solver,
-            sil_regime,
-            parent_ledger,
-            op_name=self._config.operator_name,
-            topology_axes=parent_axes,
-            roofline=self._roofline_arg_for_solver(blueprint_roofline),
-            input_dtypes=adv_dtypes or ("float16",),
-            has_nan_inf_cases=adv_nan_inf,
-            has_indirect_gather=(parent_axes.iteration_regularity == "irregular_simt"),
-            has_recurrence=(
-                parent_axes.memory_ring in ("persistent_onchip_state", "bidirectional_cv_ring")
-            ),
-            uses_cube=parent_axes.uses_cube,
-        )
-        self._live_regime_plans[regime_spec.regime_tag] = live_plan
-        if stagnation_rounds >= 1:
-            self._collect_msprof_for_regimes(
-                parent_module_source,
-                best_result,
-                working_anchors,
-                [regime_spec],
-            )
-        parent_sha = self._source_sha256(parent_module_source)
-        cached_parent_msprof = self._msprof_cache.get((parent_sha, regime_spec.regime_tag))
-        parent_lat_us = (
-            selected_stone.latency_us
-            if (selected_stone is not None and selected_stone.latency_us > 0.0)
-            else local_best.mean_latency_us()
-        )
-        parent_obj_score = (
-            selected_stone.objective_score
-            if (selected_stone is not None and selected_stone.objective_score is not None)
-            else local_best.surrogate_score
-        )
-        parent_l1_summary = (
-            compiler_summary_from_residual(selected_stone.residual)
-            if selected_stone is not None
-            else self._l1_summary_for_first_round(parent_module_source, regime_spec)
-        )
-        parent_l1_summary_source = (
-            "stepping_stone_residual"
-            if selected_stone is not None and parent_l1_summary is not None
-            else ("bisheng_l1" if parent_l1_summary is not None else "absent")
-        )
-        if cached_parent_msprof:
-            telemetry_payload: dict[str, object] = {
-                "dur_us": parent_lat_us,
-                "roofline_eta": local_best.avg_roofline_eta,
-            }
-            for k, v in cached_parent_msprof.items():
-                if k == "dur_us" and float(v) <= 0.0:
-                    continue
-                telemetry_payload[k] = v
-            parent_residual = self._compute_residual_with_roofline(
-                parent_ledger,
-                telemetry_payload,
-                compiler_summary=parent_l1_summary,
-                roofline=blueprint_roofline,
-            )
-        elif selected_stone is not None and (
-            selected_stone.residual.measured_aiv_vec_ratio > 0.0
-            or selected_stone.residual.measured_aic_mac_ratio > 0.0
-            or selected_stone.residual.measured_mte2_wait_ratio > 0.0
-            or selected_stone.residual.measured_sync_stall_ratio > 0.0
-            or selected_stone.residual.spill_bytes > 0
-            or selected_stone.residual.stack_bytes > 0
-            or (not selected_stone.residual.vloopv2_hit)
-            or selected_stone.residual.vf_fusion_breaks > 0
-            or selected_stone.residual.alias_serialized_buffers > 0
-            or selected_stone.residual.dual_issue_ipc_collapse > 0.0
-            or selected_stone.residual.dcache_dcci_flushes > 0
-            or bool(selected_stone.residual.has_local_membar_in_vf_call)
-            or selected_stone.residual.scalar_compute_loop_fallback > 0.0
-            or selected_stone.residual.dcache_bypass_narrow_store > 0.0
-        ):
-            parent_residual = selected_stone.residual
-        else:
-            telemetry_payload = {
-                "dur_us": parent_lat_us,
-                "roofline_eta": local_best.avg_roofline_eta,
-            }
-            parent_residual = self._compute_residual_with_roofline(
-                parent_ledger,
-                telemetry_payload,
-                compiler_summary=parent_l1_summary,
-                roofline=blueprint_roofline,
-            )
-        ctx = build_predicate_context(
-            parent_ledger,
-            features=parent_features,
-            residual=parent_residual,
-            compiler_summary=parent_l1_summary,
-            roofline=blueprint_roofline,
-            extra={
-                "topology_axes": parent_axes,
-                **_case_ratio_predicate_entries(regime_spec.representative_case_ratios),
-            },
-        )
-        if not gate_decision.engaged:
-            ctx["use_uncalibrated_analytical"] = False
-            if parent_l1_summary is None and not cached_parent_msprof:
-                ctx["scalar_compute_loop_fallback"] = 0.0
-                extra_sig_map = ctx.get("extra_signals")
-                if isinstance(extra_sig_map, dict):
-                    extra_sig_map.pop("scalar_compute_loop_fallback", None)
-        ranked_families = rank_symptom_families(ctx)
-        parent_p2_diag: dict[str, object] | None = None
-        p2_escalated = should_escalate_diagnostic_or_creative(
-            ranked_families,
-            stagnation_rounds=stagnation_rounds,
-        )
-        if p2_escalated:
-            top_pair = [(fam.value, score) for fam, score in ranked_families[:2]]
-            logger.info(
-                "Round %d regime %s triggers P2 deep-dive diagnostic (stagnation=%d, top2=%s)",
-                round_idx,
-                regime_spec.regime_tag,
-                stagnation_rounds,
-                top_pair,
-            )
-            parent_p2_diag = self._collect_p2_deep_dive_for_regime(
-                parent_module_source,
-                best_result,
-                working_anchors,
-                regime_spec,
-            )
-        parent_comp_summary = compiler_summary_from_residual(parent_residual)
-        parent_waterlines = getattr(parent_ledger, "waterlines", {}) or {}
-        l1_wl = parent_waterlines.get("L1")
-        ub_wl = parent_waterlines.get("UB")
-        l1_overflow = bool(l1_wl is not None and int(getattr(l1_wl, "overflow_bytes", 0) or 0) > 0)
-        ub_overflow = bool(ub_wl is not None and int(getattr(ub_wl, "overflow_bytes", 0) or 0) > 0)
-        parent_workload = self._build_cost_workload(
-            parent_ledger,
-            live_plan=live_plan,
-            axes=parent_axes,
-            blueprint=blueprint,
-        )
-        if self._experience_lake_dir is not None:
-            try:
-                self._tracker.sync_from_experience_lake(
-                    self._experience_lake_dir,
-                    exclude_run_id=self._run_id,
-                    allow_unreviewed_distilled_rules=(
-                        self._config.allow_unreviewed_distilled_rules
-                    ),
-                )
-            except (OSError, json.JSONDecodeError) as exc:
-                logger.debug("ExperienceLake per-round KB sync skipped: %s", exc)
-            try:
-                self._invoke_with_optional_kwargs(
-                    self._cost_advisor.sync_experience_lake,
-                    self._experience_lake_dir,
-                    persist_calibration=False,
-                    exclude_run_id=self._run_id,
-                )
-            except (OSError, json.JSONDecodeError) as exc:
-                logger.debug("ExperienceLake per-round cost replay skipped: %s", exc)
-        parent_cost_pred = self._cost_advisor.predict_candidate_us(
-            parent_workload,
-            bisheng_res=parent_comp_summary,
-        )
-        parent_dominant_bound = str(
-            self._cost_advisor.resolve_dominant_bound(
-                parent_ledger,
-                parent_residual,
-                fallback_cost_pred=parent_cost_pred,
-            )
-            or ""
-        )
-        bp_semantics = getattr(blueprint, "semantics", None)
-        op_semantics_for_shift = self._resolve_operator_semantics_for_gates()
-        has_promotable_recurrence = bool(
-            getattr(bp_semantics, "has_associative_outer_recurrence", False)
-            or getattr(op_semantics_for_shift, "has_associative_outer_recurrence", False)
-        )
-        paradigm_shift_active = bool(
-            stagnation_rounds >= 2
-            and float(local_best.avg_roofline_eta) < 0.15
-            and has_promotable_recurrence
-            and parent_axes.compute_engine == "aiv_only"
-        )
-        active_mask = self._resolve_trackb_freedom_mask(regime_spec)
-        escalation_decision = None
-        pipe_gap_report = None
-        escalated_trackb_tu = ""
-        if escalated:
-            active_mask = relax_facets_for_bottleneck(
-                active_mask,
-                dominant_bound=parent_dominant_bound,
-                residual=parent_residual,
-                compiler_summary=parent_comp_summary,
-                l1_overflow=l1_overflow,
-                ub_overflow=ub_overflow,
-            )
-            for fam, _score in ranked_families:
-                if not self._tracker.is_family_tabued(
-                    regime_tag=regime_spec.regime_tag,
-                    symptom_family=fam,
-                    parent_sha=parent_sha,
-                    current_round=round_idx,
-                ):
-                    fam_facets = SYMPTOM_FAMILY_TO_FACETS.get(fam, ())
-                    if fam_facets:
-                        active_mask = active_mask.unlock(*fam_facets)
-                    break
-            self._freedom_masks[regime_spec.regime_tag] = active_mask
-            if normalize_runtime_backend(regime_spec.runtime_backend) in (
-                "ascendc_trackb",
-                "hybrid_trackb",
-            ):
-                current_tier = "ascendc_template"
-            else:
-                current_tier = normalize_runtime_backend(
-                    str(live_plan.policy.get("backend_tier", "tilelang_dsl"))
-                )
-                if current_tier not in ("tilelang_dsl", "ascendc_trackb", "hybrid_trackb"):
-                    current_tier = "tilelang_dsl"
-                elif current_tier in ("ascendc_trackb", "hybrid_trackb"):
-                    current_tier = "ascendc_template"
-            sf_ctx = dict(parent_features) if isinstance(parent_features, Mapping) else {}
-            sf_ctx["l1_overflow"] = l1_overflow
-            sf_ctx["ub_overflow"] = ub_overflow
-            sf_ctx["freedom_mask"] = active_mask
-            sf_ctx.setdefault("uses_cube", parent_axes.uses_cube)
-            case_ratios = regime_spec.representative_case_ratios
-            if case_ratios is not None:
-                sf_ctx["representative_case_id"] = case_ratios.case_id
-                sf_ctx["inner_contiguous_bytes"] = case_ratios.inner_contiguous_bytes
-                sf_ctx["persistent_wave_occupancy"] = case_ratios.wave_occupancy_ratio
-            escalation_decision = evaluate_track_escalation(
-                current_tier=current_tier,
-                roofline_eta=float(local_best.avg_roofline_eta),
-                target_eta=float(self._perf_target.target_roofline_eta),
-                stagnation_rounds=int(stagnation_rounds),
-                dominant_bound=parent_dominant_bound,
-                compiler_summary=parent_comp_summary,
-                structural_features=sf_ctx,
-            )
-            pipe_gap_report = scan_tilelang_pipe_gaps()
-            if (
-                escalation_decision is not None
-                and bool(getattr(escalation_decision, "should_escalate", False))
-                and str(getattr(escalation_decision, "to_tier", "")) == "ascendc_template"
-                and _is_real_tir_primfunc(base_stage_a.prim_func)
-            ):
-                try:
-                    raw_tu = escalate_primfunc_to_trackb_tu(base_stage_a.prim_func)
-                    if len(raw_tu.encode("utf-8")) > 8192:
-                        escalated_trackb_tu = build_trackb_context_view(
-                            raw_tu,
-                            regime_tag=regime_spec.regime_tag,
-                            module_source=parent_module_source,
-                            max_bytes=8192,
-                            active_kernel=_active_trackb_kernel(
-                                raw_tu,
-                                raw_tu,
-                                regime_tag=regime_spec.regime_tag,
-                            ),
-                        )
-                    else:
-                        escalated_trackb_tu = raw_tu
-                except (ImportError, OSError, RuntimeError, ValueError) as exc:
-                    logger.warning("Track-B PrimFunc escalation lowering skipped: %s", exc)
-        else:
-            self._freedom_masks.setdefault(regime_spec.regime_tag, active_mask)
-
-        if paradigm_shift_active:
-            active_mask = unlock_cross_topology_paradigm_shift(active_mask)
-            self._freedom_masks[regime_spec.regime_tag] = active_mask
-
-        sil_policy_section = self._format_sil_live_policy_section(
-            live_plan=live_plan,
-            active_mask=active_mask,
-            escalation=escalation_decision,
-            pipe_gaps=pipe_gap_report,
-            cost_pred=parent_cost_pred,
-            escalated_trackb_tu=escalated_trackb_tu,
-            parent_ledger=parent_ledger,
-            parent_residual=parent_residual,
-        )
-        ranked_rules = list(
-            self._tracker.rank_applicable_rules(
-                ctx,
-                top_k=self._config.k_rule_workers,
-                topology_axes=parent_axes,
-                operator_name=self._config.operator_name,
-                runtime_backend=regime_spec.runtime_backend,
-                regime_tag=regime_spec.regime_tag,
-                parent_sha=parent_sha,
-                current_round=round_idx,
-                symptom_ranking=ranked_families,
-            )
-        )
-        selected_rules = ranked_rules[: self._config.k_rule_workers]
-        dispatched_shift_rule_ids: tuple[str, ...] = ()
-        worker_specs: list[tuple[str, str, AscendCausalRule | None, GenerationRequest]] = []
-        for idx, rule in enumerate(selected_rules):
-            worker_specs.append(
-                (
-                    f"r{round_idx}_rule_{idx}",
-                    "rule_exploit",
-                    rule,
-                    self._build_exploit_regime_request(
-                        snippet_source=parent_snippet,
-                        func_name=func_name,
-                        regime_spec=regime_spec,
-                        rule=rule,
-                        best_result=local_best,
-                        blueprint=blueprint,
-                        parent_ledger=parent_ledger,
-                        parent_residual=parent_residual,
-                        track=parent_track,
-                        incumbent_source=parent_module_source,
-                        sil_policy_section=sil_policy_section,
-                        effort=self._config.exploit_effort,
-                        p2_diag=parent_p2_diag,
-                    ),
-                )
-            )
-        excluded = summarize_excluded_mechanisms(
-            ranked_rules,
-            regime_beam.exploited_signatures,
-        )
-        if gate_decision.engaged and gate_decision.allow_prompt_guidance:
-            anchor_dims = (
-                regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-            )
-            prescreen_kwargs: dict[str, object] = dict(regime_spec.sample_builder_kwargs)
-            prescreen_factory = func_name
-            prescreen_pc: dict[str, object] = {}
-            prescreen_cf: tuple[str, ...] = ()
-            try:
-                resolved_cfg = resolve_regime_config(
-                    parent_module_source,
-                    regime_spec,
-                    dims=anchor_dims,
-                )
-                prescreen_kwargs.update(resolved_cfg.builder_kwargs)
-                prescreen_factory = resolved_cfg.builder_name
-                prescreen_pc = dict(resolved_cfg.pass_configs)
-                prescreen_cf = resolved_cfg.compile_flags
-            except (
-                SyntaxError,
-                AttributeError,
-                ImportError,
-                KeyError,
-                RuntimeError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                logger.warning(
-                    "Failed to resolve prescreen config for regime %s: %s",
-                    regime_spec.regime_tag,
-                    exc,
-                )
-            var_bindings = build_anchor_var_bindings(anchor_dims, kwargs=prescreen_kwargs)
-            prescreen_shapes = extract_ordered_tensor_shapes(
-                case_entry=regime_spec.representative_case_entry,
-                dims=anchor_dims,
-                proto=self._operator_proto_cache,
-            )
-            prescreen_summary = build_prescreen_summary_from_kwargs(
-                prescreen_kwargs,
-                dsl_source=parent_module_source,
-                factory_name=prescreen_factory,
-                var_bindings=var_bindings or None,
-                config_selector_name=regime_spec.config_selector_fn or None,
-                dims=anchor_dims,
-                pass_configs=prescreen_pc or None,
-                compile_flags=prescreen_cf or None,
-                cost_model=self._cost_advisor.underlying_cost_model,
-                axes=parent_axes,
-                live_plan=live_plan,
-                blueprint=blueprint,
-                sil_advisory=self._sil_advisory,
-                ordered_tensor_shapes=prescreen_shapes,
-            )
-            if not prescreen_summary:
-                advisor_guidance = self._cost_advisor.build_prompt_guidance(
-                    decision=gate_decision,
-                    base_cfg=prescreen_kwargs,
-                    dims=anchor_dims,
-                    regime_tag=regime_spec.regime_tag,
-                    top_k=4,
-                )
-                if advisor_guidance:
-                    prescreen_summary = str(advisor_guidance)
-        else:
-            prescreen_summary = ""
-        deficit = max(0, self._config.k_rule_workers - len(ranked_rules))
-        total_creative = (
-            max(2, 1 + deficit)
-            if (paradigm_shift_active or p2_escalated)
-            else (1 + deficit)
-        )
-        for c_idx in range(total_creative):
-            wid = f"r{round_idx}_creative" if c_idx == 0 else f"r{round_idx}_creative_{c_idx}"
-            hint = (
-                CREATIVE_FOCUS_HINTS[c_idx % len(CREATIVE_FOCUS_HINTS)]
-                if total_creative > 1
-                else ""
-            )
-            worker_specs.append(
-                (
-                    wid,
-                    "creative_explore",
-                    None,
-                    self._build_creative_regime_request(
-                        snippet_source=parent_snippet,
-                        func_name=func_name,
-                        regime_spec=regime_spec,
-                        best_result=local_best,
-                        effort=creative_effort,
-                        excluded_mechanisms=excluded,
-                        focus_hint=hint,
-                        prescreen_summary=prescreen_summary,
-                        blueprint=blueprint,
-                        parent_ledger=parent_ledger,
-                        parent_residual=parent_residual,
-                        track=parent_track,
-                        incumbent_source=parent_module_source,
-                        parent_hypothesis=selected_stone_hypothesis,
-                        sil_policy_section=sil_policy_section,
-                        p2_diag=parent_p2_diag,
-                        paradigm_shift=paradigm_shift_active,
-                    ),
-                )
-            )
-
-        stagger_sec = (
-            1.5
-            if isinstance(
-                backend,
-                (AgyCliLLMBackend, OpenAICompatHTTPBackend, SubprocessCliTemplateBackend),
-            )
-            else 0.0
+        outcome = await self._stage_gate_coordinator.execute_round_gates(
+            batch, active_anchors, backend=self._backend,
+            parent_sha=bundle.parent_sha, parent_workload=bundle.parent_workload,
         )
 
-        async def _call_worker(
-            slot_idx: int,
-            wid: str,
-            wkind: str,
-            rule: AscendCausalRule | None,
-            req: GenerationRequest,
-        ) -> tuple[str, str, AscendCausalRule | None, str | None, str, str, bool]:
-            if stagger_sec > 0.0 and slot_idx > 0:
-                await asyncio.sleep(float(slot_idx) * stagger_sec)
-            try:
-                raw = await backend.generate(req)
-            except (OSError, subprocess.SubprocessError, TimeoutError, RuntimeError, ConnectionError) as exc:
-                return wid, wkind, rule, None, "", f"llm_transport:{type(exc).__name__}:{exc}", True
-            try:
-                if wkind == "creative_explore":
-                    creative = extract_creative_payload(raw)
-                    snippet = creative["dsl_source"]
-                    raw_hyp = str(creative.get("physical_hypothesis", "")).strip()
-                    raw_metric = str(creative.get("target_local_metric", "")).strip()
-                    if raw_hyp and raw_metric:
-                        hypothesis_text = f"{raw_hyp} [target_metric={raw_metric}]"
-                    else:
-                        hypothesis_text = raw_hyp or raw_metric
-                else:
-                    snippet = extract_python_dsl(raw)
-                    hypothesis_text = ""
-                return wid, wkind, rule, snippet, hypothesis_text, "", False
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-                return wid, wkind, rule, None, "", f"llm_parse:{type(exc).__name__}:{exc}", False
+        self._last_l2_timing_meta = dict(self._stage_gate_coordinator._last_l2_timing_meta)
+        op_entry = _resolve_operator_entrypoint_safe(self._config.operator_name)
+        regime_beam = self.beam_for_regime(regime_spec.regime_tag)
+        checks_by_cid = {c.candidate_id: c for c in outcome.passed_checks}
 
-        llm_t0 = time.monotonic()
-        worker_replies = await asyncio.gather(
-            *(
-                _call_worker(slot_idx, wid, wkind, rule, req)
-                for slot_idx, (wid, wkind, rule, req) in enumerate(worker_specs)
-            )
-        )
-        llm_gen_sec = max(0.0, time.monotonic() - llm_t0)
-
-        raw_candidates: list[tuple[str, str]] = []
-        failed_entries: list[tuple[str, str, str]] = []
-        meta_by_id: dict[str, tuple[str, AscendCausalRule | None, str]] = {}
-        for wid, wkind, rule, snippet, cand_hypothesis, err, is_transport_error in worker_replies:
-            meta_by_id[wid] = (wkind, rule, cand_hypothesis)
-            if snippet is None:
-                stage_tag = "llm_transport" if is_transport_error else "llm_generate"
-                failed_entries.append((wid, stage_tag, err[:1500]))
-                if rule is not None and not is_transport_error:
-                    self._tracker.record_outcome(
-                        rule.rule_id,
-                        postcondition_realized=False,
-                        topology_axes=parent_axes,
-                    )
-                    self._tracker.record_scoped_failure(
-                        regime_tag=regime_spec.regime_tag,
-                        rule_id=rule.rule_id,
-                        parent_sha=parent_sha,
-                        current_round=round_idx,
-                        reason="llm_generate_parse_failed",
-                    )
-                    self._record_kb_event(
-                        rule_id=rule.rule_id,
-                        postcondition_realized=False,
-                        topology_axes=parent_axes,
-                        round_idx=round_idx,
-                    )
-            else:
-                raw_candidates.append((wid, snippet))
-
-        l0_l1_checks: list[L0L1CandidateCheck] = []
-        round_active_kernel = ""
-        if raw_candidates:
-            prescreen_top_k: int | None = None
-            stage_a_ranker = None
-            parent_analytical_us: float | None = None
-            score_stage_a_analytical_fn: (
-                Callable[[str, str, StageAResult], float] | None
-            ) = None
-            if gate_decision.engaged and gate_decision.allow_candidate_pruning:
-                if (
-                    self._config.cost_prescreen_top_k is not None
-                    and int(self._config.cost_prescreen_top_k) > 0
-                ):
-                    prescreen_top_k = int(self._config.cost_prescreen_top_k)
-                elif self._config.cost_prescreen_top_k is None:
-                    non_creative_count = sum(
-                        1
-                        for cid, _ in raw_candidates
-                        if meta_by_id[cid][0] != "creative_explore"
-                    )
-                    if non_creative_count >= 2:
-                        prescreen_top_k = max(1, non_creative_count - 1)
-                def _rank_stage_a_passers(
-                    passers: Sequence[tuple[str, str, StageAResult]],
-                ) -> list[tuple[str, float]]:
-                    if self._cost_advisor.underlying_cost_model is not None:
-                        return [
-                            (item.candidate_id, item.pred_us)
-                            for item in rank_stage_a_candidates_with_cost_model(
-                                passers,
-                                cost_model=self._cost_advisor.underlying_cost_model,
-                                live_plan=live_plan,
-                                axes=parent_axes,
-                                blueprint=blueprint,
-                                sil_advisory=self._sil_advisory,
-                                parent_ledger=parent_ledger,
-                            )
-                        ]
-                    filtered = self._cost_advisor.filter_stage_a_passers(
-                        passers,
-                        decision=gate_decision,
-                        live_plan=live_plan,
-                        axes=parent_axes,
-                        blueprint=blueprint,
-                        sil_advisory=self._sil_advisory,
-                        parent_ledger=parent_ledger,
-                        top_k=prescreen_top_k,
-                    )
-                    out_pairs: list[tuple[str, float]] = []
-                    for item in filtered:
-                        if hasattr(item, "candidate_id") and hasattr(item, "pred_us"):
-                            out_pairs.append((str(item.candidate_id), float(item.pred_us)))
-                        elif isinstance(item, (tuple, list)) and len(item) >= 2:
-                            out_pairs.append((str(item[0]), float(item[1])))
-                    return out_pairs
-
-                stage_a_ranker = _rank_stage_a_passers if prescreen_top_k is not None else None
-                parent_l0_pred = self._cost_advisor.predict_candidate_us(
-                    parent_workload,
-                    bisheng_res=None,
-                )
-                if isinstance(parent_l0_pred, (int, float)) and not isinstance(parent_l0_pred, bool):
-                    eff_parent_analytical_us = float(parent_l0_pred)
-                elif parent_l0_pred is not None:
-                    calibrated_parent_us = float(getattr(parent_l0_pred, "pred_us", 0.0) or 0.0)
-                    raw_parent_analytical_us = float(
-                        getattr(parent_l0_pred, "tier0_physics_us", 0.0) or 0.0
-                    ) + float(getattr(parent_l0_pred, "tier1_penalty_us", 0.0) or 0.0)
-                    eff_parent_analytical_us = (
-                        calibrated_parent_us
-                        if calibrated_parent_us > 0.0
-                        else raw_parent_analytical_us
-                    )
-                else:
-                    eff_parent_analytical_us = 0.0
-                parent_analytical_us = (
-                    eff_parent_analytical_us if eff_parent_analytical_us > 0.0 else None
-                )
-
-                def _score_stage_a_analytical(
-                    _cid: str,
-                    _patched_src: str,
-                    stage_a: StageAResult,
-                ) -> float:
-                    cand_axes = (
-                        self._derive_topology_axes(
-                            stage_a.ledger,
-                            features=stage_a.features,
-                            route=stage_a.route,
-                        )
-                        if stage_a.ledger is not None
-                        else parent_axes
-                    )
-                    features = build_cost_features_from_ledger(
-                        stage_a.ledger,
-                        live_plan=live_plan,
-                        axes=cand_axes,
-                        blueprint=blueprint,
-                        sil_advisory=self._sil_advisory,
-                        target=self._cost_advisor.target,
-                    )
-                    pred = self._cost_advisor.predict_candidate_us(features)
-                    if isinstance(pred, (int, float)) and not isinstance(pred, bool):
-                        return float(pred)
-                    if pred is None:
-                        return 0.0
-                    calibrated_us = float(getattr(pred, "pred_us", 0.0) or 0.0)
-                    if calibrated_us > 0.0:
-                        return calibrated_us
-                    return float(getattr(pred, "tier0_physics_us", 0.0) or 0.0) + float(
-                        getattr(pred, "tier1_penalty_us", 0.0) or 0.0
-                    )
-
-                score_stage_a_analytical_fn = _score_stage_a_analytical
-
-            creative_candidate_ids = {
-                cid
-                for cid, _ in raw_candidates
-                if meta_by_id[cid][0] == "creative_explore"
-            }
-
-            def _candidate_l0_check(mod_src: str) -> StageAResult:
-                cand_sha_in = compute_source_sha256(mod_src)
-                knob_sig_in = self._extract_knob_signature(mod_src, regime_spec)
-                infeasible_reason = self._boundary_ledger.precheck_known_infeasible(
-                    regime_tag=regime_spec.regime_tag,
-                    cand_sha=cand_sha_in,
-                    knob_signature=knob_sig_in,
-                )
-                if infeasible_reason is not None:
-                    return StageAResult(
-                        passed=False,
-                        prim_func=None,
-                        ledger=None,
-                        error_message=infeasible_reason,
-                        backend_kind=regime_spec.runtime_backend,
-                    )
-                dead_err = _detect_trackb_dead_code_edit(
-                    parent_module_source, mod_src, regime_spec
-                )
-                if dead_err is not None:
-                    return StageAResult(
-                        passed=False,
-                        prim_func=None,
-                        ledger=None,
-                        error_message=dead_err,
-                        backend_kind="ascendc",
-                    )
-                return self._invoke_with_optional_kwargs(
-                    self._run_l0,
-                    mod_src,
-                    regime_spec,
-                    anchor_dims_override=bn_dims or None,
-                )
-
-            round_active_kernel = (
-                self._resolve_active_trackb_kernel(
-                    parent_module_source,
-                    regime_spec,
-                )
-                or ""
-            )
-            parent_focus_lines, parent_diag_text = _extract_p2_focus_lines_and_diag(
-                parent_p2_diag
-            )
-            repair_parent_source = _compact_trackb_snippet_source(
-                parent_snippet,
-                regime_spec,
-                incumbent_source=parent_module_source,
-                active_kernel=round_active_kernel,
-                focus_lines=parent_focus_lines,
-                diagnostic_text=parent_diag_text,
-            )
-            trackb_prologue_line_offset = 0
-            if regime_spec.runtime_backend in ("ascendc_trackb", "cce_trackb", "hybrid_trackb"):
-                sentinel = "__TF_TRACKB_SENTINEL__"
-                try:
-                    rendered_probe = self._instantiate_trackb_tu(
-                        parent_module_source,
-                        sentinel,
-                        regime_spec,
-                    )
-                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
-                    rendered_probe = ""
-                if isinstance(rendered_probe, str) and sentinel in rendered_probe:
-                    trackb_prologue_line_offset = rendered_probe.split(sentinel, 1)[0].count("\n")
-
-            op_entry = _resolve_operator_entrypoint_safe(self._config.operator_name)
-
-            def _patch_against(base_mod_src: str, snip: str) -> str:
-                return patch_regime_into_module(
-                    base_mod_src,
-                    regime_spec,
-                    snip,
-                    operator_entrypoint=op_entry,
-                    sibling_specs=self._regime_specs,
-                    active_kernel=round_active_kernel,
-                )
-
-            class _TimedRepairBackend:
-                def __init__(self, inner: KernelLLMBackend) -> None:
-                    self._inner = inner
-                    self.repair_sec = 0.0
-
-                async def generate(
-                    self,
-                    request: GenerationRequest,
-                    *,
-                    effort_override: object = None,
-                ) -> str:
-                    t0 = time.monotonic()
-                    try:
-                        if effort_override is not None:
-                            return await self._inner.generate(
-                                request, effort_override=effort_override
-                            )
-                        return await self._inner.generate(request)
-                    finally:
-                        self.repair_sec += max(0.0, time.monotonic() - t0)
-
-            timed_repair_backend = (
-                _TimedRepairBackend(backend) if self._config.max_syntax_repairs > 0 else None
-            )
-            l0_l1_t0 = time.monotonic()
-            l0_l1_checks = await run_l0_l1_round_filter(
-                raw_candidates,
-                patch_fn=lambda snip: _patch_against(parent_module_source, snip),
-                repatch_from_current_fn=lambda cur_mod_src, snip: _patch_against(
-                    cur_mod_src, snip
-                ),
-                l0_checker=_candidate_l0_check,
-                l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),
-                repair_backend=timed_repair_backend,
-                max_syntax_repairs=self._config.max_syntax_repairs,
-                slice_hint=self._slice_contract_instruction(
-                    func_name,
-                    regime_spec,
-                    operator_entrypoint=op_entry,
-                ),
-                backend_kind=regime_spec.runtime_backend,
-                parent_source=repair_parent_source,
-                parent_module_source=parent_module_source,
-                trackb_prologue_line_offset=trackb_prologue_line_offset,
-                stage_a_cost_ranker=stage_a_ranker,
-                cost_prescreen_top_k=prescreen_top_k,
-                sil_advisory=self._sil_advisory,
-                freedom_mask=active_mask,
-                ub_256kb_unlock=(
-                    bool(parent_ledger.uses_unreserved_ubuf) if parent_ledger else False
-                ),
-                creative_candidate_ids=creative_candidate_ids,
-                parent_analytical_us=parent_analytical_us,
-                stage_a_analytical_scorer=score_stage_a_analytical_fn,
-                parent_topology_axes=parent_axes,
-                candidate_topology_axes_fn=lambda _mod_src, sa: self._derive_topology_axes(
-                    sa.ledger,
-                    features=sa.features,
-                    route=sa.route,
-                )
-                if sa.ledger is not None
-                else None,
-            )
-            l0_l1_total_sec = max(0.0, time.monotonic() - l0_l1_t0)
-            syntax_repair_sec = (
-                timed_repair_backend.repair_sec if timed_repair_backend is not None else 0.0
-            )
-            l0_l1_sec = max(0.0, l0_l1_total_sec - syntax_repair_sec)
-
-        passed_checks = [chk for chk in l0_l1_checks if chk.passed]
-        infeasible_boundaries_added = 0
-        prescreen_pruned_list: list[str] = []
-        knob_sig_by_cid: dict[str, str] = {}
-        ub_bytes_by_cid: dict[str, int] = {}
-        pred_by_cid: dict[str, float] = {}
-        cand_axes_by_cid: dict[str, TopologyAxes] = {}
-        for chk in l0_l1_checks:
-            self._persist_round_candidate_artifact(chk, round_idx=round_idx)
-            knob_sig = (
-                self._extract_knob_signature(chk.patched_module_source, regime_spec)
-                if chk.patched_module_source
-                else ""
-            )
-            knob_sig_by_cid[chk.candidate_id] = knob_sig
-            ub_bytes = 0
-            if chk.stage_a is not None and chk.stage_a.ledger is not None:
-                ub_wl = (getattr(chk.stage_a.ledger, "waterlines", {}) or {}).get("UB")
-                if ub_wl is not None:
-                    ub_bytes = int(getattr(ub_wl, "peak_allocated_bytes", 0) or 0)
-            ub_bytes_by_cid[chk.candidate_id] = ub_bytes
-            if chk.stage_a is not None and (chk.stage_a.passed or chk.stage_a.ledger is not None):
-                c_axes = self._derive_topology_axes(
-                    chk.stage_a.ledger,
-                    features=chk.stage_a.features,
-                    route=chk.stage_a.route,
-                )
-                cand_axes_by_cid[chk.candidate_id] = c_axes
-                try:
-                    c_feat = build_cost_features_from_ledger(
-                        chk.stage_a.ledger,
-                        live_plan=live_plan,
-                        axes=c_axes,
-                        blueprint=blueprint,
-                        sil_advisory=self._sil_advisory,
-                        target=self._cost_advisor.target,
-                    )
-                    c_pred = self._cost_advisor.predict_candidate_us(c_feat)
-                    if isinstance(c_pred, (int, float)) and not isinstance(c_pred, bool):
-                        c_pred_val = float(c_pred)
-                    elif c_pred is not None:
-                        c_pred_val = float(getattr(c_pred, "pred_us", 0.0) or 0.0)
-                        if c_pred_val <= 0.0:
-                            c_pred_val = float(
-                                getattr(c_pred, "tier0_physics_us", 0.0) or 0.0
-                            ) + float(getattr(c_pred, "tier1_penalty_us", 0.0) or 0.0)
-                    else:
-                        c_pred_val = 0.0
-                    if c_pred_val > 0.0:
-                        pred_by_cid[chk.candidate_id] = c_pred_val
-                except (TypeError, ValueError):
-                    pass
-        l0_l1_faults_by_cid: dict[str, TypedFault] = {}
-        for chk in l0_l1_checks:
-            if not chk.passed:
-                failed_entries.append(
-                    (chk.candidate_id, chk.failed_tier or "l0_l1", chk.error_message[:1500])
-                )
-                if chk.failed_tier == "cost_prescreen":
-                    prescreen_pruned_list.append(chk.candidate_id)
-                cand_sha_chk = (
-                    compute_source_sha256(chk.patched_module_source)
-                    if chk.patched_module_source
-                    else ""
-                )
-                raw_fp = (
-                    getattr(chk, "fault_plane", "")
-                    or (getattr(chk.stage_b, "fault_plane", "") if chk.stage_b else "")
-                    or (getattr(chk.stage_a, "fault_plane", "") if chk.stage_a else "")
-                    or (
-                        "LLM_TRANSPORT"
-                        if chk.failed_tier == "llm_transport"
-                        else (
-                            "COMPILER_LOWERING"
-                            if chk.failed_tier == "stage_b"
-                            else "STATIC_CONTRACT"
-                        )
-                    )
-                )
-                raw_fc = (
-                    getattr(chk, "fault_code", "")
-                    or (getattr(chk.stage_b, "fault_code", "") if chk.stage_b else "")
-                    or (getattr(chk.stage_a, "fault_code", "") if chk.stage_a else "")
-                    or f"{(chk.failed_tier or 'L0_L1').upper()}_FAILED"
-                )
-                chk_fault = TypedFault(
-                    plane=coerce_fault_plane(raw_fp),
-                    code=str(raw_fc),
-                    failed_tier=str(chk.failed_tier or "l0_l1"),
-                    detail=str(chk.error_message or "")[:500],
-                )
-                l0_l1_faults_by_cid[chk.candidate_id] = chk_fault
-                stack_bytes = (
-                    int(chk.stage_b.compiler_summary.stack_bytes)
-                    if chk.stage_b is not None and chk.stage_b.compiler_summary is not None
-                    else 0
-                )
-                if self._boundary_ledger.record_compile_wall(
-                    regime_tag=regime_spec.regime_tag,
-                    cand_sha=cand_sha_chk,
-                    knob_signature=knob_sig_by_cid.get(chk.candidate_id, ""),
-                    error_code_norm=chk_fault.code,
-                    ub_bytes=ub_bytes_by_cid.get(chk.candidate_id, 0),
-                    stack_bytes=stack_bytes,
-                ):
-                    infeasible_boundaries_added += 1
-                _wkind, rule, _hyp = meta_by_id.get(chk.candidate_id, ("unknown", None, ""))
-                if (
-                    rule is not None
-                    and chk_fault.plane.penalizes_bandit()
-                    and chk.failed_tier != "cost_prescreen"
-                    and "[repair_timeout]" not in chk.error_message
-                ):
-                    self._tracker.record_outcome(
-                        rule.rule_id,
-                        postcondition_realized=False,
-                        topology_axes=parent_axes,
-                    )
-                    self._tracker.record_scoped_failure(
-                        regime_tag=regime_spec.regime_tag,
-                        rule_id=rule.rule_id,
-                        parent_sha=parent_sha,
-                        current_round=round_idx,
-                        reason=f"l0_l1_failed:{chk.failed_tier or 'l0_l1'}",
-                    )
-                    self._record_kb_event(
-                        rule_id=rule.rule_id,
-                        postcondition_realized=False,
-                        topology_axes=parent_axes,
-                        round_idx=round_idx,
-                    )
-
-        l2_results: dict[str, CandidateSurrogateResult] = {}
-        l2_run_ids: dict[str, str] = {}
-        l2_infra_fault: TypedFault | None = None
-        if passed_checks:
-            with tempfile.TemporaryDirectory(prefix=f"tf_camp_r{round_idx}_") as tmp_dir:
-                cand_paths: list[tuple[str, Path]] = []
-                for chk in passed_checks:
-                    cand_file = Path(tmp_dir) / f"{chk.candidate_id}.py"
-                    cand_file.write_text(chk.patched_module_source, encoding="utf-8")
-                    cand_paths.append((chk.candidate_id, cand_file))
-                l2_t0 = time.monotonic()
-                try:
-                    l2_results, l2_run_ids = self._run_l2_batch(
-                        cand_paths,
-                        working_anchors,
-                        include_guardrails=True,
-                    )
-                except (
-                    AgentGatesDeviceFaultError,
-                    OSError,
-                    subprocess.SubprocessError,
-                    TimeoutError,
-                    json.JSONDecodeError,
-                    RuntimeError,
-                ) as exc:
-                    logger.warning(
-                        "Round %d L2 batch failed after retries: %s",
-                        round_idx,
-                        exc,
-                    )
-                    l2_results = {}
-                    l2_run_ids = {}
-                    msg_low = str(exc).lower()
-                    if isinstance(exc, AgentGatesDeviceFaultError) or "device_fault" in msg_low:
-                        exc_plane = (
-                            coerce_fault_plane(getattr(exc, "fault_plane", ""))
-                            if isinstance(exc, AgentGatesDeviceFaultError)
-                            else FaultPlane.INFRA_DEVICE_FAULT
-                        )
-                        if exc_plane == FaultPlane.UNMODELED_FAULT:
-                            exc_plane = FaultPlane.INFRA_DEVICE_FAULT
-                        exc_code = (
-                            str(getattr(exc, "fault_code", "") or "")
-                            if isinstance(exc, AgentGatesDeviceFaultError)
-                            else ""
-                        ) or (
-                            "L2_INFRA_OCCUPANCY"
-                            if exc_plane == FaultPlane.INFRA_OCCUPANCY
-                            else "L2_INFRA_DEVICE_FAULT"
-                        )
-                        exc_tier = (
-                            "l2_infra_occupancy"
-                            if exc_plane == FaultPlane.INFRA_OCCUPANCY
-                            else "l2_infra_device_fault"
-                        )
-                        l2_infra_fault = TypedFault(
-                            plane=exc_plane,
-                            code=exc_code,
-                            failed_tier=exc_tier,
-                            detail=str(exc)[:500],
-                            retriable=True,
-                        )
-                    elif (
-                        isinstance(exc, (TimeoutError, OSError, subprocess.SubprocessError))
-                        or any(
-                            tok in msg_low
-                            for tok in ("occupancy", "resource busy", "device_busy", "card_busy")
-                        )
-                    ):
-                        l2_infra_fault = TypedFault(
-                            plane=FaultPlane.INFRA_OCCUPANCY,
-                            code="L2_INFRA_OCCUPANCY",
-                            failed_tier="l2_infra_occupancy",
-                            detail=str(exc)[:500],
-                            retriable=True,
-                        )
-                    fail_tier_l2 = (
-                        l2_infra_fault.failed_tier if l2_infra_fault is not None else "l2_error"
-                    )
-                    for chk in passed_checks:
-                        failed_entries.append((chk.candidate_id, fail_tier_l2, str(exc)[:1500]))
-                l2_wall_sec = max(0.0, time.monotonic() - l2_t0)
-                raw_pw_stats = self._last_l2_timing_meta.get("prewarm_stats")
-                if isinstance(raw_pw_stats, Mapping):
-                    for pw_key in (
-                        "total_tasks",
-                        "cache_hits",
-                        "compiled_tasks",
-                        "failed_candidates",
-                    ):
-                        if pw_key in raw_pw_stats:
-                            round_prewarm_stats[pw_key] = int(raw_pw_stats[pw_key])
-                l2_prewarm_sec = float(self._last_l2_timing_meta.get("l2_prewarm_sec") or 0.0)
-                raw_npu_sec = self._last_l2_timing_meta.get("l2_npu_sec")
-                l2_npu_sec = (
-                    float(raw_npu_sec)
-                    if isinstance(raw_npu_sec, (int, float)) and not isinstance(raw_npu_sec, bool)
-                    else max(0.0, l2_wall_sec - l2_prewarm_sec)
-                )
-
-        passing_candidates: list[tuple[L0L1CandidateCheck, CandidateSurrogateResult]] = [
-            (chk, l2_results[chk.candidate_id])
-            for chk in passed_checks
-            if chk.candidate_id in l2_results and l2_results[chk.candidate_id].all_passed
-        ]
-
+        local_best = best_result.for_regime(regime_spec.regime_tag)
         best_round_speedup = best_result.avg_speedup
         best_round_surrogate_score = best_result.surrogate_score
+        all_passing_l2 = [
+            chk for chk in outcome.passed_checks
+            if chk.candidate_id in outcome.l2_results
+            and outcome.l2_results[chk.candidate_id].all_passed
+        ]
+        if all_passing_l2:
+            top_l2_only = max(
+                all_passing_l2,
+                key=lambda c: _surrogate_rank_key(outcome.l2_results[c.candidate_id]),
+            )
+            top_l2_res = outcome.l2_results[top_l2_only.candidate_id]
+            best_round_speedup = top_l2_res.avg_speedup
+            best_round_surrogate_score = top_l2_res.surrogate_score
+
         promoted = False
-        l3_resolution = L3Resolution.NOT_RUN.value
         promotion_blocked = False
-        new_incumbent = incumbent_source
-        new_best = best_result
-        round_admitted: list[str] = []
-        top_chk: L0L1CandidateCheck | None = None
-        top_res: CandidateSurrogateResult | None = None
-        rel_gain = 0.0
-        local_rel_gain = 0.0
-        stagnation_after = (
-            stagnation_rounds if l2_infra_fault is not None else (stagnation_rounds + 1)
-        )
-        promotion_attempts: tuple[dict[str, str], ...] = ()
-        tail_guard_reject_reason = ""
+        l3_resolution = L3Resolution.NOT_RUN.value
         l3_failed_cases: tuple[int, ...] = ()
         l3_failure_stage = ""
-        l3_cx_repair_passed = False
+        new_incumbent = incumbent_source
+        new_best = best_result
+        stagnation_after = stagnation_rounds
+        rel_gain = 0.0
+        local_rel_gain = 0.0
+        tail_guard_reject_reason = ""
+        promotion_attempts: tuple[dict[str, str], ...] = ()
+        top_chk: L0L1CandidateCheck | None = None
+        top_res: CandidateSurrogateResult | None = None
         initial_top_cid: str | None = None
+        l3_sec = 0.0
+        passed_checks = list(outcome.passed_checks)
+        l2_results = dict(outcome.l2_results)
+        meta_by_id = dict(outcome.meta_by_id)
 
-        if passing_candidates:
-            top_chk, top_res = max(
-                passing_candidates,
-                key=lambda item: _surrogate_rank_key(item[1]),
-            )
-            initial_top_cid = top_chk.candidate_id
-            self._last_tail_guard_reject_reason = ""
-            tail_guard_ok, top_res = self._evaluate_dual_layer_tail_guard(
-                candidate_id=top_chk.candidate_id,
-                candidate_source=top_chk.patched_module_source,
-                top_res=top_res,
-                best_result=best_result,
-                regime_spec=regime_spec,
-                active_anchors=working_anchors,
-                incumbent_source=incumbent_source,
-            )
-            l2_results[top_chk.candidate_id] = top_res
-            if not tail_guard_ok:
-                tail_guard_reject_reason = self._last_tail_guard_reject_reason or "tail_guard_rejected"
-            best_round_speedup = top_res.avg_speedup
-            best_round_surrogate_score = top_res.surrogate_score
-            rel_gain = (
-                (top_res.avg_speedup - best_result.avg_speedup)
-                / max(best_result.avg_speedup, 1e-6)
-            )
-            top_local = top_res.for_regime(regime_spec.regime_tag)
-            best_local = best_result.for_regime(regime_spec.regime_tag)
-            if top_local.anchors and best_local.anchors:
-                top_local_lat = top_local.mean_latency_us()
-                best_local_lat = best_local.mean_latency_us()
-                local_rel_gain = max(
-                    (top_local.avg_speedup - best_local.avg_speedup)
-                    / max(best_local.avg_speedup, 1e-6),
-                    (
-                        (best_local_lat - top_local_lat) / max(best_local_lat, 1e-6)
-                        if (top_local_lat > 0.0 and best_local_lat > 0.0)
-                        else 0.0
+        is_occupancy_fault = (
+            outcome.l2_infra_fault is not None
+            and outcome.l2_infra_fault.plane
+            in (FaultPlane.INFRA_OCCUPANCY, FaultPlane.INFRA_DEVICE_FAULT)
+        )
+        if is_occupancy_fault:
+            l3_resolution = L3Resolution.INFRA_DEFERRED.value
+            promotion_blocked = True
+            stagnation_after = stagnation_rounds
+        else:
+            ranked_candidates: list[RankedL2Candidate] = []
+            unchanged_by_cid: dict[str, set[str]] = {}
+            guardrail_by_cid = dict(self._stage_gate_coordinator._last_guardrail_metrics_by_cid)
+            for chk in all_passing_l2:
+                cand_res = l2_results[chk.candidate_id]
+                wkind, _rule, ceff = meta_by_id.get(
+                    chk.candidate_id, ("exploit_rule", None, "")
+                )
+                unchanged = self._unchanged_sibling_regimes(
+                    incumbent_source,
+                    chk.patched_module_source,
+                    regime_spec,
+                )
+                unchanged_by_cid[chk.candidate_id] = unchanged
+                rc = RankedL2Candidate(
+                    candidate_id=chk.candidate_id,
+                    candidate_source=chk.patched_module_source,
+                    candidate_result=cand_res,
+                    candidate_sha256=self._source_sha256(chk.patched_module_source),
+                    builder_name=bundle.func_name,
+                    parent_lane=bundle.parent_lane,
+                    creative_effort=(
+                        ceff or (creative_effort if wkind == "creative_explore" else "")
                     ),
                 )
-            if tail_guard_ok:
-                l3_t0 = time.monotonic()
-                _atomic_write_text(self._target_module_path, top_chk.patched_module_source)
-                candidate_sha = self._source_sha256(top_chk.patched_module_source)
 
-                def _record_l3_started(execution_id: str, device: str) -> None:
-                    provisional = PendingPromotion(
-                        candidate_source=top_chk.patched_module_source,
-                        candidate_sha256=candidate_sha,
-                        target_path=str(self._target_module_path),
-                        round_idx=round_idx,
-                        regime_tag=regime_spec.regime_tag,
-                        candidate_result=top_res,
-                        candidate_id=top_chk.candidate_id,
-                        builder_name=func_name,
-                        parent_lane=parent_lane,
-                        creative_effort=creative_effort,
-                        execution_id=execution_id,
-                        device_id=device,
-                        execution_terminal=False,
-                    )
-                    self._active_promotion = provisional
-                    self._pending_promotion = provisional
-                    self._persist_runtime_state(
-                        "active_promotion", provisional.to_dict()
+                def _make_retest(cid: str, src: str):
+                    return lambda dipped, cur_res: (
+                        self._stage_gate_coordinator._retest_noisy_tail_anchors(
+                            candidate_id=cid,
+                            candidate_source=src,
+                            cur_res=cur_res,
+                            regressed_anchors=dipped,
+                            active_anchors=active_anchors,
+                        )
                     )
 
-                l3_res = self._run_l3_contract(
-                    self._target_module_path,
-                    on_execution_started=_record_l3_started,
+                def _make_recheck(cid: str, src: str):
+                    return lambda anc: (
+                        self._stage_gate_coordinator._recheck_single_sibling_anchor(
+                            cid, src, anc
+                        )
+                    )
+
+                single_eval = select_top_two_l2_survivors(
+                    [rc],
+                    best_result=best_result,
+                    regime_spec=regime_spec,
+                    guardrail_cases=self._guardrail_cases,
+                    guardrail_metrics_by_cid=guardrail_by_cid,
+                    unchanged_siblings_by_cid=unchanged_by_cid,
+                    active_anchors=active_anchors,
+                    retest_noisy_fn=_make_retest(chk.candidate_id, chk.patched_module_source),
+                    recheck_single_sibling_fn=_make_recheck(
+                        chk.candidate_id, chk.patched_module_source
+                    ),
                 )
-                for busy_backoff_sec in (2.0, 5.0, 10.0):
-                    if (
-                        l3_res.passed
-                        or l3_res.failure_kind == FAILURE_KIND_CANDIDATE
-                        or "resource busy:" not in (l3_res.error_message or "").lower()
-                    ):
-                        break
-                    logger.warning(
-                        "Round %d L3 hit transient resource busy (%s); retrying after %.1fs",
-                        round_idx,
-                        (l3_res.error_message or "")[:160],
-                        busy_backoff_sec,
+                if single_eval.survivors:
+                    ranked_candidates.append(
+                        replace(
+                            rc,
+                            candidate_result=single_eval.survivors[0].candidate_result,
+                            speedup=single_eval.survivors[0].speedup,
+                        )
                     )
-                    time.sleep(busy_backoff_sec)
-                    l3_res = self._run_l3_contract(
-                        self._target_module_path,
-                        on_execution_started=_record_l3_started,
+                elif single_eval.rejected and not tail_guard_reject_reason:
+                    tail_guard_reject_reason = single_eval.rejected[0][1]
+
+            survivors = RankedL2Survivors(
+                survivors=tuple(
+                    replace(c, rank=i)
+                    for i, c in enumerate(
+                        sorted(
+                            ranked_candidates,
+                            key=lambda item: (
+                                -float(item.speedup),
+                                -float(item.candidate_result.surrogate_score),
+                                item.candidate_id,
+                            ),
+                        )[:2],
+                        start=1,
                     )
-                self._active_promotion = None
-                inline_attempts: list[dict[str, str]] = [
-                    self._promotion_attempt(
-                        l3_res,
-                        l3_res.device_id or self._config.device_id,
-                        candidate_sha256=candidate_sha,
-                    )
-                ]
-                if (
-                    not l3_res.passed
-                    and l3_res.execution_terminal
-                    and l3_res.failure_kind == FAILURE_KIND_INFRASTRUCTURE
-                    and (
-                        getattr(l3_res, "blocked_env_category", "") == "occupancy"
-                        or l3_res.failure_category == "occupancy"
-                    )
-                    and len(self._l4_device_pool) > 1
-                ):
-                    pool_pending = PendingPromotion(
-                        candidate_source=top_chk.patched_module_source,
-                        candidate_sha256=l3_res.candidate_sha256 or candidate_sha,
-                        target_path=l3_res.target_path or str(self._target_module_path),
+                )
+            )
+            if not survivors.survivors:
+                stagnation_after = stagnation_rounds + 1
+            else:
+                initial_top_cid = survivors.survivors[0].candidate_id
+                tail_guard_reject_reason = ""
+                l3_t0 = time.monotonic()
+                inline_attempts: list[dict[str, str]] = []
+                decision = self._promotion_coordinator.coordinate_top_two_l3_promotion(
+                    survivors,
+                    incumbent_source=incumbent_source,
+                    round_idx=round_idx,
+                    regime_tag=regime_spec.regime_tag,
+                    run_l3_fn=lambda cand: self._run_l3_with_card_retry(
+                        cand=cand,
                         round_idx=round_idx,
                         regime_tag=regime_spec.regime_tag,
-                        candidate_result=top_res,
-                        candidate_id=top_chk.candidate_id,
-                        builder_name=func_name,
-                        parent_lane=parent_lane,
-                        creative_effort=creative_effort,
-                        execution_id=l3_res.execution_id,
-                        run_id=l3_res.run_id,
-                        receipt_path=l3_res.receipt_path,
-                        error_message=l3_res.error_message,
-                        attempts=tuple(inline_attempts),
-                        device_id=l3_res.device_id or self._config.device_id,
-                        execution_terminal=l3_res.execution_terminal,
-                    )
-                    tried_inline_cards: set[str] = set()
-                    while self._can_retry_on_alt_card(pool_pending, pool_pending.device_id):
-                        next_dev = self._next_l3_alt_card(pool_pending, pool_pending.device_id)
-                        if not next_dev or next_dev in tried_inline_cards:
-                            break
-                        tried_inline_cards.add(next_dev)
-                        l3_res = self._retry_l3_on_alt_card(pool_pending, tuple(inline_attempts))
-                        inline_attempts.append(
-                            self._promotion_attempt(
-                                l3_res,
-                                next_dev or l3_res.device_id or self._config.device_id,
-                                candidate_sha256=candidate_sha,
-                            )
-                        )
-                        pool_pending = replace(
-                            pool_pending,
-                            execution_id=l3_res.execution_id or pool_pending.execution_id,
-                            run_id=l3_res.run_id or pool_pending.run_id,
-                            receipt_path=l3_res.receipt_path or pool_pending.receipt_path,
-                            error_message=l3_res.error_message or pool_pending.error_message,
-                            attempts=tuple(inline_attempts),
-                            device_id=next_dev or l3_res.device_id or pool_pending.device_id,
-                            execution_terminal=l3_res.execution_terminal,
-                            retry_used=True,
-                        )
-                        if (
-                            l3_res.passed
-                            or not l3_res.execution_terminal
-                            or l3_res.failure_kind == FAILURE_KIND_CANDIDATE
-                        ):
-                            break
-
-                if l3_res.passed:
+                        attempts=inline_attempts,
+                    ),
+                    target_path=str(self._target_module_path),
+                )
+                promotion_attempts = tuple(inline_attempts)
+                if (
+                    decision.resolution == L3Resolution.PROMOTED
+                    and decision.promoted_candidate is not None
+                ):
+                    win_cand = decision.promoted_candidate
+                    win_res = win_cand.candidate_result
+                    top_chk = checks_by_cid.get(win_cand.candidate_id)
+                    top_res = win_res
                     promoted = True
                     l3_resolution = L3Resolution.PROMOTED.value
-                    new_incumbent = top_chk.patched_module_source
-                    new_best = top_res
+                    new_incumbent = win_cand.candidate_source
+                    new_best = win_res
                     stagnation_after = 0
-                    if len(inline_attempts) > 1:
-                        promotion_attempts = tuple(inline_attempts)
-                    self._refresh_guardrail_incumbent_refs(top_chk.candidate_id)
+                    best_round_speedup = win_res.avg_speedup
+                    best_round_surrogate_score = win_res.surrogate_score
+                    rel_gain = (win_res.avg_speedup - best_result.avg_speedup) / max(
+                        best_result.avg_speedup, 1e-6
+                    )
+                    top_local = win_res.for_regime(regime_spec.regime_tag)
+                    if top_local.anchors and local_best.anchors:
+                        t_lat = top_local.mean_latency_us()
+                        b_lat = local_best.mean_latency_us()
+                        local_rel_gain = max(
+                            (top_local.avg_speedup - local_best.avg_speedup)
+                            / max(local_best.avg_speedup, 1e-6),
+                            ((b_lat - t_lat) / max(b_lat, 1e-6))
+                            if (t_lat > 0.0 and b_lat > 0.0)
+                            else 0.0,
+                        )
+                    self._last_local_rel_gain_by_regime[regime_spec.regime_tag] = local_rel_gain
+                    self._refresh_guardrail_incumbent_refs(win_cand.candidate_id)
                     self._pending_promotion = None
+                    self._active_promotion = None
                     self._persist_runtime_state("active_promotion", None)
                     self._persist_runtime_state("pending_promotion", None)
                     self._collect_msprof_for_regimes(
-                        top_chk.patched_module_source,
-                        top_res,
-                        working_anchors,
+                        win_cand.candidate_source,
+                        win_res,
+                        active_anchors,
                         [regime_spec],
                     )
-                elif (
-                    l3_res.failure_kind != FAILURE_KIND_CANDIDATE
-                    or not l3_res.execution_terminal
-                ):
-                    l3_failed_cases = tuple(self._extract_l3_failed_case_nums(l3_res))
-                    l3_failure_stage = str(getattr(l3_res, "failure_stage", "") or "")
-                    if l3_res.execution_terminal:
-                        self._promotion_coordinator.rollback_to_incumbent(incumbent_source)
+                elif decision.resolution == L3Resolution.INFRA_DEFERRED:
                     l3_resolution = L3Resolution.INFRA_DEFERRED.value
                     promotion_blocked = True
                     stagnation_after = stagnation_rounds
-                    self._pending_promotion = PendingPromotion(
-                        candidate_source=top_chk.patched_module_source,
-                        candidate_sha256=l3_res.candidate_sha256 or candidate_sha,
-                        target_path=l3_res.target_path or str(self._target_module_path),
-                        round_idx=round_idx,
-                        regime_tag=regime_spec.regime_tag,
-                        candidate_result=top_res,
-                        candidate_id=top_chk.candidate_id,
-                        builder_name=func_name,
-                        parent_lane=parent_lane,
-                        creative_effort=creative_effort,
-                        execution_id=l3_res.execution_id,
-                        run_id=l3_res.run_id,
-                        receipt_path=l3_res.receipt_path,
-                        error_message=l3_res.error_message,
-                        attempts=tuple(inline_attempts),
-                        device_id=l3_res.device_id or self._config.device_id,
-                        execution_terminal=l3_res.execution_terminal,
-                        retry_used=len(inline_attempts) > 1,
+                    def_cid = (
+                        decision.pending_promotion.candidate_id
+                        if decision.pending_promotion is not None
+                        else initial_top_cid
                     )
-                    promotion_attempts = self._pending_promotion.attempts
-                    self._persist_runtime_state(
-                        "pending_promotion", self._pending_promotion.to_dict()
-                    )
-                    if l3_res.execution_terminal:
-                        self._persist_runtime_state("active_promotion", None)
-                    else:
-                        self._active_promotion = self._pending_promotion
-                        self._persist_runtime_state(
-                            "active_promotion", self._pending_promotion.to_dict()
+                    top_chk = checks_by_cid.get(def_cid) if def_cid else None
+                    if decision.l3_result is not None:
+                        l3_failed_cases = tuple(
+                            self._l3_l4_recovery.extract_l3_failed_case_nums(decision.l3_result)
                         )
-                else:
-                    l3_failed_cases = tuple(self._extract_l3_failed_case_nums(l3_res))
-                    l3_failure_stage = str(getattr(l3_res, "failure_stage", "") or "")
-                    self._record_l3_guardrail_cases(
-                        l3_res,
-                        incumbent_source,
-                        regime_spec,
-                        topology_axes=parent_axes,
-                    )
-                    repaired_tuple = await self._attempt_l3_counterexample_repair(
-                        backend=backend,
-                        top_chk=top_chk,
-                        l3_res=l3_res,
-                        incumbent_source=incumbent_source,
-                        best_result=best_result,
-                        regime_spec=regime_spec,
-                        active_anchors=working_anchors,
-                        active_mask=active_mask,
-                        bn_dims=bn_dims,
-                        round_idx=round_idx,
-                        func_name=func_name,
-                        parent_lane=parent_lane,
-                        creative_effort=creative_effort,
-                    )
-                    if repaired_tuple is not None:
-                        repaired_chk, repaired_res, repaired_l3 = repaired_tuple
-                        inline_attempts.append(
-                            self._promotion_attempt(
-                                repaired_l3,
-                                repaired_l3.device_id or self._config.device_id,
-                                candidate_sha256=self._source_sha256(
-                                    repaired_chk.patched_module_source
-                                ),
-                            )
+                        l3_failure_stage = str(
+                            getattr(decision.l3_result, "failure_stage", "") or ""
                         )
-                        if repaired_l3.passed:
-                            l3_cx_repair_passed = True
-                            orig_meta = meta_by_id.get(
-                                top_chk.candidate_id,
-                                ("l3_counterexample_repair", None, ""),
+                    if decision.pending_promotion is not None:
+                        pending_obj = replace(
+                            decision.pending_promotion,
+                            attempts=tuple(inline_attempts)
+                            or decision.pending_promotion.attempts,
+                            retry_used=len(inline_attempts) > 1
+                            or decision.pending_promotion.retry_used,
+                        )
+                        self._pending_promotion = pending_obj
+                        promotion_attempts = pending_obj.attempts
+                        self._persist_runtime_state("pending_promotion", pending_obj.to_dict())
+                        if not pending_obj.execution_terminal:
+                            self._write_source_and_verify(
+                                self._target_module_path, pending_obj.candidate_source
                             )
-                            meta_by_id[repaired_chk.candidate_id] = orig_meta
-                            passed_checks.append(repaired_chk)
-                            l2_results[repaired_chk.candidate_id] = repaired_res
-                            top_chk = repaired_chk
-                            top_res = repaired_res
-                            l3_res = repaired_l3
-                            best_round_speedup = top_res.avg_speedup
-                            best_round_surrogate_score = top_res.surrogate_score
-                            rel_gain = (
-                                (top_res.avg_speedup - best_result.avg_speedup)
-                                / max(best_result.avg_speedup, 1e-6)
-                            )
-                            top_local = top_res.for_regime(regime_spec.regime_tag)
-                            best_local = best_result.for_regime(regime_spec.regime_tag)
-                            if top_local.anchors and best_local.anchors:
-                                top_local_lat = top_local.mean_latency_us()
-                                best_local_lat = best_local.mean_latency_us()
-                                local_rel_gain = max(
-                                    (top_local.avg_speedup - best_local.avg_speedup)
-                                    / max(best_local.avg_speedup, 1e-6),
-                                    (
-                                        (best_local_lat - top_local_lat)
-                                        / max(best_local_lat, 1e-6)
-                                        if (top_local_lat > 0.0 and best_local_lat > 0.0)
-                                        else 0.0
-                                    ),
-                                )
-                            promoted = True
-                            l3_resolution = L3Resolution.PROMOTED.value
-                            new_incumbent = repaired_chk.patched_module_source
-                            new_best = repaired_res
-                            stagnation_after = 0
-                            promotion_attempts = tuple(inline_attempts)
-                            self._refresh_guardrail_incumbent_refs(repaired_chk.candidate_id)
-                            self._pending_promotion = None
-                            self._persist_runtime_state("active_promotion", None)
-                            self._persist_runtime_state("pending_promotion", None)
-                            self._collect_msprof_for_regimes(
-                                repaired_chk.patched_module_source,
-                                repaired_res,
-                                working_anchors,
-                                [regime_spec],
-                            )
-                        elif (
-                            repaired_l3.failure_kind != FAILURE_KIND_CANDIDATE
-                            or not repaired_l3.execution_terminal
-                        ):
-                            if repaired_l3.execution_terminal:
-                                self._promotion_coordinator.rollback_to_incumbent(incumbent_source)
-                            l3_resolution = L3Resolution.INFRA_DEFERRED.value
-                            promotion_blocked = True
-                            stagnation_after = stagnation_rounds
-                            repaired_sha = (
-                                repaired_l3.candidate_sha256
-                                or self._source_sha256(repaired_chk.patched_module_source)
-                            )
-                            self._pending_promotion = PendingPromotion(
-                                candidate_source=repaired_chk.patched_module_source,
-                                candidate_sha256=repaired_sha,
-                                target_path=(
-                                    repaired_l3.target_path or str(self._target_module_path)
-                                ),
-                                round_idx=round_idx,
-                                regime_tag=regime_spec.regime_tag,
-                                candidate_result=repaired_res,
-                                candidate_id=repaired_chk.candidate_id,
-                                builder_name=func_name,
-                                parent_lane=parent_lane,
-                                creative_effort=creative_effort,
-                                execution_id=repaired_l3.execution_id,
-                                run_id=repaired_l3.run_id,
-                                receipt_path=repaired_l3.receipt_path,
-                                error_message=repaired_l3.error_message,
-                                attempts=tuple(inline_attempts),
-                                device_id=repaired_l3.device_id or self._config.device_id,
-                                execution_terminal=repaired_l3.execution_terminal,
-                                retry_used=len(inline_attempts) > 1,
-                            )
-                            promotion_attempts = self._pending_promotion.attempts
+                            self._active_promotion = pending_obj
                             self._persist_runtime_state(
-                                "pending_promotion", self._pending_promotion.to_dict()
+                                "active_promotion", pending_obj.to_dict()
                             )
-                            if repaired_l3.execution_terminal:
-                                self._persist_runtime_state("active_promotion", None)
-                            else:
-                                self._active_promotion = self._pending_promotion
-                                self._persist_runtime_state(
-                                    "active_promotion", self._pending_promotion.to_dict()
-                                )
-                    if not promoted and not promotion_blocked:
-                        promotion_attempts = tuple(inline_attempts)
-                        self._promotion_coordinator.rollback_to_incumbent(incumbent_source)
-                        l3_resolution = L3Resolution.CANDIDATE_REJECTED.value
-                        stagnation_after = stagnation_rounds + 1
-                        self._pending_promotion = None
-                        self._persist_runtime_state("active_promotion", None)
-                        self._persist_runtime_state("pending_promotion", None)
+                        else:
+                            self._active_promotion = None
+                            self._persist_runtime_state("active_promotion", None)
+                else:
+                    l3_resolution = L3Resolution.CANDIDATE_REJECTED.value
+                    stagnation_after = stagnation_rounds + 1
+                    rej_cid = decision.attempts[-1][0] if decision.attempts else initial_top_cid
+                    top_chk = checks_by_cid.get(rej_cid) if rej_cid else None
+                    self._pending_promotion = None
+                    self._active_promotion = None
+                    self._persist_runtime_state("active_promotion", None)
+                    self._persist_runtime_state("pending_promotion", None)
+                    if decision.l3_result is not None:
+                        l3_failure_stage = str(
+                            getattr(decision.l3_result, "failure_stage", "") or ""
+                        )
+                        self._record_l3_guardrail_cases(
+                            decision.l3_result,
+                            incumbent_source,
+                            regime_spec,
+                            topology_axes=bundle.parent_axes,
+                        )
+                        l3_failed_cases = tuple(decision.new_guardrail_cases) or tuple(
+                            self._l3_l4_recovery.extract_l3_failed_case_nums(decision.l3_result)
+                        )
                 l3_sec = max(0.0, time.monotonic() - l3_t0)
 
-        post_l3_t0 = time.monotonic()
+        post_t0 = time.monotonic()
         beam_updates: list[BeamCandidate] = []
-        top_chk_id = top_chk.candidate_id if top_chk is not None else None
+        round_admitted: list[str] = []
+        measured_by_cid: dict[str, float] = {}
+        winner_cid = top_chk.candidate_id if top_chk is not None else None
+        winner_rule_id: str | None = None
+        winner_wkind = ""
+        winner_axes = bundle.parent_axes
+        parent_bn_lat_us = (
+            float(bundle.parent_residual.measured_latency_us)
+            if bundle.parent_residual.measured_latency_us > 0.0
+            else bundle.parent_lat_us
+        )
+        top_family = (
+            bundle.ranked_families[0][0].name if bundle.ranked_families else ""
+        )
+        bp_roofline = bundle.blueprint.roofline if bundle.blueprint is not None else None
+        selected_stone: BeamCandidate | None = None
+        if bundle.selected_stone_id:
+            selected_stone = next(
+                (
+                    item for item in (
+                        *getattr(regime_beam, "stepping_stone_beam", ()),
+                        *getattr(regime_beam, "exploit_beam", ()),
+                    )
+                    if item.candidate_id == bundle.selected_stone_id
+                ),
+                None,
+            )
+
         for chk in passed_checks:
             res = l2_results.get(chk.candidate_id)
             if res is None:
                 continue
-            wkind, rule, cand_hypothesis = meta_by_id[chk.candidate_id]
-            ledger = chk.stage_a.ledger if chk.stage_a else None
-            if ledger is None:
-                continue
-            track = (
-                chk.stage_a.route.track
-                if self._enable_track_router and chk.stage_a and chk.stage_a.route is not None
-                else "unconstrained"
+            wkind, rule_obj, cand_hyp = meta_by_id.get(
+                chk.candidate_id, ("exploit_rule", None, "")
             )
-            cand_local_res = res.for_regime(regime_spec.regime_tag)
-            local_res = cand_local_res if cand_local_res.anchors else res
-            lat_us = local_res.mean_latency_us()
-            obj_score = (
-                cand_local_res.surrogate_score
-                if cand_local_res.anchors
-                else res.surrogate_score
-            )
+            cand_axes = outcome.cand_axes_by_cid.get(chk.candidate_id, bundle.parent_axes)
+            cand_local = res.for_regime(regime_spec.regime_tag)
+            local_res = cand_local if cand_local.anchors else res
+            cand_lat = local_res.mean_latency_us()
+            if cand_lat > 0.0:
+                measured_by_cid[chk.candidate_id] = float(cand_lat)
             cand_sha = self._source_sha256(chk.patched_module_source)
-            cached_cand_msprof = self._msprof_cache.get((cand_sha, regime_spec.regime_tag))
-            cand_tel: dict[str, object] = {
-                "dur_us": lat_us,
-                "measured_latency_us": lat_us,
-                "roofline_eta": local_res.avg_roofline_eta,
-            }
-            if cached_cand_msprof:
-                for k, v in cached_cand_msprof.items():
-                    if k == "dur_us" and float(v) <= 0.0:
-                        continue
-                    cand_tel[k] = v
-            cand_comp_summary = (
-                chk.stage_b.compiler_summary if getattr(chk, "stage_b", None) is not None else None
+            cand_msprof = self._msprof_cache.get((cand_sha, regime_spec.regime_tag))
+            cand_obj = float(
+                cand_local.surrogate_score if cand_local.anchors else res.surrogate_score
             )
-            cand_stage_b_prof = (
-                getattr(chk.stage_b, "microarch_profile", None)
-                if getattr(chk, "stage_b", None) is not None
-                else None
+            ledger = (
+                chk.stage_a.ledger
+                if (chk.stage_a is not None and chk.stage_a.ledger is not None)
+                else bundle.parent_ledger
             )
-            cand_residual = self._compute_residual_with_roofline(
-                ledger,
-                cand_tel,
-                compiler_summary=cand_comp_summary,
-                roofline=blueprint_roofline,
-            )
-            cand_axes = self._derive_topology_axes(
-                ledger,
-                features=chk.stage_a.features if chk.stage_a else None,
-                route=chk.stage_a.route if chk.stage_a else None,
-            )
-            stone_parent_result: CandidateSurrogateResult | None = None
-            if parent_module_source == incumbent_source:
-                stone_parent_result = best_result
-            elif selected_stone is not None and selected_stone.case_latencies_us:
-                stone_anchors = tuple(
-                    AnchorEvalMetrics(
-                        case_num=int(anc.case_num),
-                        regime_tag=anc.regime_tag,
-                        accuracy_passed=True,
-                        cand_us=float(selected_stone.case_latencies_us[int(anc.case_num)]),
-                        ref_perf_us=float(anc.ref_perf_us),
-                        t_hw_us=float(anc.t_hw_us),
-                        speedup=(
-                            float(anc.ref_perf_us)
-                            / float(selected_stone.case_latencies_us[int(anc.case_num)])
-                            if anc.ref_perf_us > 0.0
-                            and selected_stone.case_latencies_us[int(anc.case_num)] > 0.0
-                            else 0.0
-                        ),
-                        roofline_eta=(
-                            float(anc.t_hw_us)
-                            / float(selected_stone.case_latencies_us[int(anc.case_num)])
-                            if anc.t_hw_us > 0.0
-                            and selected_stone.case_latencies_us[int(anc.case_num)] > 0.0
-                            else 0.0
-                        ),
-                        eq3_score=0.0,
-                    )
-                    for anc in res.anchors
-                    if int(anc.case_num) in selected_stone.case_latencies_us
-                    and selected_stone.case_latencies_us[int(anc.case_num)] > 0.0
+            cand_comp_sum = chk.stage_b.compiler_summary if chk.stage_b is not None else None
+            if chk.stage_a is not None and chk.stage_a.ledger is not None:
+                cand_tel: dict[str, object] = {
+                    "dur_us": cand_lat,
+                    "measured_latency_us": cand_lat,
+                    "roofline_eta": local_res.avg_roofline_eta,
+                }
+                if cand_msprof:
+                    for mk, mv in cand_msprof.items():
+                        if mk == "dur_us" and float(mv) <= 0.0:
+                            continue
+                        cand_tel[mk] = mv
+                cand_res_obj = compute_static_dynamic_residual(
+                    ledger,
+                    cand_tel,
+                    compiler_summary=cand_comp_sum,
+                    roofline=bp_roofline,
+                    topology_axes=cand_axes,
                 )
-                if stone_anchors:
-                    stone_parent_result = aggregate_surrogate_result(
-                        selected_stone.candidate_id,
-                        self._config.operator_name,
-                        stone_anchors,
-                    )
-            self._record_surrogate_observations(
-                source=chk.patched_module_source,
-                result=res,
-                active_anchors=working_anchors,
-                parent_source=parent_module_source,
-                parent_result=stone_parent_result,
-                parent_ledger=parent_ledger,
-                parent_bisheng_res=parent_comp_summary,
-                parent_axes=parent_axes,
-                ledger=ledger,
-                bisheng_summary=cand_comp_summary,
-                stage_b_profile=cand_stage_b_prof,
-                axes=cand_axes,
-                policy=getattr(live_plan, "policy", None),
-                parent_policy=(
-                    selected_stone.policy or None
-                    if (selected_stone is not None and parent_module_source != incumbent_source)
-                    else None
-                ),
-                worker_kind=wkind,
-                rule_id=rule.rule_id if rule else None,
-                backend_track=track,
-                regime_tag=regime_spec.regime_tag,
+            else:
+                cand_res_obj = bundle.parent_residual
+            cand_track = (
+                chk.stage_a.route.track
+                if self._enable_track_router
+                and chk.stage_a is not None
+                and chk.stage_a.route is not None
+                else bundle.track
             )
             try:
                 _, canonical_slice = extract_regime_snippet(
                     chk.patched_module_source,
                     regime_spec,
-                    operator_entrypoint=_resolve_operator_entrypoint_safe(
-                        self._config.operator_name
-                    ),
+                    operator_entrypoint=op_entry,
                     sibling_specs=self._regime_specs,
                 )
             except (SyntaxError, ValueError):
                 canonical_slice = chk.snippet_source
-
             beam_updates.append(
                 BeamCandidate(
-                    candidate_id=chk.candidate_id,
-                    round_idx=round_idx,
-                    worker_kind=wkind,
-                    rule_id=rule.rule_id if rule else None,
-                    dsl_source=canonical_slice,
-                    track=track,
-                    ledger=ledger,
-                    residual=cand_residual,
-                    latency_us=lat_us,
+                    candidate_id=chk.candidate_id, round_idx=round_idx, worker_kind=wkind,
+                    rule_id=rule_obj.rule_id if rule_obj is not None else None,
+                    dsl_source=canonical_slice, track=cand_track, ledger=ledger,
+                    residual=cand_res_obj, latency_us=cand_lat,
                     accuracy_passed=local_res.all_passed,
                     structural_signature=extract_structural_signature(
-                        canonical_slice,
-                        track=track,
-                        residual=cand_residual,
-                        stage_b=getattr(chk, "stage_b", None),
+                        canonical_slice, track=cand_track,
+                        residual=cand_res_obj, stage_b=chk.stage_b,
                     ),
-                    hypothesis=cand_hypothesis,
-                    parent_id=active_parent_id,
+                    hypothesis=cand_hyp, parent_id=bundle.active_parent_id,
                     features=(
                         chk.stage_a.features
-                        if (self._enable_track_router and chk.stage_a)
-                        else None
+                        if (self._enable_track_router and chk.stage_a is not None) else None
                     ),
-                    objective_score=obj_score,
+                    objective_score=cand_obj,
                     case_latencies_us={
                         int(a.case_num): float(a.cand_us)
-                        for a in (res.anchors or local_res.anchors)
-                        if a.cand_us > 0.0
+                        for a in (res.anchors or local_res.anchors) if a.cand_us > 0.0
                     },
-                    policy=dict(getattr(live_plan, "policy", {}) or {}),
+                    policy=dict(getattr(bundle.live_plan, "policy", {}) or {}),
                 )
             )
-            if rule is not None and not (
-                chk.candidate_id == top_chk_id
-                and l3_resolution == L3Resolution.INFRA_DEFERRED.value
-            ):
-                cand_l3_resolution = (
-                    l3_resolution
-                    if chk.candidate_id == top_chk_id
-                    else L3Resolution.NOT_RUN.value
+            stone_parent_result = TelemetryLedgerWriter.build_stone_parent_result(
+                operator_name=self._config.operator_name,
+                parent_source=bundle.parent_module_source, incumbent_source=incumbent_source,
+                best_result=best_result, cand_result=res, selected_stone=selected_stone,
+            )
+            self._record_surrogate_observations(
+                source=chk.patched_module_source, result=res, active_anchors=active_anchors,
+                parent_source=bundle.parent_module_source, parent_result=stone_parent_result,
+                parent_ledger=bundle.parent_ledger, parent_bisheng_res=bundle.parent_l1_summary,
+                parent_axes=bundle.parent_axes,
+                ledger=chk.stage_a.ledger if chk.stage_a is not None else None,
+                bisheng_summary=cand_comp_sum,
+                stage_b_profile=(chk.stage_b.microarch_profile if chk.stage_b else None),
+                axes=cand_axes, policy=getattr(bundle.live_plan, "policy", None),
+                parent_policy=(
+                    selected_stone.policy or None
+                    if selected_stone is not None and bundle.parent_module_source != incumbent_source
+                    else None
+                ),
+                worker_kind=wkind, rule_id=rule_obj.rule_id if rule_obj is not None else None,
+                backend_track=cand_track, regime_tag=regime_spec.regime_tag,
+            )
+            if rule_obj is not None and l3_resolution != L3Resolution.INFRA_DEFERRED.value:
+                cand_l3_res = (
+                    l3_resolution if chk.candidate_id == winner_cid else L3Resolution.NOT_RUN.value
                 )
-                cand_rolled_back = bool(
-                    cand_l3_resolution == L3Resolution.CANDIDATE_REJECTED.value
-                )
-                realized, causal_gain = self._evaluate_causal_rule_outcome(
-                    rule=rule,
-                    res_all_passed=res.all_passed,
-                    rolled_back=cand_rolled_back,
-                    ledger=ledger,
-                    features=chk.stage_a.features if chk.stage_a else None,
-                    cand_residual=cand_residual,
-                    cand_lat_us=lat_us,
-                    cand_obj_score=obj_score,
-                    parent_ledger=parent_ledger,
-                    parent_residual=parent_residual,
-                    parent_lat_us=parent_lat_us,
-                    parent_obj_score=parent_obj_score,
-                    has_cand_msprof=bool(cached_cand_msprof),
-                    cand_global_score=(res.surrogate_score if selected_stone is None else None),
-                    parent_global_score=(best_result.surrogate_score if selected_stone is None else None),
-                    cand_compiler_summary=cand_comp_summary,
-                    roofline=blueprint_roofline,
+                cand_rolled_back = bool(cand_l3_res == L3Resolution.CANDIDATE_REJECTED.value)
+                cand_feats = chk.stage_a.features if chk.stage_a is not None else None
+                causal_ok, speed_gain = self._evaluate_causal_rule_outcome(
+                    rule=rule_obj, res_all_passed=res.all_passed, rolled_back=cand_rolled_back,
+                    ledger=ledger, features=cand_feats, cand_residual=cand_res_obj,
+                    cand_lat_us=cand_lat, cand_obj_score=cand_obj,
+                    parent_ledger=bundle.parent_ledger, parent_residual=bundle.parent_residual,
+                    parent_lat_us=parent_bn_lat_us, parent_obj_score=bundle.parent_obj_score,
+                    has_cand_msprof=cand_msprof is not None,
+                    cand_global_score=(
+                        res.surrogate_score if bundle.selected_stone_id is None else None
+                    ),
+                    parent_global_score=(
+                        best_result.surrogate_score if bundle.selected_stone_id is None else None
+                    ),
+                    cand_compiler_summary=cand_comp_sum, roofline=bp_roofline,
                 )
                 self._tracker.record_outcome(
-                    rule.rule_id,
-                    postcondition_realized=realized,
-                    speed_gain=causal_gain,
-                    topology_axes=cand_axes,
+                    rule_obj.rule_id, postcondition_realized=causal_ok and res.all_passed,
+                    speed_gain=speed_gain, topology_axes=cand_axes,
                 )
-                if realized:
+                self._telemetry_writer.record_kb_event(
+                    rule_id=rule_obj.rule_id, postcondition_realized=causal_ok and res.all_passed,
+                    speed_gain=speed_gain, topology_axes=cand_axes, round_idx=round_idx,
+                )
+                if causal_ok and res.all_passed:
                     self._tracker.reset_scoped_family_streak(
-                        regime_tag=regime_spec.regime_tag,
-                        rule_id=rule.rule_id,
-                        parent_sha=parent_sha,
+                        regime_tag=regime_spec.regime_tag, rule_id=rule_obj.rule_id,
+                        parent_sha=bundle.parent_sha,
                     )
+                    round_admitted.append(rule_obj.rule_id)
+                    if rule_obj.rule_id not in admitted_rule_ids:
+                        admitted_rule_ids.append(rule_obj.rule_id)
                 else:
                     no_net_speedup = (
-                        (not res.all_passed)
-                        or cand_rolled_back
-                        or parent_lat_us <= 0.0
-                        or lat_us >= parent_lat_us * 0.99
+                        (not res.all_passed) or cand_rolled_back or parent_bn_lat_us <= 0.0
+                        or cand_lat >= parent_bn_lat_us * 0.99
                     )
-                    failure_reason = (
-                        "l3_rolled_back"
-                        if cand_rolled_back
-                        else (
-                            "l2_accuracy_failed"
-                            if not res.all_passed
+                    fail_reason = (
+                        "l3_rolled_back" if cand_rolled_back else (
+                            "l2_accuracy_failed" if not res.all_passed
                             else "l2_postcondition_unrealized_no_speedup"
                         )
                     )
                     if no_net_speedup:
                         self._tracker.record_scoped_failure(
-                            regime_tag=regime_spec.regime_tag,
-                            rule_id=rule.rule_id,
-                            parent_sha=parent_sha,
-                            current_round=round_idx,
-                            reason=failure_reason,
+                            regime_tag=regime_spec.regime_tag, rule_id=rule_obj.rule_id,
+                            parent_sha=bundle.parent_sha, current_round=round_idx,
+                            reason=fail_reason,
                         )
-                    regressed_over_3pct = bool(
-                        parent_lat_us > 0.0 and lat_us > parent_lat_us * 1.03
+                    regressed_gt_3pct = bool(
+                        parent_bn_lat_us > 0.0 and cand_lat > parent_bn_lat_us * 1.03
                     )
                     if self._experience_lake_dir is not None and (
-                        not realized or regressed_over_3pct
+                        not (causal_ok and res.all_passed) or regressed_gt_3pct
                     ):
+                        pred_ctx = build_predicate_context(
+                            ledger, features=cand_feats, residual=cand_res_obj,
+                            compiler_summary=cand_comp_sum, roofline=bp_roofline,
+                        )
+                        lat_ratio = (
+                            round(float(cand_lat) / float(parent_bn_lat_us), 6)
+                            if (parent_bn_lat_us > 0.0 and cand_lat > 0.0) else 0.0
+                        )
                         try:
                             append_rule_misapplication(
                                 self._experience_lake_dir,
                                 {
-                                    "run_id": self._run_id,
-                                    "operator": self._config.operator_name,
+                                    "run_id": self._run_id, "operator": self._config.operator_name,
                                     "regime_tag": regime_spec.regime_tag,
-                                    "round_idx": int(round_idx),
-                                    "rule_id": rule.rule_id,
-                                    "symptom_family": rule.symptom_family,
-                                    "parent_sha": parent_sha,
-                                    "cand_sha": cand_sha,
-                                    "parent_latency_us": float(parent_lat_us),
-                                    "cand_latency_us": float(lat_us),
-                                    "latency_ratio": (
-                                        round(float(lat_us) / float(parent_lat_us), 6)
-                                        if (parent_lat_us > 0.0 and lat_us > 0.0)
-                                        else 0.0
-                                    ),
-                                    "postcondition_realized": bool(realized),
+                                    "round_idx": int(round_idx), "rule_id": rule_obj.rule_id,
+                                    "symptom_family": rule_obj.symptom_family,
+                                    "parent_sha": bundle.parent_sha, "cand_sha": cand_sha,
+                                    "parent_latency_us": float(parent_bn_lat_us),
+                                    "cand_latency_us": float(cand_lat), "latency_ratio": lat_ratio,
+                                    "postcondition_realized": bool(causal_ok and res.all_passed),
                                     "l2_all_passed": bool(res.all_passed),
-                                    "l3_resolution": cand_l3_resolution,
+                                    "l3_resolution": cand_l3_res,
                                     "reason": (
                                         "latency_regression_gt_3pct"
-                                        if regressed_over_3pct
-                                        else failure_reason
+                                        if regressed_gt_3pct else fail_reason
                                     ),
                                     "transfer_inflation_ratio": float(
-                                        ctx.get("transfer_inflation_ratio", 1.0)
+                                        pred_ctx.get("transfer_inflation_ratio", 1.0)
                                     ),
                                     "effective_compute_eta": float(
-                                        ctx.get("effective_compute_eta", 0.0)
+                                        pred_ctx.get("effective_compute_eta", 0.0)
                                     ),
                                     "ub_occupancy_ratio": float(
-                                        ctx.get("ub_occupancy_ratio", 0.0)
+                                        pred_ctx.get("ub_occupancy_ratio", 0.0)
                                     ),
                                     "parent_observation": (
-                                        parent_residual.observation.to_dict()
-                                        if parent_residual.observation is not None
-                                        else None
+                                        bundle.parent_residual.observation.to_dict()
+                                        if bundle.parent_residual.observation is not None else None
                                     ),
                                     "cand_observation": (
-                                        cand_residual.observation.to_dict()
-                                        if cand_residual.observation is not None
-                                        else None
+                                        cand_res_obj.observation.to_dict()
+                                        if cand_res_obj.observation is not None else None
                                     ),
                                 },
                             )
                         except (OSError, ValueError) as exc:
                             logger.debug("Appending rule misapplication skipped: %s", exc)
-                self._record_kb_event(
-                    rule_id=rule.rule_id,
-                    postcondition_realized=realized,
-                    speed_gain=causal_gain,
-                    topology_axes=cand_axes,
-                    round_idx=round_idx,
-                )
+            if chk.candidate_id == winner_cid:
+                winner_rule_id = rule_obj.rule_id if rule_obj is not None else None
+                winner_wkind = wkind
+                winner_axes = cand_axes
 
-        regime_beam.update(beam_updates)
+        if beam_updates:
+            regime_beam.update(beam_updates)
         if promoted and top_chk is not None:
             self._prune_stale_sibling_stepping_stones(regime_spec, top_chk.snippet_source)
 
+        flywheel_sec = 0.0
         if promoted and top_chk is not None and top_res is not None:
-            top_wkind, top_rule_obj, _top_hyp = meta_by_id[top_chk.candidate_id]
-            top_rule_id = top_rule_obj.rule_id if top_rule_obj is not None else None
-            top_symptom_family = ranked_families[0][0] if ranked_families else ""
-            eff_gain = max(rel_gain, local_rel_gain)
-            top_local_eval = top_res.for_regime(regime_spec.regime_tag)
-            best_local_eval = best_result.for_regime(regime_spec.regime_tag)
+            t_fw0 = time.monotonic()
+            win_local = new_best.for_regime(regime_spec.regime_tag)
+            best_local = best_result.for_regime(regime_spec.regime_tag)
             fly_base_lat = (
-                best_local_eval.mean_latency_us()
-                if best_local_eval.anchors
+                best_local.mean_latency_us()
+                if best_local.anchors
                 else best_result.mean_latency_us()
             )
-            fly_win_lat = (
-                top_local_eval.mean_latency_us()
-                if top_local_eval.anchors
-                else top_res.mean_latency_us()
+            win_lat = (
+                win_local.mean_latency_us() if win_local.anchors else new_best.mean_latency_us()
             )
-            fly_win_pts = [
+            fly_pts = [
                 to_conservation_point(a, a)
-                for a in (top_local_eval.anchors if top_local_eval.anchors else top_res.anchors)
+                for a in (win_local.anchors if win_local.anchors else new_best.anchors)
             ]
-            fly_win_sigma = (
-                math.sqrt(sum(p.sigma_paired_us() ** 2 for p in fly_win_pts))
-                / max(1, len(fly_win_pts))
-                if fly_win_pts
-                else 0.0
+            fly_sigma = (
+                math.sqrt(sum(p.sigma_paired_us() ** 2 for p in fly_pts)) / max(1, len(fly_pts))
+                if fly_pts else 0.0
             )
+            eff_gain = max(rel_gain, local_rel_gain)
             if self._flywheel_coordinator.should_trigger(
-                regime_spec.regime_tag,
-                fly_win_lat,
-                fly_win_sigma,
+                regime_spec.regime_tag, win_lat, fly_sigma
             ):
-                try:
-                    round_admitted.extend(
-                        self._run_flywheel_distillation(
-                            baseline_source=incumbent_source,
-                            winner_source=new_incumbent,
-                            baseline_latency_us=fly_base_lat,
-                            winner_latency_us=fly_win_lat,
-                            func_name=func_name,
-                            regime_spec=regime_spec,
-                            active_anchors=working_anchors,
-                            topology_axes=parent_axes,
-                            rel_gain=eff_gain,
-                            local_rel_gain=local_rel_gain,
-                            worker_kind=top_wkind,
-                            round_idx=round_idx,
-                            rule_id=top_rule_id,
-                            symptom_family=top_symptom_family,
-                            sigma_paired_us=fly_win_sigma,
-                        )
-                    )
-                    admitted_rule_ids.extend(round_admitted)
-                except (
-                    OSError,
-                    subprocess.SubprocessError,
-                    TimeoutError,
-                    RuntimeError,
-                    ValueError,
-                ) as exc:
-                    logger.warning(
-                        "Flywheel distillation failed for regime %s: %s",
-                        regime_spec.regime_tag,
-                        exc,
-                    )
+                distilled = self._run_flywheel_distillation(
+                    baseline_source=incumbent_source, winner_source=new_incumbent,
+                    baseline_latency_us=fly_base_lat, winner_latency_us=win_lat,
+                    func_name=bundle.func_name, regime_spec=regime_spec,
+                    active_anchors=active_anchors, topology_axes=winner_axes,
+                    rel_gain=eff_gain, local_rel_gain=local_rel_gain,
+                    worker_kind=winner_wkind, round_idx=round_idx, rule_id=winner_rule_id,
+                    symptom_family=top_family, sigma_paired_us=fly_sigma,
+                )
+                for dr_id in distilled:
+                    if dr_id not in round_admitted:
+                        round_admitted.append(dr_id)
+                    if dr_id not in admitted_rule_ids:
+                        admitted_rule_ids.append(dr_id)
             elif (
-                top_wkind == "creative_explore"
+                winner_wkind == "creative_explore"
                 and eff_gain >= 0.05
                 and self._experience_lake_dir is not None
             ):
@@ -10585,557 +2746,157 @@ class PerfTargetCampaignRunner:
                     append_winning_edge(
                         self._experience_lake_dir,
                         {
-                            "run_id": self._run_id,
-                            "operator": self._config.operator_name,
-                            "regime_tag": regime_spec.regime_tag,
-                            "round_idx": int(round_idx),
-                            "worker_kind": top_wkind,
-                            "rule_id": top_rule_id,
-                            "symptom_family": top_symptom_family,
+                            "run_id": self._run_id, "operator": self._config.operator_name,
+                            "regime_tag": regime_spec.regime_tag, "round_idx": int(round_idx),
+                            "worker_kind": winner_wkind, "rule_id": winner_rule_id,
+                            "symptom_family": top_family,
                             "parent_sha": self._source_sha256(incumbent_source),
                             "winner_sha": self._source_sha256(new_incumbent),
                             "baseline_latency_us": float(fly_base_lat),
-                            "winner_latency_us": float(fly_win_lat),
-                            "relative_gain": float(eff_gain),
-                            "loo_chunks": [],
-                            "staged_rule_ids": [],
-                            "topology_axes": parent_axes.to_dict(),
+                            "winner_latency_us": float(win_lat), "relative_gain": float(eff_gain),
+                            "loo_chunks": [], "staged_rule_ids": [],
+                            "topology_axes": winner_axes.to_dict(),
                         },
                     )
                 except (OSError, ValueError) as exc:
                     logger.debug("Appending explore winning edge skipped: %s", exc)
-
-        pruned_rules = self._tracker.prune_underperforming(
-            topology_axes=parent_axes,
-            round_idx=round_idx,
-        )
-        if pruned_rules:
-            logger.debug("Pruned rules for topology_axes %s: %s", parent_axes.key(), pruned_rules)
-        self._tracker.decay_and_revive(
-            round_idx=round_idx,
-            min_cooldown_rounds=10,
-            decay_factor=0.99,
-        )
-        if self._config.allow_unreviewed_distilled_rules:
-            promoted_local = self._tracker.promote_verified_local_rules()
-            if promoted_local and self._experience_lake_dir is not None:
-                for rid in promoted_local:
-                    rule_obj = self._tracker.rules.get(rid)
-                    if rule_obj is not None:
-                        try:
-                            save_distilled_rule_file(self._experience_lake_dir, rule_obj)
-                        except (OSError, ValueError) as exc:
-                            logger.debug("Persisting promoted rule %s skipped: %s", rid, exc)
-
-        diag_entry = self._ensure_regime_diag_entry(regime_spec.regime_tag)
-        if len(ranked_rules) == 0:
-            diag_entry["rule_starvation_rounds"] = int(
-                diag_entry.get("rule_starvation_rounds", 0) or 0
-            ) + 1
-        l0_reasons_raw = diag_entry.get("l0_reject_reasons")
-        l0_reasons: dict[str, int] = (
-            dict(l0_reasons_raw) if isinstance(l0_reasons_raw, Mapping) else {}
-        )
-        for chk in l0_l1_checks:
-            if chk.passed:
-                continue
-            if chk.failed_tier == "cost_prescreen":
-                diag_entry["cost_prescreen_filtered_count"] = int(
-                    diag_entry.get("cost_prescreen_filtered_count", 0) or 0
-                ) + 1
-            elif chk.failed_tier == "stage_b":
-                diag_entry["l1_compiler_penalty_rejects"] = int(
-                    diag_entry.get("l1_compiler_penalty_rejects", 0) or 0
-                ) + 1
-            else:
-                chk_fault = l0_l1_faults_by_cid.get(chk.candidate_id)
-                reason = chk_fault.code if chk_fault is not None else "l0_other"
-                l0_reasons[reason] = int(l0_reasons.get(reason, 0)) + 1
-        diag_entry["l0_reject_reasons"] = l0_reasons
-        if (
-            bool(l2_results)
-            and not promoted
-            and l3_resolution != L3Resolution.INFRA_DEFERRED.value
-            and l2_infra_fault is None
-        ):
-            diag_entry["l2_no_gain_rounds"] = int(
-                diag_entry.get("l2_no_gain_rounds", 0) or 0
-            ) + 1
-        if l3_resolution == L3Resolution.CANDIDATE_REJECTED.value:
-            diag_entry["l3_rollback_count"] = int(
-                diag_entry.get("l3_rollback_count", 0) or 0
-            ) + 1
-        diag_entry["top_symptom_families"] = [
-            {
-                "symptom_family": (
-                    fam.value if isinstance(fam, SymptomFamily) else str(fam)
-                ),
-                "severity": round(float(score), 4),
-            }
-            for fam, score in ranked_families[:3]
-        ]
+            flywheel_sec = max(0.0, time.monotonic() - t_fw0)
 
         trackb_evidence = self._collect_trackb_round_evidence(
-            round_idx=round_idx,
-            regime_spec=regime_spec,
-            blueprint=blueprint,
-            live_plan=live_plan,
-            active_mask=active_mask,
-            checks=l0_l1_checks,
-            l2_results=l2_results,
-            active_kernel=round_active_kernel,
-            l2_run_ids=l2_run_ids,
-            parent_sha256=parent_sha,
-            parent_l1_summary=parent_l1_summary,
-            parent_l1_summary_source=parent_l1_summary_source,
+            round_idx=round_idx, regime_spec=regime_spec, blueprint=bundle.blueprint,
+            live_plan=bundle.live_plan, active_kernel=outcome.round_active_kernel,
+            active_mask=bundle.active_mask or ConstraintRelaxationMask.bottom(),
+            checks=passed_checks, l2_results=l2_results, l2_run_ids=outcome.l2_run_ids,
+            parent_sha256=bundle.parent_sha, parent_l1_summary=bundle.parent_l1_summary,
+            parent_l1_summary_source=bundle.parent_l1_summary_source,
         )
-        self._last_local_rel_gain_by_regime[regime_spec.regime_tag] = float(local_rel_gain)
-        measured_by_cid: dict[str, float] = {}
-        for cid, l2_res in l2_results.items():
-            local_l2 = l2_res.for_regime(regime_spec.regime_tag)
-            eff_l2 = local_l2 if local_l2.anchors else l2_res
-            lat_val = eff_l2.mean_latency_us()
-            if lat_val > 0.0:
-                measured_by_cid[cid] = float(lat_val)
-        round_spearman_rho = compute_spearman_rho(pred_by_cid, measured_by_cid)
+        round_spearman_rho = compute_spearman_rho(outcome.pred_by_cid, measured_by_cid)
+        bucket_key = f"{regime_spec.regime_tag}:{bundle.parent_axes.key()}"
         self._boundary_ledger.record_spearman_rho(bucket_key, round_spearman_rho)
-        post_l3_sec = max(0.0, time.monotonic() - post_l3_t0)
-        cost_advisor_predictions = max(
-            0,
-            int(getattr(self._cost_advisor, "predictions_invoked", 0) or 0)
-            - start_advisor_preds,
+        diag_entry = self._telemetry_writer.ensure_regime_diag_entry(regime_spec.regime_tag)
+        if not bundle.ranked_rules:
+            diag_entry["rule_starvation_rounds"] = (
+                int(diag_entry.get("rule_starvation_rounds", 0)) + 1
+            )
+        diag_entry["cost_prescreen_filtered_count"] = (
+            int(diag_entry.get("cost_prescreen_filtered_count", 0))
+            + len(outcome.prescreen_pruned_list)
         )
-        stage_timings_sec: dict[str, float] = {
-            "llm_gen_sec": round(llm_gen_sec, 6),
-            "l0_l1_sec": round(l0_l1_sec, 6),
-            "syntax_repair_sec": round(syntax_repair_sec, 6),
-            "l2_prewarm_sec": round(l2_prewarm_sec, 6),
-            "l2_npu_sec": round(l2_npu_sec, 6),
-            "l3_sec": round(l3_sec, 6),
-            "post_l3_sec": round(post_l3_sec, 6),
+        if l3_resolution == L3Resolution.CANDIDATE_REJECTED.value:
+            diag_entry["l3_rollback_count"] = int(diag_entry.get("l3_rollback_count", 0)) + 1
+        elif not promoted and l2_results:
+            diag_entry["l2_no_gain_rounds"] = int(diag_entry.get("l2_no_gain_rounds", 0)) + 1
+        l0_reasons = diag_entry.setdefault("l0_reject_reasons", {})
+        for chk in outcome.l0_l1_checks:
+            if not chk.passed:
+                tier_low = str(chk.failed_tier or "").lower()
+                if "stage_b" in tier_low or "l1" in tier_low:
+                    diag_entry["l1_compiler_penalty_rejects"] = (
+                        int(diag_entry.get("l1_compiler_penalty_rejects", 0)) + 1
+                    )
+                elif isinstance(l0_reasons, dict):
+                    _, fcode = _derive_candidate_fault_info(chk)
+                    l0_reasons[fcode] = int(l0_reasons.get(fcode, 0)) + 1
+        if bundle.ranked_families:
+            diag_entry["top_symptom_families"] = [f.name for f, _ in bundle.ranked_families[:3]]
+        pruned_rules = tuple(
+            self._tracker.prune_underperforming(
+                topology_axes=bundle.parent_axes, round_idx=round_idx
+            )
+        )
+        self._tracker.decay_and_revive(
+            round_idx=round_idx, min_cooldown_rounds=10, decay_factor=0.99
+        )
+        post_l3_sec = max(0.0, time.monotonic() - post_t0)
+        stage_timings_sec = {
+            "llm_gen_sec": round(max(0.0, float(outcome.llm_gen_sec)), 6),
+            "l0_l1_sec": round(max(0.0, float(outcome.l0_l1_sec)), 6),
+            "syntax_repair_sec": round(max(0.0, float(outcome.syntax_repair_sec)), 6),
+            "l2_prewarm_sec": round(max(0.0, float(outcome.l2_prewarm_sec)), 6),
+            "l2_npu_sec": round(max(0.0, float(outcome.l2_npu_sec)), 6),
+            "l3_sec": round(max(0.0, float(l3_sec)), 6),
+            "post_l3_sec": round(max(0.0, float(post_l3_sec)), 6),
         }
-
-        if self._checkpoint_path is not None:
-            telemetry_dir = self._checkpoint_path.parent / "telemetry"
-            emitted_ids: set[str] = set()
-            all_checks: list[L0L1CandidateCheck] = list(l0_l1_checks)
-            if top_chk is not None and all(
-                c.candidate_id != top_chk.candidate_id for c in all_checks
-            ):
-                all_checks.append(top_chk)
-            for chk in all_checks:
-                cid = chk.candidate_id
-                emitted_ids.add(cid)
-                wkind, rule_obj, _hyp = meta_by_id.get(cid, ("unknown", None, ""))
-                l2_res = l2_results.get(cid)
-                eff_l2_ev = (
-                    l2_res.for_regime(regime_spec.regime_tag)
-                    if l2_res is not None
-                    else None
-                )
-                if eff_l2_ev is not None and not eff_l2_ev.anchors:
-                    eff_l2_ev = l2_res
-                chk_fault = l0_l1_faults_by_cid.get(cid)
-                if chk.passed:
-                    if l2_res is not None and not l2_res.all_passed:
-                        event_fault_plane = FaultPlane.CANDIDATE_NUMERIC.value
-                        err_code = "L2_ACCURACY_OR_RUNTIME_FAILED"
-                    elif l2_infra_fault is not None:
-                        event_fault_plane = l2_infra_fault.plane.value
-                        err_code = l2_infra_fault.code
-                    else:
-                        event_fault_plane = FaultPlane.NONE.value
-                        err_code = "OK"
-                elif chk_fault is not None:
-                    event_fault_plane = chk_fault.plane.value
-                    err_code = chk_fault.code or "L0_L1_FAILED"
-                else:
-                    event_fault_plane = coerce_fault_plane(
-                        getattr(chk, "fault_plane", "") or chk.failed_tier
-                    ).value
-                    err_code = str(
-                        getattr(chk, "fault_code", "")
-                        or f"{(chk.failed_tier or 'L0_L1').upper()}_FAILED"
-                    )
-                c_axes = cand_axes_by_cid.get(cid, parent_axes)
-                c_sha = (
-                    compute_source_sha256(chk.patched_module_source)
-                    if chk.patched_module_source
-                    else ""
-                )
-                burst_cv_val = (
-                    max((float(a.burst_batch_cv) for a in l2_res.anchors), default=0.0)
-                    if l2_res is not None and l2_res.anchors
-                    else 0.0
-                )
-                hbm_mb_val = (
-                    max((int(a.card_ext_hbm_mb) for a in l2_res.anchors), default=0)
-                    if l2_res is not None and l2_res.anchors
-                    else 0
-                )
-                is_promoted_cand = bool(
-                    promoted and top_chk is not None and cid == top_chk.candidate_id
-                )
-                cand_l3_stage = (
-                    l3_failure_stage
-                    if (
-                        (cid == initial_top_cid and l3_failure_stage)
-                        or (
-                            top_chk is not None
-                            and cid == top_chk.candidate_id
-                            and not promoted
-                            and l3_failure_stage
-                        )
-                    )
-                    else ""
-                )
-                delta_sp = (
-                    float(eff_l2_ev.avg_speedup - local_best.avg_speedup)
-                    if eff_l2_ev is not None and eff_l2_ev.anchors
-                    else 0.0
-                )
-                rep_delta = (
-                    abs(
-                        len((chk.snippet_source or "").splitlines())
-                        - len((parent_snippet or "").splitlines())
-                    )
-                    if chk.repaired
-                    else 0
-                )
-                event = RoundFunnelEvent(
-                    run_id=self._run_id,
-                    operator=self._config.operator_name,
-                    round_idx=int(round_idx),
-                    regime_tag=regime_spec.regime_tag,
-                    topology_axes=c_axes.to_dict(),
-                    candidate_id=cid,
-                    cand_sha=c_sha,
-                    worker_kind=wkind,
-                    rule_id=rule_obj.rule_id if rule_obj is not None else None,
-                    passed_l0_l1=bool(chk.passed),
-                    failed_tier=str(chk.failed_tier or ""),
-                    error_code_norm=err_code,
-                    repaired=bool(chk.repaired),
-                    repair_delta_lines=rep_delta,
-                    spill_bytes=(
-                        int(chk.stage_b.spill_bytes)
-                        if chk.stage_b is not None
-                        else 0
-                    ),
-                    stack_bytes=(
-                        int(chk.stage_b.compiler_summary.stack_bytes)
-                        if chk.stage_b is not None
-                        and chk.stage_b.compiler_summary is not None
-                        else 0
-                    ),
-                    ub_bytes=ub_bytes_by_cid.get(cid, 0),
-                    knob_signature=knob_sig_by_cid.get(cid, ""),
-                    analytical_pred_us=float(pred_by_cid.get(cid, 0.0)),
-                    measured_l2_us=float(measured_by_cid.get(cid, 0.0)),
-                    burst_batch_cv=burst_cv_val,
-                    card_ext_hbm_mb=hbm_mb_val,
-                    promoted_l3=is_promoted_cand,
-                    l3_failure_stage=cand_l3_stage,
-                    delta_speedup=delta_sp,
-                    noop_identical=bool(
-                        chk.failed_tier == "noop_identical"
-                        or "noop_identical" in (chk.error_message or "")
-                    ),
-                    wall_sec=(
-                        float(chk.stage_b.elapsed_sec)
-                        if chk.stage_b is not None
-                        else 0.0
-                    ),
-                    stage_timings_sec=dict(stage_timings_sec),
-                    prewarm_stats=dict(round_prewarm_stats),
-                    cost_advisor_predictions=cost_advisor_predictions,
-                    fault_plane=event_fault_plane,
-                    l3_resolution=(
-                        l3_resolution if cid == top_chk_id else L3Resolution.NOT_RUN.value
-                    ),
-                    is_real_npu=self._is_real_npu_path(),
-                )
-                try:
-                    append_round_funnel_event(telemetry_dir, event)
-                except OSError as exc:
-                    logger.debug("Appending round funnel event skipped: %s", exc)
-            for fail_cid, fail_stage, fail_err in failed_entries:
-                if fail_cid in emitted_ids:
-                    continue
-                emitted_ids.add(fail_cid)
-                wkind, rule_obj, _hyp = meta_by_id.get(fail_cid, ("unknown", None, ""))
-                fail_fault = l0_l1_faults_by_cid.get(fail_cid)
-                if fail_fault is None:
-                    if fail_stage == "l2_infra_device_fault":
-                        fail_fault = TypedFault(
-                            plane=FaultPlane.INFRA_DEVICE_FAULT,
-                            code="L2_INFRA_DEVICE_FAULT",
-                            failed_tier=fail_stage,
-                            detail=fail_err[:500],
-                            retriable=True,
-                        )
-                    elif fail_stage == "l2_infra_occupancy":
-                        fail_fault = TypedFault(
-                            plane=FaultPlane.INFRA_OCCUPANCY,
-                            code="L2_INFRA_OCCUPANCY",
-                            failed_tier=fail_stage,
-                            detail=fail_err[:500],
-                            retriable=True,
-                        )
-                    else:
-                        fail_fault = TypedFault(
-                            plane=coerce_fault_plane(fail_stage),
-                            code=f"{(fail_stage or 'UNMODELED').upper()}_FAILED",
-                            failed_tier=fail_stage,
-                            detail=fail_err[:500],
-                        )
-                fail_event = replace(
-                    RoundFunnelEvent.from_typed_fault(
-                        run_id=self._run_id,
-                        operator=self._config.operator_name,
-                        round_idx=int(round_idx),
-                        regime_tag=regime_spec.regime_tag,
-                        topology_axes=parent_axes.to_dict(),
-                        candidate_id=fail_cid,
-                        cand_sha="",
-                        worker_kind=wkind,
-                        fault=fail_fault,
-                        rule_id=rule_obj.rule_id if rule_obj is not None else None,
-                        l3_resolution=L3Resolution.NOT_RUN.value,
-                        is_real_npu=self._is_real_npu_path(),
-                    ),
-                    stage_timings_sec=dict(stage_timings_sec),
-                    prewarm_stats=dict(round_prewarm_stats),
-                    cost_advisor_predictions=cost_advisor_predictions,
-                )
-                try:
-                    append_round_funnel_event(telemetry_dir, fail_event)
-                except OSError as exc:
-                    logger.debug("Appending failed round funnel event skipped: %s", exc)
-
+        cost_advisor_predictions = (
+            (1 if bundle.parent_cost_pred is not None else 0) + len(outcome.pred_by_cid)
+        )
+        self._telemetry_writer.emit_round_funnel_events(
+            round_idx=round_idx, regime_spec=regime_spec, l0_l1_checks=outcome.l0_l1_checks,
+            failed_entries=outcome.failed_entries, meta_by_id=meta_by_id, l2_results=l2_results,
+            l0_l1_faults_by_cid=outcome.l0_l1_faults_by_cid,
+            cand_axes_by_cid=outcome.cand_axes_by_cid,
+            parent_axes=bundle.parent_axes, top_chk=top_chk, l2_infra_fault=outcome.l2_infra_fault,
+            initial_top_cid=initial_top_cid, promoted=promoted, l3_resolution=l3_resolution,
+            l3_failure_stage=l3_failure_stage, stagnation_after=stagnation_after,
+            admitted_rule_ids=round_admitted, local_best=local_best,
+            parent_snippet=bundle.parent_snippet, ub_bytes_by_cid=outcome.ub_bytes_by_cid,
+            knob_sig_by_cid=outcome.knob_sig_by_cid, pred_by_cid=outcome.pred_by_cid,
+            measured_by_cid=measured_by_cid, stage_timings_sec=stage_timings_sec,
+            prewarm_stats=outcome.round_prewarm_stats,
+            cost_advisor_predictions=cost_advisor_predictions,
+        )
+        if self._experience_lake_dir is not None and (
+            outcome.l0_l1_checks or outcome.failed_entries
+        ):
+            self._telemetry_writer.record_kb_event(
+                rule_id=winner_rule_id or "__round__", postcondition_realized=promoted,
+                speed_gain=local_rel_gain if promoted else 0.0,
+                topology_axes=bundle.parent_axes, round_idx=round_idx,
+            )
+        paradigm_shift_rule_ids = tuple(
+            str(r.rule_id) for r in bundle.ranked_rules if getattr(r, "paradigm_shift", False)
+        )
         record = CampaignRoundRecord(
-            round_idx=round_idx,
-            regime_tag=regime_spec.regime_tag,
-            builder_name=func_name,
-            parent_lane=parent_lane,
-            creative_effort=creative_effort,
+            round_idx=round_idx, regime_tag=regime_spec.regime_tag, builder_name=bundle.func_name,
+            parent_lane=bundle.parent_lane, creative_effort=creative_effort,
             l0_l1_passed_ids=tuple(c.candidate_id for c in passed_checks),
-            l0_l1_failed=tuple(failed_entries),
-            best_round_speedup=best_round_speedup,
-            best_so_far_speedup=new_best.avg_speedup,
-            promoted=promoted,
-            l3_resolution=l3_resolution,
-            stagnation_rounds_after=stagnation_after,
+            l0_l1_failed=tuple(outcome.failed_entries), best_round_speedup=best_round_speedup,
+            best_so_far_speedup=new_best.avg_speedup, promoted=promoted,
+            l3_resolution=l3_resolution, stagnation_rounds_after=stagnation_after,
             admitted_rule_ids=tuple(round_admitted),
             best_round_surrogate_score=best_round_surrogate_score,
-            best_so_far_surrogate_score=new_best.surrogate_score,
-            pruned_rule_ids=pruned_rules,
-            promotion_attempts=promotion_attempts,
-            trackb_evidence=trackb_evidence,
-            cost_model_mode=str(gate_decision.mode),
-            cost_model_engaged=bool(gate_decision.engaged),
-            cost_model_reason=str(gate_decision.reason),
-            local_rel_gain=float(local_rel_gain),
-            tail_guard_reject_reason=tail_guard_reject_reason,
-            paradigm_shift_active=paradigm_shift_active,
-            paradigm_shift_rule_ids=dispatched_shift_rule_ids,
+            best_so_far_surrogate_score=new_best.surrogate_score, pruned_rule_ids=pruned_rules,
+            promotion_attempts=promotion_attempts, trackb_evidence=trackb_evidence,
+            cost_model_mode=str(bundle.gate_decision.mode),
+            cost_model_engaged=bool(bundle.gate_decision.engaged),
+            cost_model_reason=str(bundle.gate_decision.reason),
+            local_rel_gain=float(local_rel_gain), tail_guard_reject_reason=tail_guard_reject_reason,
+            paradigm_shift_active=bool(bundle.paradigm_shift_active),
+            paradigm_shift_rule_ids=paradigm_shift_rule_ids,
             round_spearman_rho=round_spearman_rho,
-            prescreen_pruned_ids=tuple(prescreen_pruned_list),
-            l3_failed_cases=l3_failed_cases,
-            l3_failure_stage=l3_failure_stage,
-            l3_cx_repair_passed=l3_cx_repair_passed,
-            infeasible_boundaries_added=infeasible_boundaries_added,
-            stage_timings_sec=dict(stage_timings_sec),
-            prewarm_stats=dict(round_prewarm_stats),
+            prescreen_pruned_ids=tuple(outcome.prescreen_pruned_list),
+            l3_failed_cases=l3_failed_cases, l3_failure_stage=l3_failure_stage,
+            infeasible_boundaries_added=outcome.infeasible_boundaries_added,
+            stage_timings_sec=stage_timings_sec, prewarm_stats=dict(outcome.round_prewarm_stats),
             cost_advisor_predictions=cost_advisor_predictions,
         )
         return (
-            record,
-            new_incumbent,
-            new_best,
-            stagnation_after,
-            promoted,
+            record, new_incumbent, new_best, stagnation_after, promoted,
             l3_resolution == L3Resolution.CANDIDATE_REJECTED.value,
-            escalated,
-            promotion_blocked,
+            bundle.escalated, promotion_blocked,
         )
-
-    def _run_phase0_lattice_warmstart(
-        self,
-        incumbent_source: str,
-        best_result: CandidateSurrogateResult,
-        active_anchors: Sequence[AnchorCaseSpec],
-    ) -> tuple[str, CandidateSurrogateResult]:
-        """Run zero-LLM executable lattice sweep before Round 1 to warm-start incumbent."""
-        if not self._config.enable_phase0_lattice_sweep or not self._regime_specs:
-            return incumbent_source, best_result
-        sweep_fn = getattr(_tilesize_prescreen_mod, "sweep_executable_lattice_zero_llm", None)
-        if not callable(sweep_fn):
-            return incumbent_source, best_result
-
-        primary_regime = (
-            self._select_active_regime(
-                None,
-                set(),
-                best_result,
-                active_anchors,
-                allow_satisfied_fallback=True,
-            )
-            or self._regime_specs[0]
-        )
-        selector_fn = primary_regime.config_selector_fn
-        if not selector_fn:
-            return incumbent_source, best_result
-
-        try:
-            parent_sa = self._run_l0(incumbent_source, primary_regime)
-            if not parent_sa.passed or parent_sa.ledger is None:
-                return incumbent_source, best_result
-            parent_axes = self._derive_topology_axes(
-                parent_sa.ledger,
-                features=parent_sa.features,
-                route=parent_sa.route,
-            )
-            blueprint = self._regime_blueprints.get(primary_regime.regime_tag)
-            parent_wl = build_cost_features_from_ledger(
-                parent_sa.ledger,
-                live_plan=self._live_regime_plans.get(primary_regime.regime_tag),
-                axes=parent_axes,
-                blueprint=blueprint,
-                sil_advisory=self._sil_advisory,
-                target=self._cost_advisor.target,
-            )
-            parent_pred = self._cost_advisor.predict_candidate_us(parent_wl)
-            if isinstance(parent_pred, (int, float)) and not isinstance(parent_pred, bool):
-                parent_pred_us = float(parent_pred)
-            elif parent_pred is not None:
-                parent_pred_us = float(getattr(parent_pred, "pred_us", 0.0) or 0.0)
-            else:
-                parent_pred_us = 0.0
-
-            try:
-                tree = ast.parse(incumbent_source)
-                defined_funcs = {
-                    n.name for n in tree.body if isinstance(n, ast.FunctionDef)
-                }
-            except SyntaxError:
-                defined_funcs = set()
-            builder_fn = next(
-                (b for b in primary_regime.builder_candidates if b in defined_funcs),
-                primary_regime.builder_candidates[0]
-                if primary_regime.builder_candidates
-                else "",
-            )
-            if not builder_fn:
-                return incumbent_source, best_result
-
-            dims = (
-                primary_regime.representative_anchor_dims
-                or primary_regime.representative_hir_dims
-            )
-            lattice_cands = list(
-                sweep_fn(
-                    incumbent_source,
-                    selector_fn_name=selector_fn,
-                    builder_fn_name=builder_fn,
-                    sample_builder_kwargs=primary_regime.sample_builder_kwargs,
-                    dims=dims,
-                    cost_model=self._cost_advisor.underlying_cost_model,
-                    max_points=24,
-                    top_k=3,
-                )
-            )
-            if not lattice_cands:
-                return incumbent_source, best_result
-            top_pred_us = float(getattr(lattice_cands[0], "pred_us", 0.0) or 0.0)
-            if parent_pred_us > 0.0 and (
-                top_pred_us <= 0.0 or top_pred_us >= parent_pred_us * 0.97
-            ):
-                return incumbent_source, best_result
-
-            top_two = [
-                cand
-                for cand in lattice_cands[:2]
-                if isinstance(getattr(cand, "patched_source", None), str)
-                and cand.patched_source.strip()
-                and cand.patched_source != incumbent_source
-            ]
-            if not top_two:
-                return incumbent_source, best_result
-
-            with tempfile.TemporaryDirectory(prefix="tf_camp_p0_") as tmp_dir:
-                cand_paths: list[tuple[str, Path]] = []
-                source_by_cid: dict[str, str] = {}
-                for idx, cand in enumerate(top_two):
-                    cid = f"phase0_lat_{idx}"
-                    cpath = Path(tmp_dir) / f"{cid}.py"
-                    cpath.write_text(cand.patched_source, encoding="utf-8")
-                    cand_paths.append((cid, cpath))
-                    source_by_cid[cid] = cand.patched_source
-                l2_results, _ = self._run_l2_batch(
-                    cand_paths,
-                    active_anchors,
-                    include_guardrails=True,
-                )
-
-            passing = [
-                (cid, res)
-                for cid, res in l2_results.items()
-                if res.all_passed and cid in source_by_cid
-            ]
-            if not passing:
-                return incumbent_source, best_result
-            top_cid, top_res = max(passing, key=lambda item: _surrogate_rank_key(item[1]))
-            top_src = source_by_cid[top_cid]
-            tail_ok, top_res = self._evaluate_dual_layer_tail_guard(
-                candidate_id=top_cid,
-                candidate_source=top_src,
-                top_res=top_res,
-                best_result=best_result,
-                regime_spec=primary_regime,
-                active_anchors=active_anchors,
-                incumbent_source=incumbent_source,
-            )
-            if not tail_ok:
-                return incumbent_source, best_result
-
-            _atomic_write_text(self._target_module_path, top_src)
-            l3_res = self._run_l3_contract(self._target_module_path)
-            if not l3_res.passed:
-                self._write_source_and_verify(self._target_module_path, incumbent_source)
-                return incumbent_source, best_result
-
-            self._refresh_guardrail_incumbent_refs(top_cid)
-            self._active_incumbent_source = top_src
-            self._incumbent_anchor_us_by_case = {
-                int(a.case_num): float(a.cand_us)
-                for a in top_res.anchors
-                if a.cand_us > 0.0
-            }
-            return top_src, top_res
-        except (
-            OSError,
-            subprocess.SubprocessError,
-            TimeoutError,
-            json.JSONDecodeError,
-            RuntimeError,
-            ValueError,
-            TypeError,
-            SyntaxError,
-        ) as exc:
-            logger.debug("Phase-0 lattice warm-start skipped: %s", exc)
-            return incumbent_source, best_result
 
     async def run(self, *, resume: bool = False) -> CampaignReport:
-        """Execute the unattended optimisation campaign until a stopping criterion.
-
-        A resumed campaign first continues any saved L3 execution, then any saved
-        L4 execution, without regenerating or resubmitting the candidate. L4 is
-        never submitted while L3 promotion evidence is unresolved, and a
-        successful same-candidate retry resumes from the promoted regime.
-        """
+        """Execute bounded multi-round convergence campaign with checkpointing and final L4."""
+        self._sync_coordinators()
         campaign_start = self._clock()
-        if resume and self._checkpoint_path is not None and self._checkpoint_path.is_file():
+        budget_sec = self._config.max_wall_clock_min * 60.0
+
+        frozen_regimes: set[str] = set()
+        current_regime: str | None = None
+        last_unpromoted_regime: str | None = None
+        rounds: list[CampaignRoundRecord] = []
+        promoted_rounds: list[int] = []
+        rolled_back_rounds: list[int] = []
+        escalated_rounds: list[int] = []
+        admitted_rule_ids: list[str] = []
+        stagnation_by_regime: dict[str, int] = {}
+        stagnation_rounds = 0
+        pending_promotion: PendingPromotion | None = None
+        pending_l4: PendingL4 | None = None
+        l4_result: L4CannbenchResult | None = None
+
+        if resume and self._checkpoint_path is not None and self._checkpoint_path.exists():
             (
                 incumbent_source,
                 baseline_result,
@@ -11154,25 +2915,36 @@ class PerfTargetCampaignRunner:
                 pending_promotion,
                 pending_l4,
             ) = self._restore_from_checkpoint()
-            self._active_anchors = list(active_anchors)
         else:
-            self._regime_diag_stats = {}
-            self._boundary_ledger = DeterministicSearchBoundaryLedger()
+            if not self._target_module_path.exists():
+                raise FileNotFoundError(
+                    f"Target module does not exist: {self._target_module_path}"
+                )
             incumbent_source = self._target_module_path.read_text(encoding="utf-8")
             active_anchors = list(self._scoreboard_anchors)
-            self._active_anchors = list(self._scoreboard_anchors)
-            self._guardrail_cases = []
-            self._last_guardrail_metrics_by_cid = {}
-            self._last_round_promoted = True
-            self._last_round_promoted_by_regime = {}
-            baseline_result = self._evaluate_single_baseline(incumbent_source, active_anchors)
-            self._flywheel_coordinator.last_distilled_ckpt_by_regime = {}
-            self._collect_msprof_for_regimes(
+            snapshot = self._calibration_service.build_snapshot(
                 incumbent_source,
-                baseline_result,
                 active_anchors,
                 self._regime_specs,
             )
+            baseline_result = snapshot.baseline_result
+            self._null_launch_us = snapshot.null_launch_us
+            self._calibrated_dispatch_floor_us = snapshot.calibrated_dispatch_floor_us
+            self._msprof_by_case.update(snapshot.msprof_by_case)
+            sha_base = self._source_sha256(incumbent_source)
+            for (_csha, cnum), metrics in snapshot.msprof_by_case.items():
+                for anc in active_anchors:
+                    if int(anc.case_num) == int(cnum):
+                        self._msprof_cache[(sha_base, anc.regime_tag)] = dict(metrics)
+            self._active_incumbent_source = incumbent_source
+            self._incumbent_anchor_us_by_case = {
+                int(a.case_num): float(a.cand_us)
+                for a in baseline_result.anchors
+                if a.cand_us > 0.0
+            }
+            if not baseline_result.all_passed:
+                msg = baseline_result.error_message
+                raise RuntimeError(f"Baseline evaluation failed L2 surrogate gates: {msg}")
             if self._regime_specs:
                 matched_any_regime = any(
                     baseline_result.for_regime(r.regime_tag).anchors for r in self._regime_specs
@@ -11189,9 +2961,8 @@ class PerfTargetCampaignRunner:
                     except (SyntaxError, RuntimeError, ValueError, TypeError, OSError):
                         base_l1 = None
                     base_ledger = base_sa.ledger if base_sa is not None else None
-                    base_axes = self._derive_topology_axes(
-                        base_ledger,
-                        features=base_sa.features if base_sa is not None else None,
+                    base_axes = self._stage_gate_coordinator._derive_topology_axes(
+                        base_ledger, features=base_sa.features if base_sa is not None else None,
                         route=base_sa.route if base_sa is not None else None,
                     )
                     regime_res = baseline_result.for_regime(rspec.regime_tag)
@@ -11200,38 +2971,28 @@ class PerfTargetCampaignRunner:
                     ):
                         regime_res = baseline_result
                     self._record_surrogate_observations(
-                        source=incumbent_source,
-                        result=regime_res,
-                        active_anchors=active_anchors,
-                        eval_tier_override="baseline",
-                        ledger=base_ledger,
-                        bisheng_summary=base_l1,
-                        axes=base_axes,
-                        worker_kind="baseline",
+                        source=incumbent_source, result=regime_res, active_anchors=active_anchors,
+                        eval_tier_override="baseline", ledger=base_ledger, bisheng_summary=base_l1,
+                        axes=base_axes, worker_kind="baseline",
                         backend_track=(
                             base_sa.route.track
                             if self._enable_track_router
-                            and base_sa is not None
-                            and base_sa.route is not None
+                            and base_sa is not None and base_sa.route is not None
                             else "tilelang_dsl"
                         ),
                         regime_tag=rspec.regime_tag,
                     )
             else:
                 self._record_surrogate_observations(
-                    source=incumbent_source,
-                    result=baseline_result,
-                    active_anchors=active_anchors,
-                    eval_tier_override="baseline",
-                    ledger=None,
-                    axes=None,
-                    worker_kind="baseline",
-                    backend_track="tilelang_dsl",
+                    source=incumbent_source, result=baseline_result, active_anchors=active_anchors,
+                    eval_tier_override="baseline", ledger=None, axes=None,
+                    worker_kind="baseline", backend_track="tilelang_dsl",
                 )
             best_result = baseline_result
-            self._calibrated_dispatch_floor_us = calibrate_dispatch_floor_us(
-                [to_conservation_point(a, a) for a in baseline_result.anchors]
-            )
+            if not self._calibrated_dispatch_floor_us:
+                self._calibrated_dispatch_floor_us = calibrate_dispatch_floor_us(
+                    [to_conservation_point(a, a) for a in baseline_result.anchors]
+                )
             for rspec in self._regime_specs:
                 reg_base = baseline_result.for_regime(rspec.regime_tag)
                 reg_pts = [
@@ -11240,69 +3001,47 @@ class PerfTargetCampaignRunner:
                 ]
                 reg_lat = (
                     reg_base.mean_latency_us()
-                    if reg_base.anchors
-                    else baseline_result.mean_latency_us()
+                    if reg_base.anchors else baseline_result.mean_latency_us()
                 )
                 reg_sigma = (
                     math.sqrt(sum(p.sigma_paired_us() ** 2 for p in reg_pts)) / max(1, len(reg_pts))
-                    if reg_pts
-                    else 0.0
+                    if reg_pts else 0.0
                 )
                 self._flywheel_coordinator.seed_baseline(
                     rspec.regime_tag, incumbent_source, reg_lat, reg_sigma
                 )
-            self._active_incumbent_source = incumbent_source
-            self._incumbent_anchor_us_by_case = {
-                int(a.case_num): float(a.cand_us)
-                for a in best_result.anchors
-                if a.cand_us > 0.0
-            }
             incumbent_source, best_result = self._run_phase0_lattice_warmstart(
-                incumbent_source,
-                best_result,
-                active_anchors,
+                incumbent_source, best_result, active_anchors
             )
-            frozen_regimes = set()
-            current_regime = None
-            stagnation_rounds = 0
-            stagnation_by_regime = {}
-            self._stagnation_by_regime = stagnation_by_regime
             self._compile_wall_streak_by_regime = {}
-            last_unpromoted_regime = None
-            pending_promotion = None
-            pending_l4 = None
-            rounds = []
-            promoted_rounds = []
-            rolled_back_rounds = []
-            escalated_rounds = []
-            admitted_rule_ids = []
             self._save_checkpoint(
-                incumbent_source=incumbent_source,
-                baseline_result=baseline_result,
-                best_result=best_result,
-                active_anchors=active_anchors,
-                frozen_regimes=frozen_regimes,
-                current_regime=current_regime,
-                stagnation_rounds=stagnation_rounds,
-                rounds=rounds,
-                promoted_rounds=promoted_rounds,
-                rolled_back_rounds=rolled_back_rounds,
-                escalated_rounds=escalated_rounds,
-                admitted_rule_ids=admitted_rule_ids,
-                stop_reason="in_progress",
-                l4_result=None,
+                incumbent_source=incumbent_source, baseline_result=baseline_result,
+                best_result=best_result, active_anchors=active_anchors,
+                frozen_regimes=frozen_regimes, current_regime=current_regime,
+                stagnation_rounds=stagnation_rounds, rounds=rounds,
+                promoted_rounds=promoted_rounds, rolled_back_rounds=rolled_back_rounds,
+                escalated_rounds=escalated_rounds, admitted_rule_ids=admitted_rule_ids,
+                stop_reason="in_progress", l4_result=None,
                 stagnation_by_regime=stagnation_by_regime,
                 last_unpromoted_regime=last_unpromoted_regime,
-                pending_promotion=pending_promotion,
-                pending_l4=pending_l4,
             )
 
+        self._active_anchors = list(active_anchors)
+        self._active_incumbent_source = incumbent_source
+        self._incumbent_anchor_us_by_case = {
+            int(a.case_num): float(a.cand_us)
+            for a in best_result.anchors
+            if a.cand_us > 0.0
+        }
+        self._stage_gate_coordinator._incumbent_anchor_us_by_case = (
+            self._incumbent_anchor_us_by_case
+        )
         self._pending_promotion = pending_promotion
         self._pending_l4 = pending_l4
         stop_reason = ""
         promotion_blocked = False
-        l4_result: L4CannbenchResult | None = None
         l4_was_resolved = False
+
         if pending_promotion is not None:
             retried_pending = pending_promotion
             self._pending_promotion = retried_pending
@@ -11325,12 +3064,10 @@ class PerfTargetCampaignRunner:
             stagnation_rounds = stagnation_by_regime.get(retried_pending.regime_tag, 0)
             if promotion_blocked:
                 stop_reason = "promotion_blocked"
-            elif (
-                pending_promotion is None
-                and retried_pending.round_idx in promoted_rounds
-            ):
+            elif pending_promotion is None and retried_pending.round_idx in promoted_rounds:
                 current_regime = retried_pending.regime_tag
                 last_unpromoted_regime = None
+
         if pending_l4 is not None and not promotion_blocked:
             prior_stop_reason = pending_l4.prior_stop_reason
             l4_result, pending_l4 = self._resolve_pending_l4(
@@ -11344,10 +3081,12 @@ class PerfTargetCampaignRunner:
             self._record_l4_observations(
                 source=incumbent_source,
                 l4_result=l4_result,
+                best_result=best_result,
                 active_anchors=active_anchors,
             )
         elif pending_l4 is not None:
             l4_was_resolved = True
+
         if not stop_reason and self._allow_early_stop(len(rounds)):
             if best_result.meets_perf_target(self._perf_target):
                 stop_reason = "goal_met"
@@ -11363,210 +3102,210 @@ class PerfTargetCampaignRunner:
         self._stagnation_by_regime = stagnation_by_regime
         compile_wall_streak_by_regime = self._compile_wall_streak_by_regime
         start_round = (rounds[-1].round_idx + 1) if rounds else 1
-        budget_sec = self._config.max_wall_clock_min * 60.0
+        try:
+            for round_idx in range(start_round, max(0, self._config.max_rounds) + 1):
+                if stop_reason:
+                    break
+                if (self._clock() - campaign_start) >= budget_sec:
+                    stop_reason = "budget_exhausted"
+                    break
+                active_unfrozen = [
+                    spec.regime_tag
+                    for spec in self._regime_specs
+                    if spec.regime_tag not in frozen_regimes
+                ]
+                for spec in self._regime_specs:
+                    if (
+                        stagnation_by_regime.get(spec.regime_tag, 0)
+                        >= self._config.stagnation_freeze_rounds
+                    ):
+                        frozen_regimes.add(spec.regime_tag)
+                    elif (
+                        len(active_unfrozen) > 1
+                        and compile_wall_streak_by_regime.get(spec.regime_tag, 0) >= 3
+                    ):
+                        frozen_regimes.add(spec.regime_tag)
+                if current_regime and current_regime in frozen_regimes:
+                    current_regime = None
 
-        for round_idx in range(start_round, max(0, self._config.max_rounds) + 1):
-            if stop_reason:
-                break
-            if (self._clock() - campaign_start) >= budget_sec:
-                stop_reason = "budget_exhausted"
-                break
-
-            active_unfrozen = [
-                spec.regime_tag
-                for spec in self._regime_specs
-                if spec.regime_tag not in frozen_regimes
-            ]
-            for spec in self._regime_specs:
-                if stagnation_by_regime.get(spec.regime_tag, 0) >= self._config.stagnation_freeze_rounds:
-                    frozen_regimes.add(spec.regime_tag)
-                elif (
-                    len(active_unfrozen) > 1
-                    and compile_wall_streak_by_regime.get(spec.regime_tag, 0) >= 3
-                ):
-                    frozen_regimes.add(spec.regime_tag)
-            if current_regime and current_regime in frozen_regimes:
-                current_regime = None
-
-            active_regime = self._round_regime_override(round_idx)
-            if active_regime is None:
-                wall_yield_regime = next(
-                    (
-                        spec.regime_tag
-                        for spec in self._regime_specs
-                        if compile_wall_streak_by_regime.get(spec.regime_tag, 0) >= 2
-                        and spec.regime_tag not in frozen_regimes
-                    ),
-                    None,
-                )
-                active_regime = self._select_active_regime(
-                    current_regime,
-                    frozen_regimes,
-                    best_result,
-                    active_anchors,
-                    allow_satisfied_fallback=not self._allow_early_stop(len(rounds)),
-                    exclude_regime=last_unpromoted_regime or wall_yield_regime,
-                    stagnation_by_regime=stagnation_by_regime,
-                )
-            if active_regime is None:
-                stop_reason = "all_regimes_converged"
-                break
-            active_tag = active_regime.regime_tag
-
-            (
-                rec,
-                incumbent_source,
-                best_result,
-                stagnation_rounds,
-                promoted,
-                rolled_back,
-                escalated,
-                promotion_blocked,
-            ) = await self._execute_single_round(
-                round_idx=round_idx,
-                regime_spec=active_regime,
-                incumbent_source=incumbent_source,
-                best_result=best_result,
-                active_anchors=active_anchors,
-                stagnation_rounds=stagnation_by_regime.get(active_tag, 0),
-                admitted_rule_ids=admitted_rule_ids,
-            )
-            rounds.append(rec)
-            pending_promotion = self._pending_promotion
-            self._last_round_promoted = bool(promoted)
-            self._last_round_promoted_by_regime[active_tag] = bool(promoted)
-            all_noop = bool(rec.l0_l1_failed) and all(
-                stage == "noop_identical" or "noop_identical" in err
-                for _cid, stage, err in rec.l0_l1_failed
-            )
-            is_infra_deferred = rec.l3_resolution == L3Resolution.INFRA_DEFERRED.value or (
-                bool(rec.l0_l1_failed)
-                and all(
-                    stage in ("l2_infra_occupancy", "l2_infra_device_fault")
-                    for _cid, stage, _err in rec.l0_l1_failed
-                )
-            )
-            if promoted:
-                stagnation_rounds = 0
-                stagnation_by_regime[active_tag] = 0
-                compile_wall_streak_by_regime[active_tag] = 0
-                current_regime = active_tag
-                last_unpromoted_regime = None
-                promoted_rounds.append(round_idx)
-            elif is_infra_deferred:
-                stagnation_by_regime[active_tag] = stagnation_by_regime.get(active_tag, 0)
-                current_regime = None
-                last_unpromoted_regime = active_tag
-            else:
-                stagnation_by_regime[active_tag] = stagnation_rounds
-                if len(rec.l0_l1_passed_ids) == 0 or all_noop:
-                    compile_wall_streak_by_regime[active_tag] = (
-                        compile_wall_streak_by_regime.get(active_tag, 0) + 1
-                    )
-                else:
-                    compile_wall_streak_by_regime[active_tag] = 0
-                current_regime = None
-                last_unpromoted_regime = active_tag
-            other_unfrozen = any(
-                s.regime_tag != active_tag and s.regime_tag not in frozen_regimes
-                for s in self._regime_specs
-            )
-            if other_unfrozen and compile_wall_streak_by_regime.get(active_tag, 0) >= 3:
-                frozen_regimes.add(active_tag)
-            if rolled_back:
-                rolled_back_rounds.append(round_idx)
-            if escalated:
-                escalated_rounds.append(round_idx)
-            if promotion_blocked:
-                stop_reason = "promotion_blocked"
-
-            early_stop_allowed = self._allow_early_stop(len(rounds))
-            if not promotion_blocked:
-                if early_stop_allowed and best_result.meets_perf_target(self._perf_target):
-                    stop_reason = "goal_met"
-                elif early_stop_allowed and best_result.is_roofline_saturated(self._perf_target):
-                    stop_reason = "roofline_saturated"
-                elif (
-                    stagnation_by_regime.get(active_tag, 0)
-                    >= self._config.stagnation_freeze_rounds
-                    or (
-                        other_unfrozen
-                        and compile_wall_streak_by_regime.get(active_tag, 0) >= 3
-                    )
-                ):
-                    frozen_regimes.add(active_tag)
-                    next_reg = self._select_active_regime(
+                forced_regime = self._round_regime_override(round_idx)
+                active_regime = forced_regime
+                if active_regime is None:
+                    wall_yield_regime = next(
+                        (
+                            spec.regime_tag
+                            for spec in self._regime_specs
+                            if compile_wall_streak_by_regime.get(spec.regime_tag, 0) >= 2
+                            and spec.regime_tag not in frozen_regimes
+                        ),
                         None,
+                    )
+                    active_regime = self._select_active_regime(
+                        current_regime,
                         frozen_regimes,
                         best_result,
                         active_anchors,
-                        allow_satisfied_fallback=not early_stop_allowed,
-                        exclude_regime=last_unpromoted_regime,
+                        allow_satisfied_fallback=not self._allow_early_stop(len(rounds)),
+                        exclude_regime=last_unpromoted_regime or wall_yield_regime,
                         stagnation_by_regime=stagnation_by_regime,
                     )
-                    if next_reg is None:
-                        stop_reason = "all_regimes_converged"
-
-            self._save_checkpoint(
-                incumbent_source=incumbent_source,
-                baseline_result=baseline_result,
-                best_result=best_result,
-                active_anchors=active_anchors,
-                frozen_regimes=frozen_regimes,
-                current_regime=current_regime,
-                stagnation_rounds=stagnation_rounds,
-                rounds=rounds,
-                promoted_rounds=promoted_rounds,
-                rolled_back_rounds=rolled_back_rounds,
-                escalated_rounds=escalated_rounds,
-                admitted_rule_ids=admitted_rule_ids,
-                stop_reason=stop_reason or "in_progress",
-                l4_result=None,
-                stagnation_by_regime=stagnation_by_regime,
-                last_unpromoted_regime=last_unpromoted_regime,
-                pending_promotion=pending_promotion,
-                pending_l4=self._pending_l4,
-            )
-            if stop_reason:
-                break
+                if (
+                    active_regime is None
+                    and forced_regime is None
+                    and last_unpromoted_regime is not None
+                ):
+                    active_regime = self._select_active_regime(
+                        current_regime,
+                        frozen_regimes,
+                        best_result,
+                        active_anchors,
+                        allow_satisfied_fallback=not self._allow_early_stop(len(rounds)),
+                        stagnation_by_regime=stagnation_by_regime,
+                    )
+                if active_regime is None:
+                    stop_reason = "all_regimes_converged"
+                    break
+                active_tag = active_regime.regime_tag
+                current_regime = active_tag
+                self._active_regime_tag = active_tag
+                (
+                    rec,
+                    incumbent_source,
+                    best_result,
+                    stagnation_rounds,
+                    promoted,
+                    rolled_back,
+                    escalated,
+                    promotion_blocked,
+                ) = await self._execute_single_round(
+                    round_idx=round_idx,
+                    regime_spec=active_regime,
+                    incumbent_source=incumbent_source,
+                    best_result=best_result,
+                    active_anchors=active_anchors,
+                    stagnation_rounds=stagnation_by_regime.get(active_tag, 0),
+                    admitted_rule_ids=admitted_rule_ids,
+                )
+                rounds.append(rec)
+                pending_promotion = self._pending_promotion
+                self._last_round_promoted = bool(promoted)
+                self._last_round_promoted_by_regime[active_tag] = bool(promoted)
+                all_noop = bool(rec.l0_l1_failed) and all(
+                    stage == "noop_identical" or "noop_identical" in err
+                    for _cid, stage, err in rec.l0_l1_failed
+                )
+                is_infra_deferred = rec.l3_resolution == L3Resolution.INFRA_DEFERRED.value or (
+                    bool(rec.l0_l1_failed)
+                    and all(
+                        stage in ("l2_infra_occupancy", "l2_infra_device_fault")
+                        for _cid, stage, _err in rec.l0_l1_failed
+                    )
+                )
+                if promoted:
+                    stagnation_rounds = 0
+                    stagnation_by_regime[active_tag] = 0
+                    compile_wall_streak_by_regime[active_tag] = 0
+                    current_regime = active_tag
+                    last_unpromoted_regime = None
+                    promoted_rounds.append(round_idx)
+                elif is_infra_deferred:
+                    stagnation_by_regime[active_tag] = stagnation_by_regime.get(active_tag, 0)
+                    current_regime = None
+                    last_unpromoted_regime = active_tag
+                else:
+                    stagnation_by_regime[active_tag] = stagnation_rounds
+                    if len(rec.l0_l1_passed_ids) == 0 or all_noop:
+                        compile_wall_streak_by_regime[active_tag] = (
+                            compile_wall_streak_by_regime.get(active_tag, 0) + 1
+                        )
+                    else:
+                        compile_wall_streak_by_regime[active_tag] = 0
+                    current_regime = None
+                    last_unpromoted_regime = active_tag
+                other_unfrozen = any(
+                    s.regime_tag != active_tag and s.regime_tag not in frozen_regimes
+                    for s in self._regime_specs
+                )
+                if other_unfrozen and compile_wall_streak_by_regime.get(active_tag, 0) >= 3:
+                    frozen_regimes.add(active_tag)
+                if rolled_back:
+                    rolled_back_rounds.append(round_idx)
+                if escalated:
+                    escalated_rounds.append(round_idx)
+                if promotion_blocked:
+                    stop_reason = "promotion_blocked"
+                early_stop_allowed = self._allow_early_stop(len(rounds))
+                if not promotion_blocked:
+                    if early_stop_allowed and best_result.meets_perf_target(self._perf_target):
+                        stop_reason = "goal_met"
+                    elif (
+                        early_stop_allowed
+                        and best_result.is_roofline_saturated(self._perf_target)
+                    ):
+                        stop_reason = "roofline_saturated"
+                    elif (
+                        stagnation_by_regime.get(active_tag, 0)
+                        >= self._config.stagnation_freeze_rounds
+                        or (
+                            other_unfrozen
+                            and compile_wall_streak_by_regime.get(active_tag, 0) >= 3
+                        )
+                    ):
+                        frozen_regimes.add(active_tag)
+                        next_reg = self._select_active_regime(
+                            None,
+                            frozen_regimes,
+                            best_result,
+                            active_anchors,
+                            allow_satisfied_fallback=not early_stop_allowed,
+                            exclude_regime=last_unpromoted_regime,
+                            stagnation_by_regime=stagnation_by_regime,
+                        )
+                        if next_reg is None:
+                            stop_reason = "all_regimes_converged"
+                self._stagnation_by_regime = stagnation_by_regime
+                self._compile_wall_streak_by_regime = compile_wall_streak_by_regime
+                self._save_checkpoint(
+                    incumbent_source=incumbent_source, baseline_result=baseline_result,
+                    best_result=best_result, active_anchors=active_anchors,
+                    frozen_regimes=frozen_regimes, current_regime=current_regime,
+                    stagnation_rounds=stagnation_rounds, rounds=rounds,
+                    promoted_rounds=promoted_rounds, rolled_back_rounds=rolled_back_rounds,
+                    escalated_rounds=escalated_rounds, admitted_rule_ids=admitted_rule_ids,
+                    stop_reason=stop_reason or "in_progress", l4_result=None,
+                    stagnation_by_regime=stagnation_by_regime,
+                    last_unpromoted_regime=last_unpromoted_regime,
+                )
+                if stop_reason:
+                    break
+        finally:
+            await self._stage_gate_coordinator.cancel_pending_speculative()
 
         if not stop_reason:
             stop_reason = "budget_exhausted"
 
-        if (
-            self._config.run_final_l4
-            and not promotion_blocked
-            and not l4_was_resolved
-        ):
+        if self._config.run_final_l4 and not promotion_blocked and not l4_was_resolved:
             l4_result = self._run_final_l4_tracked(
-                incumbent_source=incumbent_source,
-                prior_stop_reason=stop_reason,
+                incumbent_source=incumbent_source, prior_stop_reason=stop_reason
             )
+            pending_l4 = self._pending_l4
+            if pending_l4 is not None and not stop_reason:
+                stop_reason = "l4_pending"
             self._record_l4_observations(
-                source=incumbent_source,
-                l4_result=l4_result,
-                active_anchors=active_anchors,
+                source=incumbent_source, l4_result=l4_result,
+                best_result=best_result, active_anchors=active_anchors,
             )
 
         self._save_checkpoint(
-            incumbent_source=incumbent_source,
-            baseline_result=baseline_result,
-            best_result=best_result,
-            active_anchors=active_anchors,
-            frozen_regimes=frozen_regimes,
-            current_regime=current_regime,
-            stagnation_rounds=stagnation_rounds,
-            rounds=rounds,
-            promoted_rounds=promoted_rounds,
-            rolled_back_rounds=rolled_back_rounds,
-            escalated_rounds=escalated_rounds,
-            admitted_rule_ids=admitted_rule_ids,
-            stop_reason=stop_reason,
-            l4_result=l4_result,
+            incumbent_source=incumbent_source, baseline_result=baseline_result,
+            best_result=best_result, active_anchors=active_anchors,
+            frozen_regimes=frozen_regimes, current_regime=current_regime,
+            stagnation_rounds=stagnation_rounds, rounds=rounds,
+            promoted_rounds=promoted_rounds, rolled_back_rounds=rolled_back_rounds,
+            escalated_rounds=escalated_rounds, admitted_rule_ids=admitted_rule_ids,
+            stop_reason=stop_reason, l4_result=l4_result,
             stagnation_by_regime=stagnation_by_regime,
             last_unpromoted_regime=last_unpromoted_regime,
-            pending_promotion=pending_promotion,
-            pending_l4=self._pending_l4,
         )
 
         stagnation_diagnosis = self._build_stagnation_diagnosis(
@@ -11578,6 +3317,8 @@ class PerfTargetCampaignRunner:
             l4_err = l4_result.error_message or ""
             if l4_result.passed:
                 l4_status = "passed"
+            elif pending_l4 is not None:
+                l4_status = "pending_infrastructure"
             elif not promotion_blocked and (
                 "BLOCKED_ENV" in l4_err
                 or "BLOCKED_EXIT_CODE: 75" in l4_err
@@ -11587,29 +3328,21 @@ class PerfTargetCampaignRunner:
             else:
                 l4_status = "failed"
         return CampaignReport(
-            operator_name=self._config.operator_name,
-            stop_reason=stop_reason,
-            total_rounds=len(rounds),
-            baseline_result=baseline_result,
-            best_result=best_result,
-            rounds=tuple(rounds),
-            promoted_rounds=tuple(promoted_rounds),
+            operator_name=self._config.operator_name, stop_reason=stop_reason,
+            total_rounds=len(rounds), baseline_result=baseline_result, best_result=best_result,
+            rounds=tuple(rounds), promoted_rounds=tuple(promoted_rounds),
             rolled_back_rounds=tuple(rolled_back_rounds),
             escalated_rounds=tuple(escalated_rounds),
             frozen_regimes=tuple(sorted(frozen_regimes)),
             active_anchors=tuple(self._scoreboard_anchors),
-            admitted_rule_ids=tuple(admitted_rule_ids),
-            l4_result=l4_result,
-            l4_status=l4_status,
-            pending_promotion=pending_promotion,
-            pending_l4=self._pending_l4,
-            promotion_blocked=promotion_blocked,
+            scoreboard_anchor_count=len(self._scoreboard_anchors),
+            scoreboard_anchors=tuple(self._scoreboard_anchors),
+            admitted_rule_ids=tuple(admitted_rule_ids), l4_result=l4_result, l4_status=l4_status,
+            pending_promotion=pending_promotion, pending_l4=pending_l4,
+            promotion_blocked=promotion_blocked or pending_promotion is not None,
             pure_golden_mode=bool(self._config.pure_golden),
             blueprint_provenance=dict(self._blueprint_provenance),
-            stagnation_diagnosis=stagnation_diagnosis,
-            scoreboard_anchor_count=len(self._scoreboard_anchors),
-            scoreboard_anchors=self._scoreboard_anchors,
-            real_npu_path=self._is_real_npu_path(),
+            stagnation_diagnosis=stagnation_diagnosis, real_npu_path=self._is_real_npu_path(),
             calibrated_dispatch_floor_us=self._calibrated_dispatch_floor_us,
             geometric_speedup=geometric_speedup(
                 [to_conservation_point(a, a) for a in best_result.anchors]
@@ -11626,57 +3359,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--operator",
         required=True,
-        help="Target operator to optimize (short name e.g. rms_norm or task id e.g. level2/rms_norm).",
+        help="Target operator (short name e.g. rms_norm or task id e.g. level2/rms_norm).",
     )
     parser.add_argument("--max-rounds", type=int, default=12)
     parser.add_argument("--max-wall-clock-min", type=float, default=180.0)
-    parser.add_argument(
-        "--device-id",
-        default="",
-        help=(
-            "Authorized NPU device ID; defaults to the first card declared by "
-            "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS, else 1."
-        ),
-    )
+    parser.add_argument("--device-id", default="", help="Authorized primary NPU device ID.")
     parser.add_argument(
         "--device-ids",
         type=parse_device_ids,
         default=(),
-        help=(
-            "Extra explicitly authorized NPU cards for whole-L4 attempts, "
-            "comma-separated; a blocked-env preemption moves to the next "
-            "untried pool card."
-        ),
+        help="Extra authorized NPU cards for whole-L4 attempts, comma-separated.",
     )
     parser.add_argument(
         "--retry-device-id",
         default="",
-        help=(
-            "Explicitly authorized alternate NPU card for at most one fresh "
-            "retry after a proven-terminal infrastructure failure."
-        ),
+        help="Alternate NPU card for single fresh retry after infrastructure failure.",
     )
-    parser.add_argument(
-        "--disable-early-goal-stop",
-        action="store_true",
-        help="Continue optimizing through max-rounds even after target thresholds pass.",
-    )
-    parser.add_argument(
-        "--min-surrogate-gain",
-        type=float,
-        default=0.25,
-        help="Minimum surrogate_score gain on [0, 100] scale required for L3 promotion.",
-    )
+    parser.add_argument("--disable-early-goal-stop", action="store_true")
+    parser.add_argument("--min-surrogate-gain", type=float, default=0.25)
     parser.add_argument("--checkpoint", default=None, help="Atomic checkpoint JSON path.")
     parser.add_argument("--report-json", default=None, help="Optional final report JSON path.")
     parser.add_argument("--run-final-l4", action="store_true", help="Run final official L4 gate.")
     parser.add_argument("--resume", action="store_true", help="Resume from existing checkpoint.")
     parser.add_argument("--k-rule-workers", type=int, default=2)
-    parser.add_argument(
-        "--target-module",
-        default=None,
-        help="Optional override path to target operator kernels module.",
-    )
+    parser.add_argument("--target-module", default=None, help="Override path to kernels module.")
     parser.add_argument("--source-root", default=None, help="TileFoundry workspace root.")
     parser.add_argument("--env-file", default=None, help="Path to tilefoundry-npu env.sh.")
     parser.add_argument(
@@ -11685,28 +3391,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable tile-size prescreen guidance table in creative prompts.",
     )
-    parser.add_argument(
-        "--cost-prescreen-top-k",
-        type=int,
-        default=None,
-        help="Keep only the top-K cost-model candidates during creative prescreen.",
-    )
+    parser.add_argument("--cost-prescreen-top-k", type=int, default=None)
     parser.add_argument(
         "--cost-model-mode",
         choices=("advisory", "shadow", "off"),
         default="off",
         help="Cost model advisory gate policy mode.",
     )
-    parser.add_argument(
-        "--enable-phase0-lattice-sweep",
-        action="store_true",
-        help="Enable zero-LLM Phase-0 lattice warm-start sweep before Round 1.",
-    )
-    parser.add_argument(
-        "--pure-golden",
-        action="store_true",
-        help="Disable authored/scheduled HIR paths and synthesize blueprints strictly from golden.py.",
-    )
+    parser.add_argument("--enable-phase0-lattice-sweep", action="store_true")
+    parser.add_argument("--pure-golden", action="store_true")
     return parser
 
 
@@ -11718,12 +3411,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     primary_device_id, device_pool = resolve_campaign_device_plan(
         device_id=str(args.device_id),
         device_ids=tuple(args.device_ids),
-        env_device_ids=parse_device_ids(
-            env_values.get(CAMPAIGN_DEVICE_IDS_ENV_KEY, "")
-        ),
-        visible_device_ids=parse_device_ids(
-            os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
-        ),
+        env_device_ids=parse_device_ids(env_values.get(CAMPAIGN_DEVICE_IDS_ENV_KEY, "")),
+        visible_device_ids=parse_device_ids(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")),
     )
     llm_backend = create_llm_backend_from_env(overrides=env_values or None)
     cfg = CampaignConfig(
@@ -11769,17 +3458,32 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "CAMPAIGN_DEVICE_IDS_ENV_KEY",
+    "CalibrationService",
+    "CalibrationSnapshot",
     "CampaignConfig",
     "CampaignReport",
     "CampaignRoundRecord",
+    "L3L4RecoveryCoordinator",
+    "PendingL4",
+    "PendingPromotion",
     "PerfTargetCampaignRunner",
     "ResolvedRegimeConfig",
+    "RoundContextBuilder",
+    "StageGateCoordinator",
+    "TelemetryLedgerWriter",
+    "apply_ast_patch",
     "build_arg_parser",
     "extract_regime_snippet",
     "main",
     "parse_device_ids",
     "patch_regime_into_module",
+    "rank_stage_a_candidates_with_cost_model",
+    "resolve_campaign_device_plan",
     "resolve_regime_config",
+    "resolve_regime_for_case",
+    "run_l1_compile_check",
+    "split_readonly_host_tail",
 ]
 
 

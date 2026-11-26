@@ -791,7 +791,10 @@ def test_submit_fast_gate_progressive_occupancy_backoff_and_budget_cap(
         )
 
     monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _fake_v2_always_busy)
-    with pytest.raises(RuntimeError, match="did not verify"):
+    with pytest.raises(
+        surrogate_cannbench.OccupancyExhaustedError,
+        match=r"NPU occupancy/env blocked after 8 attempts \(rc=75\): \[occupancy\]",
+    ):
         surrogate_cannbench._submit_fast_gate(
             agent_gates_bin="agent-gates",
             root=tmp_path,

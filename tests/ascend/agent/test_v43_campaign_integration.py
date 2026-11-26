@@ -1128,14 +1128,12 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
         tracker = BayesianRuleTracker.from_rules(rules)
         backend = _CapturingBackend(
             lambda req, idx: (
-                json.dumps(
-                    {
-                        "physical_hypothesis": f"hyp_{idx}",
-                        "target_local_metric": "latency_us",
-                        "dsl_source": _REG_A_IMPROVED.replace(
-                            "tile_m=32", f"tile_m={32 + idx}"
-                        ),
-                    }
+                (
+                    "# target_bottleneck: latency_us\n"
+                    f"# structural_hypothesis: hyp_{idx}\n"
+                    "```python\n"
+                    f"{_REG_A_IMPROVED.replace('tile_m=32', f'tile_m={32 + idx}')}\n"
+                    "```\n"
                 )
                 if req.role == "explore_creative"
                 else _REG_A_IMPROVED.replace("tile_m=32", f"tile_m={32 + idx}")

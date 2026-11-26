@@ -37,11 +37,14 @@ from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
     append_round_funnel_event,
     is_clean_calibration_sample,
 )
+from tilefoundry_ascend.agent.campaign.l3_l4_recovery import PendingL4
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import PendingPromotion
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+    AnchorEvalMetrics,
     CandidateSurrogateResult,
     L0L1CandidateCheck,
     L4CannbenchResult,
+    aggregate_surrogate_result,
     bottleneck_anchor_for_regime,
     extract_ordered_tensor_shapes,
 )
@@ -1826,17 +1829,13 @@ class TelemetryLedgerWriter:
     ]:
         """Rehydrate persisted campaign state and verify candidate bytes on disk."""
         assert self._checkpoint_path is not None
-        if round_record_from_dict is None or pending_l4_from_dict is None:
-            from tilefoundry_ascend.agent.campaign.campaign_runner import (
-                CampaignRoundRecord,
-                PendingL4,
-            )
+        eff_l4_from_dict = pending_l4_from_dict or PendingL4.from_dict
+        if round_record_from_dict is None:
+            from tilefoundry_ascend.agent.campaign.campaign_runner import CampaignRoundRecord
 
-            eff_round_from_dict = round_record_from_dict or CampaignRoundRecord.from_dict
-            eff_l4_from_dict = pending_l4_from_dict or PendingL4.from_dict
+            eff_round_from_dict = CampaignRoundRecord.from_dict
         else:
             eff_round_from_dict = round_record_from_dict
-            eff_l4_from_dict = pending_l4_from_dict
 
         payload = json.loads(self._checkpoint_path.read_text(encoding="utf-8"))
         saved_run_id = payload.get("run_id")
@@ -2241,6 +2240,72 @@ class TelemetryLedgerWriter:
             "final_roofline_eta": round(overall_eta, 6),
             "regimes": regimes_payload,
         }
+
+    @staticmethod
+    def fold_regime_msprof_cache(
+        msprof_by_case: Mapping[tuple[str, int], Mapping[str, float]],
+        regime_msprof_cache: Mapping[tuple[str, str], Mapping[str, float]],
+        active_anchors: Sequence[AnchorCaseSpec],
+        *,
+        active_regime_tag: str,
+        single_regime: bool,
+    ) -> dict[tuple[str, int], dict[str, float]]:
+        """Fold legacy (sha, regime_tag) msprof entries into case-keyed telemetry."""
+        merged = {k: dict(v) for k, v in msprof_by_case.items()}
+        for (csha, rtag), metrics in regime_msprof_cache.items():
+            matched = False
+            for anc in active_anchors:
+                if anc.regime_tag == rtag:
+                    merged.setdefault((str(csha), int(anc.case_num)), dict(metrics))
+                    matched = True
+            if not matched and single_regime and rtag == active_regime_tag:
+                for anc in active_anchors:
+                    merged.setdefault((str(csha), int(anc.case_num)), dict(metrics))
+        return merged
+
+    @staticmethod
+    def build_stone_parent_result(
+        *,
+        operator_name: str,
+        parent_source: str,
+        incumbent_source: str,
+        best_result: CandidateSurrogateResult,
+        cand_result: CandidateSurrogateResult,
+        selected_stone: object | None,
+    ) -> CandidateSurrogateResult | None:
+        """Build paired parent result from incumbent best or selected stepping stone."""
+        if parent_source == incumbent_source:
+            return best_result
+        case_lats = getattr(selected_stone, "case_latencies_us", None) if selected_stone else None
+        if selected_stone is None or not isinstance(case_lats, Mapping) or not case_lats:
+            return None
+        s_ancs = tuple(
+            AnchorEvalMetrics(
+                case_num=int(a.case_num),
+                regime_tag=a.regime_tag,
+                accuracy_passed=True,
+                cand_us=float(case_lats[int(a.case_num)]),
+                ref_perf_us=float(a.ref_perf_us),
+                t_hw_us=float(a.t_hw_us),
+                speedup=(
+                    float(a.ref_perf_us) / float(case_lats[int(a.case_num)])
+                    if a.ref_perf_us > 0.0
+                    else 0.0
+                ),
+                roofline_eta=(
+                    float(a.t_hw_us) / float(case_lats[int(a.case_num)])
+                    if a.t_hw_us > 0.0
+                    else 0.0
+                ),
+                eq3_score=0.0,
+            )
+            for a in cand_result.anchors
+            if int(a.case_num) in case_lats and float(case_lats[int(a.case_num)]) > 0.0
+        )
+        if not s_ancs:
+            return None
+        stone_cid = str(getattr(selected_stone, "candidate_id", ""))
+        return aggregate_surrogate_result(stone_cid, operator_name, s_ancs)
 
 
 __all__ = [

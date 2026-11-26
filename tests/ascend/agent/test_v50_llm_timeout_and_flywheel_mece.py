@@ -43,10 +43,7 @@ from tilefoundry_ascend.agent.orchestrator import (
     portfolio_runner as portfolio_mod,
 )
 from tilefoundry_ascend.agent.orchestrator import cpp_slice_protocol as slice_mod
-from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
-    CREATIVE_SOURCE_MAX_BYTES,
-    compact_creative_source_slice,
-)
+from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import compact_creative_source_slice
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     AgyCliLLMBackend,
     GenerationRequest,
@@ -239,7 +236,7 @@ def _sample_small_dsl() -> str:
 
 
 def test_slice_helpers_sink_to_cpp_slice_protocol_and_creative_14kb_budget() -> None:
-    """Verify slice helper unification, deleted folding helpers, and <=14,336B creative budget."""
+    """Verify slice helper unification, deleted folding helpers, and lossless creative slicing."""
     for removed in (
         "_ANY_FOLDING_MARKER_RE",
         "_compact_trackb_repair_source",
@@ -266,14 +263,30 @@ def test_slice_helpers_sink_to_cpp_slice_protocol_and_creative_14kb_budget() -> 
         for idx in range(25)
     )
     large_py_dsl = helpers + "\n\n" + _sample_small_dsl()
-    assert len(large_py_dsl.encode("utf-8")) > CREATIVE_SOURCE_MAX_BYTES
 
     folded = compact_creative_source_slice(large_py_dsl)
-    assert len(folded.encode("utf-8")) <= CREATIVE_SOURCE_MAX_BYTES
+    assert folded == large_py_dsl
     ast.parse(folded)
     assert "@T.prim_func" in folded
     assert "T.gemm" in folded
-    assert "READ-ONLY HELPER FOLDED" in folded
+    assert "READ-ONLY HELPER FOLDED" not in folded
+
+    trackb_cpp = (
+        "#include <tl_templates/ascend/common.h>\n"
+        "__aicore__ inline float live_helper(float v) { return v + 1.0f; }\n"
+        'extern "C" __global__ __vector__ void active_k(__gm__ float* x) {\n'
+        "    x[0] = live_helper(x[0]);\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void sibling_k(__gm__ float* y) {\n'
+        "    y[0] = 2.0f;\n"
+        "}\n"
+    )
+    scoped_cpp = compact_creative_source_slice(trackb_cpp, active_kernel="active_k")
+    assert "x[0] = live_helper(x[0]);" in scoped_cpp
+    assert "live_helper(float v)" in scoped_cpp
+    assert "// [READONLY_SIBLING_DECLARATION]" in scoped_cpp
+    assert "y[0] = 2.0f;" not in scoped_cpp
+    assert "READ-ONLY HELPER FOLDED" not in scoped_cpp
 
     ledger = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
@@ -307,7 +320,7 @@ def test_slice_helpers_sink_to_cpp_slice_protocol_and_creative_14kb_budget() -> 
     src_block = req.user_prompt.split("### CURRENT KERNEL SOURCE\n```python\n", 1)[1].rsplit(
         "\n```\n", 1
     )[0]
-    assert len(src_block.encode("utf-8")) <= CREATIVE_SOURCE_MAX_BYTES
+    assert src_block == large_py_dsl.strip()
     ast.parse(src_block)
 
 

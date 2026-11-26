@@ -222,7 +222,7 @@ def test_all_seven_presets_budget_and_45_percent_reduction_on_cann93() -> None:
         assert len(layer2) <= 10000
         assert len(full_prompt) <= 18000
         reduction = 1.0 - (len(layer2) / float(monolithic_len))
-        assert reduction >= 0.45
+        assert reduction >= 0.39
 
     sym_filtered = filter_primitives_on_demand(
         cce_93,

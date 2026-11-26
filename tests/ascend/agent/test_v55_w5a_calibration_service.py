@@ -120,16 +120,14 @@ def test_calibration_snapshot_is_frozen_and_captures_null_launch() -> None:
         ),
     )
 
-    class _BatchWithNull(L2BatchResults):
-        null_launch_us: float = 1.75
-
     def _l2_eval(cands: list[tuple[str, Path]], eval_anchors: list[AnchorCaseSpec]) -> L2BatchResults:
         assert len(cands) == 1
         assert cands[0][0] == "incumbent_baseline"
         assert len(eval_anchors) == 3
-        return _BatchWithNull(
+        return L2BatchResults(
             {"incumbent_baseline": base_res},
             {"incumbent_baseline": "run-001"},
+            null_launch_us=1.75,
         )
 
     def _msprof(

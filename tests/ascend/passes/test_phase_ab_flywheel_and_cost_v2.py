@@ -615,12 +615,10 @@ def build_vec(tile_m=1):
     class _RoleMockBackend:
         async def generate(self, req):
             if req.role == "explore_creative":
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "test hypothesis",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": cand_bad_acc_snip,
-                    }
+                return (
+                    "# target_bottleneck: aiv_vec\n"
+                    "# structural_hypothesis: test hypothesis\n"
+                    f"```python\n{cand_bad_acc_snip}\n```\n"
                 )
             return cand_good_snip
 

@@ -204,12 +204,10 @@ async def test_slow_creative_nonblocking_and_harvested_next_round(tmp_path: Path
             _ = effort_override
             if req.role == "explore_creative":
                 await creative_gate.wait()
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "Widen vector tile to 64",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": _CREATIVE_SNIPPET,
-                    }
+                return (
+                    "# target_bottleneck: aiv_vec\n"
+                    "# structural_hypothesis: Widen vector tile to 64\n"
+                    f"```python\n{_CREATIVE_SNIPPET}\n```"
                 )
             return _EXPLOIT_SNIPPET
 
@@ -273,12 +271,10 @@ async def test_fast_creative_finishes_in_same_round(tmp_path: Path) -> None:
             _ = effort_override
             if req.role == "explore_creative":
                 await asyncio.sleep(0.005)
-                return json.dumps(
-                    {
-                        "physical_hypothesis": "Fast creative tile",
-                        "target_local_metric": "ub_bytes",
-                        "dsl_source": _CREATIVE_SNIPPET,
-                    }
+                return (
+                    "# target_bottleneck: ub_bytes\n"
+                    "# structural_hypothesis: Fast creative tile\n"
+                    f"```python\n{_CREATIVE_SNIPPET}\n```"
                 )
             await asyncio.sleep(0.05)
             return _EXPLOIT_SNIPPET
@@ -316,12 +312,10 @@ async def test_creative_only_round_awaits_synchronously(tmp_path: Path) -> None:
         ) -> str:
             _ = (req, effort_override)
             await asyncio.sleep(0.01)
-            return json.dumps(
-                {
-                    "physical_hypothesis": "Creative only round",
-                    "target_local_metric": "aiv_vec",
-                    "dsl_source": _CREATIVE_SNIPPET,
-                }
+            return (
+                "# target_bottleneck: aiv_vec\n"
+                "# structural_hypothesis: Creative only round\n"
+                f"```python\n{_CREATIVE_SNIPPET}\n```"
             )
 
     coord = _make_coordinator(tmp_path, backend=_CreativeOnlyBackend())
@@ -360,7 +354,7 @@ async def test_occupancy_exceptions_produce_typed_infra_occupancy_fault(
         fault_plane = "INFRA_OCCUPANCY"
 
     for exc_to_raise in (
-        OccupancyExhaustedError("all NPU cards busy"),
+        OccupancyExhaustedError(3, ("all NPU cards busy",)),
         _CustomOccupancyError("card pool saturated"),
     ):
 

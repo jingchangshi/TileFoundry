@@ -616,19 +616,15 @@ def test_campaign_patience_escalation_xhigh_stepping_stone_and_regime_rotation(
     target_path = tmp_path / "kernels.py"
     target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
 
-    creative_a_payload = json.dumps(
-        {
-            "physical_hypothesis": "Novel SSBUF path",
-            "target_local_metric": "sync_stall",
-            "dsl_source": _SSBUF_REGIME_A,
-        }
+    creative_a_payload = (
+        "# target_bottleneck: sync_stall\n"
+        "# structural_hypothesis: Novel SSBUF path\n"
+        f"```python\n{_SSBUF_REGIME_A}\n```\n"
     )
-    creative_b_payload = json.dumps(
-        {
-            "physical_hypothesis": "Regime B probe",
-            "target_local_metric": "aiv_vec",
-            "dsl_source": _IMPROVED_REGIME_B,
-        }
+    creative_b_payload = (
+        "# target_bottleneck: aiv_vec\n"
+        "# structural_hypothesis: Regime B probe\n"
+        f"```python\n{_IMPROVED_REGIME_B}\n```\n"
     )
 
     class _RegimeDispatchBackend:
@@ -1122,7 +1118,7 @@ def test_campaign_l3_candidate_failure_clears_pending_and_counts_stagnation(
     assert report.rolled_back_rounds == (1,)
     assert report.rounds[0].stagnation_rounds_after == 1
     assert target_path.read_text(encoding="utf-8") == _MULTI_REGIME_MODULE
-    assert len(l3_calls) == 1
+    assert len(l3_calls) == 2
 
 
 def test_campaign_l3_active_wait_timeout_keeps_candidate_and_resume_identity(
@@ -1324,7 +1320,9 @@ def test_campaign_consumes_signed_l3_observation_classification(
         assert target_path.read_text(encoding="utf-8") == candidate_source
 
     attempts = report.rounds[0].promotion_attempts
-    assert len(attempts) == 1
+    assert len(attempts) == (
+        2 if expected_kind == surrogate_cannbench.FAILURE_KIND_CANDIDATE and terminal else 1
+    )
     attempt = attempts[0]
     assert attempt["execution_id"] == execution_id
     assert attempt["device_id"] == "4"
@@ -1992,13 +1990,9 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
         responses={
             "exploit_rule": [_IMPROVED_REGIME_A] * 2,
             "explore_creative": [
-                json.dumps(
-                    {
-                        "physical_hypothesis": "Novel SSBUF handoff",
-                        "target_local_metric": "sync_stall",
-                        "dsl_source": _SSBUF_REGIME_A,
-                    }
-                )
+                "# target_bottleneck: sync_stall\n"
+                "# structural_hypothesis: Novel SSBUF handoff\n"
+                f"```python\n{_SSBUF_REGIME_A}\n```\n"
             ]
             * 2,
         }
@@ -2492,20 +2486,12 @@ def test_surrogate_dual_criterion_tail_guard_and_meets_perf_target(tmp_path: Pat
                 bottleneck_fix_dsl,
             ],
             "explore_creative": [
-                json.dumps(
-                    {
-                        "physical_hypothesis": "Inflate small anchor only",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": small_inflate_dsl,
-                    }
-                ),
-                json.dumps(
-                    {
-                        "physical_hypothesis": "Fix large bottleneck anchor",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": bottleneck_fix_dsl,
-                    }
-                ),
+                "# target_bottleneck: aiv_vec\n"
+                "# structural_hypothesis: Inflate small anchor only\n"
+                f"```python\n{small_inflate_dsl}\n```\n",
+                "# target_bottleneck: aiv_vec\n"
+                "# structural_hypothesis: Fix large bottleneck anchor\n"
+                f"```python\n{bottleneck_fix_dsl}\n```\n",
             ],
         }
     )
@@ -2658,10 +2644,12 @@ def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> N
 
     split_spec = mla_specs["split_kv_decode"]
     fname, snippet = extract_regime_snippet(mla_src, split_spec)
-    assert fname == "_build_mla_split_kv_decode_func"
+    assert fname == "_select_mla_decode_config"
     assert "def _select_mla_decode_config(" in snippet
-    assert "def _build_mla_split_kv_decode_func(" in snippet
-    assert "def _build_mla_split_kv_combine_func(" in snippet
+    assert "_MLA_TRACKB_SRC" in snippet
+    assert "def _render_trackb_tu(" in snippet
+    assert "def _build_mla_split_kv_decode_func(" not in snippet
+    assert "def _build_mla_split_kv_combine_func(" not in snippet
     assert "_select_mla_bnsd_config" not in snippet
     assert "_build_mla_prefill_func" not in snippet
     assert "def mla(" not in snippet
@@ -2676,18 +2664,19 @@ def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> N
     assert "def _mla_decode_helper(" in patched
     assert '"num_kv_splits": 4,' in patched
     _, re_extracted = extract_regime_snippet(patched, split_spec)
-    assert "def _mla_decode_helper(" in re_extracted
+    assert '"num_kv_splits": 4,' in re_extracted
 
     cleaned = patch_regime_into_module(patched, split_spec, snippet)
     assert "def _mla_decode_helper(" not in cleaned
 
-    partial_without_combine = patch_regime_into_module(
+    partial_without_tu = patch_regime_into_module(
         mla_src,
         split_spec,
-        snippet.split("def _build_mla_split_kv_combine_func")[0],
+        snippet.split("def _render_trackb_tu")[0],
     )
-    assert "def _build_mla_split_kv_combine_func(" in partial_without_combine
-    assert "def _build_mla_split_kv_decode_func(" in partial_without_combine
+    assert "def _render_trackb_tu(" in partial_without_tu
+    assert "def _build_mla_split_kv_combine_func(" in partial_without_tu
+    assert "def _build_mla_split_kv_decode_func(" in partial_without_tu
 
     with pytest.raises(ValueError, match="at least one authorized regime symbol"):
         patch_regime_into_module(
@@ -2917,9 +2906,17 @@ def test_all_six_production_regimes_extract_resolve_and_pass_stage_a() -> None:
         source = path.read_text(encoding="utf-8")
         for spec in get_default_regime_specs(op_name):
             fname, snippet = extract_regime_snippet(source, spec)
-            assert fname in spec.builder_candidates
-            for sym in spec.editable_symbols:
-                assert sym in snippet
+            if spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb") and spec.trackb_symbols:
+                assert fname == spec.config_selector_fn
+                assert spec.config_selector_fn in snippet
+                for sym in spec.trackb_symbols:
+                    assert sym in snippet
+                for builder in spec.builder_candidates:
+                    assert f"def {builder}(" not in snippet
+            else:
+                assert fname in spec.builder_candidates
+                for sym in spec.editable_symbols:
+                    assert sym in snippet
             resolved = resolve_regime_config(source, spec)
             stage_a = run_stage_a_static(
                 source,
@@ -3007,19 +3004,15 @@ def test_per_regime_beam_isolation_objective_ranking_and_checkpoint(tmp_path: Pa
     target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
     ckpt_path = tmp_path / "ckpt_multi_beam.json"
 
-    creative_a = json.dumps(
-        {
-            "physical_hypothesis": "SSBUF on regime A",
-            "target_local_metric": "sync_stall",
-            "dsl_source": _SSBUF_REGIME_A,
-        }
+    creative_a = (
+        "# target_bottleneck: sync_stall\n"
+        "# structural_hypothesis: SSBUF on regime A\n"
+        f"```python\n{_SSBUF_REGIME_A}\n```\n"
     )
-    creative_b = json.dumps(
-        {
-            "physical_hypothesis": "Kernel(2) on regime B",
-            "target_local_metric": "aiv_vec",
-            "dsl_source": _IMPROVED_REGIME_B,
-        }
+    creative_b = (
+        "# target_bottleneck: aiv_vec\n"
+        "# structural_hypothesis: Kernel(2) on regime B\n"
+        f"```python\n{_IMPROVED_REGIME_B}\n```\n"
     )
     class _IsolationDispatchBackend:
         def __init__(self) -> None:
@@ -3995,8 +3988,10 @@ def test_wp_final1_pruned_inline_regimes_partial_override_and_mla_combine_gate(
 
     for spec in DEFAULT_REGIME_SPECS["mla"]:
         _, snip = extract_regime_snippet(mla_src, spec)
-        assert "@T.prim_func" in snip
+        assert "@T.prim_func" not in snip
         assert "_build_mla_prim_func(" not in snip
+        assert spec.config_selector_fn in snip
+        assert "__global__" in snip
         if spec.regime_tag == "bnsd_gather":
             assert '"BSND"' not in snip
         elif spec.regime_tag == "prefill_compute":
@@ -4153,11 +4148,9 @@ def test_wp_final1_pruned_inline_regimes_partial_override_and_mla_combine_gate(
     monkeypatch.setattr(cr_mod, "run_l1_compile_check", _fake_l1)
     l1_bad = runner._run_l1(broken_combine_mod, split_spec)
     assert not l1_bad.passed
-    assert l1_builders == [
-        "_build_mla_split_kv_decode_func",
-        "_build_mla_split_kv_decode_func",
-        "_build_mla_split_kv_combine_func",
-    ]
+    assert len(l1_builders) >= 3
+    assert all(b == "_build_mla_split_kv_decode_func" for b in l1_builders[:-1])
+    assert l1_builders[-1] == "_build_mla_split_kv_combine_func"
     assert "combine_kernel(_build_mla_split_kv_combine_func): broken combine ir" == l1_bad.error_message
 
 
@@ -4575,12 +4568,10 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
 
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),)
     regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {"bm": 64, "bn": 64, "bk": 64}),)
-    creative_reply = json.dumps(
-        {
-            "physical_hypothesis": "Static pingpong buffers eliminate aliasing",
-            "target_local_metric": "mte2_wait_ratio",
-            "dsl_source": _SSBUF_REGIME_A,
-        }
+    creative_reply = (
+        "# target_bottleneck: mte2_wait_ratio\n"
+        "# structural_hypothesis: Static pingpong buffers eliminate aliasing\n"
+        f"```python\n{_SSBUF_REGIME_A}\n```\n"
     )
 
     def _l2_eval(cands, active_anchors):
@@ -4940,19 +4931,15 @@ def _build_reg_a(tile_m=3):
     )
     tracker = BayesianRuleTracker.from_rules([causal_rule])
 
-    creative_r1 = json.dumps(
-        {
-            "physical_hypothesis": "Introduce helper macro and SSBUF stone",
-            "target_local_metric": "sync_stall_ratio",
-            "dsl_source": stone_partial_dsl,
-        }
+    creative_r1 = (
+        "# target_bottleneck: sync_stall_ratio\n"
+        "# structural_hypothesis: Introduce helper macro and SSBUF stone\n"
+        f"```python\n{stone_partial_dsl}\n```\n"
     )
-    creative_r2 = json.dumps(
-        {
-            "physical_hypothesis": "Keep inherited helper macro",
-            "target_local_metric": "wave_occupancy",
-            "dsl_source": child_partial_dsl,
-        }
+    creative_r2 = (
+        "# target_bottleneck: wave_occupancy\n"
+        "# structural_hypothesis: Keep inherited helper macro\n"
+        f"```python\n{child_partial_dsl}\n```\n"
     )
     backend = MockLLMBackend(
         responses={
@@ -5120,7 +5107,7 @@ def _build_reg_a(tile_m=3):
                 "current_source_identity": {"root": str(tmp_path.resolve())},
             }
         else:
-            raise AssertionError(f"unexpected V2 command {argv}")
+            raise AssertionError(f"unexpected verb command {argv}")
         return subprocess.CompletedProcess(argv, 0, json.dumps(body), ""), body
 
     monkeypatch.setattr(surrogate_cannbench, "_run_agent_gates_v2_cmd", _fake_v2_cmd)
@@ -7180,7 +7167,7 @@ def test_build_syntax_repair_request_lowered_excerpt_and_extractor() -> None:
     assert excerpt_pos < broken_pos
     section_body = req.user_prompt[excerpt_pos:broken_pos]
     inner_code = section_body.split("```cpp\n", 1)[1].split("\n```", 1)[0]
-    assert len(inner_code) <= 2400
+    assert inner_code == long_excerpt
 
     req_cpp = build_syntax_repair_request(
         "__aicore__ void k() {}",

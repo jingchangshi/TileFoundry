@@ -230,7 +230,7 @@ def test_split_readonly_host_tail_and_tracka_prompt_rendering(
         incumbent_source=full_slice,
     )
     for req in (exploit_req, creative_req):
-        assert req.json_schema is None
+        assert not hasattr(req, "json_schema")
         assert "<read_only_host_tail>" in req.user_prompt
         assert "</read_only_host_tail>" in req.user_prompt
         assert "Never define a nested `def` inside `@T.prim_func`" in req.user_prompt
@@ -354,10 +354,10 @@ def test_same_case_eta_and_build_round_bundle_uses_msprof_by_case(
     assert bundle.parent_residual.observation is not None
     assert abs(bundle.parent_residual.observation.compute_issue.l2_roofline_eta - 0.25) < 1e-6
     assert abs(bundle.parent_residual.effective_compute_eta - 0.25) < 1e-6
-    assert bundle.parent_residual.transfer_inflation_ratio == 0.0
+    assert bundle.parent_residual.transfer_inflation_ratio > 1.0
     assert len(bundle.worker_specs) >= 2
     for _wid, _wkind, _rule, req in bundle.worker_specs:
-        assert req.json_schema is None
+        assert not hasattr(req, "json_schema")
         assert "# target_bottleneck:" in req.system_prompt
         assert "# structural_hypothesis:" in req.system_prompt
 
@@ -437,7 +437,7 @@ def test_eta_case_clamps_to_one_and_trackb_unified_header_protocol() -> None:
     assert bundle.parent_residual.effective_compute_eta == 1.0
     assert "_build_tb_func" not in bundle.parent_snippet
     for _wid, _wkind, _rule, req in bundle.worker_specs:
-        assert req.json_schema is None
+        assert not hasattr(req, "json_schema")
         assert "# target_bottleneck:" in req.system_prompt
         assert "# structural_hypothesis:" in req.system_prompt
         assert "raw JSON" not in req.system_prompt

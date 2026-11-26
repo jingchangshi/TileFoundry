@@ -26,6 +26,7 @@ from tilefoundry_ascend.agent.orchestrator import (
     extract_python_dsl,
     extract_structural_signature,
 )
+from tilefoundry_ascend.agent.orchestrator.llm_client import ProseRefusalError
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     apply_scoped_trackb_patch,
     build_trackb_context_view,
@@ -205,12 +206,14 @@ def test_build_trackb_context_view_mla_kv_reuse_no_middle_omitted() -> None:
         "hello",
         json.dumps({"response": "### Gaps Found\n- Cannot complete task"}),
         json.dumps({"structured_output": {"dsl_source": "I cannot complete this task."}}),
+        json.dumps({"dsl_source": "def foo():\n    pass\n"}),
+        json.dumps({"structured_output": {"dsl_source": "```python\nx = 2\n```"}}),
         "```python\nI cannot complete this task.\n```",
     ],
 )
 def test_extract_python_dsl_fast_fails_on_prose_refusals(prose_reply: str) -> None:
-    """Raise llm_prose_refusal_no_code when response lacks executable DSL or patch hunks."""
-    with pytest.raises(ValueError, match="llm_prose_refusal_no_code"):
+    """Raise ProseRefusalError when response lacks executable DSL or patch hunks."""
+    with pytest.raises(ProseRefusalError, match="llm_prose_refusal_no_code"):
         extract_python_dsl(prose_reply)
 
 
@@ -221,9 +224,16 @@ def test_extract_python_dsl_fast_fails_on_prose_refusals(prose_reply: str) -> No
         ("x = 1", "x = 1"),
         ("import tilelang\n", "import tilelang"),
         ("def broken(:\n    pass", "def broken(:"),
-        (json.dumps({"dsl_source": "def foo():\n    pass\n"}), "def foo():"),
         (
-            json.dumps({"structured_output": {"dsl_source": "```python\nx = 2\n```"}}),
+            "# target_bottleneck: aiv_vec\n"
+            "# structural_hypothesis: vectorize tail\n"
+            "```python\ndef foo():\n    pass\n```\n",
+            "def foo():",
+        ),
+        (
+            "# target_bottleneck: pipe_m\n"
+            "# structural_hypothesis: unroll tile\n"
+            "```python\nx = 2\n```\n",
             "x = 2",
         ),
         ("```python\ndef bar():\n    return 3\n```", "def bar():"),

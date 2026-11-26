@@ -51,6 +51,7 @@ from tilefoundry_ascend.agent.campaign.latency_algebra import (
     compute_adaptive_poison_pill_timeout_sec,
 )
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+    classify_stage_failure_for_repair,
     parse_scoped_search_replace_blocks,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
@@ -1967,20 +1968,8 @@ def _extract_candidate_topology_axes(
     return None
 
 
-_NON_SYNTAX_REPAIR_FAULT_CODES: frozenset[str] = frozenset(
-    {
-        "NOOP_IDENTICAL",
-        "UB_SRAM_OVERFLOW",
-        "UB_OVERFLOW",
-        "L1_SRAM_OVERFLOW",
-        "L0C_SRAM_OVERFLOW",
-        "VF_STACK_OVERFLOW",
-    }
-)
-
-
 def _should_skip_syntax_repair(fault_code: str) -> bool:
-    return str(fault_code or "").strip().upper() in _NON_SYNTAX_REPAIR_FAULT_CODES
+    return not classify_stage_failure_for_repair(fault_code)
 
 
 def _is_noop_identical_failure(

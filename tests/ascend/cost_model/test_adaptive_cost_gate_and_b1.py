@@ -33,7 +33,7 @@ from tilefoundry_ascend.ascend.target import AscendTarget
 
 
 def test_evaluate_cost_gate_policy_state_transitions() -> None:
-    """Verify CostGateDecision V5.4 modes (off, shadow, advisory) and t-stat gating."""
+    """Verify CostGateDecision modes (off, shadow, advisory) and t-stat gating."""
     default_off = evaluate_cost_gate_policy()
     assert isinstance(default_off, CostGateDecision)
     assert default_off.mode == CostModelMode.OFF
@@ -277,6 +277,7 @@ def test_rank_symptom_families_caps_scalar_trap_and_drops_tie_privilege() -> Non
                 "l0_cube_cycles": 1000,
                 "l0_vec_cycles": 200,
                 "scalar_compute_loop_fallback": 3.0,
+                "stack_bytes": 512,
             }
         )
     )
@@ -293,6 +294,6 @@ def test_rank_symptom_families_caps_scalar_trap_and_drops_tie_privilege() -> Non
     )
     tie_scores = dict(tie_ranked)
     assert sum(tie_scores.values()) == pytest.approx(1.0, abs=1e-6)
-    assert tie_scores[SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP] == pytest.approx(0.425, rel=1e-4)
-    assert tie_scores[SymptomFamily.SCALAR_LOOP_TRAP] == pytest.approx(0.425, rel=1e-4)
+    assert tie_scores[SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP] == pytest.approx(0.5, rel=1e-4)
+    assert tie_scores[SymptomFamily.SCALAR_LOOP_TRAP] == pytest.approx(0.5, rel=1e-4)
     assert tie_ranked[0][0] == SymptomFamily.SCALAR_LOOP_TRAP

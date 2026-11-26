@@ -294,7 +294,9 @@ def test_format_blueprint_delta_section_and_portfolio_roofline_eta() -> None:
         assert "- steady_state_ii:" in req.user_prompt
     for cand in report.evaluated_candidates:
         assert cand.residual.predicted_bottleneck_util >= 0.0
-        assert cand.residual.unexplained_gap_ratio > 0.0
+        assert cand.residual.unexplained_gap_ratio == pytest.approx(0.0)
+        assert cand.residual.observation is not None
+        assert cand.residual.observation.has_l2_pmu is False
 
 
 def test_format_blueprint_delta_section_gates_cross_scale_deltas() -> None:

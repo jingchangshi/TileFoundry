@@ -18,6 +18,7 @@ from tilefoundry_ascend.agent.campaign import (
     extract_regime_snippet,
     patch_regime_into_module,
 )
+from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import StageGateCoordinator
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     CandidateSurrogateResult,
     L3AcceptanceResult,
@@ -394,7 +395,7 @@ def test_dual_layer_tail_guard_active_gain_and_sibling_recheck_protocol(tmp_path
     assert ok_active_bad is False
     assert recheck_calls == []
     assert "_recheck_single_sibling_anchor" in inspect.getsource(
-        PerfTargetCampaignRunner._evaluate_dual_layer_tail_guard
+        StageGateCoordinator._evaluate_dual_layer_tail_guard
     )
 
 
@@ -435,13 +436,9 @@ def test_stage6_zero_shot_prescreen_and_experience_lake_anomaly_wiring(
         responses={
             "exploit_rule": [fast_cand, slow_cand],
             "explore_creative": [
-                json.dumps(
-                    {
-                        "physical_hypothesis": "Keep creative unpruned explore candidate",
-                        "target_local_metric": "aiv_vec",
-                        "dsl_source": fast_cand,
-                    }
-                )
+                "# target_bottleneck: aiv_vec\n"
+                "# structural_hypothesis: Keep creative unpruned explore candidate\n"
+                f"```python\n{fast_cand}\n```"
             ],
         }
     )
