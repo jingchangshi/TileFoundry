@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import math
 import operator
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -20,11 +20,11 @@ from tilefoundry_ascend.ascend.passes.observation_space import (
     RooflineSummaryLike,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
-from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
+from tilefoundry_ascend.ascend.sil.schema import VALID_FREEDOM_FACETS, CasePhysicsRatios
 
 
 class SymptomFamily(str, Enum):
-    """Fixed 12-family hardware waste taxonomy shared across diagnosis and rule routing."""
+    """Fixed 14-family hardware waste taxonomy shared across diagnosis and rule routing."""
 
     DMA_REDUNDANT_GM_ROUNDTRIP = "DMA_REDUNDANT_GM_ROUNDTRIP"
     DMA_UNALIGNED_SHORT_BURST = "DMA_UNALIGNED_SHORT_BURST"
@@ -39,6 +39,12 @@ class SymptomFamily(str, Enum):
     SYNC_PSEUDO_DOUBLE_BUFFER = "SYNC_PSEUDO_DOUBLE_BUFFER"
     SYNC_BARRIER_SERIALIZATION = "SYNC_BARRIER_SERIALIZATION"
     GRID_TAIL_WAVE_UNDERUTIL = "GRID_TAIL_WAVE_UNDERUTIL"
+    UNMODELED_SILICON_RESIDUAL = "UNMODELED_SILICON_RESIDUAL"
+
+
+DETERMINISTIC_SYMPTOM_FAMILIES: frozenset[SymptomFamily] = frozenset(
+    family for family in SymptomFamily if family is not SymptomFamily.UNMODELED_SILICON_RESIDUAL
+)
 
 
 SYMPTOM_FAMILY_TO_AXIS: dict[SymptomFamily, str] = {
@@ -55,6 +61,7 @@ SYMPTOM_FAMILY_TO_AXIS: dict[SymptomFamily, str] = {
     SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER: "pipeline_sync",
     SymptomFamily.SYNC_BARRIER_SERIALIZATION: "pipeline_sync",
     SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL: "grid_wave",
+    SymptomFamily.UNMODELED_SILICON_RESIDUAL: "unmodeled_residual",
 }
 
 SYMPTOM_FAMILY_TO_FACETS: dict[SymptomFamily, tuple[str, ...]] = {
@@ -108,6 +115,28 @@ SYMPTOM_FAMILY_TO_FACETS: dict[SymptomFamily, tuple[str, ...]] = {
         "grid_and_workspace_topology",
         "tile_and_stage_knobs",
     ),
+    SymptomFamily.UNMODELED_SILICON_RESIDUAL: VALID_FREEDOM_FACETS,
+}
+
+_CANONICAL_PHYSICAL_PRIORITY: tuple[SymptomFamily, ...] = (
+    SymptomFamily.SCALAR_LOOP_TRAP,
+    SymptomFamily.SRAM_REGISTER_SPILL_STACK,
+    SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP,
+    SymptomFamily.DMA_UNALIGNED_SHORT_BURST,
+    SymptomFamily.DMA_L2_THRASH_REUSE_MISS,
+    SymptomFamily.SYNC_BARRIER_SERIALIZATION,
+    SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER,
+    SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT,
+    SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED,
+    SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE,
+    SymptomFamily.COMPUTE_FIXPIPE_ACCUM_IMBALANCE,
+    SymptomFamily.SRAM_UB_L1_BANK_CONFLICT,
+    SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL,
+    SymptomFamily.UNMODELED_SILICON_RESIDUAL,
+)
+
+_PHYSICAL_PRIORITY_INDEX: dict[SymptomFamily, int] = {
+    family: idx for idx, family in enumerate(_CANONICAL_PHYSICAL_PRIORITY)
 }
 
 _BIN_OPS = {
@@ -353,12 +382,21 @@ class AscendCausalRule:
         cleaned_family = str(self.symptom_family or "").strip()
         if cleaned_family:
             try:
-                SymptomFamily(cleaned_family)
+                parsed_family = SymptomFamily(cleaned_family)
             except ValueError as exc:
-                valid = tuple(fam.value for fam in SymptomFamily)
+                valid = tuple(
+                    fam.value for fam in SymptomFamily if fam in DETERMINISTIC_SYMPTOM_FAMILIES
+                )
                 raise ValueError(
                     f"invalid symptom_family {cleaned_family!r}; expected one of {valid}"
                 ) from exc
+            if parsed_family not in DETERMINISTIC_SYMPTOM_FAMILIES:
+                valid = tuple(
+                    fam.value for fam in SymptomFamily if fam in DETERMINISTIC_SYMPTOM_FAMILIES
+                )
+                raise ValueError(
+                    f"invalid symptom_family {cleaned_family!r}; expected one of {valid}"
+                )
         object.__setattr__(self, "symptom_family", cleaned_family)
         anti_expr = str(self.anti_precondition or "False").strip() or "False"
         object.__setattr__(self, "anti_precondition", anti_expr)
@@ -726,8 +764,16 @@ def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
         else:
             ns[key] = str(raw_val)
     raw_prof = getattr(ledger, "microarch_profile", None)
-    if isinstance(raw_prof, Mapping) and "pipeline_depth" in raw_prof:
-        ns["pipeline_depth"] = max(1, int(raw_prof.get("pipeline_depth", 1) or 1))
+    if isinstance(raw_prof, Mapping):
+        stage_hint = max(
+            int(raw_prof.get("pipeline_depth", 1) or 1),
+            int(raw_prof.get("num_stages", 1) or 1),
+        )
+        if stage_hint > 1 or "pipeline_depth" in raw_prof or "num_stages" in raw_prof:
+            ns["pipeline_depth"] = max(1, stage_hint)
+            ns["num_stages"] = max(1, stage_hint)
+        if not ns.get("compute_engine") and raw_prof.get("compute_engine"):
+            ns["compute_engine"] = str(raw_prof["compute_engine"])
 
     total_bloat = 0
     degraded_total = 0
@@ -1116,6 +1162,19 @@ def _populate_state_context(
         float(extra_signals_map.get("dcache_bypass_narrow_store", 0.0) or 0.0),
     )
     ctx["l2_pmu_available"] = _resolve_l2_pmu_flag(residual, embedded_obs, extra)
+    if embedded_obs is not None:
+        if not ctx.get("compute_engine") and embedded_obs.compute_engine:
+            ctx["compute_engine"] = embedded_obs.compute_engine
+        obs_stages = max(1, int(getattr(embedded_obs, "num_stages", 1) or 1))
+        if int(ctx.get("pipeline_depth", 1) or 1) <= 1 and obs_stages > 1:
+            ctx["pipeline_depth"] = obs_stages
+        ctx["num_stages"] = max(int(ctx.get("pipeline_depth", 1) or 1), obs_stages)
+        ctx["has_l2_pmu"] = bool(ctx["l2_pmu_available"]) or bool(
+            getattr(embedded_obs, "has_l2_pmu", False)
+        )
+    else:
+        ctx["has_l2_pmu"] = bool(ctx["l2_pmu_available"])
+        ctx.setdefault("num_stages", max(1, int(ctx.get("pipeline_depth", 1) or 1)))
 
     if (
         float(ctx.get("ub_bank_conflict_risk", 0.0)) == 0.0
@@ -1234,6 +1293,9 @@ def build_predicate_context(
             ctx["l2_aic_mac_ratio"] = extra_aic
             ctx["measured_aic_mac_ratio"] = extra_aic
         ctx["l2_pmu_available"] = _resolve_l2_pmu_flag(residual, embedded_obs, extra)
+        ctx["has_l2_pmu"] = bool(ctx["l2_pmu_available"]) or (
+            embedded_obs is not None and bool(getattr(embedded_obs, "has_l2_pmu", False))
+        )
         extra_axes = extra.get("topology_axes")
         if isinstance(extra_axes, Mapping):
             for ak in ("compute_engine", "memory_ring", "iteration_regularity"):
@@ -1407,6 +1469,14 @@ def _observation_to_signal_dict(
             ),
         ),
     )
+    has_pmu_flag = bool(getattr(obs, "has_l2_pmu", False)) or (
+        obs.has_l2_telemetry
+        and not bool(getattr(obs, "is_analytical_proxy", False))
+        and any(f in _PMU_L2_FIELD_NAMES for f in obs.measured_l2_fields)
+    )
+    obs_stages = max(1, int(getattr(obs, "num_stages", 1) or 1))
+    obs_engine = str(getattr(obs, "compute_engine", "") or "")
+    dyn_pipe = _read_signal_bool(sync_map, "l0_uses_dynamic_offset_pipe")
     out: dict[str, object] = {
         "transfer_inflation_ratio": transfer_inflation,
         "effective_compute_eta": effective_eta,
@@ -1442,15 +1512,13 @@ def _observation_to_signal_dict(
         "scalar_compute_loop_fallback": max(scalar_fallback, float(ub_scalar_loops)),
         "ub_scalar_compute_loops": ub_scalar_loops,
         "dcache_bypass_narrow_store": dcache_bypass,
-        "l2_pmu_available": (
-            1
-            if (
-                obs.has_l2_telemetry
-                and not bool(getattr(obs, "is_analytical_proxy", False))
-                and any(f in _PMU_L2_FIELD_NAMES for f in obs.measured_l2_fields)
-            )
-            else 0
-        ),
+        "compute_engine": obs_engine,
+        "num_stages": obs_stages,
+        "pipeline_depth": obs_stages,
+        "has_dynamic_double_buffer": dyn_pipe,
+        "uses_dynamic_offset_pipelining": dyn_pipe,
+        "has_l2_pmu": has_pmu_flag,
+        "l2_pmu_available": 1 if has_pmu_flag else 0,
         "max_overflow_bytes": _read_signal_int(sram_map, "l0_max_overflow_bytes"),
         "degraded_buffer_count": _read_signal_int(sram_map, "l0_degraded_single_buffers"),
         "bank_conflict_ratio": _read_signal_float(sram_map, "l2_bank_conflict_ratio"),
@@ -1488,17 +1556,111 @@ def _observation_to_signal_dict(
     return out
 
 
-def rank_symptom_families(
+def _resolve_simplex_compute_engine(
+    sig: Mapping[str, object],
+    *,
+    topology_axes: object | None,
+    l0_cube_cycles: int,
+    l0_vec_cycles: int,
+    cube_ratio: float,
+    aic_mac: float,
+    aiv_vec: float,
+    pipe_fix: int,
+) -> str:
+    """Resolve canonical compute_engine from topology_axes, signals, or pipe activity."""
+    valid_engines = ("aiv_only", "aic_only", "coupled_1c2v")
+    for source in (topology_axes, sig.get("topology_axes")):
+        if isinstance(source, Mapping):
+            cand = str(source.get("compute_engine", "") or "").strip()
+            if cand in valid_engines:
+                return cand
+        elif source is not None:
+            cand = str(getattr(source, "compute_engine", "") or "").strip()
+            if cand in valid_engines:
+                return cand
+    raw_ce = str(sig.get("compute_engine", "") or "").strip()
+    if raw_ce in valid_engines:
+        return raw_ce
+    has_cube = l0_cube_cycles > 0 or cube_ratio > 0.0 or aic_mac > 0.0 or pipe_fix > 0
+    has_vec = l0_vec_cycles > 0 or aiv_vec > 0.0
+    if has_cube and has_vec:
+        return "coupled_1c2v"
+    if has_cube:
+        return "aic_only"
+    if has_vec:
+        return "aiv_only"
+    return ""
+
+
+def _resolve_simplex_has_l2_pmu(
+    sig: Mapping[str, object],
+    *,
+    aiv_vec: float,
+    aic_mac: float,
+    mte2_wait: float,
+    sync_stall: float,
+    bank_conflict: float,
+    fixpipe_ratio: float,
+    l2_hit: float,
+) -> bool:
+    """Determine whether real L2 PMU counters are present in the signal payload."""
+    if _read_signal_bool(sig, "is_analytical_proxy"):
+        return False
+    if "has_l2_pmu" in sig:
+        return bool(sig["has_l2_pmu"])
+    if "l2_pmu_available" in sig:
+        raw_flag = sig["l2_pmu_available"]
+        if isinstance(raw_flag, (int, float)) and not isinstance(raw_flag, bool):
+            return bool(int(raw_flag))
+        return bool(raw_flag)
+    pmu_keys = (
+        "measured_aiv_vec_ratio",
+        "aiv_vec_ratio",
+        "l2_aiv_vec_ratio",
+        "aiv_vec",
+        "measured_aic_mac_ratio",
+        "aic_mac_ratio",
+        "l2_aic_mac_ratio",
+        "aic_mac",
+        "aic_mad",
+        "measured_mte2_wait_ratio",
+        "mte2_wait_ratio",
+        "aiv_mte2",
+        "aic_mte2",
+        "measured_sync_stall_ratio",
+        "sync_stall_ratio",
+        "bank_conflict_ratio",
+        "ub_bank_conflict_ratio",
+        "aic_fixpipe_ratio",
+        "aic_fixpipe",
+    )
+    has_positive_pmu = (
+        aiv_vec > 0.0
+        or aic_mac > 0.0
+        or mte2_wait > 0.0
+        or sync_stall > 0.0
+        or bank_conflict > 0.0
+        or fixpipe_ratio > 0.0
+        or l2_hit < 1.0
+    )
+    return any(key in sig for key in pmu_keys) and has_positive_pmu
+
+
+def compute_symptom_simplex(
     obs_or_context: ObservationVector5D | Mapping[str, object],
     *,
     case_ratios: object | None = None,
+    topology_axes: object | None = None,
 ) -> list[tuple[SymptomFamily, float]]:
-    """Score and rank all 12 hardware SymptomFamily categories in descending severity."""
-    sig: Mapping[str, object] = (
-        _observation_to_signal_dict(obs_or_context, case_ratios=case_ratios)
-        if isinstance(obs_or_context, ObservationVector5D)
-        else obs_or_context
-    )
+    """Compute topology-gated simplex shares over all 14 SymptomFamily categories."""
+    if isinstance(obs_or_context, ObservationVector5D):
+        sig: dict[str, object] = _observation_to_signal_dict(
+            obs_or_context, case_ratios=case_ratios
+        )
+    else:
+        sig = dict(obs_or_context)
+        if case_ratios is not None:
+            _apply_case_ratios(sig, case_ratios)
 
     transfer_inflation = _read_signal_float(sig, "transfer_inflation_ratio", default=1.0)
     effective_eta = _read_signal_float(sig, "effective_compute_eta", default=0.0)
@@ -1562,6 +1724,33 @@ def rank_symptom_families(
     num_aic = max(1, _read_signal_int(sig, "num_aic_cores", default=28))
     num_aiv = max(1, _read_signal_int(sig, "num_aiv_cores", default=56))
     grid_symbolic = _read_signal_bool(sig, "grid_is_symbolic")
+
+    compute_engine = _resolve_simplex_compute_engine(
+        sig,
+        topology_axes=topology_axes,
+        l0_cube_cycles=l0_cube_cycles,
+        l0_vec_cycles=l0_vec_cycles,
+        cube_ratio=cube_ratio,
+        aic_mac=aic_mac,
+        aiv_vec=aiv_vec,
+        pipe_fix=pipe_fix,
+    )
+    num_stages = _read_signal_int(sig, "num_stages", "pipeline_depth", default=1)
+    has_dynamic_db = (
+        _read_signal_bool(sig, "has_dynamic_double_buffer")
+        or _read_signal_bool(sig, "uses_dynamic_offset_pipelining")
+        or _read_signal_bool(sig, "l0_uses_dynamic_offset_pipe")
+    )
+    has_l2_pmu = _resolve_simplex_has_l2_pmu(
+        sig,
+        aiv_vec=aiv_vec,
+        aic_mac=aic_mac,
+        mte2_wait=mte2_wait,
+        sync_stall=sync_stall,
+        bank_conflict=bank_conflict,
+        fixpipe_ratio=fixpipe_ratio,
+        l2_hit=l2_hit,
+    )
 
     inflation_score = (
         min(1.0, 0.35 + 0.65 * min(1.0, (transfer_inflation - 1.30) / 1.70))
@@ -1653,6 +1842,8 @@ def rank_symptom_families(
             min(1.0, 0.30 * float(alias_ser)),
         ),
     )
+    if num_stages <= 1 and not has_dynamic_db:
+        pseudo_db_score = 0.0
 
     barrier_score = (
         min(
@@ -1663,7 +1854,7 @@ def rank_symptom_families(
                 0.55 if pipe_all > 0 else 0.0,
             ),
         )
-        if (not pseudo_db and alias_ser == 0)
+        if pseudo_db_score == 0.0
         else 0.0
     )
 
@@ -1684,24 +1875,6 @@ def rank_symptom_families(
         ),
     )
 
-    has_l2_pmu = (
-        any(
-            k in sig
-            for k in (
-                "measured_aiv_vec_ratio",
-                "aiv_vec_ratio",
-                "measured_aic_mac_ratio",
-                "aic_mac_ratio",
-            )
-        )
-        and (
-            aiv_vec > 0.0
-            or aic_mac > 0.0
-            or mte2_wait > 0.0
-            or sync_stall > 0.0
-            or _read_signal_float(sig, "measured_latency_us") > 0.0
-        )
-    )
     has_simtvf = _read_signal_bool(sig, "has_simtvf")
     if has_l2_pmu:
         if aiv_vec >= 0.08 or aic_mac >= 0.05:
@@ -1724,23 +1897,142 @@ def rank_symptom_families(
         )
         scalar_loop_score = 1.0 if is_scalar_trap else 0.0
 
-    scored: list[tuple[SymptomFamily, float]] = [
-        (SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP, round(dma_roundtrip_score, 6)),
-        (SymptomFamily.DMA_UNALIGNED_SHORT_BURST, round(short_burst_score, 6)),
-        (SymptomFamily.DMA_L2_THRASH_REUSE_MISS, round(l2_thrash_score, 6)),
-        (SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED, round(vec_loop_score, 6)),
-        (SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT, round(ineffective_compute_score, 6)),
-        (SymptomFamily.COMPUTE_FIXPIPE_ACCUM_IMBALANCE, round(fixpipe_score, 6)),
-        (SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE, round(subcore_imbalance_score, 6)),
-        (SymptomFamily.SCALAR_LOOP_TRAP, round(scalar_loop_score, 6)),
-        (SymptomFamily.SRAM_REGISTER_SPILL_STACK, round(sram_spill_score, 6)),
-        (SymptomFamily.SRAM_UB_L1_BANK_CONFLICT, round(bank_conflict_score, 6)),
-        (SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER, round(pseudo_db_score, 6)),
-        (SymptomFamily.SYNC_BARRIER_SERIALIZATION, round(barrier_score, 6)),
-        (SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL, round(grid_wave_score, 6)),
-    ]
-    scored.sort(key=lambda item: (-item[1], item[0].value))
-    return scored
+    raw_weights: dict[SymptomFamily, float] = {
+        SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP: max(0.0, dma_roundtrip_score),
+        SymptomFamily.DMA_UNALIGNED_SHORT_BURST: max(0.0, short_burst_score),
+        SymptomFamily.DMA_L2_THRASH_REUSE_MISS: max(0.0, l2_thrash_score),
+        SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED: max(0.0, vec_loop_score),
+        SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT: max(0.0, ineffective_compute_score),
+        SymptomFamily.COMPUTE_FIXPIPE_ACCUM_IMBALANCE: max(0.0, fixpipe_score),
+        SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE: max(0.0, subcore_imbalance_score),
+        SymptomFamily.SCALAR_LOOP_TRAP: max(0.0, scalar_loop_score),
+        SymptomFamily.SRAM_REGISTER_SPILL_STACK: max(0.0, sram_spill_score),
+        SymptomFamily.SRAM_UB_L1_BANK_CONFLICT: max(0.0, bank_conflict_score),
+        SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER: max(0.0, pseudo_db_score),
+        SymptomFamily.SYNC_BARRIER_SERIALIZATION: max(0.0, barrier_score),
+        SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL: max(0.0, grid_wave_score),
+    }
+
+    if compute_engine == "aiv_only":
+        raw_weights[SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE] = 0.0
+        raw_weights[SymptomFamily.COMPUTE_FIXPIPE_ACCUM_IMBALANCE] = 0.0
+    elif compute_engine == "aic_only":
+        raw_weights[SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE] = 0.0
+        raw_weights[SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED] = 0.0
+
+    cycle_scale = float(max(0, l0_cube_cycles + l0_vec_cycles))
+    excess_cycles: dict[SymptomFamily, float] = {
+        SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP: (
+            float(gm_roundtrip) + max(0.0, transfer_inflation - 1.0) * cycle_scale
+        ),
+        SymptomFamily.DMA_UNALIGNED_SHORT_BURST: float(unaligned_pad),
+        SymptomFamily.DMA_L2_THRASH_REUSE_MISS: max(0.0, 1.0 - l2_hit) * cycle_scale,
+        SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED: (
+            float(vf_breaks) * cycle_scale + dual_collapse * cycle_scale
+        ),
+        SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT: (
+            max(0.0, 1.0 - eff_eta_obs) * cycle_scale if eff_eta_obs > 0.0 else 0.0
+        ),
+        SymptomFamily.COMPUTE_FIXPIPE_ACCUM_IMBALANCE: float(max(0, pipe_fix - pipe_m)),
+        SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE: float(abs(aiv0_v - aiv1_v)),
+        SymptomFamily.SCALAR_LOOP_TRAP: cycle_scale + scalar_fallback * 64.0,
+        SymptomFamily.SRAM_REGISTER_SPILL_STACK: float(
+            spill_bytes + stack_bytes + max_overflow + degraded_bufs * 64
+        ),
+        SymptomFamily.SRAM_UB_L1_BANK_CONFLICT: (
+            max(bank_conflict, ub_bank_risk, l1_bank_risk) * cycle_scale
+        ),
+        SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER: float(alias_ser) * cycle_scale,
+        SymptomFamily.SYNC_BARRIER_SERIALIZATION: (
+            sync_stall * cycle_scale + float(pipe_all * 64)
+        ),
+        SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL: (
+            max(wave_waste, underfill_score) * cycle_scale
+        ),
+        SymptomFamily.UNMODELED_SILICON_RESIDUAL: 0.0,
+    }
+    for fam, weight in raw_weights.items():
+        if weight <= 0.0:
+            excess_cycles[fam] = 0.0
+
+    eta_for_excess = roofline_eta if roofline_eta > 0.0 else effective_eta
+    delta_eta_excess = 1.0 if eta_for_excess <= 0.0 else max(0.0, 1.0 - eta_for_excess)
+    sum_w = sum(raw_weights.values())
+
+    shares: dict[SymptomFamily, float] = {
+        fam: 0.0 for fam in SymptomFamily
+    }
+    if delta_eta_excess <= 1e-9 or sum_w <= 1e-12:
+        shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL] = 1.0
+    elif sum_w <= delta_eta_excess:
+        for fam, weight in raw_weights.items():
+            shares[fam] = weight / delta_eta_excess
+        det_sum = sum(shares[fam] for fam in DETERMINISTIC_SYMPTOM_FAMILIES)
+        shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL] = max(0.0, 1.0 - det_sum)
+    else:
+        unmodeled_floor = 0.0 if has_l2_pmu else 0.15
+        scale = (1.0 - unmodeled_floor) / sum_w
+        for fam, weight in raw_weights.items():
+            shares[fam] = weight * scale
+        det_sum = sum(shares[fam] for fam in DETERMINISTIC_SYMPTOM_FAMILIES)
+        shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL] = max(0.0, 1.0 - det_sum)
+
+    for fam in shares:
+        shares[fam] = min(1.0, max(0.0, shares[fam]))
+    diff = 1.0 - sum(shares.values())
+    if abs(diff) > 0.0:
+        unmodeled_val = shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL]
+        if 0.0 <= unmodeled_val + diff <= 1.0:
+            shares[SymptomFamily.UNMODELED_SILICON_RESIDUAL] = unmodeled_val + diff
+        else:
+            largest_fam = max(shares, key=lambda fam: shares[fam])
+            shares[largest_fam] = min(1.0, max(0.0, shares[largest_fam] + diff))
+
+    ordered = sorted(
+        shares.items(),
+        key=lambda item: (
+            -item[1],
+            -excess_cycles.get(item[0], 0.0),
+            _PHYSICAL_PRIORITY_INDEX[item[0]],
+        ),
+    )
+    return ordered
+
+
+def rank_symptom_families(
+    obs_or_context: ObservationVector5D | Mapping[str, object],
+    *,
+    case_ratios: object | None = None,
+    topology_axes: object | None = None,
+) -> list[tuple[SymptomFamily, float]]:
+    """Compute simplex-conserved shares over all 14 SymptomFamily categories."""
+    return compute_symptom_simplex(
+        obs_or_context,
+        case_ratios=case_ratios,
+        topology_axes=topology_axes,
+    )
+
+
+def should_escalate_diagnostic_or_creative(
+    simplex: Sequence[tuple[SymptomFamily | str, float]],
+    *,
+    stagnation_rounds: int,
+) -> bool:
+    """Escalate when stalled on dominant unmodeled residual or high simplex entropy."""
+    if stagnation_rounds < 1 or not simplex:
+        return False
+    top_raw = max(simplex, key=lambda item: float(item[1]))[0]
+    top_name = top_raw.value if isinstance(top_raw, SymptomFamily) else str(top_raw)
+    if top_name == SymptomFamily.UNMODELED_SILICON_RESIDUAL.value:
+        return True
+    weights = [max(0.0, float(val)) for _, val in simplex]
+    total = sum(weights)
+    if total <= 0.0:
+        return True
+    probs = [w / total for w in weights if w > 0.0]
+    entropy = -sum(prob * math.log(prob) for prob in probs)
+    log_k = math.log(len(SymptomFamily))
+    return (entropy / log_k) > (1.0 - 1.0 / log_k)
 
 
 def default_seed_rules_path() -> Path:
@@ -1773,10 +2065,13 @@ def load_seed_rules(
             if require_symptom_family is not None
             else (is_bundled_seed or not rule.source_provenance.startswith("flywheel:"))
         )
-        if enforce_family and not rule.symptom_family:
+        if enforce_family and (
+            not rule.symptom_family
+            or SymptomFamily(rule.symptom_family) not in DETERMINISTIC_SYMPTOM_FAMILIES
+        ):
             raise ValueError(
                 f"seed rule {rule.rule_id!r} in {target_path} must declare a valid "
-                "non-empty symptom_family"
+                "deterministic symptom_family"
             )
         rules.append(rule)
     return tuple(rules)
@@ -1793,16 +2088,19 @@ def save_rules_yaml(rules: tuple[AscendCausalRule, ...] | list[AscendCausalRule]
 
 __all__ = [
     "AscendCausalRule",
+    "DETERMINISTIC_SYMPTOM_FAMILIES",
     "SYMPTOM_FAMILY_TO_AXIS",
     "SYMPTOM_FAMILY_TO_FACETS",
     "SymptomFamily",
     "UnsafePredicateError",
     "build_predicate_context",
+    "compute_symptom_simplex",
     "default_seed_rules_path",
     "load_seed_rules",
     "normalize_runtime_backend",
     "rank_symptom_families",
     "safe_eval_predicate",
     "save_rules_yaml",
+    "should_escalate_diagnostic_or_creative",
     "validate_rule_predicate",
 ]

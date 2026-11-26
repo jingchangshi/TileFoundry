@@ -7,6 +7,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from tilefoundry_ascend.agent.kb.schema import SymptomFamily, compute_symptom_simplex
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
 from tilefoundry_ascend.ascend.passes.observation_space import (
     CompilerSummaryLike,
@@ -225,6 +226,7 @@ def compute_static_dynamic_residual(
     *,
     compiler_summary: CompilerSummaryLike | None = None,
     roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
+    topology_axes: object | None = None,
 ) -> StaticDynamicResidual:
     """Compute StaticDynamicResidual from ledger, msprof telemetry, compiler, and Roofline."""
     measured_us = _read_float(telemetry, "measured_latency_us", "dur_us")
@@ -244,27 +246,15 @@ def compute_static_dynamic_residual(
     else:
         predicted_util = 0.0
 
-    pmu_keys = (
-        "aic_mac_ratio",
-        "aic_mad",
-        "aiv_vec_ratio",
-        "aiv_vec",
-        "mte2_wait_ratio",
-        "aiv_mte2",
-        "aic_fixpipe",
+    observation = ObservationVector5D.from_tiers(
+        ledger,
+        compiler_summary=compiler_summary,
+        telemetry=telemetry,
+        roofline=roofline,
+        topology_axes=topology_axes,
     )
-    if any(key in telemetry for key in pmu_keys):
-        aic_fix = _read_float(telemetry, "aic_fixpipe")
-        observed_util = max(aic_mac, aiv_vec, mte2_wait, aic_fix)
-        unexplained = min(
-            1.0,
-            max(max(0.0, predicted_util - observed_util), sync_stall * 0.5),
-        )
-    elif "roofline_eta" in telemetry:
-        eta = min(1.0, max(0.0, _read_float(telemetry, "roofline_eta")))
-        unexplained = min(1.0, max(max(0.0, predicted_util - eta), sync_stall * 0.5))
-    else:
-        unexplained = min(1.0, sync_stall * 0.5)
+    simplex = dict(compute_symptom_simplex(observation, topology_axes=topology_axes))
+    unexplained = float(simplex.get(SymptomFamily.UNMODELED_SILICON_RESIDUAL, 0.0))
 
     steady_ii = ledger.steady_state_ii
     ii_looks_pipelined = steady_ii is None or steady_ii <= 2
@@ -356,12 +346,6 @@ def compute_static_dynamic_residual(
         _read_float(extra_map, "dcache_bypass_narrow_store"),
     )
 
-    observation = ObservationVector5D.from_tiers(
-        ledger,
-        compiler_summary=compiler_summary,
-        telemetry=telemetry,
-        roofline=roofline,
-    )
     transfer_inflation_ratio = compute_transfer_inflation_ratio(
         ledger,
         telemetry=telemetry,
@@ -441,13 +425,12 @@ def compute_eq3_hap_objective(
     residual: StaticDynamicResidual | None = None,
 ) -> float:
     """Compute CANNBench Eq.3 performance score discounted by HAP hardware penalties."""
+    _ = spill_bytes
     if measured_latency_us <= 0.0:
         return 0.0
-    eff_spill = max(0, int(spill_bytes))
     eff_bank = max(0.0, min(1.0, float(bank_conflict_ratio)))
     eff_l2 = max(0.0, min(1.0, float(l2_hit_rate)))
     if residual is not None:
-        eff_spill = max(eff_spill, int(residual.spill_bytes))
         eff_bank = max(eff_bank, float(residual.bank_conflict_ratio))
         if l2_hit_rate == 1.0:
             eff_l2 = max(0.0, min(1.0, float(residual.l2_hit_rate)))
@@ -461,10 +444,9 @@ def compute_eq3_hap_objective(
     else:
         eq3 = 1.0 / float(measured_latency_us)
 
-    spill_penalty = 1.0 + min(1.0, float(eff_spill) / 1024.0) * 0.25
     bank_penalty = 1.0 + eff_bank * 0.30
     l2_penalty = 1.0 + (1.0 - eff_l2) * 0.15
-    return round(eq3 / (spill_penalty * bank_penalty * l2_penalty), 6)
+    return round(eq3 / (bank_penalty * l2_penalty), 6)
 
 
 def _is_int_gt_one(node: ast.AST) -> bool:
