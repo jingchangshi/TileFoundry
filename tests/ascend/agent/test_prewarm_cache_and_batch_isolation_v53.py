@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -936,4 +937,164 @@ def test_prewarm_anchor_reference_cache_marker_skips_and_invalidates(
     assert spawn_count == 3
     updated_marker = json.loads(marker_path.read_text(encoding="utf-8"))
     assert updated_marker["cases_yaml_sha256"] != marker_data["cases_yaml_sha256"]
+
+
+def test_ref_cache_env_stripping_for_prewarm_and_agent_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strip host CPU thread and ISA env keys in prewarm and agent-gates subprocesses."""
+    fake_root, cann_repo, _tl_stub, work_root, env_file = _setup_prewarm_fixture(tmp_path)
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "small_decode", 1.5, 0.5),)
+    ref_cache = work_root / "surrogate" / "reference"
+
+    dirty_env = {
+        "OMP_NUM_THREADS": "16",
+        "MKL_NUM_THREADS": "8",
+        "ATEN_CPU_CAPABILITY": "avx512",
+        "TORCH_NUM_THREADS": "4",
+        "OPENBLAS_NUM_THREADS": "4",
+        "NUMEXPR_NUM_THREADS": "4",
+    }
+    for key, val in dirty_env.items():
+        monkeypatch.setenv(key, val)
+    monkeypatch.setenv("TILEFOUNDRY_NPU_SECRET", "should_strip")
+    monkeypatch.setenv("KEEP_UNRELATED_VAR", "keep_me")
+
+    seen_prewarm_envs: list[dict[str, str]] = []
+
+    def _fake_run(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        env = kwargs.get("env")
+        assert isinstance(env, dict)
+        seen_prewarm_envs.append(dict(env))
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
+
+    surrogate_cannbench.prewarm_anchor_reference_cache(
+        "attention_residual",
+        anchors,
+        cannbench_repo=cann_repo,
+        env_file=env_file,
+        cache_dir=ref_cache,
+        source_root=fake_root,
+    )
+    assert len(seen_prewarm_envs) == 1
+    prewarm_env = seen_prewarm_envs[0]
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "ATEN_CPU_CAPABILITY"):
+        assert key not in prewarm_env
+    for key in dirty_env:
+        assert key not in prewarm_env
+    assert prewarm_env["KEEP_UNRELATED_VAR"] == "keep_me"
+
+    gates_env = surrogate_cannbench._clean_agent_gates_subprocess_env(
+        {"CANNBENCH_CACHE_DIR": str(ref_cache)}
+    )
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "ATEN_CPU_CAPABILITY"):
+        assert key not in gates_env
+    for key in dirty_env:
+        assert key not in gates_env
+    assert "TILEFOUNDRY_NPU_SECRET" not in gates_env
+    assert gates_env["KEEP_UNRELATED_VAR"] == "keep_me"
+    assert gates_env["CANNBENCH_CACHE_DIR"] == str(ref_cache)
+
+
+def test_run_l1_compile_check_overlaps_diag_with_anchor_plan_and_cleans_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlap diag worker with anchor_plan and shut down executor on plan failure."""
+    tl_stub = tmp_path / "tl_stub"
+    tl_stub.mkdir()
+    work_root = tmp_path / "work_root"
+    env_file = tmp_path / "env.sh"
+    env_file.write_text(
+        f"TILEFOUNDRY_NPU_WORK_ROOT={work_root}\n"
+        f"TILEFOUNDRY_NPU_TILELANG_SOURCE={tl_stub}\n"
+        f"TILEFOUNDRY_NPU_PYTHON={sys.executable}\n",
+        encoding="utf-8",
+    )
+    mod_src = "def build_op(m=32):\n    return {'m': int(m)}\n"
+    anchors = [(1, "default", {"m": 32})]
+
+    diag_started = threading.Event()
+    diag_finished = threading.Event()
+    release_diag = threading.Event()
+    diag_runs = 0
+    plan_saw_diag_started = False
+
+    def _mock_fail_plan_run(cmd, *args, **kwargs):
+        nonlocal diag_runs, plan_saw_diag_started
+        _ = args
+        script_name = Path(str(cmd[-1])).name
+        if script_name == "diag_driver.py":
+            diag_runs += 1
+            diag_started.set()
+            assert release_diag.wait(timeout=2.0)
+            assert Path(str(kwargs["cwd"])).is_dir()
+            diag_finished.set()
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        if script_name == "anchor_plan.py":
+            plan_saw_diag_started = diag_started.wait(timeout=2.0)
+            release_diag.set()
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1, stdout="", stderr="plan_failed"
+            )
+        raise AssertionError(f"unexpected script: {script_name}")
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _mock_fail_plan_run)
+    fail_res = surrogate_cannbench.run_l1_compile_check(
+        mod_src,
+        builder_name="build_op",
+        builder_kwargs={},
+        dims={"m": 32},
+        source_root=tmp_path,
+        env_file=env_file,
+        tl_cache_dir=work_root / "tl_cache",
+        anchor_case_specs=anchors,
+        operator_name="mla",
+    )
+    assert fail_res.passed is False
+    assert plan_saw_diag_started is True
+    assert diag_finished.is_set() is True
+    assert diag_runs == 1
+
+    diag_started.clear()
+    diag_finished.clear()
+    release_diag.set()
+    diag_runs = 0
+
+    def _mock_ok_plan_run(cmd, *args, **kwargs):
+        nonlocal diag_runs
+        _ = args, kwargs
+        script_name = Path(str(cmd[-1])).name
+        if script_name == "diag_driver.py":
+            diag_runs += 1
+            diag_started.set()
+            diag_finished.set()
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        if script_name == "anchor_plan.py":
+            assert diag_started.wait(timeout=2.0)
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout='{"tasks": []}\n', stderr=""
+            )
+        if script_name == "compile_driver.py":
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected script: {script_name}")
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _mock_ok_plan_run)
+    ok_res = surrogate_cannbench.run_l1_compile_check(
+        mod_src,
+        builder_name="build_op",
+        builder_kwargs={},
+        dims={"m": 32},
+        source_root=tmp_path,
+        env_file=env_file,
+        tl_cache_dir=work_root / "tl_cache",
+        anchor_case_specs=anchors,
+        operator_name="mla",
+    )
+    assert ok_res.passed is True
+    assert diag_runs == 1
+    assert diag_finished.is_set() is True
 

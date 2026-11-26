@@ -423,8 +423,11 @@ rules:
       Use compiler-managed pipelining via T.Pipelined(extent, num_stages>=2,
       annotations={"enable_offset": True}) with outer T.Stage(0) / T.Stage(1) task scopes
       (never nesting T.Stage inside T.Task, T.SimdVF, T.SimtVF, or T.Parallel) and
-      T.annotate_buffer_versions({buf: (2, "counter") | "auto"}) instead of hand-rolled
-      manual multi-buffers or inner PIPE_ALL barriers. Omitting
+      T.annotate_buffer_versions({buf: "auto"}) instead of hand-rolled
+      manual multi-buffers or inner PIPE_ALL barriers. NEVER use (2, "counter") on
+      buffers written in T.Stage(0) and read in T.Stage(1) (causes TileLang
+      PrepareMultiBuffer fatal error: counter multi-buffer storage accessed at
+      multiple schedule stages in one owner loop). Omitting
       annotations={"enable_offset": True} fails NONZERO_STAGE_WITHOUT_ENABLE_OFFSET:
       ```python
       for k in T.Pipelined(N, num_stages=2, annotations={"enable_offset": True}):

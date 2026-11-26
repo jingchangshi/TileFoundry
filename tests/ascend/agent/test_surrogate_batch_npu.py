@@ -1090,70 +1090,83 @@ def _evaluate_operator_batch(
     loaded_cands: list[tuple[str, object, object]] = []
     cand_paths: dict[str, Path] = {}
 
-    with contract_mod.ReferenceCache(harness) as cache:
-        if use_poison_pill:
+    if use_poison_pill:
+        with contract_mod.ReferenceCache(harness) as warm_cache:
+            cache_folder = getattr(warm_cache, "folder", None)
             for spec in anchors:
                 case = case_by_num[int(spec.case_num)]
+                oracle_file: Path | None = None
+                if cache_folder is not None:
+                    get_case_id = getattr(case, "get_case_id_str", None)
+                    case_id_str = get_case_id() if callable(get_case_id) else None
+                    if isinstance(case_id_str, str):
+                        digest = hashlib.sha256(case_id_str.encode()).hexdigest()
+                        oracle_file = Path(cache_folder) / f"{digest}.oracle.pt"
+                if (
+                    oracle_file is None
+                    or not oracle_file.is_file()
+                    or oracle_file.stat().st_size <= 0
+                ):
+                    def _warm_prep(c=case, h=harness):
+                        ts = h.prepare(c)
+                        return {"inputs": ts, "oracle": h.reference_output(c, ts)}
 
-                def _warm_prep(c=case, h=harness):
-                    ts = h.prepare(c)
-                    return {"inputs": ts, "oracle": h.reference_output(c, ts)}
+                    warm_cache.get(case, "oracle", _warm_prep)
 
-                cache.get(case, "oracle", _warm_prep)
-
-            for cand in candidates:
-                cid = str(cand["candidate_id"])
-                mod_path = Path(str(cand["module_path"]))
-                if cid in _INCUMBENT_CANDIDATE_IDS:
-                    continue
-                passed_iso, batch_err, per_case = _screen_candidate_isolated(
-                    operator_name=op_name,
-                    entrypoint=entrypoint,
-                    candidate_id=cid,
-                    module_path=mod_path,
-                    anchors=anchors,
-                    source_root=source_root,
-                    cannbench_repo=cannbench_repo,
-                    timeout_sec=eff_pill_timeout,
-                )
-                if passed_iso:
-                    phase_a_passed_ids.add(cid)
-                else:
-                    fallback_err = batch_err or "poison_pill_timeout_or_crash"
-                    for spec in anchors:
-                        case_entry = per_case.get(int(spec.case_num))
-                        case_err = (
-                            case_entry[1]
-                            if case_entry is not None and not case_entry[0] and case_entry[1]
-                            else fallback_err
+        for cand in candidates:
+            cid = str(cand["candidate_id"])
+            mod_path = Path(str(cand["module_path"]))
+            if cid in _INCUMBENT_CANDIDATE_IDS:
+                continue
+            passed_iso, batch_err, per_case = _screen_candidate_isolated(
+                operator_name=op_name,
+                entrypoint=entrypoint,
+                candidate_id=cid,
+                module_path=mod_path,
+                anchors=anchors,
+                source_root=source_root,
+                cannbench_repo=cannbench_repo,
+                timeout_sec=eff_pill_timeout,
+            )
+            if passed_iso:
+                phase_a_passed_ids.add(cid)
+            else:
+                fallback_err = batch_err or "poison_pill_timeout_or_crash"
+                for spec in anchors:
+                    case_entry = per_case.get(int(spec.case_num))
+                    case_err = (
+                        case_entry[1]
+                        if case_entry is not None and not case_entry[0] and case_entry[1]
+                        else fallback_err
+                    )
+                    per_cand_metrics[cid].append(
+                        build_anchor_metrics(
+                            spec,
+                            accuracy_passed=False,
+                            cand_us=0.0,
+                            error_message=case_err[:300],
                         )
-                        per_cand_metrics[cid].append(
-                            build_anchor_metrics(
-                                spec,
-                                accuracy_passed=False,
-                                cand_us=0.0,
-                                error_message=case_err[:300],
-                            )
-                        )
+                    )
 
-            for idx, cand in enumerate(candidates):
-                cid = str(cand["candidate_id"])
-                if cid not in _INCUMBENT_CANDIDATE_IDS and cid not in phase_a_passed_ids:
-                    continue
-                mod_path = Path(str(cand["module_path"]))
-                tag = f"{op_name}_{idx}_{int(time.monotonic_ns())}"
-                fn, mod_obj = _load_candidate_entrypoint(mod_path, entrypoint, tag)
-                loaded_cands.append((cid, fn, mod_obj))
-                cand_paths[cid] = mod_path
-        else:
-            for idx, cand in enumerate(candidates):
-                cid = str(cand["candidate_id"])
-                mod_path = Path(str(cand["module_path"]))
-                tag = f"{op_name}_{idx}_{int(time.monotonic_ns())}"
-                fn, mod_obj = _load_candidate_entrypoint(mod_path, entrypoint, tag)
-                loaded_cands.append((cid, fn, mod_obj))
-                cand_paths[cid] = mod_path
+        for idx, cand in enumerate(candidates):
+            cid = str(cand["candidate_id"])
+            if cid not in _INCUMBENT_CANDIDATE_IDS and cid not in phase_a_passed_ids:
+                continue
+            mod_path = Path(str(cand["module_path"]))
+            tag = f"{op_name}_{idx}_{int(time.monotonic_ns())}"
+            fn, mod_obj = _load_candidate_entrypoint(mod_path, entrypoint, tag)
+            loaded_cands.append((cid, fn, mod_obj))
+            cand_paths[cid] = mod_path
+    else:
+        for idx, cand in enumerate(candidates):
+            cid = str(cand["candidate_id"])
+            mod_path = Path(str(cand["module_path"]))
+            tag = f"{op_name}_{idx}_{int(time.monotonic_ns())}"
+            fn, mod_obj = _load_candidate_entrypoint(mod_path, entrypoint, tag)
+            loaded_cands.append((cid, fn, mod_obj))
+            cand_paths[cid] = mod_path
 
+    with contract_mod.ReferenceCache(harness) as cache:
         for spec in anchors:
             case = case_by_num[int(spec.case_num)]
 

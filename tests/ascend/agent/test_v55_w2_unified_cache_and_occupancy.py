@@ -11,8 +11,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 import yaml
 
+from tests.ascend.agent import test_surrogate_batch_npu as batch_harness
 from tilefoundry_ascend.agent.campaign import surrogate_cannbench
 from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
@@ -1452,3 +1454,203 @@ def test_merge_tl_cache_tree_skips_hardlinked_same_inode_without_reading_bytes(
     assert any(p.name == "separate.so" for p in read_paths)
     assert (shared_dir / "new_out.so").read_bytes() == b"ELF_NEW_OUT"
     assert (shared_dir / "seeded.so").read_bytes() == b"ELF_HARDLINKED"
+
+
+def test_poison_pill_releases_reference_cache_lock_and_skips_warm_oracle_get(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Release ReferenceCache lock before poison-pill spawn and skip warm .oracle.pt get."""
+    cache_dir = tmp_path / "ref_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    case_id_str = "level4/mla:case_3"
+    oracle_file = (
+        cache_dir / f"{hashlib.sha256(case_id_str.encode()).hexdigest()}.oracle.pt"
+    )
+
+    events: list[tuple[str, ...]] = []
+    state = {"lock_held": False, "session_seq": 0}
+
+    class _Case:
+        def __init__(self, case_num: int) -> None:
+            self.case_num = case_num
+
+        def get_case_id_str(self) -> str:
+            return case_id_str
+
+    class _Tensor:
+        def npu(self) -> _Tensor:
+            return self
+
+        def clone(self) -> _Tensor:
+            return self
+
+        def numel(self) -> int:
+            return 1024
+
+        def element_size(self) -> int:
+            return 2
+
+    class _Harness:
+        def prepare(self, _case: object) -> dict[str, _Tensor]:
+            return {"x": _Tensor()}
+
+        def reference_output(
+            self,
+            _case: object,
+            _ts: object,
+            native: bool = False,
+        ) -> str:
+            _ = native
+            return "ref"
+
+        def params(self, _case: object, tensors: dict[str, _Tensor]) -> dict[str, object]:
+            return {"x": tensors["x"]}
+
+        def compare(
+            self,
+            _case: object,
+            actual: object,
+            _oracle: object,
+            _tensors: object,
+            _native_fn: object,
+        ) -> tuple[bool, dict[str, object]]:
+            return (actual in {"inc", "good"}), {}
+
+    class _TrackingRefCache:
+        def __init__(self, _harness: object) -> None:
+            self.folder = cache_dir
+            state["session_seq"] += 1
+            self._sid = str(state["session_seq"])
+            self._store: dict[tuple[int, str], object] = {}
+
+        def __enter__(self) -> _TrackingRefCache:
+            assert state["lock_held"] is False
+            state["lock_held"] = True
+            events.append(("enter", self._sid))
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            state["lock_held"] = False
+            events.append(("exit", self._sid))
+
+        def get(self, case: object, tag: str, builder: object) -> object:
+            events.append(("get", self._sid, tag))
+            key = (int(getattr(case, "case_num", 0)), tag)
+            if key not in self._store:
+                self._store[key] = builder()
+            return self._store[key]
+
+    fake_contract = SimpleNamespace(
+        ReferenceCache=_TrackingRefCache,
+        map_tensors=lambda obj, fn: {k: fn(v) for k, v in obj.items()},
+    )
+    monkeypatch.setattr(
+        batch_harness,
+        "load_cannbench_contract_module",
+        lambda **_kw: fake_contract,
+    )
+    monkeypatch.setattr(
+        batch_harness,
+        "load_anchor_harness_and_cases",
+        lambda _op, anc, **_kw: (
+            _Harness(),
+            [_Case(int(a.case_num)) for a in anc],
+        ),
+    )
+
+    class _FakeEvent:
+        def __init__(self, enable_timing: bool = True) -> None:
+            _ = enable_timing
+
+        def record(self) -> None:
+            return None
+
+        def elapsed_time(self, _other: _FakeEvent) -> float:
+            return 0.01
+
+    fake_npu = SimpleNamespace(
+        Event=_FakeEvent,
+        synchronize=lambda: None,
+        empty_cache=lambda: None,
+        is_available=lambda: True,
+        set_device=lambda _idx: None,
+    )
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+
+    inc_mod = tmp_path / "inc.py"
+    inc_mod.write_text("def run_op(x):\n    return 'inc'\n", encoding="utf-8")
+    good_mod = tmp_path / "good.py"
+    good_mod.write_text("def run_op(x):\n    return 'good'\n", encoding="utf-8")
+
+    def _fake_load(mod_path: Path, _entrypoint: str, _tag: str) -> tuple[object, object]:
+        tag = "inc" if mod_path == inc_mod else "good"
+        return (lambda x, _t=tag: _t), SimpleNamespace()
+
+    def _fake_screen(**kwargs: object) -> tuple[bool, str, dict[int, tuple[bool, str]]]:
+        assert state["lock_held"] is False
+        events.append(("screen", str(kwargs["candidate_id"])))
+        return True, "", {3: (True, "")}
+
+    monkeypatch.setattr(batch_harness, "_load_candidate_entrypoint", _fake_load)
+    monkeypatch.setattr(batch_harness, "_screen_candidate_isolated", _fake_screen)
+    monkeypatch.setattr(
+        batch_harness,
+        "measure_paired_interleaved_micro_burst",
+        lambda *_a, **_k: {
+            "incumbent_slot": (20.0, 1, 0.01, 1.0, 0.0),
+            "c_good": (10.0, 1, 0.01, 2.0, 0.01),
+        },
+    )
+
+    batch = {
+        "operator_name": "mla",
+        "entrypoint": "run_op",
+        "candidates": [
+            {"candidate_id": "incumbent_slot", "module_path": str(inc_mod)},
+            {"candidate_id": "c_good", "module_path": str(good_mod)},
+        ],
+        "anchors": [AnchorCaseSpec("level4/mla", 3, "decode", 20.0, 6.0).to_dict()],
+    }
+
+    oracle_file.write_bytes(b"CACHED_ORACLE_BYTES")
+    warm_res = batch_harness._evaluate_operator_batch(
+        batch,
+        source_root=tmp_path,
+        cannbench_repo=tmp_path,
+        warmup=1,
+        repeat=3,
+        poison_pill_isolation=True,
+    )
+    assert warm_res["incumbent_slot"].all_passed is True
+    assert warm_res["c_good"].all_passed is True
+    assert events == [
+        ("enter", "1"),
+        ("exit", "1"),
+        ("screen", "c_good"),
+        ("enter", "2"),
+        ("get", "2", "oracle"),
+        ("exit", "2"),
+    ]
+
+    events.clear()
+    oracle_file.write_bytes(b"")
+    cold_res = batch_harness._evaluate_operator_batch(
+        batch,
+        source_root=tmp_path,
+        cannbench_repo=tmp_path,
+        warmup=1,
+        repeat=3,
+        poison_pill_isolation=True,
+    )
+    assert cold_res["c_good"].all_passed is True
+    assert events == [
+        ("enter", "3"),
+        ("get", "3", "oracle"),
+        ("exit", "3"),
+        ("screen", "c_good"),
+        ("enter", "4"),
+        ("get", "4", "oracle"),
+        ("exit", "4"),
+    ]
+
