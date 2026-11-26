@@ -112,8 +112,8 @@ def test_simplex_conservation_across_static_pmu_zero_excess_and_overloaded_profi
     static_simplex = compute_symptom_simplex(static_obs)
     _assert_simplex_valid(static_simplex)
     static_map = dict(static_simplex)
-    assert static_map[SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP] == pytest.approx(0.45)
-    assert static_map[SymptomFamily.UNMODELED_SILICON_RESIDUAL] == pytest.approx(0.55)
+    assert static_map[SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP] == pytest.approx(1.0)
+    assert static_map[SymptomFamily.UNMODELED_SILICON_RESIDUAL] == pytest.approx(0.0)
 
     pmu_simplex = compute_symptom_simplex(
         {
@@ -129,7 +129,7 @@ def test_simplex_conservation_across_static_pmu_zero_excess_and_overloaded_profi
     assert pmu_map[SymptomFamily.DMA_L2_THRASH_REUSE_MISS] == pytest.approx(1.0)
     assert pmu_map[SymptomFamily.UNMODELED_SILICON_RESIDUAL] == pytest.approx(0.0)
 
-    zero_excess_simplex = compute_symptom_simplex(
+    decoupled_at_roof = compute_symptom_simplex(
         {
             "roofline_eta": 1.0,
             "transfer_inflation_ratio": 3.0,
@@ -137,9 +137,23 @@ def test_simplex_conservation_across_static_pmu_zero_excess_and_overloaded_profi
             "measured_aiv_vec_ratio": 0.90,
         }
     )
-    _assert_simplex_valid(zero_excess_simplex)
-    assert zero_excess_simplex[0][0] == SymptomFamily.UNMODELED_SILICON_RESIDUAL
-    assert zero_excess_simplex[0][1] == pytest.approx(1.0)
+    _assert_simplex_valid(decoupled_at_roof)
+    decoupled_map = dict(decoupled_at_roof)
+    assert decoupled_map[SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP] == pytest.approx(0.5)
+    assert decoupled_map[SymptomFamily.SRAM_REGISTER_SPILL_STACK] == pytest.approx(0.5)
+    assert decoupled_map[SymptomFamily.UNMODELED_SILICON_RESIDUAL] == pytest.approx(0.0)
+
+    unmodeled_only = compute_symptom_simplex(
+        {
+            "roofline_eta": 0.50,
+            "l0_vec_cycles": 200,
+            "measured_aiv_vec_ratio": 0.50,
+            "has_l2_pmu": True,
+        }
+    )
+    _assert_simplex_valid(unmodeled_only)
+    assert unmodeled_only[0][0] == SymptomFamily.UNMODELED_SILICON_RESIDUAL
+    assert unmodeled_only[0][1] == pytest.approx(1.0)
 
     overloaded_no_pmu = compute_symptom_simplex(
         {
@@ -153,9 +167,9 @@ def test_simplex_conservation_across_static_pmu_zero_excess_and_overloaded_profi
     )
     _assert_simplex_valid(overloaded_no_pmu)
     no_pmu_map = dict(overloaded_no_pmu)
-    assert no_pmu_map[SymptomFamily.UNMODELED_SILICON_RESIDUAL] == pytest.approx(0.15)
-    assert no_pmu_map[SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP] == pytest.approx(0.425)
-    assert no_pmu_map[SymptomFamily.SRAM_REGISTER_SPILL_STACK] == pytest.approx(0.425)
+    assert no_pmu_map[SymptomFamily.UNMODELED_SILICON_RESIDUAL] == pytest.approx(0.0)
+    assert no_pmu_map[SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP] == pytest.approx(0.5)
+    assert no_pmu_map[SymptomFamily.SRAM_REGISTER_SPILL_STACK] == pytest.approx(0.5)
 
     overloaded_with_pmu = compute_symptom_simplex(
         {
@@ -274,8 +288,8 @@ def test_tie_break_follows_physical_priority_not_ascii() -> None:
     zero_all = compute_symptom_simplex({"roofline_eta": 1.0})
     _assert_simplex_valid(zero_all)
     zero_tail = [fam for fam, prob in zero_all if prob == 0.0]
-    assert zero_tail.index(SymptomFamily.SCALAR_LOOP_TRAP) < zero_tail.index(
-        SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP
+    assert zero_tail.index(SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP) < zero_tail.index(
+        SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT
     )
     assert zero_tail.index(SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT) < zero_tail.index(
         SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE

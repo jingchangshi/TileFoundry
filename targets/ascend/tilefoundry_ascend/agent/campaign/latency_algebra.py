@@ -9,6 +9,24 @@ from dataclasses import dataclass
 MAD_TO_SIGMA: float = 1.482602218505602
 
 
+def compute_paired_sigma_us(
+    base_us: float,
+    paired_rel_mad: float,
+    cand_burst_cv: float,
+    ref_burst_cv: float,
+    burst_count: int,
+) -> float:
+    """Compute paired latency uncertainty from paired MAD and batch standard error."""
+    safe_base = max(0.0, float(base_us)) if math.isfinite(base_us) else 0.0
+    safe_mad = max(0.0, float(paired_rel_mad)) if math.isfinite(paired_rel_mad) else 0.0
+    safe_cand_cv = max(0.0, float(cand_burst_cv)) if math.isfinite(cand_burst_cv) else 0.0
+    safe_ref_cv = max(0.0, float(ref_burst_cv)) if math.isfinite(ref_burst_cv) else 0.0
+    n_eff = max(1, int(burst_count))
+    sigma_from_diff = safe_base * safe_mad
+    sigma_from_batch_se = safe_base * max(safe_cand_cv, safe_ref_cv) / math.sqrt(n_eff)
+    return max(sigma_from_diff, sigma_from_batch_se)
+
+
 @dataclass(frozen=True)
 class AnchorConservationPoint:
     """Single anchor measurement decomposing latency into floor, roofline, and schedule."""
@@ -21,13 +39,22 @@ class AnchorConservationPoint:
     t_roof_us: float
     paired_rel_mad: float
     accuracy_passed: bool
+    cand_burst_cv: float = 0.0
+    ref_burst_cv: float = 0.0
+    burst_count: int = 1
 
     def sigma_paired_us(self) -> float:
-        """Convert paired relative MAD into a 1-sigma uncertainty floor in microseconds."""
+        """Convert paired relative MAD and burst CVs into 1-sigma uncertainty in microseconds."""
         inc_val = float(self.inc_us) if math.isfinite(self.inc_us) else 0.0
         mad_val = float(self.paired_rel_mad) if math.isfinite(self.paired_rel_mad) else 0.0
-        base = max(inc_val, 1e-6)
-        return max(1e-3 * base, MAD_TO_SIGMA * max(0.0, mad_val) * base)
+        scaled_mad = MAD_TO_SIGMA * max(0.0, mad_val)
+        return compute_paired_sigma_us(
+            base_us=max(0.0, inc_val),
+            paired_rel_mad=scaled_mad,
+            cand_burst_cv=self.cand_burst_cv,
+            ref_burst_cv=self.ref_burst_cv,
+            burst_count=self.burst_count,
+        )
 
     def recoverable_sched_us(self, dispatch_floor_us: float) -> float:
         """Return non-negative recoverable scheduling latency above floor and roofline."""
@@ -42,22 +69,59 @@ def calibrate_dispatch_floor_us(
     *,
     null_launch_us: float | None = None,
 ) -> float:
-    """Calibrate dispatch floor from null-kernel launch or minimum anchor excess."""
-    if null_launch_us is not None:
-        val = float(null_launch_us)
-        if math.isfinite(val) and val >= 0.0:
-            return val
-    residuals = [
-        max(0.0, float(p.cand_us) - max(0.0, float(p.t_roof_us)))
-        for p in points
-        if (
+    """Bound dispatch floor using fastest observed real kernel and null-launch overhead."""
+    upper_bounds: list[float] = []
+    for p in points:
+        if not (
             p.accuracy_passed
             and math.isfinite(p.cand_us)
             and p.cand_us > 0.0
             and math.isfinite(p.t_roof_us)
-        )
-    ]
-    return min(residuals) if residuals else 0.0
+        ):
+            continue
+        cand_val = float(p.cand_us)
+        ref_val = float(p.ref_us) if math.isfinite(p.ref_us) else 0.0
+        fastest_real_us = min(cand_val, ref_val) if ref_val > 0.0 else cand_val
+        upper_bounds.append(max(0.0, fastest_real_us - max(0.0, float(p.t_roof_us))))
+    observed_cap = min(upper_bounds) if upper_bounds else 0.0
+    if null_launch_us is not None:
+        val = float(null_launch_us)
+        if math.isfinite(val) and val > 0.0:
+            return min(val, observed_cap) if upper_bounds else val
+    return observed_cap
+
+
+def calibrate_dispatch_floor_from_series(
+    cand_us_by_case: Sequence[float],
+    ref_us_by_case: Sequence[float],
+    roofline_us_by_case: Sequence[float],
+    null_launch_us: float | None = None,
+) -> float:
+    """Bound fixed launch overhead from aligned candidate, reference, and roofline series."""
+    upper_bounds: list[float] = []
+    for cand_us, ref_us, roof_us in zip(
+        cand_us_by_case, ref_us_by_case, roofline_us_by_case
+    ):
+        cand_val = float(cand_us)
+        ref_val = float(ref_us)
+        roof_val = float(roof_us)
+        if not (math.isfinite(cand_val) and math.isfinite(roof_val)):
+            continue
+        if math.isfinite(ref_val) and ref_val > 0.0 and cand_val > 0.0:
+            fastest_real_us = min(cand_val, ref_val)
+        elif cand_val > 0.0:
+            fastest_real_us = cand_val
+        elif math.isfinite(ref_val) and ref_val > 0.0:
+            fastest_real_us = ref_val
+        else:
+            continue
+        upper_bounds.append(max(0.0, fastest_real_us - max(0.0, roof_val)))
+    observed_cap = min(upper_bounds) if upper_bounds else 0.0
+    if null_launch_us is not None:
+        val = float(null_launch_us)
+        if math.isfinite(val) and val > 0.0:
+            return min(val, observed_cap) if upper_bounds else val
+    return observed_cap
 
 
 def geometric_speedup(points: Sequence[AnchorConservationPoint]) -> float:
@@ -182,11 +246,13 @@ def compute_adaptive_poison_pill_timeout_sec(inc_latencies_us: Sequence[float]) 
 __all__ = [
     "AnchorConservationPoint",
     "MAD_TO_SIGMA",
+    "calibrate_dispatch_floor_from_series",
     "calibrate_dispatch_floor_us",
     "check_family_and_sibling_non_regression",
     "check_guardrail_non_regression",
     "check_regime_net_improvement",
     "compute_adaptive_poison_pill_timeout_sec",
+    "compute_paired_sigma_us",
     "geometric_speedup",
     "is_regime_saturated",
     "regime_bandit_ucb_us",
