@@ -2130,12 +2130,16 @@ def test_run_l1_hybrid_trackb_marks_shared_sos_verified_and_skips_prewarm_subpro
         AnchorCaseSpec("level4/mla", 0, "decode", 20.0, 2.0),
         AnchorCaseSpec("level4/mla", 1, "prefill", 20.0, 2.0),
     )
+    guardrails = (
+        GuardrailCaseSpec("level4/mla", 3, "bnsd_gather", 30.0, 3.0),
+    )
     coord = StageGateCoordinator(
         operator_name="mla",
         source_root=tmp_path,
         target_module_path=tmp_path / "kernel.py",
         regime_specs=(hyb_spec,),
         scoreboard_anchors=anchors,
+        guardrail_cases=guardrails,
         static_width_dims_fn=lambda _s: (),
     )
 
@@ -2145,7 +2149,7 @@ def test_run_l1_hybrid_trackb_marks_shared_sos_verified_and_skips_prewarm_subpro
         hyb_src,
         unified_cache,
         coord._resolve_cases_yaml_sha256(),
-        [0, 1],
+        [0, 1, 3],
     )
     assert expected_key in surrogate_cannbench._VERIFIED_HYBRID_TRACKB_SO_KEYS
 
@@ -2161,7 +2165,7 @@ def test_run_l1_hybrid_trackb_marks_shared_sos_verified_and_skips_prewarm_subpro
         operator_name="mla",
         valid_candidates=[("cand_0", str(cand_path))],
         cand_sources={"cand_0": hyb_src},
-        anchors=(anchors[1], anchors[0]),
+        anchors=(guardrails[0].to_anchor_spec(), anchors[1], anchors[0]),
         repo=tmp_path,
         root=tmp_path,
         resolved_tl_cache=unified_cache.resolve(),

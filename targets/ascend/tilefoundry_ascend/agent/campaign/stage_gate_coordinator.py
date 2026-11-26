@@ -1297,11 +1297,15 @@ class StageGateCoordinator:
         regime_spec: RegimeTargetSpec,
         selector_flags: Sequence[str] | None,
     ) -> list[tuple[str, tuple[str, ...]]]:
-        """Render distinct (TU, effective flags) pairs across all scoreboard anchors."""
+        """Render distinct (TU, effective flags) pairs across scoreboard and guardrail cases."""
         rendered_pairs: list[tuple[str, tuple[str, ...]]] = []
         seen_keys: set[tuple[str, tuple[str, ...]]] = set()
-        for anc in self._scoreboard_anchors:
+        seen_cases: set[int] = set()
+        for anc in (*self._scoreboard_anchors, *self._guardrail_cases):
             cnum = int(anc.case_num)
+            if cnum in seen_cases:
+                continue
+            seen_cases.add(cnum)
             anc_rtag = str(anc.regime_tag or regime_spec.regime_tag)
             anc_dims = (
                 self._lookup_case_static_spec_safe(cnum)
@@ -1954,12 +1958,12 @@ class StageGateCoordinator:
                 failed_tier="stage_b",
             )
             return tb_b, cached_tb_rec, tb_elapsed_sec, fail_res
-        if not has_tb_override and self._scoreboard_anchors:
+        if not has_tb_override and (self._scoreboard_anchors or self._guardrail_cases):
             mark_hybrid_trackb_shared_sos_verified(
                 module_source,
                 unified_tl_cache,
                 self._resolve_cases_yaml_sha256(),
-                [int(a.case_num) for a in self._scoreboard_anchors],
+                [int(a.case_num) for a in (*self._scoreboard_anchors, *self._guardrail_cases)],
             )
         return tb_b, cached_tb_rec, tb_elapsed_sec, None
 
