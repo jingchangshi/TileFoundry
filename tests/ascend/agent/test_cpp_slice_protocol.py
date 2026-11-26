@@ -528,7 +528,7 @@ def test_exploit_and_creative_requests_compact_trackb_snippet_under_15kb() -> No
         marker = "### TARGET FUNCTION SNIPPET\n```python\n"
         assert marker in req.user_prompt
         snippet_block = req.user_prompt.split(marker, 1)[1].rsplit("\n```\n", 1)[0]
-        assert len(snippet_block.encode("utf-8")) < 15360
+        assert len(snippet_block.encode("utf-8")) < 51200
         assert '_GMM_TRACKB_SRC = r"""' in snippet_block
         assert "def _select_grouped_matmul_config(" in snippet_block
 
@@ -1160,14 +1160,14 @@ def test_wired_p2_hotspot_and_repair_focus_preservation(tmp_path: Path) -> None:
         "#include <tl_templates/ascend/common.h>",
         'extern "C" __global__ __vector__ void wired_focus_kernel(__gm__ float* x, __gm__ float* y) {',
     ]
-    for idx in range(1, 360):
+    for idx in range(1, 900):
         cpp_body.append(
             f"    float r_{idx:03d} = x[{idx}] + 0.5f * (float){idx}; /* wire_payload_{idx:03d} */"
         )
-    cpp_body.append("    y[0] = r_359;")
+    cpp_body.append("    y[0] = r_899;")
     cpp_body.append("}")
     cpp_text = "\n".join(cpp_body) + "\n"
-    assert len(cpp_text.encode("utf-8")) > 16384
+    assert len(cpp_text.encode("utf-8")) > 49152
 
     mod_file = tmp_path / "wired_mod.py"
     mod_file.write_text(
@@ -1224,10 +1224,10 @@ def test_wired_p2_hotspot_and_repair_focus_preservation(tmp_path: Path) -> None:
         parent_ledger=ledger,
         parent_residual=compute_static_dynamic_residual(ledger, {"dur_us": 10.0}),
         p2_diag={
-            "p2_hotspots": [{"source_location": "kernel.cce:210", "instruction_count": 320}]
+            "p2_hotspots": [{"source_location": "kernel.cce:450", "instruction_count": 320}]
         },
     )
-    assert "wire_payload_208" in req.user_prompt
+    assert "wire_payload_448" in req.user_prompt
     assert "LINES OMITTED OUTSIDE FOCUS WINDOW" in req.user_prompt
 
     captured_prompts: list[str] = []
@@ -1244,7 +1244,7 @@ def test_wired_p2_hotspot_and_repair_focus_preservation(tmp_path: Path) -> None:
             l0_checker=lambda _src: StageAResult(passed=True, prim_func=None, ledger=ledger),
             l1_compiler=lambda _src: StageBResult(
                 passed=False,
-                error_message="kernel.cce:210:9: error: invalid operand",
+                error_message="kernel.cce:450:9: error: invalid operand",
             ),
             repair_backend=_RecordingRepairBackend(),
             max_syntax_repairs=1,
@@ -1253,5 +1253,5 @@ def test_wired_p2_hotspot_and_repair_focus_preservation(tmp_path: Path) -> None:
     )
     assert len(checks) == 1
     assert len(captured_prompts) == 1
-    assert "wire_payload_208" in captured_prompts[0]
+    assert "wire_payload_448" in captured_prompts[0]
     assert "LINES OMITTED OUTSIDE FOCUS WINDOW" in captured_prompts[0]

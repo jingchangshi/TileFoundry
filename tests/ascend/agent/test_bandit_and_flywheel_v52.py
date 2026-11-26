@@ -328,7 +328,8 @@ async def test_b_stage_a_uses_calibrated_pred_us(
             return _make_cost_pred(500.0, 10.0, 10.0)
         return _make_cost_pred(50.0, 50.0, 0.0)
 
-    monkeypatch.setattr(runner._cost_model, "predict", _calibrated_predict)
+    assert runner._cost_advisor.underlying_cost_model is not None
+    monkeypatch.setattr(runner._cost_advisor.underlying_cost_model, "predict", _calibrated_predict)
     monkeypatch.setattr(
         campaign_runner,
         "rank_stage_a_candidates_with_cost_model",
@@ -829,6 +830,8 @@ def test_g_phase0_lattice_warmstart_and_paired_l2_incumbent_slot(
             operator_name="demo_op",
             max_rounds=0,
             enable_tilesize_prescreen=True,
+            cost_model_mode="auto",
+            enable_phase0_lattice_sweep=True,
         ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("demo_op", 2.0, 1.5, 0.9),
@@ -841,8 +844,9 @@ def test_g_phase0_lattice_warmstart_and_paired_l2_incumbent_slot(
         checkpoint_path=tmp_path / "ckpt.json",
     )
     monkeypatch.setattr(runner, "_collect_msprof_for_regimes", lambda *_a, **_kw: None)
+    assert runner._cost_advisor.underlying_cost_model is not None
     monkeypatch.setattr(
-        runner._cost_model,
+        runner._cost_advisor.underlying_cost_model,
         "predict",
         lambda *_a, **_kw: _make_cost_pred(10.0, 10.0, 0.0),
     )

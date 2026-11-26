@@ -748,6 +748,16 @@ class PluginCostModelAdvisor:
                 persist=False,
                 refit=False,
             )
+            cand_sha = str(item.get("cand_sha") or "")
+            if cand_sha and "case_num" in item:
+                self._cost_model.mark_online_observation_key(
+                    cand_sha=cand_sha,
+                    operator=str(item.get("operator") or self._operator_name or ""),
+                    regime_tag=str(item.get("regime_tag") or ""),
+                    case_num=int(item.get("case_num") or 0),
+                    eval_tier=str(item.get("eval_tier") or "surrogate"),
+                    measured_us=measured_us,
+                )
             obs_count += 1
 
         msprof_count = 0
@@ -783,6 +793,16 @@ class PluginCostModelAdvisor:
                 parent_bisheng_res=pitem.get("parent_bisheng_res"),
                 refit=False,
             )
+            cand_sha = str(pitem.get("cand_sha") or "")
+            parent_sha = str(pitem.get("parent_sha") or "")
+            if cand_sha and parent_sha and "case_num" in pitem:
+                self._cost_model.mark_online_pair_key(
+                    cand_sha=cand_sha,
+                    parent_sha=parent_sha,
+                    operator=str(pitem.get("operator") or self._operator_name or ""),
+                    regime_tag=str(pitem.get("regime_tag") or ""),
+                    case_num=int(pitem.get("case_num") or 0),
+                )
             pair_count += 1
 
         if refit:

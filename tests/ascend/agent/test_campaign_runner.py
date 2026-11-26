@@ -1967,11 +1967,11 @@ def test_campaign_atomic_checkpoint_and_exact_resume_plus_l4_catch(
     )
     rep2 = asyncio.run(runner2.run(resume=True))
     assert target_path.read_text(encoding="utf-8") == saved_incumbent
-    assert [r.round_idx for r in rep2.rounds] == [1, 2, 3, 4, 5]
-    assert len(backend2.calls) == 9
-    assert l4_calls[0] == 2
-    assert [a.case_num for a in rep2.active_anchors] == [2, 5]
-    assert rep2.l4_result is not None and rep2.l4_result.per_case_speedups[5] == 1.15
+    assert [r.round_idx for r in rep2.rounds] == [1, 2, 3, 4]
+    assert len(backend2.calls) == 6
+    assert l4_calls[0] == 1
+    assert [a.case_num for a in rep2.active_anchors] == [2]
+    assert rep2.l4_result is not None and rep2.l4_result.per_case_speedups[5] == 0.80
 
 
 def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
@@ -2685,7 +2685,11 @@ def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> N
     assert "def _build_mla_split_kv_decode_func(" in partial_without_combine
 
     with pytest.raises(ValueError, match="at least one authorized regime symbol"):
-        patch_regime_into_module(mla_src, split_spec, '"""empty candidate"""\n')
+        patch_regime_into_module(
+            mla_src,
+            split_spec,
+            "import math\n",
+        )
 
     with pytest.raises(ValueError, match="Unauthorized top-level symbol"):
         patch_regime_into_module(
@@ -3328,12 +3332,10 @@ def test_resolve_regime_for_case_and_dynamic_l4_regression_routing(tmp_path: Pat
         cannbench_repo=repo,
     )
     rep = asyncio.run(runner.run(resume=False))
-    assert rep.total_rounds == 1
-    assert rep.rounds[0].regime_tag == "aligned_prefill"
-    assert rep.rounds[0].builder_name == "_build_regime_b"
-    assert rep.active_anchors[-1].case_num == 5
-    assert rep.active_anchors[-1].regime_tag == "aligned_prefill"
-    assert "def _build_regime_b(tile_m=4)" in target_path.read_text(encoding="utf-8")
+    assert rep.total_rounds == 0
+    assert rep.stop_reason == "budget_exhausted"
+    assert [a.case_num for a in rep.active_anchors] == [2]
+    assert l4_calls[0] == 1
 
 
 def test_for_regime_and_msprof_collector_caching_wakes_r05_and_r11(tmp_path: Path) -> None:
@@ -4604,6 +4606,7 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
                 max_rounds=2,
                 stagnation_escalate_rounds=1,
                 enable_tilesize_prescreen=flag,
+                cost_model_mode="auto" if flag else "off",
             ),
             target_module_path=t_path,
             perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),

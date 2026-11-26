@@ -152,7 +152,12 @@ class _FakeTensor:
         return _FakeTensor(self.nbytes, self.tag)
 
 
-def _make_dummy_runner(tmp_path: Path, *, operator_name: str = "rms_norm") -> campaign_runner.PerfTargetCampaignRunner:
+def _make_dummy_runner(
+    tmp_path: Path,
+    *,
+    operator_name: str = "rms_norm",
+    cost_model_mode: str = "off",
+) -> campaign_runner.PerfTargetCampaignRunner:
     target_mod = tmp_path / "dummy_op.py"
     target_mod.write_text("def kernel(x):\n    return x\n", encoding="utf-8")
     specs = (
@@ -194,6 +199,7 @@ def _make_dummy_runner(tmp_path: Path, *, operator_name: str = "rms_norm") -> ca
             device_id="1",
             warmup=1,
             repeat=1,
+            cost_model_mode=cost_model_mode,
         ),
         target_module_path=target_mod,
         perf_target=perf_target,
@@ -471,7 +477,7 @@ def _build_small():
 def _build_large():
     return _shared_helper(99)
 '''
-    runner = _make_dummy_runner(tmp_path)
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
     small_spec = runner._regime_specs[0]
     assert "large" in runner._unchanged_sibling_regimes(
         incumbent_src, cand_unchanged_sibling, small_spec
@@ -650,7 +656,7 @@ def test_l3_failure_kind_candidate_and_infra_distinction() -> None:
 
 def test_vf_stack_overflow_and_max_row_width_helpers(tmp_path: Path) -> None:
     """Verify VF stack overflow detection and max-row-width resolution."""
-    runner = _make_dummy_runner(tmp_path)
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
     spec = runner._regime_specs[0]
     overflow_res = StageBResult(
         passed=False,
@@ -719,7 +725,7 @@ def _build_small(tile_n=64):
     )
     assert "MUST NOT" not in instr_tilelang
 
-    runner = _make_dummy_runner(tmp_path)
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
     kda_spec = RegimeTargetSpec(
         regime_tag="small",
         builder_candidates=("_build_small",),
@@ -819,7 +825,7 @@ def test_prewarm_dedup_and_strict_error(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
 def test_recoverable_excess_launch_floors(tmp_path: Path) -> None:
     """Verify per-backend launch floor constants used in _regime_mean_recoverable_excess_us."""
-    runner = _make_dummy_runner(tmp_path)
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
     tl_spec = runner._regime_specs[0]
     tb_spec = RegimeTargetSpec(
         regime_tag="small",
@@ -873,7 +879,7 @@ def _build_large():
 def kernel(x):
     return x
 '''
-    runner = _make_dummy_runner(tmp_path)
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
     runner._target_module_path.write_text(mod_src, encoding="utf-8")
 
     class _FakeLLM:
@@ -1069,7 +1075,7 @@ def _build_large():
 def kernel(x):
     return x
 '''
-    runner = _make_dummy_runner(tmp_path)
+    runner = _make_dummy_runner(tmp_path, cost_model_mode="auto")
     runner._target_module_path.write_text(mod_src, encoding="utf-8")
 
     captured_requests: list[GenerationRequest] = []

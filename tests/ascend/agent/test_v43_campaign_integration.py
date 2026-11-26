@@ -748,6 +748,7 @@ def test_online_cost_model_dedup_all_regime_baseline_and_stepping_stone_deltas(
             max_rounds=1,
             k_rule_workers=0,
             min_surrogate_gain=0.1,
+            cost_model_mode="auto",
         ),
         target_module_path=target_mod,
         anchors=anchors,
@@ -770,22 +771,26 @@ def test_online_cost_model_dedup_all_regime_baseline_and_stepping_stone_deltas(
     )
 
     seen_exclude_run_ids: list[str | None] = []
-    orig_replay = runner._cost_model.replay_experience_lake
+    cost_model = runner._cost_advisor.underlying_cost_model
+    assert cost_model is not None
+    orig_replay = cost_model.replay_experience_lake
 
     def _wrapped_replay(
         lake: ExperienceLake | str | Path,
         *,
         persist_calibration: bool = False,
         exclude_run_id: str | None = None,
+        operator_filter: str | None = None,
     ) -> dict[str, int]:
         seen_exclude_run_ids.append(exclude_run_id)
         return orig_replay(
             lake,
             persist_calibration=persist_calibration,
             exclude_run_id=exclude_run_id,
+            operator_filter=operator_filter,
         )
 
-    monkeypatch.setattr(runner._cost_model, "replay_experience_lake", _wrapped_replay)
+    monkeypatch.setattr(cost_model, "replay_experience_lake", _wrapped_replay)
 
     report = asyncio.run(runner.run())
     assert report.total_rounds == 1
@@ -808,8 +813,8 @@ def test_online_cost_model_dedup_all_regime_baseline_and_stepping_stone_deltas(
     assert sorted(o.case_num for o in baseline_obs) == [1, 2]
 
     assert seen_exclude_run_ids and all(rid == runner._run_id for rid in seen_exclude_run_ids)
-    assert runner._cost_model._replayed_obs_keys
-    assert runner._cost_model._replayed_pair_keys
+    assert cost_model._replayed_obs_keys
+    assert cost_model._replayed_pair_keys
     replay_counts = orig_replay(lake_dir)
     assert replay_counts["observations"] == 0
     assert replay_counts["pair_deltas"] == 0
@@ -828,6 +833,7 @@ def test_online_cost_model_dedup_all_regime_baseline_and_stepping_stone_deltas(
             max_rounds=1,
             k_rule_workers=0,
             stagnation_escalate_rounds=0,
+            cost_model_mode="auto",
         ),
         target_module_path=stone_module_path,
         anchors=anchors,
@@ -886,7 +892,9 @@ def test_online_cost_model_dedup_all_regime_baseline_and_stepping_stone_deltas(
     monkeypatch.setattr(stone_runner, "_record_surrogate_observations", _spy_record)
 
     captured_pair_deltas: list[tuple[dict[str, object], float]] = []
-    orig_pair = stone_runner._cost_model.observe_pair_delta
+    stone_cost_model = stone_runner._cost_advisor.underlying_cost_model
+    assert stone_cost_model is not None
+    orig_pair = stone_cost_model.observe_pair_delta
 
     def _spy_pair(
         cand_wl: Mapping[str, object],
@@ -898,7 +906,7 @@ def test_online_cost_model_dedup_all_regime_baseline_and_stepping_stone_deltas(
         captured_pair_deltas.append((dict(parent_wl), float(parent_us)))
         orig_pair(cand_wl, cand_us, parent_wl, parent_us, **kwargs)
 
-    monkeypatch.setattr(stone_runner._cost_model, "observe_pair_delta", _spy_pair)
+    monkeypatch.setattr(stone_cost_model, "observe_pair_delta", _spy_pair)
 
     asyncio.run(stone_runner.run())
     child_calls = [c for c in captured_calls if c.get("worker_kind") != "baseline"]

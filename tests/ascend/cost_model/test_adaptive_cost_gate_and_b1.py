@@ -34,7 +34,19 @@ from tilefoundry_ascend.ascend.target import AscendTarget
 
 def test_evaluate_cost_gate_policy_state_transitions() -> None:
     """Verify every CostGateDecision state transition and mode override."""
+    default_off = evaluate_cost_gate_policy(
+        round_idx=1,
+        incumbent_roofline_eta=0.20,
+        target_roofline_eta=0.85,
+        stagnation_rounds=0,
+        mean_recoverable_excess_us=12.0,
+    )
+    assert isinstance(default_off, CostGateDecision)
+    assert default_off.mode == CostModelMode.OFF
+    assert default_off.engaged is False
+
     engaged = evaluate_cost_gate_policy(
+        mode=CostModelMode.AUTO,
         round_idx=1,
         incumbent_roofline_eta=0.20,
         target_roofline_eta=0.85,
@@ -50,6 +62,7 @@ def test_evaluate_cost_gate_policy_state_transitions() -> None:
     assert engaged.allow_candidate_pruning is True
 
     near_limit = evaluate_cost_gate_policy(
+        mode=CostModelMode.AUTO,
         round_idx=1,
         incumbent_roofline_eta=0.65,
         target_roofline_eta=0.85,
@@ -61,6 +74,7 @@ def test_evaluate_cost_gate_policy_state_transitions() -> None:
     assert near_limit.allow_candidate_pruning is False
 
     near_floor = evaluate_cost_gate_policy(
+        mode=CostModelMode.AUTO,
         round_idx=1,
         incumbent_roofline_eta=0.20,
         mean_recoverable_excess_us=1.0,
@@ -70,6 +84,7 @@ def test_evaluate_cost_gate_policy_state_transitions() -> None:
     assert math.isinf(near_floor.coarse_reject_ratio)
 
     stagnant = evaluate_cost_gate_policy(
+        mode=CostModelMode.AUTO,
         round_idx=2,
         stagnation_rounds=1,
         incumbent_roofline_eta=0.20,
@@ -79,6 +94,7 @@ def test_evaluate_cost_gate_policy_state_transitions() -> None:
     assert math.isinf(stagnant.coarse_reject_ratio)
 
     slow_vel = evaluate_cost_gate_policy(
+        mode=CostModelMode.AUTO,
         round_idx=2,
         stagnation_rounds=0,
         incumbent_roofline_eta=0.20,

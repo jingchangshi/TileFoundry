@@ -98,9 +98,9 @@ def _make_result(tail_eta: float, subatom_eta: float) -> CandidateSurrogateResul
         case_num=2,
         regime_tag="reduce_tail_subatom",
         accuracy_passed=True,
-        cand_us=max(1.0, 2.0 / max(1e-4, subatom_eta)),
+        cand_us=max(1.0, 4.0 / max(1e-4, subatom_eta)),
         ref_perf_us=10.0,
-        t_hw_us=2.0,
+        t_hw_us=4.0,
         speedup=subatom_eta * 2.0,
         roofline_eta=subatom_eta,
         eq3_score=subatom_eta,
@@ -128,7 +128,11 @@ def test_arch3_non_sticky_headroom_regime_rotation(tmp_path: Path) -> None:
 
     res_close = _make_result(tail_eta=0.14, subatom_eta=0.15)
     picked_tie = runner._select_active_regime(
-        "reduce_tail_subatom", set(), res_close, anchors
+        "reduce_tail_subatom",
+        set(),
+        res_close,
+        anchors,
+        last_round_promoted=True,
     )
     assert picked_tie is not None
     assert picked_tie.regime_tag == "reduce_tail_subatom"

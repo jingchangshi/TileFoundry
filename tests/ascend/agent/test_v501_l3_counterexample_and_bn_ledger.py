@@ -504,8 +504,8 @@ __global__ void gmm_kernel(int k_cur, int bk) {
         )
     )
 
-    assert [a.case_num for a in anchors] == [2, 14]
-    assert anchors[1].ref_perf_us == pytest.approx(12.0)
+    assert [a.case_num for a in anchors] == [2]
+    assert [g.case_num for g in runner._guardrail_cases] == [14]
     assert len(repair_prompts) == 1
     assert "k_cur <= bk - 16" in repair_prompts[0].user_prompt
     assert "MIDDLE BODY OMITTED" not in repair_prompts[0].user_prompt
@@ -646,7 +646,8 @@ def kernel(x):
         )
     )
 
-    assert [a.case_num for a in anchors] == [2, 14, 15]
+    assert [a.case_num for a in anchors] == [2]
+    assert [g.case_num for g in runner._guardrail_cases] == [14, 15]
     assert promoted is False
     assert rolled_back is True
     assert stag_after == 2

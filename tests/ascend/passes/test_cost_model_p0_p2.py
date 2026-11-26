@@ -340,6 +340,7 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
             max_syntax_repairs=0,
             enable_tilesize_prescreen=True,
             cost_prescreen_top_k=1,
+            cost_model_mode="auto",
         ),
         target_module_path=mod_file,
         perf_target=PerfTargetSpec(
@@ -386,7 +387,8 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
     expected_cal_path = (ckpt_path.parent / "cost_model_calibration.jsonl").resolve()
     assert runner._cost_calibration_path == expected_cal_path
     assert expected_cal_path.is_file()
-    assert runner._cost_model.sample_count >= 1
+    assert runner._cost_advisor.underlying_cost_model is not None
+    assert runner._cost_advisor.underlying_cost_model.sample_count >= 1
     changed_rids = [
         rid for rid in prior_trials if tracker.posteriors[rid].trials != prior_trials[rid]
     ]

@@ -476,6 +476,7 @@ def test_stage6_zero_shot_prescreen_and_experience_lake_anomaly_wiring(
             k_rule_workers=2,
             enable_tilesize_prescreen=True,
             cost_prescreen_top_k=None,
+            cost_model_mode="auto",
         ),
         target_module_path=target_mod,
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
@@ -494,12 +495,14 @@ def test_stage6_zero_shot_prescreen_and_experience_lake_anomaly_wiring(
         experience_lake_dir=lake_dir,
     )
 
-    assert runner._cost_model.anomaly_lake is runner._experience_lake
-    assert len(runner._cost_model._samples) == 0
+    cost_model = runner._cost_advisor.underlying_cost_model
+    assert cost_model is not None
+    assert cost_model.anomaly_lake is runner._experience_lake
+    assert len(cost_model._samples) == 0
     cf = CostFeatures(vec_flops=1e6, gm_bytes=1e5, active_aiv_cores=56)
-    ana = runner._cost_model.predict(cf).pred_us
-    runner._cost_model.observe(cf, ana * 5000.0)
-    assert len(runner._cost_model._samples) == 0
+    ana = cost_model.predict(cf).pred_us
+    cost_model.observe(cf, ana * 5000.0)
+    assert len(cost_model._samples) == 0
     anomaly_file = lake_dir / "unmodeled_anomalies.jsonl"
     assert anomaly_file.is_file()
     assert len(anomaly_file.read_text(encoding="utf-8").splitlines()) == 1

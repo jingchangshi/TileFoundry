@@ -508,6 +508,7 @@ def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
         funnel=funnel,
         tracker=tracker,
         k_rule_workers=2,
+        cost_model_mode="auto",
     )
     default_specs = default_runner.plan_workers(
         cube_parent,
@@ -523,6 +524,7 @@ def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
         tracker=tracker,
         k_rule_workers=2,
         enable_tilesize_prescreen=False,
+        cost_model_mode="auto",
     )
     disabled_specs = disabled_runner.plan_workers(
         cube_parent,
@@ -538,6 +540,7 @@ def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
         tracker=tracker,
         k_rule_workers=2,
         enable_tilesize_prescreen=True,
+        cost_model_mode="auto",
     )
     specs_cube = runner.plan_workers(
         cube_parent,

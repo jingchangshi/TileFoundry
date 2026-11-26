@@ -346,6 +346,7 @@ def test_portfolio_plan_workers_respects_cost_gate_policy(
         ),
         tracker=BayesianRuleTracker.from_seed_yaml(),
         enable_tilesize_prescreen=True,
+        cost_model_mode="auto",
     )
 
     engaged_specs = runner.plan_workers(

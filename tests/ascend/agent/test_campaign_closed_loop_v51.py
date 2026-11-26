@@ -330,12 +330,13 @@ def _build_op(tile_m=8):
         )
     )
 
-    assert [a.case_num for a in anchors] == [2, 14]
+    assert [a.case_num for a in anchors] == [2]
+    assert [g.case_num for g in runner._guardrail_cases] == [14]
     assert promoted is True
     assert rolled_back is False
     assert blocked is False
     assert "tail_fixed" in new_inc
-    assert {int(a.case_num) for a in new_best.anchors} == {2, 14}
+    assert {int(a.case_num) for a in new_best.anchors} == {2}
     assert rec.l3_failed_cases == (14,)
     assert rec.l3_failure_stage == "accuracy"
     assert rec.l3_cx_repair_passed is True
@@ -848,7 +849,11 @@ def test_arc2_and_arc3_clean_gating_anomaly_log_and_lake_seed_injection(
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "small_decode", 10.0, 2.0),)
 
     runner = PerfTargetCampaignRunner(
-        config=CampaignConfig(operator_name="attention_residual", max_rounds=1),
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=1,
+            cost_model_mode="auto",
+        ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
@@ -880,7 +885,9 @@ def test_arc2_and_arc3_clean_gating_anomaly_log_and_lake_seed_injection(
         ledger=ledger,
         regime_tag="small_decode",
     )
-    assert len(runner._cost_model._samples) == 0
+    cost_model = runner._cost_advisor.underlying_cost_model
+    assert cost_model is not None
+    assert len(cost_model._samples) == 0
 
     lake = ExperienceLake(lake_dir)
     _cands, observations = lake.load_records()
@@ -939,7 +946,7 @@ def test_arc2_and_arc3_clean_gating_anomaly_log_and_lake_seed_injection(
         ledger=ledger,
         regime_tag="small_decode",
     )
-    assert len(runner._cost_model._samples) == 1
+    assert len(cost_model._samples) == 1
 
     append_counterexample_boundary(
         lake_dir,
@@ -957,12 +964,12 @@ def test_arc2_and_arc3_clean_gating_anomaly_log_and_lake_seed_injection(
     seeded_runner = PerfTargetCampaignRunner(
         config=CampaignConfig(operator_name="attention_residual", max_rounds=1),
         target_module_path=target_path,
-        anchors=None,
+        anchors=anchors,
         regime_specs=(spec,),
         checkpoint_path=tmp_path / "ckpt_seeded.json",
         experience_lake_dir=lake_dir,
     )
-    assert any(int(a.case_num) == 14 for a in seeded_runner._initial_anchors)
+    assert [int(a.case_num) for a in seeded_runner._scoreboard_anchors] == [2]
 
 
 @pytest.mark.anyio
@@ -1082,6 +1089,7 @@ async def test_arc3_spearman_quarantine_and_round_funnel_events_emitted(
             enable_tilesize_prescreen=True,
             cost_prescreen_top_k=None,
             min_surrogate_gain=999.0,
+            cost_model_mode="auto",
         ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("attention_residual", 50.0, 50.0, 0.99),

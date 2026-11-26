@@ -1347,16 +1347,16 @@ def test_syntax_repair_includes_bounded_parent_source_and_round_filter_forwards_
     )
     assert len(parent_section) < 16200
 
-    backend = _ScriptedBackend(["repaired_snippet"])
+    backend = _ScriptedBackend(["__global__ void repaired_snippet() {}"])
 
     def _patch_fn(snip: str) -> str:
-        if snip != "repaired_snippet":
+        if snip != "__global__ void repaired_snippet() {}":
             raise ValueError("SEARCH block did not match target C++ source")
         return "patched_module"
 
     checks = asyncio.run(
         run_l0_l1_round_filter(
-            [("w1", "bad_hunk")],
+            [("w1", "__global__ void k() { bad_hunk }")],
             patch_fn=_patch_fn,
             l0_checker=lambda _mod: StageAResult(passed=True, prim_func=None, ledger=None),
             l1_compiler=lambda _mod: StageBResult(passed=True),

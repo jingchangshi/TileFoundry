@@ -376,7 +376,7 @@ def test_campaign_runner_telemetry_hazards_and_pure_l0_parent_cost() -> None:
     assert "dcache_bypass_narrow_store: 2.0" in section
 
     src_text = Path(inspect.getfile(PerfTargetCampaignRunner)).read_text(encoding="utf-8")
-    assert "self._cost_model.predict(parent_workload, bisheng_res=None)" in src_text
+    assert "self._cost_advisor.predict_candidate_us(" in src_text
 
 
 def test_ordered_tensor_shapes_and_prev_residual_wiring(tmp_path: Path) -> None:

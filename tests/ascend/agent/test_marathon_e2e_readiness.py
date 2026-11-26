@@ -438,6 +438,7 @@ def test_campaign_runner_live_sil_7facet_cost_calibration_and_shared_stone_pruni
             k_rule_workers=1,
             stagnation_escalate_rounds=1,
             exploit_effort="high",
+            cost_model_mode="auto",
         ),
         target_module_path=mod_file,
         perf_target=PerfTargetSpec("demo_op", 4.0, 3.5, 0.95),
@@ -563,7 +564,8 @@ def test_campaign_runner_live_sil_7facet_cost_calibration_and_shared_stone_pruni
     assert mask.exec_mode_and_spr is True
     assert mask.pipeline_and_sync_graph is True
 
-    assert runner._cost_model.sample_count > 0
+    cost_model = runner._cost_advisor.underlying_cost_model
+    assert cost_model is not None and cost_model.sample_count > 0
 
     assert runner._beams["r2_tail"].stepping_stone_beam == []
 

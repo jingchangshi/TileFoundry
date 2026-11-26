@@ -102,11 +102,11 @@ def test_marathon_dead_prewarm_removed_and_cost_model_mode_added() -> None:
     assert "cost_model_mode" in field_names
 
     cfg = MarathonConfig(operator_name="mla")
-    assert cfg.cost_model_mode == "auto"
+    assert cfg.cost_model_mode == "off"
     parsed = build_marathon_arg_parser().parse_args(
-        ["run", "--operator", "mla", "--cost-model-mode", "off"]
+        ["run", "--operator", "mla", "--cost-model-mode", "auto"]
     )
-    assert parsed.cost_model_mode == "off"
+    assert parsed.cost_model_mode == "auto"
 
 
 def test_sil_verifier_tilelang_ast_stage_and_parallel_redlines() -> None:
