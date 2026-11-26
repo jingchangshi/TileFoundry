@@ -15,7 +15,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+from tilefoundry_ascend.ascend.compile_cache.cpp_closure import (
     _split_cpp_units,
     extract_reachable_trackb_source,
     select_active_trackb_kernel,

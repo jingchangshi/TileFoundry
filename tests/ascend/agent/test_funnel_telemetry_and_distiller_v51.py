@@ -14,15 +14,16 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     RegimeTargetSpec,
     inject_lake_counterexample_anchors,
 )
+from tilefoundry_ascend.agent.campaign.fault_types import FaultPlane, TypedFault
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
     MAX_CLEAN_CALIBRATION_BURST_CV,
     SPEARMAN_QUARANTINE_FLOOR,
     DeterministicSearchBoundaryLedger,
     RoundFunnelEvent,
     append_round_funnel_event,
+    assert_unmodeled_fault_share_bounded,
     compute_spearman_rho,
     is_clean_calibration_sample,
-    normalize_compile_error_code,
 )
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
     AscendCausalRule,
@@ -177,14 +178,35 @@ def test_counterexample_boundary_append_and_load(tmp_path: Path) -> None:
     assert mla_recs[0]["case_num"] == 7
 
 
-def test_funnel_telemetry_events_and_error_normalization(tmp_path: Path) -> None:
-    """Funnel telemetry normalizes error codes, gates noise, and persists JSONL."""
-    assert normalize_compile_error_code(None, "") == "OK"
-    assert normalize_compile_error_code("stage_a", "noop_identical") == "NOOP_IDENTICAL"
-    assert normalize_compile_error_code("stage_b", "exceeded vf stack size") == "VF_STACK_OVERFLOW"
-    assert normalize_compile_error_code("stage_b", "ub_overflow 999") == "UB_SRAM_OVERFLOW"
-    assert normalize_compile_error_code("stage_b", "cbuf exceed") == "L1_SRAM_OVERFLOW"
-    assert normalize_compile_error_code("stage_b", "custom error") == "STAGE_B_OTHER"
+def test_funnel_telemetry_events_and_typed_fault_contract(tmp_path: Path) -> None:
+    """Funnel telemetry preserves TypedFault planes, gates noise, and persists JSONL."""
+    evt_ok = RoundFunnelEvent.from_typed_fault(
+        run_id="r1",
+        operator="grouped_matmul",
+        round_idx=1,
+        regime_tag="unaligned_tail",
+        topology_axes={"compute_engine": "aic_only", "memory_ring": "gm_l1_l0_fixpipe"},
+        candidate_id="cand_ok",
+        cand_sha="abc",
+        worker_kind="rule_codegen",
+        fault=None,
+    )
+    assert evt_ok.error_code_norm == "OK"
+    assert evt_ok.fault_plane == FaultPlane.NONE.value
+    assert evt_ok.passed_l0_l1 is True
+
+    evt_noop = evt_ok.apply_typed_fault(
+        TypedFault(
+            plane=FaultPlane.NOOP_IDENTICAL,
+            code="NOOP_IDENTICAL",
+            failed_tier="noop_identical",
+            detail="identical",
+        )
+    )
+    assert evt_noop.fault_plane == FaultPlane.NOOP_IDENTICAL.value
+    assert evt_noop.error_code_norm == "NOOP_IDENTICAL"
+    assert evt_noop.noop_identical is True
+    assert_unmodeled_fault_share_bounded([evt_ok, evt_noop])
 
     assert is_clean_calibration_sample(MAX_CLEAN_CALIBRATION_BURST_CV) is True
     assert is_clean_calibration_sample(MAX_CLEAN_CALIBRATION_BURST_CV + 0.01) is False

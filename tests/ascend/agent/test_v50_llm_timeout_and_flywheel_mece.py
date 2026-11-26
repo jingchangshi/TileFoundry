@@ -239,15 +239,19 @@ def _sample_small_dsl() -> str:
 
 
 def test_slice_helpers_sink_to_cpp_slice_protocol_and_creative_14kb_budget() -> None:
-    """Verify slice helper unification and <=14,336B AST-safe creative folding."""
-    for attr in (
+    """Verify slice helper unification, deleted folding helpers, and <=14,336B creative budget."""
+    for removed in (
         "_ANY_FOLDING_MARKER_RE",
         "_compact_trackb_repair_source",
+        "_resplice_trackb_omitted_spans",
+        "_splice_cpp_omitted_spans",
+    ):
+        assert not hasattr(portfolio_mod, removed)
+        assert not hasattr(slice_mod, removed)
+    for attr in (
         "_detect_trackb_prologue_line_offset",
         "_find_python_cpp_literal_spans",
         "_looks_like_python_primfunc_slice",
-        "_resplice_trackb_omitted_spans",
-        "_splice_cpp_omitted_spans",
     ):
         assert getattr(portfolio_mod, attr) is getattr(slice_mod, attr)
 
@@ -346,15 +350,15 @@ def test_portfolio_plan_workers_respects_cost_gate_policy(
         ),
         tracker=BayesianRuleTracker.from_seed_yaml(),
         enable_tilesize_prescreen=True,
-        cost_model_mode="auto",
+        cost_model_mode="advisory",
     )
 
     engaged_specs = runner.plan_workers(
         parent,
         round_idx=1,
         factory_kwargs={"bm": 64, "bn": 64, "bk": 64},
-        ideal_roofline_us=10.0,
-        incumbent_roofline_eta=0.25,
+        bucket_clean_samples=30,
+        out_of_sample_spearman_rho=0.72,
     )
     engaged_creative = next(s for s in engaged_specs if s.worker_kind == "creative_explore")
     assert "### TILE PRESCREEN GUIDANCE" in engaged_creative.request.user_prompt
@@ -363,8 +367,8 @@ def test_portfolio_plan_workers_respects_cost_gate_policy(
         parent,
         round_idx=2,
         factory_kwargs={"bm": 64, "bn": 64, "bk": 64},
-        ideal_roofline_us=38.0,
-        incumbent_roofline_eta=0.95,
+        bucket_clean_samples=2,
+        out_of_sample_spearman_rho=0.72,
     )
     disengaged_creative = next(s for s in disengaged_specs if s.worker_kind == "creative_explore")
     assert "### TILE PRESCREEN GUIDANCE" not in disengaged_creative.request.user_prompt
@@ -489,8 +493,6 @@ def test_flywheel_distiller_strict_monotonic_and_dual_track_gates(tmp_path: Path
             "optimized_dur_us": 10.0,
             "numerical_ok": 1.0,
         },
-        min_edit_gain=0.05,
-        min_probe_speedup=1.2,
     )
     base_dsl = _sample_small_dsl()
     win_dsl = base_dsl.replace("with T.Kernel(2):", "with T.Kernel(8):")

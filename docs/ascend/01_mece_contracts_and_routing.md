@@ -39,7 +39,7 @@ Legal transformation freedom is partitioned into the 7-facet `ConstraintRelaxati
   - **L2 (`format_target_dialect_layer`)**: Active `cann_9_3` `dav-3510` API surface (`cann_9_2.toml` is a frozen inert placeholder—target `cann_9_3` exclusively with zero `cann_9_2` conditional shims), two-stage on-demand pruning, 4 lowering guardrails, and `seed_rules.yaml` entries guarded by `anti_precondition` and `l2_pmu_available`.
   - **L3 (Causal Feedback)**: Top-ranked KB hypotheses matched to the active `SymptomFamily` and 3-axis Bayesian utility.
 - **`syntax_repair` & `explore_creative` Discipline**: Syntax repair and Stage-0 retries apply `L1 + L2 + G5` Parent Monotonicity Lock (`format_g5_parent_monotonicity_lock`, forbidding dropping `T.Pipelined` stages or downgrading execution domains). `explore_creative` remains `Rule-Blind` to L3 heuristics, gated by L1 legality, compilation, and bounded analytical pass-through (`predicted_us <= 1.5 * parent_analytical_us`).
-- **CoW Helper Isolation (`patch_regime_into_module`)**: Clones/prefixes regime-local helpers as `_{regime_tag}_*` instead of mutating shared helpers in place, prunes unreachable dead helpers, and enforces the dual-layer orthogonal tail guard (`>= 0.97x` worst case in active regime; `>= 0.98x` untouched sibling regimes with single-point anti-jitter recheck).
+- **CoW Helper Isolation & Lossless Track-B Closures**: `patch_regime_into_module` clones/prefixes regime helpers as `_{regime_tag}_*`, prunes dead helpers, and pairs with `render_active_symbol_closure_view` + Mode A/B `apply_scoped_trackb_patch` (zero middle truncation) and `PromotionCoordinator` ($3\sigma_{\text{paired}}$ CEGAR guardrail & `L3Resolution` states). `llm_client.py` defaults to `max_sandbox_tool_calls=0`.
 
 ## [SEC-C3] 5D Observation, 13 Symptom Families & Frozen KB
 
@@ -48,9 +48,9 @@ Legal transformation freedom is partitioned into the 7-facet `ConstraintRelaxati
 - **`transfer_inflation_ratio`**: `measured_hbm_bytes / max(1.0, blueprint_min_gm_bytes)` when measured HBM bytes exist, else `(blueprint_min_gm_bytes + static_extra_roundtrip_bytes) / max(1.0, blueprint_min_gm_bytes)`.
 - **`effective_compute_eta`**: `blueprint_compute_floor_us / max(1e-3, measured_latency_us)`.
 
-Every diagnosed waste maps deterministically to the closed 13-member `SymptomFamily` taxonomy (`agent/kb/schema.py`):
+Every diagnosed waste maps deterministically to the closed 14-member `SymptomFamily` (`13` causal + `UNMODELED_SILICON_RESIDUAL`, normalized via `compute_symptom_simplex` in `agent/kb/schema.py`), while `TypedFault` (`fault_types.py`) isolates infra faults (`INFRA_OCCUPANCY`, `INFRA_DEVICE_FAULT`, `LLM_TRANSPORT`) from Bandit updates:
 
-| `SymptomFamily` (13 Closed Members) | `SYMPTOM_FAMILY_TO_AXIS` | `SYMPTOM_FAMILY_TO_FACETS` |
+| `SymptomFamily` (13+1 Closed Members) | `SYMPTOM_FAMILY_TO_AXIS` | `SYMPTOM_FAMILY_TO_FACETS` |
 | :--- | :--- | :--- |
 | `DMA_REDUNDANT_GM_ROUNDTRIP` | `offchip_dma` | `dma_and_cache_hierarchy`, `sram_layout_and_aliasing`, `pipeline_and_sync_graph` |
 | `DMA_UNALIGNED_SHORT_BURST` | `offchip_dma` | `tile_and_stage_knobs`, `dma_and_cache_hierarchy` |
@@ -65,5 +65,6 @@ Every diagnosed waste maps deterministically to the closed 13-member `SymptomFam
 | `SYNC_PSEUDO_DOUBLE_BUFFER` | `pipeline_sync` | `pipeline_and_sync_graph`, `sram_layout_and_aliasing` |
 | `SYNC_BARRIER_SERIALIZATION` | `pipeline_sync` | `pipeline_and_sync_graph`, `tile_and_stage_knobs` |
 | `GRID_TAIL_WAVE_UNDERUTIL` | `grid_wave` | `grid_and_workspace_topology`, `tile_and_stage_knobs` |
+| `UNMODELED_SILICON_RESIDUAL` | `grid_wave` | `tile_and_stage_knobs`, `alg_compute_and_monoid` |
 
 - **Frozen Online KB (`agent/kb/`)**: `seed_rules.yaml` holds 41 orthogonal atomic causal rules (`R01..R41`, zero latency-noise escapes) evaluated read-only online under a strict AST inequality whitelist (`_ALLOWED_AST_NODES`), ranked by 3-axis factorized Bayesian tracking (`ce:*`, `mr:*`, `ir:*`), and pruned against repeated dead-ends via Scoped Tabu (`excluded_mechanisms`).

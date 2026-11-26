@@ -105,7 +105,7 @@ def test_default_off_mode_and_null_advisor_zero_leakage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify default mode=off never initializes HybridAscendCostModel or leaks guidance."""
-    default_decision = evaluate_cost_gate_policy(round_idx=1, incumbent_roofline_eta=0.1)
+    default_decision = evaluate_cost_gate_policy()
     assert default_decision.mode == CostModelMode.OFF
     assert default_decision.engaged is False
 
@@ -132,12 +132,8 @@ def test_default_off_mode_and_null_advisor_zero_leakage(
     assert advisor.sync_experience_lake(tmp_path) == {}
     decision = advisor.evaluate_round_policy(
         enable_prescreen_flag=True,
-        round_idx=1,
-        stagnation_rounds=0,
-        incumbent_roofline_eta=0.2,
-        target_roofline_eta=0.85,
-        prev_local_rel_gain=None,
-        mean_recoverable_excess_us=20.0,
+        bucket_clean_samples=0,
+        out_of_sample_spearman_rho=None,
     )
     assert decision.mode == CostModelMode.OFF
     assert decision.engaged is False
@@ -269,12 +265,8 @@ def test_shadow_mode_observes_without_prompt_or_pruning_leakage(tmp_path: Path) 
 
     decision = advisor.evaluate_round_policy(
         enable_prescreen_flag=True,
-        round_idx=1,
-        stagnation_rounds=0,
-        incumbent_roofline_eta=0.2,
-        target_roofline_eta=0.85,
-        prev_local_rel_gain=None,
-        mean_recoverable_excess_us=15.0,
+        bucket_clean_samples=30,
+        out_of_sample_spearman_rho=0.72,
     )
     assert decision.mode == CostModelMode.SHADOW
     assert decision.engaged is False
@@ -294,10 +286,9 @@ def test_shadow_mode_observes_without_prompt_or_pruning_leakage(tmp_path: Path) 
     assert advisor.underlying_cost_model.sample_count == 1
 
     forced_decision = CostGateDecision(
-        mode=CostModelMode.AUTO,
+        mode=CostModelMode.ADVISORY,
         engaged=True,
         reason="forced",
-        coarse_reject_ratio=2.0,
         allow_prompt_guidance=True,
         allow_candidate_pruning=True,
     )
@@ -397,7 +388,7 @@ def test_auto_mode_operator_filter_multi_anchor_and_pruning(tmp_path: Path) -> N
     )
 
     advisor = create_cost_advisor(
-        "auto",
+        "advisory",
         operator_name="rms_norm",
         experience_lake=lake,
     )
@@ -426,15 +417,12 @@ def test_auto_mode_operator_filter_multi_anchor_and_pruning(tmp_path: Path) -> N
 
     decision = advisor.evaluate_round_policy(
         enable_prescreen_flag=True,
-        round_idx=1,
-        stagnation_rounds=0,
-        incumbent_roofline_eta=0.2,
-        target_roofline_eta=0.85,
-        prev_local_rel_gain=None,
-        mean_recoverable_excess_us=20.0,
-        coarse_reject_ratio=3.0,
+        bucket_clean_samples=30,
+        out_of_sample_spearman_rho=0.72,
     )
     assert decision.engaged is True
+    assert decision.allow_prompt_guidance is True
+    assert decision.allow_candidate_pruning is False
     guidance = advisor.build_prompt_guidance(
         decision=decision,
         base_cfg={"bm": 64, "bn": 128, "bk": 64},
@@ -462,9 +450,8 @@ def test_auto_mode_operator_filter_multi_anchor_and_pruning(tmp_path: Path) -> N
         candidate_workspace_stages_by_id={},
         creative_ids={"slow_creative"},
     )
-    assert kept == ["fast_exploit", "slow_creative", "slow_shift"]
-    assert len(rejected) == 1
-    assert rejected[0][0] == "slow_exploit"
+    assert kept == ["fast_exploit", "slow_exploit", "slow_creative", "slow_shift"]
+    assert rejected == []
 
 
 def test_zero_cost_lattice_sweep_without_cost_model(monkeypatch: pytest.MonkeyPatch) -> None:

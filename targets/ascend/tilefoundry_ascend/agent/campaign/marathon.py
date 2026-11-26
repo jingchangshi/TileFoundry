@@ -224,9 +224,7 @@ class MarathonConfig:
     max_wall_clock_min: float = 720.0
     k_rule_workers: int = 2
     max_syntax_repairs: int = 1
-    min_l2_gain_for_l3: float = 0.005
     min_surrogate_gain: float = 0.08
-    min_flywheel_gain: float = 0.03
     stagnation_escalate_rounds: int = 1
     stagnation_freeze_rounds: int = 12
     stagnation_discount: float = 0.45
@@ -243,13 +241,11 @@ class MarathonConfig:
     enable_tilesize_prescreen: bool = True
     cost_prescreen_top_k: int | None = None
     cost_model_mode: str = "off"
-    cost_disengage_eta: float = 0.65
-    cost_slow_gain_threshold: float = 0.03
     allow_unreviewed_distilled_rules: bool = False
     salvage_beam_candidates: bool = True
     resume: bool | None = None
     escalate_model: str | None = None
-    exploit_effort: str = "high"
+    exploit_effort: str = "medium"
     auto_bootstrap_seed: bool = True
     cold_start: bool = False
     pure_golden: bool = False
@@ -1442,17 +1438,6 @@ class ExtremeCampaignRunner(PerfTargetCampaignRunner):
             )
 
 
-def _is_non_fallback_l2_env_error(exc: BaseException) -> bool:
-    """Return True when an L2 failure reflects NPU occupancy or device rejection."""
-    low = str(exc).lower()
-    return (
-        "occupancy" in low
-        or "blocked_env" in low
-        or "blocked_exit_code: 75" in low
-        or "device_rejected" in low
-    )
-
-
 def _extract_l2_telemetry(
     res_obj: object,
 ) -> tuple[dict[str, int], float, float]:
@@ -1486,8 +1471,8 @@ def build_resilient_l2_evaluator(
     batch_fn: Callable[..., tuple[dict[str, CandidateSurrogateResult], str, str]] | None = None,
     op_logger: logging.Logger | None = None,
 ) -> Callable[[Sequence[tuple[str, Path]], Sequence[AnchorCaseSpec]], L2BatchResults]:
-    """Build batched L2 evaluator with paired-incumbent fallback on non-env failures."""
-    log = op_logger or logger
+    """Build batched L2 evaluator propagating AgentGates errors directly."""
+    _ = op_logger or logger
     eval_fn = batch_fn or run_surrogate_batch_via_agent_gates
 
     def _eval(
@@ -1498,106 +1483,27 @@ def build_resilient_l2_evaluator(
         pool_kwargs: dict[str, object] = (
             {"device_pool": device_pool} if batch_fn is None and device_pool else {}
         )
-        try:
-            res, run_id, _rcp = eval_fn(
-                operator_name,
-                cand_list,
-                anc_seq,
-                source_root=worktree,
-                env_file=env_file,
-                device_id=device_id,
-                warmup=warmup,
-                repeat=repeat,
-                require_all_passed=False,
-                timeout_sec=660,
-                **pool_kwargs,
-            )
-            p_stats, p_sec, n_sec = _extract_l2_telemetry(res)
-            return L2BatchResults(
-                res,
-                {cid: run_id for cid in res},
-                prewarm_stats=p_stats,
-                l2_prewarm_sec=p_sec,
-                l2_npu_sec=n_sec,
-            )
-        except FileNotFoundError:
-            raise
-        except Exception as exc:
-            if _is_non_fallback_l2_env_error(exc) or len(cand_list) <= 1:
-                raise
-            inc_entry = next(
-                ((cid, p) for cid, p in cand_list if cid == "incumbent_slot"),
-                None,
-            )
-            non_inc = [(cid, p) for cid, p in cand_list if cid != "incumbent_slot"]
-            if inc_entry is not None and not non_inc:
-                raise
-            fallback_batches: list[list[tuple[str, Path]]] = (
-                [[inc_entry, (cid, mod_path)] for cid, mod_path in non_inc]
-                if inc_entry is not None
-                else [[(cid, mod_path)] for cid, mod_path in cand_list]
-            )
-            log.warning(
-                "Batched L2 failed (%s: %s); falling back to isolated evaluation for %s",
-                type(exc).__name__,
-                exc,
-                [cid for cid, _ in non_inc] if inc_entry is not None else [cid for cid, _ in cand_list],
-            )
-            merged: dict[str, CandidateSurrogateResult] = {}
-            run_ids: dict[str, str] = {}
-            agg_stats: dict[str, int] = {
-                "total_tasks": 0,
-                "cache_hits": 0,
-                "compiled_tasks": 0,
-                "failed_candidates": 0,
-            }
-            agg_prewarm_sec = 0.0
-            agg_npu_sec = 0.0
-            last_exc: Exception | None = None
-            for sub_batch in fallback_batches:
-                try:
-                    one_res, run_id, _rcp = eval_fn(
-                        operator_name,
-                        sub_batch,
-                        anc_seq,
-                        source_root=worktree,
-                        env_file=env_file,
-                        device_id=device_id,
-                        warmup=warmup,
-                        repeat=repeat,
-                        require_all_passed=False,
-                        timeout_sec=360,
-                        **pool_kwargs,
-                    )
-                    merged.update(one_res)
-                    run_ids.update({cand_id: run_id for cand_id in one_res})
-                    sub_stats, sub_p_sec, sub_n_sec = _extract_l2_telemetry(one_res)
-                    for key in agg_stats:
-                        agg_stats[key] += int(sub_stats.get(key, 0))
-                    agg_prewarm_sec += sub_p_sec
-                    agg_npu_sec += sub_n_sec
-                except FileNotFoundError:
-                    raise
-                except Exception as sub_exc:
-                    if _is_non_fallback_l2_env_error(sub_exc):
-                        raise
-                    last_exc = sub_exc
-                    log.warning(
-                        "Isolated L2 fallback failed for %s: %s: %s",
-                        [cid for cid, _ in sub_batch],
-                        type(sub_exc).__name__,
-                        sub_exc,
-                    )
-            if merged:
-                return L2BatchResults(
-                    merged,
-                    run_ids,
-                    prewarm_stats=agg_stats,
-                    l2_prewarm_sec=agg_prewarm_sec,
-                    l2_npu_sec=agg_npu_sec,
-                )
-            assert last_exc is not None
-            raise last_exc
+        res, run_id, _rcp = eval_fn(
+            operator_name,
+            cand_list,
+            anc_seq,
+            source_root=worktree,
+            env_file=env_file,
+            device_id=device_id,
+            warmup=warmup,
+            repeat=repeat,
+            require_all_passed=False,
+            timeout_sec=660,
+            **pool_kwargs,
+        )
+        p_stats, p_sec, n_sec = _extract_l2_telemetry(res)
+        return L2BatchResults(
+            res,
+            {cid: run_id for cid in res},
+            prewarm_stats=p_stats,
+            l2_prewarm_sec=p_sec,
+            l2_npu_sec=n_sec,
+        )
 
     setattr(_eval, "is_real_npu", True)
     return _eval
@@ -1810,7 +1716,7 @@ def salvage_unpromoted_beam_winner(
             cur_idx = int(r.get("round_idx", -1))
             if cur_idx == r_idx:
                 r["promoted"] = True
-                r["rolled_back_l3"] = False
+                r["l3_resolution"] = "PROMOTED"
                 r["stagnation_rounds_after"] = 0
                 r["best_round_surrogate_score"] = round(cand_res.surrogate_score, 6)
                 r["best_so_far_surrogate_score"] = round(cand_res.surrogate_score, 6)
@@ -2113,8 +2019,6 @@ def run_operator_marathon(
     campaign_field_names = {f.name for f in fields(CampaignConfig)}
     for field_name in (
         "cost_model_mode",
-        "cost_disengage_eta",
-        "cost_slow_gain_threshold",
         "allow_unreviewed_distilled_rules",
     ):
         if field_name in campaign_field_names:
@@ -2125,9 +2029,7 @@ def run_operator_marathon(
         max_wall_clock_min=cfg.max_wall_clock_min,
         k_rule_workers=cfg.k_rule_workers,
         max_syntax_repairs=cfg.max_syntax_repairs,
-        min_l2_gain_for_l3=cfg.min_l2_gain_for_l3,
         min_surrogate_gain=cfg.min_surrogate_gain,
-        min_flywheel_gain=cfg.min_flywheel_gain,
         stagnation_escalate_rounds=cfg.stagnation_escalate_rounds,
         stagnation_freeze_rounds=cfg.stagnation_freeze_rounds,
         disable_early_goal_stop=cfg.disable_early_goal_stop,
@@ -2464,7 +2366,7 @@ def _detect_watch_changes(
                     "best_round_speedup": r.get("best_round_speedup"),
                     "best_so_far_speedup": r.get("best_so_far_speedup"),
                     "promoted": bool(r.get("promoted", False)),
-                    "rolled_back_l3": bool(r.get("rolled_back_l3", False)),
+                    "l3_resolution": str(r.get("l3_resolution", "NOT_RUN")),
                     "stagnation_by_regime": st["stagnation_by_regime"],
                     "frozen_regimes": st["frozen_regimes"],
                 }
@@ -2797,21 +2699,9 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cost-model-mode",
-        choices=("off", "shadow", "auto", "coarse_only"),
+        choices=("off", "shadow", "advisory"),
         default="off",
-        help="Cost model prescreen gate policy mode.",
-    )
-    parser.add_argument(
-        "--cost-disengage-eta",
-        type=float,
-        default=0.65,
-        help="Roofline eta threshold above which cost model auto-disengages.",
-    )
-    parser.add_argument(
-        "--cost-slow-gain-threshold",
-        type=float,
-        default=0.03,
-        help="Local relative gain threshold below which cost model disengages when eta >= disengage_eta.",
+        help="Cost model advisory gate policy mode.",
     )
     parser.add_argument(
         "--allow-unreviewed-distilled-rules",
@@ -2909,8 +2799,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
         ),
         cost_model_mode=str(args.cost_model_mode),
-        cost_disengage_eta=float(args.cost_disengage_eta),
-        cost_slow_gain_threshold=float(args.cost_slow_gain_threshold),
         allow_unreviewed_distilled_rules=bool(args.allow_unreviewed_distilled_rules),
         llm_backend=args.llm_backend,
         exploit_model=args.exploit_model,

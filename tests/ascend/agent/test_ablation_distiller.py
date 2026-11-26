@@ -124,8 +124,6 @@ def test_single_variable_ablation_and_negative_filtering(tmp_path: Path) -> None
             "optimized_dur_us": 12.0,
             "numerical_ok": 1.0,
         },
-        min_edit_gain=0.05,
-        min_probe_speedup=1.2,
     )
     report = distiller.distill_from_pair(
         baseline_dsl=_BASELINE_DSL,
@@ -380,8 +378,9 @@ def test_hardware_gate_enforces_108x_and_wait_ratio_non_regression(tmp_path: Pat
         probe,
         probe_runner=lambda _s: {
             "numerical_ok": True,
-            "baseline_dur_us": 106.0,
+            "baseline_dur_us": 100.5,
             "optimized_dur_us": 100.0,
+            "sigma_paired_us": 1.0,
         },
     )
     assert ok_106 is False
@@ -434,7 +433,6 @@ def test_hardware_gate_enforces_108x_and_wait_ratio_non_regression(tmp_path: Pat
             "optimized_aiv_mte2": 0.35,
         },
     )
-    assert distiller._min_probe_speedup == 1.08
     report = distiller.distill_from_pair(
         baseline_dsl=base_dsl,
         winner_dsl=win_dsl,
@@ -548,8 +546,6 @@ def make_reg_kernel(cores: int = 2):
         funnel=GateFunnel(skip_stage_b=True),
         tracker=tracker,
         probe_runner=lambda _s: {"baseline_dur_us": 40.0, "optimized_dur_us": 10.0, "numerical_ok": 1.0},
-        min_edit_gain=0.05,
-        min_probe_speedup=1.08,
     )
     from tilefoundry_ascend.ascend.sil.schema import TopologyAxes  # noqa: PLC0415
 

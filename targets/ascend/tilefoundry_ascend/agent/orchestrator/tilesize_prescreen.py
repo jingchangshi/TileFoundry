@@ -138,10 +138,11 @@ def _compute_tile_roofline_and_waste(
         return max(t_comp_us, t_mem_us), tail_waste_ratio
 
     _ = accum_bytes
+    per_core_hbm_bps = hbm_bps / float(num_aic)
     cube_cycles = flops / float(max(1, macs_per_cycle))
     fixpipe_cycles = float(l0c_bytes) / float(fixpipe_bpc)
     t_tile_comp_us = max(cube_cycles, fixpipe_cycles) / (clock_ghz * 1e3)
-    t_tile_mem_us = (mem_traffic / hbm_bps) * 1e6 if hbm_bps > 0.0 else 0.0
+    t_tile_mem_us = (mem_traffic / per_core_hbm_bps) * 1e6 if per_core_hbm_bps > 0.0 else 0.0
     t_tile_roof_us = max(t_tile_comp_us, t_tile_mem_us)
     t_roof_per_mflop_us = (t_tile_roof_us / max(1.0, flops)) * 1e6
     return t_roof_per_mflop_us, 0.0
@@ -1009,7 +1010,8 @@ def prescreen_live_ir_neighborhood(
                 k_dim=k_dim,
             )
             wave_burst_score = t_roof_us
-            sort_key = (t_roof_us, tail_waste, float(dom_cycles), float(idx))
+            norm_dom_cycles = float(dom_cycles) / float(max(1, cand.bm * cand.bn * cand.bk))
+            sort_key = (t_roof_us, tail_waste, norm_dom_cycles, float(idx))
 
         cost_pred: CostPrediction | None = None
         cost_score = 0.0

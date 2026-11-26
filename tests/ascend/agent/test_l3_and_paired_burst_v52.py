@@ -19,10 +19,11 @@ from tests.ascend.benchmarks.l3_contract import (
 )
 from tilefoundry_ascend.agent.campaign import surrogate_cannbench
 from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec
+from tilefoundry_ascend.agent.campaign.fault_types import FaultPlane, TypedFault
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
     DeterministicSearchBoundaryLedger,
+    RoundFunnelEvent,
     is_clean_calibration_sample,
-    normalize_compile_error_code,
 )
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     PatchAnchorMissError,
@@ -540,44 +541,28 @@ def test_cpp_slice_protocol_raises_patch_anchor_miss_error() -> None:
         splice_cpp_units_into_tu(cpp, identical_unit, active_kernel="kernel_active")
 
 
-def test_funnel_telemetry_error_normalization_and_ledger_sha_pruning() -> None:
-    """Funnel telemetry normalizes Stage-A error codes and prunes repeated bad SHAs."""
-    assert (
-        normalize_compile_error_code(
-            "stage_a", "PatchAnchorMissError: SEARCH block did not match target C++ source"
+def test_funnel_telemetry_typed_fault_and_ledger_sha_pruning() -> None:
+    """Funnel telemetry persists TypedFault planes and prunes repeated bad SHAs."""
+    fault_pairs = (
+        (FaultPlane.SYNTAX_AST, "PATCH_ANCHOR_MISS", "stage_a"),
+        (FaultPlane.STATIC_CONTRACT, "TRACKB_SLICE_SPLICE_ERR", "stage_a"),
+        (FaultPlane.COMPILER_LOWERING, "CCE_UNDECLARED_INTRINSIC", "stage_b"),
+    )
+    for plane, code, tier in fault_pairs:
+        ev = RoundFunnelEvent.from_typed_fault(
+            run_id="r_test",
+            operator="mla",
+            round_idx=1,
+            regime_tag="decode",
+            topology_axes={"compute_engine": "coupled_1c2v"},
+            candidate_id=f"cid_{code}",
+            cand_sha="abc",
+            worker_kind="exploit_rule",
+            fault=TypedFault(plane=plane, code=code, failed_tier=tier, detail="err"),
         )
-        == "PATCH_ANCHOR_MISS"
-    )
-    assert (
-        normalize_compile_error_code(
-            "stage_a", "Spliced C++ units are identical to parent Track-B translation unit"
-        )
-        == "PATCH_ANCHOR_MISS"
-    )
-    assert (
-        normalize_compile_error_code("stage_a", "DEAD_CODE_TRACKB_EDIT in helper")
-        == "TRACKB_SLICE_SPLICE_ERR"
-    )
-    assert (
-        normalize_compile_error_code("stage_a", "signature mismatch: missing regime symbols")
-        == "SIGNATURE_CONTRACT_MISMATCH"
-    )
-    assert (
-        normalize_compile_error_code("stage_a", "unexpected keyword argument 'foo'")
-        == "SIGNATURE_CONTRACT_MISMATCH"
-    )
-    assert (
-        normalize_compile_error_code("stage_a", "non-contiguous stride contract error")
-        == "DYNAMIC_STRIDE_CONTRACT_ERR"
-    )
-    assert (
-        normalize_compile_error_code("stage_b", "implicit declaration of function asc_vadd")
-        == "CCE_UNDECLARED_INTRINSIC"
-    )
-    assert (
-        normalize_compile_error_code("stage_b", "unknown type name 'half_t'")
-        == "CCE_UNDECLARED_INTRINSIC"
-    )
+        assert ev.fault_plane == plane.value
+        assert ev.error_code_norm == code
+        assert ev.passed_l0_l1 is False
 
     ledger = DeterministicSearchBoundaryLedger()
     for idx, code in enumerate(

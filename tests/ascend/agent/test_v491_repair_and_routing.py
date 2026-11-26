@@ -17,13 +17,14 @@ from tilefoundry_ascend.agent import (
 )
 from tilefoundry_ascend.agent.campaign.anchor_specs import RegimeTargetSpec
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
-    _reject_trackb_folding_markers,
+    _reject_trackb_context_markers,
     patch_regime_into_module,
 )
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    _compact_trackb_repair_source,
+from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     _detect_trackb_prologue_line_offset,
-    _resplice_trackb_omitted_spans,
+    render_active_symbol_closure_view,
+)
+from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     run_l0_l1_round_filter,
 )
 from tilefoundry_ascend.agent.kb.schema import (
@@ -87,10 +88,10 @@ def _grouped_matmul_parent_module() -> tuple[str, RegimeTargetSpec]:
     return mod_src, spec
 
 
-def test_trackb_prologue_offset_no_exec_module_and_multi_literal_budget(
+def test_trackb_prologue_offset_no_exec_module_and_lossless_closure_view(
     tmp_path: Path,
 ) -> None:
-    """Verify AST prologue offset skips exec and multi-literal budget splits fairly."""
+    """Verify AST prologue offset skips exec and lossless closure view preserves full body."""
     side_effect_file = tmp_path / "executed.flag"
     untrusted_mod = (
         "from pathlib import Path\n"
@@ -116,41 +117,16 @@ def test_trackb_prologue_offset_no_exec_module_and_multi_literal_budget(
         "    o[0] = v_var_219;",
         "}",
     ]
-    mla_mod = (
-        'MLA_PROLOGUE = "#define MLA_HDR 1\\n#define MLA_HDR2 2\\n#define MLA_HDR3 3\\n#define MLA_HDR4 4\\n#define MLA_HDR5 5\\n"\n'
-        'MLA_CUBE_CPP = r"""\n'
-        + "\n".join(cube_lines)
-        + '\n"""\n\n'
-        'MLA_VEC_CPP = r"""\n'
-        + "\n".join(vec_lines)
-        + '\n"""\n\n'
-        "def _render_trackb_tu(trackb_src: str) -> str:\n"
-        "    return MLA_PROLOGUE + trackb_src\n"
+    cpp_tu = "\n".join([*cube_lines, "", *vec_lines])
+    closure_view = render_active_symbol_closure_view(
+        cpp_tu,
+        "mla_cube_kernel",
+        include_line_numbers=True,
     )
-    err_line_in_cube = 5 + 1 + 221
-    diag = f"/tmp/mla.cce:{err_line_in_cube}:5: error: undeclared TARGET_MLA_CUBE_ERR"
-    compacted = _compact_trackb_repair_source(
-        mla_mod,
-        diag,
-        max_bytes=12000,
-        prologue_line_offset=5,
-    )
-    tree = ast.parse(compacted)
-    lit_sizes: dict[str, int] = {}
-    for node in tree.body:
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-            and node.targets[0].id in ("MLA_CUBE_CPP", "MLA_VEC_CPP")
-        ):
-            lit_sizes[node.targets[0].id] = len(node.value.value.encode("utf-8"))
-    assert lit_sizes["MLA_CUBE_CPP"] > 2000
-    assert lit_sizes["MLA_VEC_CPP"] > 2000
-    assert len(compacted.encode("utf-8")) <= 12500
-    assert "TARGET_MLA_CUBE_ERR" in compacted
+    assert "TARGET_MLA_CUBE_ERR" in closure_view
+    assert "c_var_120" in closure_view
+    assert "MIDDLE BODY OMITTED" not in closure_view
+    assert "mla_vec_kernel" not in closure_view or "READONLY_SIBLING_DECLARATION" in closure_view
 
 
 def test_trackb_stageb_repair_repatch_against_cur_patched_and_fallback() -> None:
@@ -270,112 +246,15 @@ def test_trackb_stageb_repair_repatch_against_cur_patched_and_fallback() -> None
     assert "ast_patch_error" in mismatch_checks[0].error_message
 
 
-def test_trackb_folding_marker_resplice_and_unresolvable_rejection() -> None:
-    """Verify folding marker omitted spans splice back cleanly while hallucinated markers fail."""
-    orig_cpp_lines = [
-        "#include <tl_templates/ascend/common.h>",
-        'extern "C" __global__ __aicore__ void gmm_fold_kernel(__gm__ half* x) {',
-        "    int head_0 = 0;",
-        "    int head_1 = 1;",
-        *(f"    int mid_{i} = {i};" for i in range(10)),
-        "    int tail_0 = 100;",
-        "    int tail_1 = BROKEN_CALL();",
-        "}",
-    ]
-    orig_cpp = "\n".join(orig_cpp_lines) + "\n"
-    orig_mod = (
-        'GMM_TRACKB_CPP = r"""\n'
-        f"{orig_cpp}"
-        '"""\n'
-        "def _select_gmm_config():\n"
-        '    return {"tile_m": 64}\n'
+def test_trackb_readonly_context_marker_rejection() -> None:
+    """Verify echoing read-only sibling markers in Track-B candidates is rejected."""
+    _reject_trackb_context_markers(
+        'extern "C" __global__ __aicore__ void gmm_fold_kernel(__gm__ half* x) {}',
+        "gmm_fold",
     )
-    spec = RegimeTargetSpec(
-        regime_tag="gmm_fold",
-        builder_candidates=("_select_gmm_config",),
-        sample_builder_kwargs={},
-        representative_hir_dims={"M": 64, "N": 64},
-        editable_symbols=("GMM_TRACKB_CPP", "_select_gmm_config"),
-        runtime_backend="ascendc_trackb",
-        trackb_symbols=("GMM_TRACKB_CPP",),
-        config_selector_fn="_select_gmm_config",
-    )
-
-    folded_reply_cpp = "\n".join(
-        [
-            "#include <tl_templates/ascend/common.h>",
-            'extern "C" __global__ __aicore__ void gmm_fold_kernel(__gm__ half* x) {',
-            "    int head_0 = 0;",
-            "    int head_1 = 1;",
-            "    /* ... 10 lines omitted ... */",
-            "    int tail_0 = 100;",
-            "    int tail_1 = 777;",
-            "}",
-        ]
-    )
-    folded_reply_mod = (
-        'GMM_TRACKB_CPP = r"""\n'
-        f"{folded_reply_cpp}\n"
-        '"""\n'
-    )
-    ledger = build_objective_physical_ledger(
-        analysis_mode="readonly_envelope",
-        is_legal=True,
-        steady_state_ii=8,
-        pipe_cycles={"AIV0.PIPE_V": 32},
-        waterlines={},
-    )
-    checks = asyncio.run(
-        run_l0_l1_round_filter(
-            [("c_fold", orig_mod)],
-            patch_fn=lambda snip: patch_regime_into_module(
-                orig_mod, spec, snip, active_kernel="gmm_fold_kernel"
-            ),
-            l0_checker=lambda _src: StageAResult(passed=True, prim_func=None, ledger=ledger),
-            l1_compiler=lambda mod: StageBResult(
-                passed=("BROKEN_CALL" not in mod and "int tail_1 = 777;" in mod),
-                error_message="gmm.cce:17:5: error: BROKEN_CALL undeclared",
-            ),
-            repair_backend=MockLLMBackend(default_response=folded_reply_mod),
-            max_syntax_repairs=1,
-            backend_kind="ascendc_trackb",
-        )
-    )
-    assert checks[0].passed is True, checks[0].error_message
-    assert "int mid_5 = 5;" in checks[0].patched_module_source
-    assert "/* ... 10 lines omitted ... */" not in checks[0].patched_module_source
-
-    context_marker_reply = folded_reply_cpp.replace(
-        "/* ... 10 lines omitted ... */",
-        "/* [LINES OMITTED OUTSIDE FOCUS WINDOW; PATCH VISIBLE LINES] */",
-    )
-    respliced_ctx = _resplice_trackb_omitted_spans(
-        context_marker_reply,
-        pre_compaction_source=orig_cpp,
-    )
-    assert "int mid_9 = 9;" in respliced_ctx
-    assert "LINES OMITTED" not in respliced_ctx
-
-    hallucinated_wrong_count = folded_reply_mod.replace("10 lines omitted", "999 lines omitted")
-    bad_checks = asyncio.run(
-        run_l0_l1_round_filter(
-            [("c_bad_fold", orig_mod)],
-            patch_fn=lambda snip: patch_regime_into_module(
-                orig_mod, spec, snip, active_kernel="gmm_fold_kernel"
-            ),
-            l0_checker=lambda _src: StageAResult(passed=True, prim_func=None, ledger=ledger),
-            l1_compiler=lambda _mod: StageBResult(passed=False, error_message="compile error"),
-            repair_backend=MockLLMBackend(default_response=hallucinated_wrong_count),
-            max_syntax_repairs=1,
-            backend_kind="ascendc_trackb",
-        )
-    )
-    assert bad_checks[0].passed is False
-    assert "trackb_folding_marker_rejected" in bad_checks[0].error_message
-
-    with pytest.raises(ValueError, match="truncated context markers"):
-        _reject_trackb_folding_markers(
-            "/* ... 12 lines omitted ... */",
+    with pytest.raises(ValueError, match="echoes read-only markers"):
+        _reject_trackb_context_markers(
+            "// [READONLY_SIBLING_DECLARATION] void other();\n",
             "gmm_fold",
         )
 
@@ -535,9 +414,10 @@ def test_hybrid_trackb_python_primfunc_routing_and_portfolio_repair_context() ->
     repair_prompt = repair_calls[0].user_prompt
     assert "### PARENT AUTHORIZED SOURCE" in repair_prompt
     assert "### COMPILER LOWERED EXCERPT (READ-ONLY CONTEXT)" in repair_prompt
-    assert "252: // cce_stmt_252" in repair_prompt
+    assert repair_prompt.count("252: // cce_stmt_252") == 1
     assert "FAIL_LINE_SENTINEL" in repair_prompt
-    assert "LINES OMITTED OUTSIDE FOCUS WINDOW" in repair_prompt
+    assert "MIDDLE BODY OMITTED" not in repair_prompt
+    assert "LINES OMITTED OUTSIDE FOCUS WINDOW" not in repair_prompt
 
 
 def test_portfolio_plan_workers_threads_case_ratios_compiler_summary_and_r16_text() -> None:

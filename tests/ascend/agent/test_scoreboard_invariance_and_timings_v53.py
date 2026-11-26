@@ -65,26 +65,14 @@ def _ensure_cost_advisor_stub() -> None:
             self,
             *,
             enable_prescreen_flag: bool = True,
-            round_idx: int = 1,
-            stagnation_rounds: int = 0,
-            incumbent_roofline_eta: float = 0.0,
-            target_roofline_eta: float = 0.85,
-            prev_local_rel_gain: float | None = None,
-            mean_recoverable_excess_us: float | None = None,
-            disengage_roofline_eta: float = 0.65,
-            slow_gain_threshold: float = 0.03,
+            bucket_clean_samples: int = 0,
+            out_of_sample_spearman_rho: float | None = None,
         ) -> CostGateDecision:
             return evaluate_cost_gate_policy(
                 mode=self.mode,
                 enable_prescreen_flag=enable_prescreen_flag,
-                round_idx=round_idx,
-                stagnation_rounds=stagnation_rounds,
-                incumbent_roofline_eta=incumbent_roofline_eta,
-                target_roofline_eta=target_roofline_eta,
-                prev_local_rel_gain=prev_local_rel_gain,
-                mean_recoverable_excess_us=mean_recoverable_excess_us,
-                disengage_roofline_eta=disengage_roofline_eta,
-                slow_gain_threshold=slow_gain_threshold,
+                bucket_clean_samples=bucket_clean_samples,
+                out_of_sample_spearman_rho=out_of_sample_spearman_rho,
             )
 
         def predict_candidate_us(
@@ -409,7 +397,7 @@ async def test_scoreboard_invariance_on_l3_failure_and_no_post_budget_round(
     report = await runner.run()
     assert len(report.rounds) == 1
     assert l4_calls == 1
-    assert report.rounds[0].rolled_back_l3 is True
+    assert report.rounds[0].l3_resolution == "CANDIDATE_REJECTED"
     assert report.scoreboard_anchor_count == 5
     assert [int(a.case_num) for a in report.active_anchors] == [2, 4, 14, 16, 17]
     assert [int(a.case_num) for a in report.scoreboard_anchors] == [2, 4, 14, 16, 17]
@@ -607,7 +595,6 @@ def test_flywheel_persistence_unlock_real_npu_and_cumulative_8pct_trigger(
     flywheel = FlywheelDistiller(
         funnel=GateFunnel(skip_stage_b=True),
         tracker=tracker,
-        min_edit_gain=0.03,
     )
 
     class _RealNPUL2Evaluator:
@@ -661,7 +648,7 @@ def test_flywheel_persistence_unlock_real_npu_and_cumulative_8pct_trigger(
         ),
     )
 
-    runner._last_distilled_lat_by_regime["reg_a"] = 100.0
+    runner._flywheel_coordinator.seed_baseline("reg_a", base_dsl, 100.0, 0.5)
     admitted = runner._run_flywheel_distillation(
         baseline_source=base_dsl,
         winner_source=win_dsl,
@@ -677,11 +664,15 @@ def test_flywheel_persistence_unlock_real_npu_and_cumulative_8pct_trigger(
         round_idx=3,
         rule_id=None,
         symptom_family="GRID_TAIL_WAVE_UNDERUTIL",
+        sigma_paired_us=0.5,
     )
     assert admitted
     distilled_files = sorted((lake_dir / "kb" / "distilled_rules").glob("*.json"))
     assert len(distilled_files) == len(admitted)
-    assert runner._last_distilled_lat_by_regime["reg_a"] == pytest.approx(91.5)
+    assert (
+        runner._flywheel_coordinator.last_distilled_ckpt_by_regime["reg_a"].latency_us
+        == pytest.approx(91.5)
+    )
 
 
 def test_bandit_launch_floor_detrapping_and_sticky_gate(tmp_path: Path) -> None:
@@ -901,7 +892,7 @@ async def test_substage_timings_prewarm_stats_and_48kb_trackb_passthrough(
             max_rounds=1,
             k_rule_workers=0,
             max_syntax_repairs=0,
-            cost_model_mode="auto",
+            cost_model_mode="advisory",
         ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("attention_residual", 5.0, 2.0, 0.99),

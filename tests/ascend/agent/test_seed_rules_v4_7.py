@@ -13,6 +13,7 @@ from tilefoundry_ascend.agent.kb import (
     load_seed_rules,
     validate_rule_predicate,
 )
+from tilefoundry_ascend.agent.kb.schema import DETERMINISTIC_SYMPTOM_FAMILIES
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     StaticDynamicResidual,
     compute_static_dynamic_residual,
@@ -56,7 +57,7 @@ def test_seed_rules_exact_41_mece_provenance_and_ast_validity() -> None:
     assert "asc_set_l0c_copy_nz_para" in r02.cpp20_transform_template
 
     covered_families = {SymptomFamily(r.symptom_family) for r in rules}
-    assert covered_families == set(SymptomFamily)
+    assert covered_families == DETERMINISTIC_SYMPTOM_FAMILIES
     mechanism_tags = {r.mechanism_tag for r in rules}
     assert len(mechanism_tags) == 41
     assert all(tag.strip() for tag in mechanism_tags)

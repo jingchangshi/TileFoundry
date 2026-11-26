@@ -522,8 +522,6 @@ def test_campaign_early_stop_on_goal_met_and_roofline_saturated(tmp_path: Path) 
     flywheel = FlywheelDistiller(
         funnel=GateFunnel(skip_stage_b=True),
         tracker=tracker,
-        min_edit_gain=0.0,
-        min_probe_speedup=1.0,
     )
     kb_out = tmp_path / "campaign_rules.yaml"
     runner = PerfTargetCampaignRunner(
@@ -1030,7 +1028,8 @@ def test_campaign_l3_infrastructure_failure_preserves_pending_promotion(
     assert report.promotion_blocked is True
     assert report.total_rounds == 1
     assert report.promoted_rounds == ()
-    assert report.rolled_back_rounds == (1,)
+    assert report.rolled_back_rounds == ()
+    assert report.rounds[0].l3_resolution == "INFRA_DEFERRED"
     assert report.rounds[0].stagnation_rounds_after == 0
     assert target_path.read_text(encoding="utf-8") == _MULTI_REGIME_MODULE
     assert l4_calls == []
@@ -1237,7 +1236,7 @@ def test_campaign_l3_active_wait_timeout_keeps_candidate_and_resume_identity(
             True,
             0,
             True,
-            True,
+            False,
         ),
         (
             "numeric",
@@ -1255,7 +1254,7 @@ def test_campaign_l3_active_wait_timeout_keeps_candidate_and_resume_identity(
             True,
             0,
             True,
-            True,
+            False,
         ),
         (
             "active_numeric",
@@ -1978,7 +1977,10 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
     tmp_path: Path,
 ) -> None:
     """Verify --resume restores stepping_stone_beam, passes roofline_eta, and exempts 503."""
-    from tilefoundry_ascend.agent.orchestrator import TwoLaneBeamSearch  # noqa: PLC0415
+    from tilefoundry_ascend.agent.orchestrator import (  # noqa: PLC0415
+        TwoLaneBeamSearch,
+        compute_static_dynamic_residual,
+    )
 
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 4.0),)
     regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {"bm": 64, "bn": 64, "bk": 64}),)
@@ -2034,11 +2036,14 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
     )
     asyncio.run(runner1.run(resume=False))
     assert any("T.alloc_ss" in c.structural_signature for c in beam1.stepping_stone_beam)
-    expected_gap = round(
-        beam1.exploit_beam[0].residual.predicted_bottleneck_util - 0.3333333333333333,
-        6,
+    expected_residual = compute_static_dynamic_residual(
+        beam1.exploit_beam[0].ledger,
+        {"dur_us": 12.0, "roofline_eta": 4.0 / 12.0},
     )
-    assert abs(beam1.exploit_beam[0].residual.unexplained_gap_ratio - max(0.0, expected_gap)) < 1e-4
+    assert beam1.exploit_beam[0].residual.unexplained_gap_ratio == pytest.approx(
+        expected_residual.unexplained_gap_ratio,
+        abs=1e-4,
+    )
 
     ckpt_payload = json.loads(ckpt_path.read_text(encoding="utf-8"))
     assert "beam_state" in ckpt_payload
@@ -2061,7 +2066,7 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
             max_rounds=2,
             stagnation_escalate_rounds=1,
             enable_tilesize_prescreen=True,
-            cost_model_mode="coarse_only",
+            cost_model_mode="advisory",
         ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
@@ -2084,7 +2089,7 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
         or ("T.MixedKernel", "T.alloc_ss", "track:developer") in runner2._beam.exploited_signatures
     )
     assert any("T.alloc_ss" in c.user_prompt for c in fail_backend.calls)
-    assert any("### TILE PRESCREEN GUIDANCE" in c.user_prompt for c in fail_backend.calls)
+    assert all("### TILE PRESCREEN GUIDANCE" not in c.user_prompt for c in fail_backend.calls)
     for rid, stats in fail_tracker.posteriors.items():
         assert stats.trials == prior_trials[rid]
 
@@ -2560,7 +2565,7 @@ def test_surrogate_dual_criterion_tail_guard_and_meets_perf_target(tmp_path: Pat
             "best_round_speedup": 1.1,
             "best_so_far_speedup": 1.1,
             "promoted": False,
-            "rolled_back_l3": False,
+            "l3_resolution": "NOT_RUN",
             "stagnation_rounds_after": 1,
         }
     )
@@ -3376,7 +3381,7 @@ def test_for_regime_and_msprof_collector_caching_wakes_r05_and_r11(tmp_path: Pat
         steady_state_ii=None,
         pipe_cycles={"AIV0.PIPE_V": 64, "AIV1.PIPE_V": 64},
         waterlines={"UB": ub_half},
-        dominant_contig_bytes=512,
+        dominant_contig_bytes=16384,
         has_online_rescale_loop=True,
     )
 
@@ -3408,9 +3413,9 @@ def test_for_regime_and_msprof_collector_caching_wakes_r05_and_r11(tmp_path: Pat
         return {
             "regime_a": {
                 "aic_mac_ratio": 0.0,
-                "aiv_vec_ratio": 0.20,
-                "mte2_wait_ratio": 0.30,
-                "sync_stall_ratio": 0.60,
+                "aiv_vec_ratio": 0.10,
+                "mte2_wait_ratio": 0.16,
+                "sync_stall_ratio": 0.18,
                 "dur_us": 18.0,
             }
         }
@@ -3449,7 +3454,7 @@ def test_for_regime_and_msprof_collector_caching_wakes_r05_and_r11(tmp_path: Pat
         config=CampaignConfig(
             operator_name="attention_residual",
             max_rounds=2,
-            k_rule_workers=3,
+            k_rule_workers=5,
         ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("attention_residual", 5.0, 3.0, 0.95),
@@ -3833,7 +3838,7 @@ def test_up3_domain_envelope_prompt_and_host_dispatch_cache(tmp_path: Path, monk
         resolve_regime_config,
     )
     from tilefoundry_ascend.agent.campaign.campaign_runner import (  # noqa: PLC0415
-        _FORBIDDEN_SLICE_SYMBOLS,
+        _derive_dynamic_protected_symbols,
     )
 
     ar_env = get_input_domain_envelope("attention_residual")
@@ -3841,8 +3846,6 @@ def test_up3_domain_envelope_prompt_and_host_dispatch_cache(tmp_path: Path, monk
     assert ar_env is not None and mla_env is not None
     assert "builder_kwargs" in ar_env.format_prompt_block()
     assert "builder_kwargs" in mla_env.format_prompt_block()
-    assert "_DISPATCH_CACHE" in _FORBIDDEN_SLICE_SYMBOLS
-
     dummy_dsl = (
         "def _select_demo_config(n_depth=8):\n"
         "    return {'tile_m': 16, 'builder_kwargs': {'omit_max_shift': True}}\n\n"
@@ -3857,6 +3860,9 @@ def test_up3_domain_envelope_prompt_and_host_dispatch_cache(tmp_path: Path, monk
         config_selector_fn="_select_demo_config",
         builder_candidates=("_build_demo",),
         editable_symbols=("_select_demo_config", "_build_demo"),
+    )
+    assert "_DISPATCH_CACHE" not in _derive_dynamic_protected_symbols(
+        dummy_dsl, demo_spec, sibling_specs=()
     )
     resolved = resolve_regime_config(dummy_dsl, demo_spec, dims={"N": 8})
     assert resolved.builder_kwargs.get("omit_max_shift") is True
@@ -4606,7 +4612,7 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
                 max_rounds=2,
                 stagnation_escalate_rounds=1,
                 enable_tilesize_prescreen=flag,
-                cost_model_mode="auto" if flag else "off",
+                cost_model_mode="advisory" if flag else "off",
             ),
             target_module_path=t_path,
             perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
@@ -5002,8 +5008,6 @@ def _build_reg_a(tile_m=3):
         funnel=GateFunnel(skip_stage_b=True),
         tracker=tracker,
         probe_runner=lambda _spec: {"baseline_dur_us": 40.0, "optimized_dur_us": 20.0, "numerical_ok": 1.0},
-        min_edit_gain=0.05,
-        min_probe_speedup=1.08,
     )
     runner = PerfTargetCampaignRunner(
         config=CampaignConfig(
@@ -5013,7 +5017,6 @@ def _build_reg_a(tile_m=3):
             stagnation_freeze_rounds=4,
             k_rule_workers=1,
             min_surrogate_gain=0.25,
-            min_flywheel_gain=0.03,
         ),
         target_module_path=t_path,
         perf_target=PerfTargetSpec("attention_residual", 2.8, 1.5, 0.95),
@@ -5611,7 +5614,7 @@ def test_trackb_patch_protocol_accepts_scoped_hunks_bare_units_and_full_tu() -> 
         "/* [READ-ONLY SIBLING KERNEL: kernel_sibling] */\n"
         "extern \"C\" __global__ __vector__ void kernel_sibling",
     )
-    with pytest.raises(ValueError, match="echoes truncated context markers"):
+    with pytest.raises(ValueError, match="echoes read-only markers"):
         patch_regime_into_module(_TRACKB_MODULE, spec, folded)
 
     selector_only = (

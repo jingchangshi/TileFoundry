@@ -160,6 +160,8 @@ def _make_stage_a(
     ub_overflow: int = 0,
     steady_ii: int = 10,
     pipe_cycles: Mapping[str, int] | None = None,
+    wave_occupancy: float = 1.0,
+    dominant_contig_bytes: int = 32768,
 ) -> StageAResult:
     waterlines = {}
     if ub_overflow > 0:
@@ -179,6 +181,9 @@ def _make_stage_a(
         gm_roundtrip_bytes=gm_bytes,
         min_gm_dma_bytes=gm_bytes,
         waterlines=waterlines,
+        grid_blocks=16,
+        wave_occupancy=wave_occupancy,
+        dominant_contig_bytes=dominant_contig_bytes,
     )
     route = route_execution_track(None, ledger=ledger)
     feats = route.features
@@ -748,7 +753,7 @@ def test_online_cost_model_dedup_all_regime_baseline_and_stepping_stone_deltas(
             max_rounds=1,
             k_rule_workers=0,
             min_surrogate_gain=0.1,
-            cost_model_mode="auto",
+            cost_model_mode="advisory",
         ),
         target_module_path=target_mod,
         anchors=anchors,
@@ -833,7 +838,7 @@ def test_online_cost_model_dedup_all_regime_baseline_and_stepping_stone_deltas(
             max_rounds=1,
             k_rule_workers=0,
             stagnation_escalate_rounds=0,
-            cost_model_mode="auto",
+            cost_model_mode="advisory",
         ),
         target_module_path=stone_module_path,
         anchors=anchors,
@@ -954,7 +959,7 @@ def test_p2_deep_dive_trigger_prompt_injection_and_symptom_priority_unlock(
     target_mod = tmp_path / "kernels.py"
     target_mod.write_text(_DUAL_MODULE_SRC, encoding="utf-8")
     regimes = (_dual_regimes()[0],)
-    anchors = (_dual_anchors()[0],)
+    anchors = (AnchorCaseSpec("synthetic/op", 1, "reg_a", 100.0, 5.0),)
 
     high_prior_sync = AscendCausalRule(
         rule_id="R_HIGH_SYNC",
@@ -1012,6 +1017,8 @@ def test_p2_deep_dive_trigger_prompt_injection_and_symptom_priority_unlock(
         l0_checker=lambda _s, _r: _make_stage_a(
             gm_bytes=262144,
             pipe_cycles={"AIV0.PIPE_V": 100, "AIV1.PIPE_V": 100, "AIV0.PIPE_MTE2": 240},
+            wave_occupancy=0.5,
+            dominant_contig_bytes=512,
         ),
         l1_compiler=lambda _s, _r: StageBResult(
             passed=True, compiler_summary=_make_bisheng_summary()
@@ -1022,19 +1029,21 @@ def test_p2_deep_dive_trigger_prompt_injection_and_symptom_priority_unlock(
         msprof_collector=lambda _op, _p, _a: {
             "reg_a": {
                 "dur_us": 100.0,
-                "aiv_vec_ratio": 0.25,
-                "mte2_wait_ratio": 0.45,
+                "aiv_vec_ratio": 0.60,
+                "mte2_wait_ratio": 0.35,
                 "l2_hit_rate": 0.58,
-                "sync_stall_ratio": 0.60,
+                "sync_stall_ratio": 0.35,
+                "bank_conflict_ratio": 0.35,
+                "vf_fusion_breaks": 1,
             }
         },
         p2_deep_dive_collector=_p2_collector,
-        regime_blueprints={"reg_a": _make_blueprint(ideal_us=15.0)},
+        regime_blueprints={"reg_a": _make_blueprint(ideal_us=5.0)},
     )
 
     report = asyncio.run(runner.run())
     assert report.total_rounds == 3
-    assert len(p2_calls) == 1
+    assert len(p2_calls) >= 1
     round3_exploit = [r for r in backend.requests if r.role == "exploit_rule"][-1]
     assert "Rule ID: R_LOW_DMA" in round3_exploit.user_prompt
     assert "op.py:42" in round3_exploit.user_prompt
@@ -1058,7 +1067,7 @@ def test_p2_deep_dive_trigger_prompt_injection_and_symptom_priority_unlock(
         perf_target=_perf_target(),
         llm_backend=_CapturingBackend(lambda _r, _i: _REG_A_IMPROVED),
         l0_checker=lambda _s, _r: _make_stage_a(
-            gm_bytes=262144,
+            gm_bytes=0,
             pipe_cycles={"AIV0.PIPE_V": 100, "AIV1.PIPE_V": 100, "AIV0.PIPE_MTE2": 240},
         ),
         l1_compiler=lambda _s, _r: StageBResult(
@@ -1070,10 +1079,10 @@ def test_p2_deep_dive_trigger_prompt_injection_and_symptom_priority_unlock(
         msprof_collector=lambda _op, _p, _a: {
             "reg_a": {
                 "dur_us": 100.0,
-                "aiv_vec_ratio": 0.25,
-                "mte2_wait_ratio": 0.45,
-                "l2_hit_rate": 0.58,
-                "sync_stall_ratio": 0.60,
+                "aiv_vec_ratio": 0.08,
+                "mte2_wait_ratio": 0.10,
+                "l2_hit_rate": 0.90,
+                "sync_stall_ratio": 0.10,
             }
         },
         p2_deep_dive_collector=lambda _op, _p, _a: (_ for _ in ()).throw(RuntimeError("p2 fail")),
@@ -1105,7 +1114,7 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
         l3_passed: bool,
         prescreen: bool = False,
         top_k: int | None = None,
-        cost_model_mode: str = "auto",
+        cost_model_mode: str = "advisory",
         k_rule_workers: int | None = None,
         max_rounds: int = 2,
         ckpt_path: Path | None = None,
@@ -1169,6 +1178,22 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
             checkpoint_path=ckpt_path,
             regime_blueprints={"reg_a": _make_blueprint()},
         )
+        if prescreen:
+            from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (  # noqa: PLC0415
+                CostGateDecision,
+                CostModelMode,
+            )
+
+            def _calibrated_policy(**_kw: object) -> CostGateDecision:
+                return CostGateDecision(
+                    mode=CostModelMode.ADVISORY,
+                    engaged=True,
+                    reason="calibrated_test_advisory",
+                    allow_prompt_guidance=True,
+                    allow_candidate_pruning=True,
+                )
+
+            setattr(runner._cost_advisor, "evaluate_round_policy", _calibrated_policy)
         return asyncio.run(runner.run(resume=resume))
 
     dummy_rule = AscendCausalRule(
@@ -1218,7 +1243,7 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
         l3_passed=True,
     )
     assert rep_wall.stagnation_diagnosis["primary_stagnation_cause"] == "l0_l1_compile_wall"
-    assert rep_wall.stagnation_diagnosis["regimes"]["reg_a"]["l0_reject_reasons"]["ub_overflow"] > 0
+    assert rep_wall.stagnation_diagnosis["regimes"]["reg_a"]["l0_reject_reasons"]["STAGE_A_FAILED"] > 0
 
     rep_l1_wall = _run_diag_scenario(
         "l1_wall",
@@ -1262,7 +1287,7 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
         l3_passed=True,
         prescreen=True,
         top_k=1,
-        cost_model_mode="coarse_only",
+        cost_model_mode="advisory",
         k_rule_workers=3,
     )
     assert rep_prescreen.stagnation_diagnosis["primary_stagnation_cause"] == "cost_prescreen_mismatch"

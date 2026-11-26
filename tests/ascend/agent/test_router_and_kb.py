@@ -1672,7 +1672,14 @@ def test_p0_residual_l1_projection_and_p1_subcore_r35_r13_routing() -> None:
     obs_imbal = pure_vec_imbal.to_observation_5d()
     assert obs_imbal.compute_issue.l0_aiv_subcore_imbalance is True
     ranked_obs = dict(rank_symptom_families(obs_imbal))
-    assert ranked_obs[SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE] == pytest.approx(0.7)
+    assert ranked_obs[SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE] == 0.0
+    coupled_imbal = dict(
+        rank_symptom_families(
+            obs_imbal,
+            topology_axes=TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd"),
+        )
+    )
+    assert coupled_imbal[SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE] > 0.5
 
     roof_ctx = build_predicate_context(
         build_objective_physical_ledger(

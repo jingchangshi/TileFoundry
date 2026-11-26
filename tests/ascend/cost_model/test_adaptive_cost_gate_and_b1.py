@@ -33,78 +33,44 @@ from tilefoundry_ascend.ascend.target import AscendTarget
 
 
 def test_evaluate_cost_gate_policy_state_transitions() -> None:
-    """Verify every CostGateDecision state transition and mode override."""
-    default_off = evaluate_cost_gate_policy(
-        round_idx=1,
-        incumbent_roofline_eta=0.20,
-        target_roofline_eta=0.85,
-        stagnation_rounds=0,
-        mean_recoverable_excess_us=12.0,
-    )
+    """Verify CostGateDecision V5.4 modes (off, shadow, advisory) and t-stat gating."""
+    default_off = evaluate_cost_gate_policy()
     assert isinstance(default_off, CostGateDecision)
     assert default_off.mode == CostModelMode.OFF
     assert default_off.engaged is False
 
-    engaged = evaluate_cost_gate_policy(
-        mode=CostModelMode.AUTO,
-        round_idx=1,
-        incumbent_roofline_eta=0.20,
-        target_roofline_eta=0.85,
-        stagnation_rounds=0,
-        mean_recoverable_excess_us=12.0,
+    shadow = evaluate_cost_gate_policy(
+        mode=CostModelMode.SHADOW,
+        bucket_clean_samples=30,
+        out_of_sample_spearman_rho=0.65,
     )
-    assert isinstance(engaged, CostGateDecision)
-    assert engaged.mode == CostModelMode.AUTO
-    assert engaged.engaged is True
-    assert engaged.reason == "early_coarse_prescreen"
-    assert engaged.coarse_reject_ratio == pytest.approx(3.0)
-    assert engaged.allow_prompt_guidance is True
-    assert engaged.allow_candidate_pruning is True
+    assert shadow.mode == CostModelMode.SHADOW
+    assert shadow.engaged is False
+    assert shadow.allow_prompt_guidance is False
+    assert shadow.allow_candidate_pruning is False
+    assert shadow.reason == "shadow_observation_only"
 
-    near_limit = evaluate_cost_gate_policy(
-        mode=CostModelMode.AUTO,
-        round_idx=1,
-        incumbent_roofline_eta=0.65,
-        target_roofline_eta=0.85,
+    insufficient = evaluate_cost_gate_policy(
+        mode=CostModelMode.ADVISORY,
+        bucket_clean_samples=2,
+        out_of_sample_spearman_rho=0.8,
     )
-    assert near_limit.engaged is False
-    assert near_limit.reason == "near_theoretical_limit"
-    assert math.isinf(near_limit.coarse_reject_ratio)
-    assert near_limit.allow_prompt_guidance is False
-    assert near_limit.allow_candidate_pruning is False
+    assert insufficient.mode == CostModelMode.ADVISORY
+    assert insufficient.engaged is False
+    assert insufficient.reason == "insufficient_bucket_samples"
 
-    near_floor = evaluate_cost_gate_policy(
-        mode=CostModelMode.AUTO,
-        round_idx=1,
-        incumbent_roofline_eta=0.20,
-        mean_recoverable_excess_us=1.0,
+    advisory_ok = evaluate_cost_gate_policy(
+        mode=CostModelMode.ADVISORY,
+        bucket_clean_samples=30,
+        out_of_sample_spearman_rho=0.65,
     )
-    assert near_floor.engaged is False
-    assert near_floor.reason == "near_launch_floor"
-    assert math.isinf(near_floor.coarse_reject_ratio)
+    assert advisory_ok.mode == CostModelMode.ADVISORY
+    assert advisory_ok.engaged is True
+    assert advisory_ok.allow_prompt_guidance is True
+    assert advisory_ok.allow_candidate_pruning is False
+    assert advisory_ok.reason == "advisory_t_stat_validated"
 
-    stagnant = evaluate_cost_gate_policy(
-        mode=CostModelMode.AUTO,
-        round_idx=2,
-        stagnation_rounds=1,
-        incumbent_roofline_eta=0.20,
-    )
-    assert stagnant.engaged is False
-    assert stagnant.reason == "stagnation_detected"
-    assert math.isinf(stagnant.coarse_reject_ratio)
-
-    slow_vel = evaluate_cost_gate_policy(
-        mode=CostModelMode.AUTO,
-        round_idx=2,
-        stagnation_rounds=0,
-        incumbent_roofline_eta=0.20,
-        prev_local_rel_gain=0.02,
-    )
-    assert slow_vel.engaged is False
-    assert slow_vel.reason == "slow_iteration_velocity"
-    assert math.isinf(slow_vel.coarse_reject_ratio)
-
-    disabled_flag = evaluate_cost_gate_policy(enable_prescreen_flag=False)
+    disabled_flag = evaluate_cost_gate_policy(enable_prescreen_flag=False, mode="advisory")
     assert disabled_flag.mode == CostModelMode.OFF
     assert disabled_flag.engaged is False
     assert disabled_flag.reason == "disabled_by_config"
@@ -113,19 +79,6 @@ def test_evaluate_cost_gate_policy_state_transitions() -> None:
     assert disabled_mode.mode == CostModelMode.OFF
     assert disabled_mode.engaged is False
     assert disabled_mode.reason == "disabled_by_config"
-
-    forced_coarse = evaluate_cost_gate_policy(
-        mode="coarse_only",
-        stagnation_rounds=3,
-        incumbent_roofline_eta=0.90,
-        coarse_reject_ratio=4.5,
-    )
-    assert forced_coarse.mode == CostModelMode.COARSE_ONLY
-    assert forced_coarse.engaged is True
-    assert forced_coarse.reason == "forced_coarse_only"
-    assert forced_coarse.coarse_reject_ratio == pytest.approx(4.5)
-    assert forced_coarse.allow_prompt_guidance is True
-    assert forced_coarse.allow_candidate_pruning is True
 
 
 def test_is_paradigm_shift_exempt_and_prescreen_ratio() -> None:
@@ -173,14 +126,11 @@ def test_is_paradigm_shift_exempt_and_prescreen_ratio() -> None:
         cost_model=model,
         axes=axes_b,
         parent_ledger=parent_ledger,
-        coarse_reject_ratio=3.0,
         creative_candidate_ids={"creative_slow"},
     )
     by_id = {item.candidate_id: item for item in ranked}
     assert by_id["exploit_slow"].coarse_reject_exempt is False
-    assert by_id["exploit_slow"].coarse_rejected is True
     assert by_id["creative_slow"].coarse_reject_exempt is True
-    assert by_id["creative_slow"].coarse_rejected is False
 
 
 def test_outer_gm_metadata_loop_decoupled_and_no_cost_avalanche() -> None:
@@ -317,7 +267,8 @@ def test_rank_symptom_families_caps_scalar_trap_and_drops_tie_privilege() -> Non
         }
     )
     ranked_map = dict(ranked)
-    assert ranked_map[SymptomFamily.SCALAR_LOOP_TRAP] == pytest.approx(0.30)
+    assert ranked_map[SymptomFamily.SCALAR_LOOP_TRAP] == pytest.approx(0.30 / 1.10, rel=1e-4)
+    assert sum(ranked_map.values()) == pytest.approx(1.0, abs=1e-6)
     assert ranked[0][0] == SymptomFamily.DMA_L2_THRASH_REUSE_MISS
 
     static_ranked = dict(
@@ -341,6 +292,7 @@ def test_rank_symptom_families_caps_scalar_trap_and_drops_tie_privilege() -> Non
         }
     )
     tie_scores = dict(tie_ranked)
-    assert tie_scores[SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP] == pytest.approx(1.0)
-    assert tie_scores[SymptomFamily.SCALAR_LOOP_TRAP] == pytest.approx(1.0)
-    assert tie_ranked[0][0] == SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP
+    assert sum(tie_scores.values()) == pytest.approx(1.0, abs=1e-6)
+    assert tie_scores[SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP] == pytest.approx(0.425, rel=1e-4)
+    assert tie_scores[SymptomFamily.SCALAR_LOOP_TRAP] == pytest.approx(0.425, rel=1e-4)
+    assert tie_ranked[0][0] == SymptomFamily.SCALAR_LOOP_TRAP

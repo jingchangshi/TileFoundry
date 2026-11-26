@@ -297,7 +297,7 @@ async def test_b_stage_a_uses_calibrated_pred_us(
             k_rule_workers=2,
             enable_tilesize_prescreen=True,
             cost_prescreen_top_k=1,
-            cost_model_mode="auto",
+            cost_model_mode="advisory",
         ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("demo_op", 2.0, 1.5, 0.90),
@@ -359,8 +359,8 @@ async def test_b_stage_a_uses_calibrated_pred_us(
         stagnation_rounds=0,
         admitted_rule_ids=[],
     )
-    assert len(rec.prescreen_pruned_ids) == 1
-    assert len(rec.l0_l1_passed_ids) == 2
+    assert len(rec.prescreen_pruned_ids) == 0
+    assert len(rec.l0_l1_passed_ids) == 3
 
     obs_records = [
         r for r in ExperienceLake(lake_dir)._load_observations() if r.operator == "demo_op"
@@ -477,7 +477,7 @@ async def test_c_bandit_scheduler_and_compile_wall_regime_switch(
         set(),
         best_for_bandit,
         anchors,
-        stagnation_by_regime={"reg_a": 16, "reg_b": 0},
+        stagnation_by_regime={"reg_a": 100, "reg_b": 0},
     )
     assert stag_pick is not None and stag_pick.regime_tag == "reg_b"
 
@@ -534,7 +534,6 @@ def make_kernel():
     flywheel = FlywheelDistiller(
         funnel=GateFunnel(skip_stage_b=True),
         tracker=tracker,
-        min_edit_gain=0.03,
     )
     runner = PerfTargetCampaignRunner(
         config=CampaignConfig(
@@ -830,7 +829,7 @@ def test_g_phase0_lattice_warmstart_and_paired_l2_incumbent_slot(
             operator_name="demo_op",
             max_rounds=0,
             enable_tilesize_prescreen=True,
-            cost_model_mode="auto",
+            cost_model_mode="advisory",
             enable_phase0_lattice_sweep=True,
         ),
         target_module_path=target_path,

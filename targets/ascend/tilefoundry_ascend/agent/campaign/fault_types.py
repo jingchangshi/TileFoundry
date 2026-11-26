@@ -41,6 +41,29 @@ class L3Resolution(str, Enum):
     INFRA_DEFERRED = "INFRA_DEFERRED"
 
 
+_STAGE_PLANE_ALIASES: dict[str, FaultPlane] = {
+    "STAGE_A_STATIC": FaultPlane.STATIC_CONTRACT,
+    "STAGE_B_COMPILE": FaultPlane.COMPILER_LOWERING,
+    "INFRA_TOOLCHAIN": FaultPlane.INFRA_DEVICE_FAULT,
+    "COST_PRESCREEN": FaultPlane.STATIC_CONTRACT,
+}
+
+
+def coerce_fault_plane(raw_plane: object) -> FaultPlane:
+    """Resolve a FaultPlane from enum values or stage producer labels."""
+    if isinstance(raw_plane, FaultPlane):
+        return raw_plane
+    key = str(raw_plane or "").strip().upper()
+    if not key:
+        return FaultPlane.NONE
+    if key in _STAGE_PLANE_ALIASES:
+        return _STAGE_PLANE_ALIASES[key]
+    try:
+        return FaultPlane(key)
+    except ValueError:
+        return FaultPlane.UNMODELED_FAULT
+
+
 @dataclass(frozen=True)
 class TypedFault:
     """Structured fault record emitted directly by compiler, runtime, and gate stages."""
@@ -67,13 +90,7 @@ class TypedFault:
     def from_dict(cls, payload: Mapping[str, object]) -> TypedFault:
         """Reconstruct TypedFault from a serialized dictionary."""
         raw_plane = payload.get("plane", FaultPlane.UNMODELED_FAULT.value)
-        if isinstance(raw_plane, FaultPlane):
-            plane = raw_plane
-        else:
-            try:
-                plane = FaultPlane(str(raw_plane).strip().upper())
-            except ValueError:
-                plane = FaultPlane.UNMODELED_FAULT
+        plane = coerce_fault_plane(raw_plane) if raw_plane != "" else FaultPlane.UNMODELED_FAULT
         raw_cases = payload.get("failed_cases", ())
         cases: list[int] = []
         if isinstance(raw_cases, Sequence) and not isinstance(raw_cases, (str, bytes)):
@@ -110,4 +127,5 @@ __all__ = [
     "L3Resolution",
     "TypedFault",
     "TypedFaultError",
+    "coerce_fault_plane",
 ]

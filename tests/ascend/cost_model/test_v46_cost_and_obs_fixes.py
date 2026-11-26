@@ -74,8 +74,9 @@ def test_rank_symptom_families_honors_l2_over_l1_over_l0() -> None:
         SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP,
         SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT,
     )
-    assert moe_map[SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP] > 0.9
-    assert moe_map[SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT] > 0.9
+    assert moe_map[SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP] > 0.45
+    assert moe_map[SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT] > 0.45
+    assert sum(w for _, w in moe_ranked) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_seed_rules_41_r34_r19_r36_r37_predicates() -> None:

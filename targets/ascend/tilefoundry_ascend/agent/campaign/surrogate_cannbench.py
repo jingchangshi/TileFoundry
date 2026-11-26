@@ -48,6 +48,9 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     resolve_cannbench_repo,
     resolve_cannbench_tasks_root,
 )
+from tilefoundry_ascend.agent.campaign.latency_algebra import (
+    compute_adaptive_poison_pill_timeout_sec,
+)
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     parse_scoped_search_replace_blocks,
 )
@@ -1599,7 +1602,6 @@ async def run_l0_l1_round_filter(
     ]
     | None = None,
     cost_prescreen_top_k: int | None = None,
-    cost_coarse_reject_ratio: float = 3.0,
     sil_advisory: object | None = None,
     sil_verification: object | None = None,
     freedom_mask: ConstraintRelaxationMask | None = None,
@@ -2061,55 +2063,47 @@ async def run_l0_l1_round_filter(
                 passed_l1 += 1
 
     if reserve_same:
-        has_parent_ana = (
-            parent_analytical_us is not None
-            and math.isfinite(float(parent_analytical_us))
-            and float(parent_analytical_us) > 0.0
-        )
-        eff_reject_ratio = max(1.0, float(cost_coarse_reject_ratio))
-        for idx, cid, cur_snippet, patched, stage_a, repaired, attempt in reserve_same:
-            pred_us = pred_by_id.get(cid, float("inf"))
-            raw_ana_ratio = float("nan")
-            if has_parent_ana:
-                analytical_us = (
-                    float(stage_a_analytical_scorer(cid, patched, stage_a))
-                    if stage_a_analytical_scorer is not None
-                    else pred_us
+        _ = (parent_analytical_us, stage_a_analytical_scorer)
+        if passed_l1 < top_k:
+            for idx, cid, cur_snippet, patched, stage_a, repaired, attempt in reserve_same:
+                if passed_l1 >= top_k:
+                    pred_us = pred_by_id.get(cid, float("inf"))
+                    results_by_idx[idx] = L0L1CandidateCheck(
+                        candidate_id=cid,
+                        passed=False,
+                        failed_tier="cost_prescreen",
+                        patched_module_source=patched,
+                        snippet_source=cur_snippet,
+                        repaired=repaired,
+                        stage_a=stage_a,
+                        stage_b=None,
+                        error_message=f"cost_prescreen_pruned:pred_us={pred_us:.2f}",
+                        fault_plane="COST_PRESCREEN",
+                        fault_code="COST_PRESCREEN_PRUNED",
+                    )
+                    continue
+                chk = await _run_stage_b_and_repairs(
+                    cid, cur_snippet, patched, stage_a, repaired, attempt
                 )
-                if math.isfinite(analytical_us):
-                    raw_ana_ratio = analytical_us / float(parent_analytical_us)
-                else:
-                    raw_ana_ratio = float("inf")
-            should_prune = passed_l1 >= top_k and (
-                (not has_parent_ana) or raw_ana_ratio > eff_reject_ratio
-            )
-            if should_prune:
-                err_msg = (
-                    f"cost_prescreen_pruned:pred_us={pred_us:.2f},"
-                    f"analytical_ratio={raw_ana_ratio:.3f}"
-                    if math.isfinite(raw_ana_ratio)
-                    else f"cost_prescreen_pruned:pred_us={pred_us:.2f}"
-                )
+                results_by_idx[idx] = chk
+                if chk.passed:
+                    passed_l1 += 1
+        else:
+            for idx, cid, cur_snippet, patched, stage_a, _repaired, _attempt in reserve_same:
+                pred_us = pred_by_id.get(cid, float("inf"))
                 results_by_idx[idx] = L0L1CandidateCheck(
                     candidate_id=cid,
                     passed=False,
                     failed_tier="cost_prescreen",
                     patched_module_source=patched,
                     snippet_source=cur_snippet,
-                    repaired=repaired,
+                    repaired=_repaired,
                     stage_a=stage_a,
                     stage_b=None,
-                    error_message=err_msg,
+                    error_message=f"cost_prescreen_pruned:pred_us={pred_us:.2f}",
                     fault_plane="COST_PRESCREEN",
                     fault_code="COST_PRESCREEN_PRUNED",
                 )
-                continue
-            chk = await _run_stage_b_and_repairs(
-                cid, cur_snippet, patched, stage_a, repaired, attempt
-            )
-            results_by_idx[idx] = chk
-            if chk.passed:
-                passed_l1 += 1
 
     return _finalize([results_by_idx[i] for i in range(len(candidates))])
 
@@ -3589,11 +3583,7 @@ def _inspect_v2_device_fault(
 
 def compute_adaptive_poison_pill_timeout(inc_latencies_us: Sequence[float]) -> float:
     """Compute bounded poison-pill kernel timeout in [10.0, 60.0] seconds."""
-    total_sec = sum(
-        max(max(0.0, float(inc_us)) * 1e-6, 1e-3)
-        for inc_us in inc_latencies_us
-    )
-    return min(60.0, max(10.0, 25.0 * total_sec))
+    return compute_adaptive_poison_pill_timeout_sec(inc_latencies_us)
 
 
 def run_poison_pill_subprocess(

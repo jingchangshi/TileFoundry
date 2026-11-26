@@ -153,7 +153,7 @@ def test_cost_prescreen_pruned_includes_analytical_ratio_and_fallbacks() -> None
     assert results_by_id["creative_0"].passed is True
     pruned = results_by_id["rule_2"]
     assert pruned.failed_tier == "cost_prescreen"
-    assert pruned.error_message == "cost_prescreen_pruned:pred_us=35.00,analytical_ratio=3.500"
+    assert pruned.error_message == "cost_prescreen_pruned:pred_us=35.00"
 
     checks_no_parent = asyncio.run(
         run_l0_l1_round_filter(
@@ -331,8 +331,6 @@ def test_ablation_distiller_populates_symptom_family_and_anti_precondition(
             "optimized_dur_us": 12.0,
             "numerical_ok": 1.0,
         },
-        min_edit_gain=0.05,
-        min_probe_speedup=1.2,
     )
     kb_path = tmp_path / "flywheel_rules.yaml"
     report = distiller.distill_from_pair(
