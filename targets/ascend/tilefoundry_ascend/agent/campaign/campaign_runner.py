@@ -881,8 +881,10 @@ class PerfTargetCampaignRunner:
         sgc._topology_axes = self._topology_axes
         sgc._semantic_topology_axes = self._semantic_topology_axes
         sgc._sil_advisory = self._sil_advisory
+        sgc._run_id = self._run_id
 
         rcb = self._round_context_builder
+        rcb._run_id = self._run_id
         rcb._regime_specs = tuple(self._regime_specs)
         rcb._perf_target = self._perf_target
         rcb._topology_axes = self._topology_axes
@@ -963,6 +965,7 @@ class PerfTargetCampaignRunner:
                     _PROPAGATED_HOOKS.discard((mod, name))
 
         tlw = self._telemetry_writer
+        tlw.run_id = self._run_id
         tlw._regime_specs = tuple(self._regime_specs)
         tlw._perf_target = self._perf_target
         tlw.scoreboard_anchors = tuple(self._scoreboard_anchors)
@@ -982,6 +985,7 @@ class PerfTargetCampaignRunner:
         tlw.last_local_rel_gain_by_regime = self._last_local_rel_gain_by_regime
 
         rec = self._l3_l4_recovery
+        rec._run_id = self._run_id
         rec._l3_contract_runner = self._l3_contract_runner
         rec._l4_cannbench_runner = self._l4_cannbench_runner
         rec.scoreboard_anchors = tuple(self._scoreboard_anchors)
