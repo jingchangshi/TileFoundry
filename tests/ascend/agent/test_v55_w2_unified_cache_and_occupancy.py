@@ -1654,3 +1654,156 @@ def test_poison_pill_releases_reference_cache_lock_and_skips_warm_oracle_get(
         ("exit", "4"),
     ]
 
+
+def test_stage_b_cache_driver_propagates_defaults_and_collects_tl_cache_attrs(
+    tmp_path: Path,
+) -> None:
+    """Propagate callable defaults to _get_kernel and collect _tilelang_cache_* bins."""
+    tl_stub = tmp_path / "tl_stub"
+    tl_backend = tl_stub / "tilelang" / "backend"
+    tl_backend.mkdir(parents=True)
+    (tl_backend / "__init__.py").write_text("", encoding="utf-8")
+    (tl_backend / "module.py").write_text(
+        "import contextlib\n"
+        "from types import SimpleNamespace\n"
+        "def create_backend_context(_t):\n"
+        "    return SimpleNamespace(target=contextlib.nullcontext())\n",
+        encoding="utf-8",
+    )
+    (tl_stub / "tvm.py").write_text(
+        "import contextlib\n"
+        "class _Target:\n"
+        "    @staticmethod\n"
+        "    def current(allow_none=True):\n"
+        "        return 'ascend'\n"
+        "class target:\n"
+        "    Target = _Target\n"
+        "class transform:\n"
+        "    @staticmethod\n"
+        "    def PassContext(config=None):\n"
+        "        return contextlib.nullcontext()\n"
+        "class tirx:\n"
+        "    PrimFunc = dict\n"
+        "class IRModule:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (tl_stub / "tilelang" / "__init__.py").write_text(
+        "import json, os, tvm\n"
+        "from pathlib import Path\n"
+        "class _KPath:\n"
+        "    def __init__(self, p, src):\n"
+        "        self._tilelang_cache_path = str(p)\n"
+        "        self.kernel_source = src\n"
+        "class _KKey:\n"
+        "    def __init__(self, k, src):\n"
+        "        self._tilelang_cache_key = str(k)\n"
+        "        self.kernel_source = src\n"
+        "def compile(prog, target='ascend', out_idx=None, pass_configs=None, compile_flags=None):\n"
+        "    _ = (target, pass_configs, compile_flags)\n"
+        "    rec_p = os.environ.get('TF_TEST_COMPILE_RECORD')\n"
+        "    if rec_p:\n"
+        "        Path(rec_p).write_text(\n"
+        "            json.dumps({'prog': prog, 'out_idx': out_idx}), encoding='utf-8'\n"
+        "        )\n"
+        "    cdir = Path(os.environ['TILELANG_CACHE_DIR'])\n"
+        "    cdir.mkdir(parents=True, exist_ok=True)\n"
+        "    if prog.get('tag') == 'by_key':\n"
+        "        kdir = cdir / 'tl_key_01'\n"
+        "        kdir.mkdir(parents=True, exist_ok=True)\n"
+        "        (kdir / 'kernel.so').write_bytes(b'ELF_BY_KEY')\n"
+        "        return _KKey('tl_key_01', '// cce')\n"
+        "    so_p = cdir / f\"by_path_{prog['mode']}.so\"\n"
+        "    so_p.write_bytes(b'ELF_BY_PATH')\n"
+        "    return _KPath(so_p, '// cce')\n",
+        encoding="utf-8",
+    )
+
+    cand_path = tmp_path / "cand_defaults.py"
+    cand_path.write_text(
+        "import tilelang\n"
+        "def _sel_cfg(d_dim=128):\n"
+        "    return {'pass_configs': {}, 'compile_flags': []}\n"
+        "def _build_prog(d_dim, schedule_mode, tag='by_path'):\n"
+        "    return {'d': int(d_dim), 'mode': schedule_mode, 'tag': tag}\n"
+        "def _get_kernel(\n"
+        "    d_dim, schedule_mode, tag='by_path', *, builder_fn=None, pass_configs=None,\n"
+        "    compile_flags=None\n"
+        "):\n"
+        "    prog = builder_fn(d_dim, schedule_mode, tag=tag)\n"
+        "    return tilelang.compile(\n"
+        "        prog, target='ascend', out_idx=[3, 4, 5],\n"
+        "        pass_configs=pass_configs, compile_flags=compile_flags,\n"
+        "    )\n"
+        "def run_op(x, schedule_mode='tuned'):\n"
+        "    return x\n"
+        "kernel = run_op\n",
+        encoding="utf-8",
+    )
+
+    def _run_driver(
+        factory_kwargs: dict[str, object],
+        emit_json: Path,
+        rec_json: Path,
+        cache_dir: Path,
+    ) -> dict[str, object]:
+        drv_src = build_stage_b_driver_source(
+            cand_path,
+            factory_name="_build_prog",
+            factory_kwargs=factory_kwargs,
+            config_selector_name="_sel_cfg",
+            compile_for_cache=True,
+            emit_cache_bins_path=emit_json,
+        )
+        wrapper = (
+            "import json\n"
+            f"_ns = {{}}\n"
+            f"exec(compile({drv_src!r}, 'stage_b_driver', 'exec'), _ns)\n"
+            "assert _ns['_used_cache_path'] is True\n"
+        )
+        env = {
+            **dict(surrogate_cannbench.os.environ),
+            "PYTHONPATH": str(tl_stub),
+            "TILELANG_CACHE_DIR": str(cache_dir),
+            "TF_TEST_COMPILE_RECORD": str(rec_json),
+        }
+        proc = subprocess.run(
+            [sys.executable, "-c", wrapper],
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return {
+            "bins": json.loads(emit_json.read_text(encoding="utf-8")),
+            "compile": json.loads(rec_json.read_text(encoding="utf-8")),
+        }
+
+    res_default = _run_driver(
+        {"d_dim": 128},
+        tmp_path / "emit_default.json",
+        tmp_path / "rec_default.json",
+        tmp_path / "cache_default",
+    )
+    assert res_default["compile"] == {
+        "prog": {"d": 128, "mode": "tuned", "tag": "by_path"},
+        "out_idx": [3, 4, 5],
+    }
+    assert len(res_default["bins"]) == 1
+    assert res_default["bins"][0].endswith("by_path_tuned.so")
+
+    res_override = _run_driver(
+        {"d_dim": 128, "schedule_mode": "baseline", "tag": "by_key"},
+        tmp_path / "emit_override.json",
+        tmp_path / "rec_override.json",
+        tmp_path / "cache_override",
+    )
+    assert res_override["compile"] == {
+        "prog": {"d": 128, "mode": "baseline", "tag": "by_key"},
+        "out_idx": [3, 4, 5],
+    }
+    assert len(res_override["bins"]) == 1
+    assert res_override["bins"][0].endswith("tl_key_01/kernel.so")
+
+

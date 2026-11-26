@@ -1884,6 +1884,24 @@ for case_num, rtag, case_dims in anchor_specs:
     if callable(get_kernel_fn) and callable(b_fn):
         gk_sig = inspect.signature(get_kernel_fn)
         var_kinds = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        eff_sel = sel_name or (getattr(resolved, "selector_name", "") if resolved is not None else "")
+        for src_fn in (
+            getattr(mod, entrypoint, None) if entrypoint else None,
+            getattr(mod, "kernel", None),
+            getattr(mod, eff_sel, None) if eff_sel else None,
+            b_fn,
+        ):
+            if callable(src_fn):
+                try:
+                    for p in inspect.signature(src_fn).parameters.values():
+                        if (
+                            p.default is not inspect.Parameter.empty
+                            and p.kind not in var_kinds
+                            and p.name not in pool
+                        ):
+                            pool[p.name] = p.default
+                except (TypeError, ValueError):
+                    pass
         has_req = all(
             p.name in pool
             for p in gk_sig.parameters.values()
@@ -1896,13 +1914,22 @@ for case_num, rtag, case_dims in anchor_specs:
                 for k, v in sorted(gk_kw.items())
                 if k != "builder_fn"
             }}
+            fkw_out = dict(b_kwargs_base)
+            for k, v in serial_gk.items():
+                if k not in (
+                    "pass_configs",
+                    "compile_flags",
+                    "extra_builder_kwargs",
+                    "extra_combine_kwargs",
+                ) and k not in fkw_out:
+                    fkw_out[k] = v
             tasks.append({{
                 "case_num": int(case_num),
                 "regime_tag": str(rtag),
                 "mode": "_get_kernel",
                 "builder_name": str(b_name),
                 "selector_name": sel_name or "",
-                "factory_kwargs": _json_safe(b_kwargs_base),
+                "factory_kwargs": _json_safe(fkw_out),
                 "dims": _json_safe(case_dims),
                 "kwargs": serial_gk,
                 "pass_configs": _json_safe(pc_safe),
@@ -4348,14 +4375,35 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
             used_get_kernel = False
             if callable(get_kernel_fn):
                 gk_sig = inspect.signature(get_kernel_fn)
+                var_kinds = (
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                )
+                eff_sel = sel_name or (
+                    getattr(resolved, "selector_name", "") if resolved is not None else ""
+                )
+                for src_fn in (
+                    getattr(mod, entrypoint, None) if entrypoint else None,
+                    getattr(mod, "kernel", None),
+                    getattr(mod, eff_sel, None) if eff_sel else None,
+                    builder_fn,
+                ):
+                    if callable(src_fn):
+                        try:
+                            for p in inspect.signature(src_fn).parameters.values():
+                                if (
+                                    p.default is not inspect.Parameter.empty
+                                    and p.kind not in var_kinds
+                                    and p.name not in pool
+                                ):
+                                    pool[p.name] = p.default
+                        except (TypeError, ValueError):
+                            pass
                 has_req = all(
                     p.name in pool
                     for p in gk_sig.parameters.values()
                     if p.default is inspect.Parameter.empty
-                    and p.kind not in (
-                        inspect.Parameter.VAR_POSITIONAL,
-                        inspect.Parameter.VAR_KEYWORD,
-                    )
+                    and p.kind not in var_kinds
                 )
                 if has_req:
                     gk_kwargs = _filter_callable_kwargs(get_kernel_fn, pool)

@@ -1098,3 +1098,178 @@ def test_run_l1_compile_check_overlaps_diag_with_anchor_plan_and_cleans_up(
     assert diag_runs == 1
     assert diag_finished.is_set() is True
 
+
+def test_anchor_and_prewarm_plans_propagate_entrypoint_and_kernel_defaults(
+    tmp_path: Path,
+) -> None:
+    """Propagate defaults from entrypoint or kernel into _get_kernel plan tasks."""
+    repo_root = Path(__file__).resolve().parents[3]
+    cann_repo = tmp_path / "cann_repo"
+    op_dir = cann_repo / "tasks" / "level3" / "add_rms_norm_dynamic_quant"
+    op_dir.mkdir(parents=True, exist_ok=True)
+    cases_payload = {
+        "cases": [
+            {
+                "case_id": 3,
+                "input_shape": [[8192, 8192], [8192, 8192], [8192]],
+                "dtype": "float16",
+                "attrs": {"epsilon": 1e-6},
+            }
+        ]
+    }
+    (op_dir / "cases.yaml").write_text(yaml.safe_dump(cases_payload), encoding="utf-8")
+    (op_dir / "golden.py").write_text(
+        "import torch\n"
+        "def add_rms_norm_dynamic_quant(x1, x2, gamma, epsilon=1e-6):\n"
+        "    s = x1 + x2\n"
+        "    return s * torch.rsqrt(torch.mean(s * s, dim=-1, keepdim=True) + epsilon) * gamma\n",
+        encoding="utf-8",
+    )
+
+    cand_ep = tmp_path / "cand_ep.py"
+    cand_ep.write_text(
+        "def _select_add_rms_norm_dynamic_quant_config(d_dim, tl_dtype='float16'):\n"
+        "    return {'pass_configs': {}, 'compile_flags': []}\n"
+        "def _build_add_rms_norm_dynamic_quant_prim_func(d_dim, schedule_mode):\n"
+        "    return {'d': d_dim, 'mode': schedule_mode}\n"
+        "def _get_kernel(d_dim, schedule_mode, *, builder_fn=None, pass_configs=None, "
+        "compile_flags=None):\n"
+        "    return builder_fn(d_dim, schedule_mode)\n"
+        "def add_rms_norm_dynamic_quant(x1, x2, gamma, schedule_mode='tuned'):\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+
+    l1_script = tmp_path / "l1_plan.py"
+    l1_script.write_text(
+        surrogate_cannbench._L1_ANCHOR_PLAN_TEMPLATE.format(
+            ascend_target_dir=str(repo_root / "targets" / "ascend"),
+            op_name="add_rms_norm_dynamic_quant",
+            mod_path=str(cand_ep),
+            anchor_specs_json=json.dumps([[3, "reduce_tail_residency_sram", {"d_dim": 8192}]]),
+            def_builder="_build_add_rms_norm_dynamic_quant_prim_func",
+            def_bk_json=json.dumps({}),
+            def_sel="_select_add_rms_norm_dynamic_quant_config",
+            def_pc_json=json.dumps({}),
+            def_cf_json=json.dumps([]),
+        ),
+        encoding="utf-8",
+    )
+    l1_proc = subprocess.run(
+        [sys.executable, str(l1_script)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert l1_proc.returncode == 0, l1_proc.stderr
+    l1_plan = json.loads(l1_proc.stdout.strip().splitlines()[-1])
+    assert len(l1_plan["tasks"]) == 1
+    l1_task = l1_plan["tasks"][0]
+    assert l1_task["mode"] == "_get_kernel"
+    assert l1_task["kwargs"]["schedule_mode"] == "tuned"
+    assert l1_task["factory_kwargs"]["schedule_mode"] == "tuned"
+    assert json.loads(json.dumps(l1_task["factory_kwargs"])) == l1_task["factory_kwargs"]
+
+    prewarm_script = tmp_path / "prewarm_plan.py"
+    prewarm_script.write_text(
+        surrogate_cannbench._PREWARM_TL_PLAN_TEMPLATE.format(
+            ascend_target_dir=str(repo_root / "targets" / "ascend"),
+            op_name="add_rms_norm_dynamic_quant",
+            case_ids_json=json.dumps([3]),
+            cand_paths_json=json.dumps([["c_ep", str(cand_ep)]]),
+            repo=str(cann_repo),
+            anchor_regimes_json=json.dumps({"3": "reduce_tail_residency_sram"}),
+        ),
+        encoding="utf-8",
+    )
+    pw_proc = subprocess.run(
+        [sys.executable, str(prewarm_script)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert pw_proc.returncode == 0, pw_proc.stderr
+    pw_plan = json.loads(pw_proc.stdout.strip().splitlines()[-1])
+    assert pw_plan["errors"] == []
+    assert len(pw_plan["tasks"]) == 1
+    pw_task = pw_plan["tasks"][0]
+    assert pw_task["mode"] == "_get_kernel"
+    assert pw_task["kwargs"]["schedule_mode"] == "tuned"
+
+    cand_kernel = tmp_path / "cand_kernel.py"
+    cand_kernel.write_text(
+        "def kernel(d_dim=1024, schedule_mode='tuned'):\n"
+        "    return None\n"
+        "def _build_op(d_dim):\n"
+        "    return d_dim\n"
+        "def _get_kernel(d_dim, schedule_mode, *, builder_fn=None):\n"
+        "    return builder_fn(d_dim)\n",
+        encoding="utf-8",
+    )
+    l1_kernel_script = tmp_path / "l1_kernel_plan.py"
+    l1_kernel_script.write_text(
+        surrogate_cannbench._L1_ANCHOR_PLAN_TEMPLATE.format(
+            ascend_target_dir=str(repo_root / "targets" / "ascend"),
+            op_name="",
+            mod_path=str(cand_kernel),
+            anchor_specs_json=json.dumps([[1, "default", {"d_dim": 1024}]]),
+            def_builder="_build_op",
+            def_bk_json=json.dumps({}),
+            def_sel="",
+            def_pc_json=json.dumps({}),
+            def_cf_json=json.dumps([]),
+        ),
+        encoding="utf-8",
+    )
+    l1_k_proc = subprocess.run(
+        [sys.executable, str(l1_kernel_script)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert l1_k_proc.returncode == 0, l1_k_proc.stderr
+    l1_k_plan = json.loads(l1_k_proc.stdout.strip().splitlines()[-1])
+    assert len(l1_k_plan["tasks"]) == 1
+    l1_k_task = l1_k_plan["tasks"][0]
+    assert l1_k_task["mode"] == "_get_kernel"
+    assert l1_k_task["kwargs"]["schedule_mode"] == "tuned"
+    assert l1_k_task["factory_kwargs"]["schedule_mode"] == "tuned"
+
+    cand_pw_kernel = tmp_path / "cand_pw_kernel.py"
+    cand_pw_kernel.write_text(
+        "def _select_add_rms_norm_dynamic_quant_config(d_dim, tl_dtype='float16'):\n"
+        "    return {'pass_configs': {}, 'compile_flags': []}\n"
+        "def _build_add_rms_norm_dynamic_quant_prim_func(d_dim, schedule_mode):\n"
+        "    return {'d': d_dim, 'mode': schedule_mode}\n"
+        "def _get_kernel(d_dim, schedule_mode, *, builder_fn=None):\n"
+        "    return builder_fn(d_dim, schedule_mode)\n"
+        "def kernel(d_dim=8192, schedule_mode='tuned'):\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+    pw_k_script = tmp_path / "prewarm_kernel_plan.py"
+    pw_k_script.write_text(
+        surrogate_cannbench._PREWARM_TL_PLAN_TEMPLATE.format(
+            ascend_target_dir=str(repo_root / "targets" / "ascend"),
+            op_name="add_rms_norm_dynamic_quant",
+            case_ids_json=json.dumps([3]),
+            cand_paths_json=json.dumps([["c_kern", str(cand_pw_kernel)]]),
+            repo=str(cann_repo),
+            anchor_regimes_json=json.dumps({"3": "reduce_tail_residency_sram"}),
+        ),
+        encoding="utf-8",
+    )
+    pw_k_proc = subprocess.run(
+        [sys.executable, str(pw_k_script)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert pw_k_proc.returncode == 0, pw_k_proc.stderr
+    pw_k_plan = json.loads(pw_k_proc.stdout.strip().splitlines()[-1])
+    assert pw_k_plan["errors"] == []
+    assert len(pw_k_plan["tasks"]) == 1
+    assert pw_k_plan["tasks"][0]["mode"] == "_get_kernel"
+    assert pw_k_plan["tasks"][0]["kwargs"]["schedule_mode"] == "tuned"
+
+
