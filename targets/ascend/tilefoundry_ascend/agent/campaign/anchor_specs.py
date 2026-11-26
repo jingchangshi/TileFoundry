@@ -73,6 +73,50 @@ class AnchorCaseSpec:
 
 
 @dataclass(frozen=True)
+class GuardrailCaseSpec:
+    """Non-scoreboard L3 failure probe tracked for regression guarding."""
+
+    task: str
+    case_num: int
+    regime_tag: str
+    incumbent_ref_us: float = 0.0
+    t_hw_us: float = 0.0
+
+    def to_anchor_spec(self) -> AnchorCaseSpec:
+        """Convert guardrail case into an AnchorCaseSpec for batched L2 probing."""
+        ref_us = float(self.incumbent_ref_us) if self.incumbent_ref_us > 0.0 else 1.0
+        hw_us = float(self.t_hw_us) if self.t_hw_us > 0.0 else min(1.0, ref_us)
+        return AnchorCaseSpec(
+            task=self.task,
+            case_num=int(self.case_num),
+            regime_tag=self.regime_tag,
+            ref_perf_us=ref_us,
+            t_hw_us=hw_us,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize guardrail specification to a JSON-compatible dictionary."""
+        return {
+            "task": self.task,
+            "case_num": int(self.case_num),
+            "regime_tag": self.regime_tag,
+            "incumbent_ref_us": float(self.incumbent_ref_us),
+            "t_hw_us": float(self.t_hw_us),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> GuardrailCaseSpec:
+        """Reconstruct GuardrailCaseSpec from a JSON mapping."""
+        return cls(
+            task=str(payload["task"]),
+            case_num=int(payload["case_num"]),
+            regime_tag=str(payload["regime_tag"]),
+            incumbent_ref_us=float(payload.get("incumbent_ref_us", 0.0) or 0.0),
+            t_hw_us=float(payload.get("t_hw_us", 0.0) or 0.0),
+        )
+
+
+@dataclass(frozen=True)
 class PerfTargetSpec:
     """Operator-level performance and Roofline convergence targets."""
 
@@ -3327,6 +3371,7 @@ __all__ = [
     "DEFAULT_ANCHORS",
     "DEFAULT_PERF_TARGETS",
     "DEFAULT_REGIME_SPECS",
+    "GuardrailCaseSpec",
     "INPUT_DOMAIN_ENVELOPES",
     "InputDomainEnvelope",
     "MLA_ANCHORS",

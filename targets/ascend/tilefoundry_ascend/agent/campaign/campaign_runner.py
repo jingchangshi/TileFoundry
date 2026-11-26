@@ -31,10 +31,10 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     CannbenchOpSpec,
     CannbenchOpsRegistry,
     CasePhysicsRatios,
+    GuardrailCaseSpec,
     PerfTargetSpec,
     RegimeTargetSpec,
     _has_flat_operator_layout,
-    append_dynamic_anchor,
     build_anchor_var_bindings,
     compute_case_eq3_score,
     default_source_root,
@@ -46,7 +46,6 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_operator_entrypoint,
     get_operator_module_relpath,
     get_operator_task,
-    inject_lake_counterexample_anchors,
     lookup_case_dims,
     lookup_case_metadata,
     parse_simple_env_file,
@@ -63,6 +62,10 @@ from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
     compute_spearman_rho,
     is_clean_calibration_sample,
     normalize_compile_error_code,
+)
+from tilefoundry_ascend.agent.cost_advisor import (
+    CostModelAdvisor,
+    create_cost_advisor,
 )
 from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
     extract_golden_entrypoint_contract,
@@ -174,14 +177,7 @@ from tilefoundry_ascend.agent.router.isa_gap_scanner import scan_tilelang_pipe_g
 from tilefoundry_ascend.ascend.cost_model import (
     BishengResourceSummary,
     CostFeatures,
-    HybridAscendCostModel,
     build_cost_features_from_ledger,
-)
-from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (
-    CostGateDecision,
-    CostModelMode,
-    evaluate_cost_gate_policy,
-    is_paradigm_shift_exempt,
 )
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
     CandidateArtifactRecord,
@@ -283,9 +279,10 @@ class CampaignConfig:
     round_regime_tags: tuple[str, ...] = ()
     allow_unreviewed_distilled_rules: bool = False
     pure_golden: bool = False
-    cost_model_mode: str = "auto"
+    cost_model_mode: str = "off"
     cost_disengage_eta: float = 0.65
     cost_slow_gain_threshold: float = 0.03
+    enable_phase0_lattice_sweep: bool = False
 
 
 LAUNCH_FLOOR_US: dict[str, float] = {
@@ -433,7 +430,7 @@ class CampaignRoundRecord:
     pruned_rule_ids: tuple[str, ...] = ()
     promotion_attempts: tuple[dict[str, str], ...] = ()
     trackb_evidence: tuple[dict[str, object], ...] = ()
-    cost_model_mode: str = "auto"
+    cost_model_mode: str = "off"
     cost_model_engaged: bool = False
     cost_model_reason: str = ""
     local_rel_gain: float = 0.0
@@ -446,6 +443,9 @@ class CampaignRoundRecord:
     l3_failure_stage: str = ""
     l3_cx_repair_passed: bool = False
     infeasible_boundaries_added: int = 0
+    stage_timings_sec: dict[str, float] = field(default_factory=dict)
+    prewarm_stats: dict[str, int] = field(default_factory=dict)
+    cost_advisor_predictions: int = 0
 
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignRoundRecord into a JSON-compatible dictionary."""
@@ -485,6 +485,11 @@ class CampaignRoundRecord:
             "l3_failure_stage": self.l3_failure_stage,
             "l3_cx_repair_passed": bool(self.l3_cx_repair_passed),
             "infeasible_boundaries_added": int(self.infeasible_boundaries_added),
+            "stage_timings_sec": {
+                str(k): round(float(v), 6) for k, v in self.stage_timings_sec.items()
+            },
+            "prewarm_stats": {str(k): int(v) for k, v in self.prewarm_stats.items()},
+            "cost_advisor_predictions": int(self.cost_advisor_predictions),
         }
 
     @classmethod
@@ -501,6 +506,26 @@ class CampaignRoundRecord:
             float(raw_rho)
             if raw_rho is not None and not isinstance(raw_rho, bool)
             else None
+        )
+        raw_timings = payload.get("stage_timings_sec")
+        stage_timings_sec = (
+            {
+                str(k): float(v)
+                for k, v in raw_timings.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            }
+            if isinstance(raw_timings, Mapping)
+            else {}
+        )
+        raw_prewarm = payload.get("prewarm_stats")
+        prewarm_stats = (
+            {
+                str(k): int(v)
+                for k, v in raw_prewarm.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            }
+            if isinstance(raw_prewarm, Mapping)
+            else {}
         )
         return cls(
             round_idx=int(payload["round_idx"]),
@@ -529,7 +554,7 @@ class CampaignRoundRecord:
                 for item in payload.get("trackb_evidence", ())
                 if isinstance(item, Mapping)
             ),
-            cost_model_mode=str(payload.get("cost_model_mode", "auto") or "auto"),
+            cost_model_mode=str(payload.get("cost_model_mode", "off") or "off"),
             cost_model_engaged=bool(payload.get("cost_model_engaged", False)),
             cost_model_reason=str(payload.get("cost_model_reason", "") or ""),
             local_rel_gain=float(payload.get("local_rel_gain", 0.0) or 0.0),
@@ -550,6 +575,9 @@ class CampaignRoundRecord:
             infeasible_boundaries_added=int(
                 payload.get("infeasible_boundaries_added", 0) or 0
             ),
+            stage_timings_sec=stage_timings_sec,
+            prewarm_stats=prewarm_stats,
+            cost_advisor_predictions=int(payload.get("cost_advisor_predictions", 0) or 0),
         )
 
 
@@ -786,6 +814,8 @@ class CampaignReport:
     pure_golden_mode: bool = False
     blueprint_provenance: dict[str, object] = field(default_factory=dict)
     stagnation_diagnosis: dict[str, object] = field(default_factory=dict)
+    scoreboard_anchor_count: int = 0
+    scoreboard_anchors: tuple[AnchorCaseSpec, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignReport into a JSON-compatible dictionary."""
@@ -801,6 +831,14 @@ class CampaignReport:
             "escalated_rounds": list(self.escalated_rounds),
             "frozen_regimes": list(self.frozen_regimes),
             "active_anchors": [a.to_dict() for a in self.active_anchors],
+            "scoreboard_anchor_count": (
+                int(self.scoreboard_anchor_count)
+                if self.scoreboard_anchor_count > 0
+                else len(self.scoreboard_anchors or self.active_anchors)
+            ),
+            "scoreboard_anchors": [
+                a.to_dict() for a in (self.scoreboard_anchors or self.active_anchors)
+            ],
             "admitted_rule_ids": list(self.admitted_rule_ids),
             "l4_result": self.l4_result.to_dict() if self.l4_result else None,
             "l4_status": self.l4_status,
@@ -2091,10 +2129,12 @@ def _compact_trackb_snippet_source(
     *,
     incumbent_source: str = "",
     max_bytes: int = 14800,
+    cpp_max_bytes: int = 49152,
     active_kernel: str | None = None,
     focus_lines: Sequence[int] = (),
     diagnostic_text: str = "",
 ) -> str:
+    _ = max_bytes
     if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
         return snippet_source
     if not regime_spec.trackb_symbols:
@@ -2105,11 +2145,7 @@ def _compact_trackb_snippet_source(
         return snippet_source
     lines = snippet_source.splitlines(keepends=True)
     hits = _find_top_level_str_assign_span(tree, lines, set(regime_spec.trackb_symbols))
-    surrounding_bytes = len(snippet_source.encode("utf-8")) - sum(
-        len(snippet_source[start_pos:end_pos].encode("utf-8"))
-        for _sym, _cpp, start_pos, end_pos in hits
-    )
-    cpp_budget = max(4096, (max_bytes - surrounding_bytes - 128) // max(1, len(hits)))
+    cpp_budget = max(4096, int(cpp_max_bytes) // max(1, len(hits)))
     replacements: list[tuple[int, int, str]] = []
     for sym_name, cpp_text, start_pos, end_pos in hits:
         if len(cpp_text.encode("utf-8")) <= cpp_budget:
@@ -2889,18 +2925,22 @@ class PerfTargetCampaignRunner:
             if self._experience_lake_dir is not None
             else None
         )
-        self._cost_model = HybridAscendCostModel(
-            self._target,
+        self._cost_advisor: CostModelAdvisor = create_cost_advisor(
+            self._config.cost_model_mode,
+            target=self._target,
+            operator_name=self._config.operator_name,
             calibration_path=self._cost_calibration_path,
-            anomaly_lake=self._experience_lake,
+            experience_lake=self._experience_lake,
         )
         op_slug = self._config.operator_name.replace("/", "_")
         self._run_id = f"{op_slug}_{int(time.time())}_{os.getpid()}"
         self._case_dims_cache: dict[int, dict[str, object]] = {}
         if self._experience_lake_dir is not None and self._experience_lake_dir.exists():
             try:
-                self._cost_model.replay_experience_lake(
+                self._invoke_with_optional_kwargs(
+                    self._cost_advisor.sync_experience_lake,
                     self._experience_lake_dir,
+                    persist_calibration=False,
                     exclude_run_id=self._run_id,
                 )
             except (OSError, json.JSONDecodeError) as exc:
@@ -2918,25 +2958,14 @@ class PerfTargetCampaignRunner:
         else:
             self._topology_axes = None
         self._boundary_ledger = DeterministicSearchBoundaryLedger()
-        if anchors is None and self._experience_lake_dir is not None:
-            try:
-                injected_anchors = inject_lake_counterexample_anchors(
-                    self._initial_anchors,
-                    operator_name=config.operator_name,
-                    regime_specs=self._regime_specs,
-                    experience_lake_dir=self._experience_lake_dir,
-                    cannbench_repo=self._cannbench_repo,
-                    env_file=self._env_file,
-                    topology_axes=(
-                        self._topology_axes.to_dict()
-                        if self._topology_axes is not None
-                        else None
-                    ),
-                )
-                self._initial_anchors = tuple(injected_anchors)
-            except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                logger.debug("ExperienceLake counterexample anchor injection skipped: %s", exc)
-        self._active_anchors: list[AnchorCaseSpec] = list(self._initial_anchors)
+        self._scoreboard_anchors: tuple[AnchorCaseSpec, ...] = tuple(self._initial_anchors)
+        self._active_anchors: list[AnchorCaseSpec] = list(self._scoreboard_anchors)
+        self._guardrail_cases: list[GuardrailCaseSpec] = []
+        self._last_guardrail_metrics_by_cid: dict[str, dict[int, AnchorEvalMetrics]] = {}
+        self._last_distilled_lat_by_regime: dict[str, float] = {}
+        self._last_round_promoted: bool = True
+        self._last_round_promoted_by_regime: dict[str, bool] = {}
+        self._last_l2_timing_meta: dict[str, object] = {}
 
         self._golden_abi_block_cache: str | None = None
         self._blueprint_provenance: dict[str, object] = {}
@@ -4101,6 +4130,55 @@ class PerfTargetCampaignRunner:
 
         return max(candidates, key=_row_width_score)
 
+    def _resolve_tail_anchor_dims(
+        self,
+        regime_spec: RegimeTargetSpec,
+    ) -> dict[str, object] | None:
+        """Return the smallest-element case dims routed to ``regime_spec`` when distinct."""
+        primary_dims = dict(
+            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+        )
+        candidates: list[dict[str, object]] = []
+        tasks_root = self._resolve_cannbench_tasks_root()
+        if tasks_root is not None:
+            try:
+                task = get_operator_task(self._config.operator_name)
+                cases_path = tasks_root / task / "cases.yaml"
+                if cases_path.is_file():
+                    parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
+                    for row in parsed.get("cases") or ():
+                        if isinstance(row, Mapping) and row.get("case_id") is not None:
+                            cnum = int(row["case_id"])
+                            dims = self._lookup_case_dims_safe(cnum, regime_spec.regime_tag)
+                            if dims and self._belongs_to_regime(dims, regime_spec):
+                                candidates.append(dict(dims))
+            except (FileNotFoundError, KeyError, OSError, ValueError, TypeError):
+                pass
+        for anc in self._scoreboard_anchors:
+            if len(self._regime_specs) > 1 and anc.regime_tag != regime_spec.regime_tag:
+                continue
+            dims = self._lookup_case_dims_safe(int(anc.case_num), anc.regime_tag)
+            if dims and self._belongs_to_regime(dims, regime_spec):
+                candidates.append(dict(dims))
+        if regime_spec.representative_hir_dims:
+            candidates.append(dict(regime_spec.representative_hir_dims))
+        if not candidates:
+            return None
+
+        def _elem_score(dims: Mapping[str, object]) -> tuple[int, int]:
+            prod = 1
+            count = 0
+            for val in dims.values():
+                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                    prod *= val
+                    count += 1
+            return (prod if count > 0 else 0, len(dims))
+
+        smallest = min(candidates, key=_elem_score)
+        if smallest == primary_dims:
+            return None
+        return smallest
+
     @staticmethod
     def _has_vf_stack_overflow(stage_b: StageBResult) -> bool:
         if not stage_b.passed:
@@ -4117,8 +4195,14 @@ class PerfTargetCampaignRunner:
         return False
 
     def _run_l1(self, module_source: str, regime_spec: RegimeTargetSpec) -> StageBResult:
+        tail_anchor_dims = self._resolve_tail_anchor_dims(regime_spec)
         if self._l1_compiler is not None:
-            return self._l1_compiler(module_source, regime_spec)
+            return self._invoke_with_optional_kwargs(
+                self._l1_compiler,
+                module_source,
+                regime_spec,
+                tail_anchor_dims=tail_anchor_dims,
+            )
         tb_extracted = (
             _extract_trackb_cpp_source(module_source, regime_spec)
             if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
@@ -4197,7 +4281,8 @@ class PerfTargetCampaignRunner:
                 passed=False,
                 error_message=f"l1_config_resolve_error: {type(exc).__name__}: {exc}",
             )
-        primary_b = run_l1_compile_check(
+        primary_b = self._invoke_with_optional_kwargs(
+            run_l1_compile_check,
             module_source,
             builder_name=resolved.builder_name,
             builder_kwargs=resolved.builder_kwargs,
@@ -4206,6 +4291,7 @@ class PerfTargetCampaignRunner:
             compile_flags=resolved.compile_flags or None,
             source_root=self._source_root,
             env_file=self._env_file,
+            tail_anchor_dims=tail_anchor_dims,
         )
         if not primary_b.passed:
             if (
@@ -4395,6 +4481,8 @@ class PerfTargetCampaignRunner:
         self,
         candidates: Sequence[tuple[str, Path]],
         active_anchors: Sequence[AnchorCaseSpec],
+        *,
+        include_guardrails: bool = True,
     ) -> tuple[dict[str, CandidateSurrogateResult], dict[str, str]]:
         """Evaluate one batch and return results plus each measured candidate's AgentGates run id.
 
@@ -4420,11 +4508,44 @@ class PerfTargetCampaignRunner:
             and "incumbent_baseline" not in cand_ids
         )
 
+        scoreboard_case_nums = {int(a.case_num) for a in active_anchors}
+        extra_guardrails: list[AnchorCaseSpec] = []
+        guardrail_case_nums: set[int] = set()
+        if include_guardrails and self._guardrail_cases and active_anchors:
+            for g in self._guardrail_cases:
+                g_cnum = int(g.case_num)
+                if g_cnum not in scoreboard_case_nums and g_cnum not in guardrail_case_nums:
+                    extra_guardrails.append(g.to_anchor_spec())
+                    guardrail_case_nums.add(g_cnum)
+        eval_anchors = [*active_anchors, *extra_guardrails] if extra_guardrails else list(active_anchors)
+
+        l2_meta: dict[str, object] = {
+            "prewarm_stats": {},
+            "l2_prewarm_sec": 0.0,
+            "l2_npu_sec": None,
+        }
+
+        def _capture_l2_meta(evaluated: object) -> None:
+            raw_prewarm = getattr(evaluated, "prewarm_stats", None)
+            if isinstance(raw_prewarm, Mapping):
+                l2_meta["prewarm_stats"] = {
+                    str(k): int(v)
+                    for k, v in raw_prewarm.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                }
+            raw_pw_sec = getattr(evaluated, "l2_prewarm_sec", None)
+            if isinstance(raw_pw_sec, (int, float)) and not isinstance(raw_pw_sec, bool):
+                l2_meta["l2_prewarm_sec"] = float(raw_pw_sec)
+            raw_npu_sec = getattr(evaluated, "l2_npu_sec", None)
+            if isinstance(raw_npu_sec, (int, float)) and not isinstance(raw_npu_sec, bool):
+                l2_meta["l2_npu_sec"] = float(raw_npu_sec)
+
         def _dispatch(
             batch_cands: Sequence[tuple[str, Path]],
         ) -> tuple[dict[str, CandidateSurrogateResult], dict[str, str]]:
             if self._l2_batch_evaluator is not None:
-                evaluated = self._l2_batch_evaluator(batch_cands, active_anchors)
+                evaluated = self._l2_batch_evaluator(batch_cands, eval_anchors)
+                _capture_l2_meta(evaluated)
                 if isinstance(evaluated, L2BatchResults):
                     return dict(evaluated), dict(evaluated.run_ids)
                 return dict(evaluated), {}
@@ -4432,7 +4553,7 @@ class PerfTargetCampaignRunner:
                 run_surrogate_batch_via_agent_gates,
                 self._config.operator_name,
                 batch_cands,
-                active_anchors,
+                eval_anchors,
                 source_root=self._source_root,
                 env_file=self._env_file,
                 device_id=self._config.device_id,
@@ -4441,6 +4562,7 @@ class PerfTargetCampaignRunner:
                 repeat=self._config.repeat,
                 require_all_passed=False,
             )
+            _capture_l2_meta(results)
             return results, {candidate_id: run_id for candidate_id in results}
 
         if should_prepend_incumbent:
@@ -4451,9 +4573,32 @@ class PerfTargetCampaignRunner:
         else:
             results, run_ids = _dispatch(candidates)
 
+        self._last_l2_timing_meta = l2_meta
         inc_slot_result = results.pop("incumbent_slot", None)
         run_ids.pop("incumbent_slot", None)
-        return self._normalize_paired_l2_results(results, inc_slot_result), run_ids
+        normalized = self._normalize_paired_l2_results(results, inc_slot_result)
+        if guardrail_case_nums:
+            stripped_results: dict[str, CandidateSurrogateResult] = {}
+            for cid, cand_res in normalized.items():
+                kept_anchors = tuple(
+                    a for a in cand_res.anchors if int(a.case_num) not in guardrail_case_nums
+                )
+                self._last_guardrail_metrics_by_cid[cid] = {
+                    int(a.case_num): a
+                    for a in cand_res.anchors
+                    if int(a.case_num) in guardrail_case_nums
+                }
+                if kept_anchors:
+                    stripped_results[cid] = aggregate_surrogate_result(
+                        cand_res.candidate_id,
+                        cand_res.operator_name,
+                        kept_anchors,
+                        error_message=cand_res.error_message,
+                    )
+                else:
+                    stripped_results[cid] = replace(cand_res, anchors=())
+            return stripped_results, run_ids
+        return normalized, run_ids
 
     def _recheck_single_sibling_anchor(
         self,
@@ -4467,7 +4612,9 @@ class PerfTargetCampaignRunner:
             cand_file.write_text(candidate_source, encoding="utf-8")
             try:
                 l2_results, _ = self._run_l2_batch(
-                    [(candidate_id, cand_file)], [dipped_anchor]
+                    [(candidate_id, cand_file)],
+                    [dipped_anchor],
+                    include_guardrails=False,
                 )
             except (
                 OSError,
@@ -4575,7 +4722,11 @@ class PerfTargetCampaignRunner:
             cand_file = Path(tmp_dir) / f"{candidate_id}.py"
             cand_file.write_text(candidate_source, encoding="utf-8")
             try:
-                l2_results, _ = self._run_l2_batch([(candidate_id, cand_file)], retest_specs)
+                l2_results, _ = self._run_l2_batch(
+                    [(candidate_id, cand_file)],
+                    retest_specs,
+                    include_guardrails=False,
+                )
             except (
                 OSError,
                 subprocess.SubprocessError,
@@ -4617,6 +4768,23 @@ class PerfTargetCampaignRunner:
         """Enforce active-regime tail floor and 0.98x changed-sibling guard with noise floor."""
         self._last_tail_guard_reject_reason = ""
         cur_res = top_res
+        cand_guardrail_metrics = self._last_guardrail_metrics_by_cid.get(candidate_id, {})
+        cur_by_case = {int(a.case_num): a for a in cur_res.anchors}
+        for guardrail in self._guardrail_cases:
+            g_metric = cand_guardrail_metrics.get(int(guardrail.case_num))
+            if g_metric is None:
+                g_metric = cur_by_case.get(int(guardrail.case_num))
+            if g_metric is None:
+                continue
+            if not g_metric.accuracy_passed:
+                self._last_tail_guard_reject_reason = "guardrail_accuracy_failed"
+                return False, cur_res
+            if (
+                guardrail.incumbent_ref_us > 0.0
+                and g_metric.cand_us > 1.05 * guardrail.incumbent_ref_us
+            ):
+                self._last_tail_guard_reject_reason = "guardrail_latency_regression"
+                return False, cur_res
         eff_incumbent = incumbent_source or self._active_incumbent_source
         unchanged_siblings = (
             self._unchanged_sibling_regimes(eff_incumbent, candidate_source, regime_spec)
@@ -4825,6 +4993,22 @@ class PerfTargetCampaignRunner:
             return False, updated_top_res
         return True, updated_top_res
 
+    def _refresh_guardrail_incumbent_refs(self, winner_candidate_id: str) -> None:
+        """Update guardrail incumbent reference latencies from a newly promoted winner."""
+        if not self._guardrail_cases:
+            return
+        metrics_by_case = self._last_guardrail_metrics_by_cid.get(winner_candidate_id)
+        if not metrics_by_case:
+            return
+        refreshed: list[GuardrailCaseSpec] = []
+        for guardrail in self._guardrail_cases:
+            metric = metrics_by_case.get(int(guardrail.case_num))
+            if metric is not None and metric.accuracy_passed and metric.cand_us > 0.0:
+                refreshed.append(replace(guardrail, incumbent_ref_us=float(metric.cand_us)))
+            else:
+                refreshed.append(guardrail)
+        self._guardrail_cases = refreshed
+
     def _run_l3_contract(
         self,
         module_path: Path,
@@ -4980,6 +5164,7 @@ class PerfTargetCampaignRunner:
         allow_satisfied_fallback: bool = False,
         exclude_regime: str | None = None,
         stagnation_by_regime: Mapping[str, int] | None = None,
+        last_round_promoted: bool | None = None,
     ) -> RegimeTargetSpec | None:
         by_tag = {r.regime_tag: r for r in self._regime_specs}
         wall_map = getattr(self, "_compile_wall_streak_by_regime", {})
@@ -5010,7 +5195,53 @@ class PerfTargetCampaignRunner:
         if exclude_regime and any(spec.regime_tag != exclude_regime for spec in candidates):
             candidates = [spec for spec in candidates if spec.regime_tag != exclude_regime]
 
-        def _urgency_key(spec: RegimeTargetSpec) -> tuple[int, int, float, float, float, str]:
+        floor_saturated_map: dict[str, bool] = {}
+        high_excess_map: dict[str, bool] = {}
+        for spec in candidates:
+            sb_nums = {
+                int(a.case_num)
+                for a in active_anchors
+                if a.regime_tag == spec.regime_tag
+            }
+            if sb_nums:
+                matched = [
+                    a
+                    for a in best_result.anchors
+                    if int(a.case_num) in sb_nums and a.cand_us > 0.0
+                ]
+            else:
+                matched = [
+                    a
+                    for a in best_result.anchors
+                    if a.regime_tag == spec.regime_tag and a.cand_us > 0.0
+                ]
+            eff_floor_us = max(_launch_floor_us_for_backend(spec.runtime_backend), 11.5)
+            floor_saturated_map[spec.regime_tag] = bool(matched) and all(
+                float(a.cand_us) <= max(eff_floor_us + 2.0, 1.15 * float(a.t_hw_us))
+                for a in matched
+            )
+            excesses = [
+                max(0.0, float(a.cand_us) - max(eff_floor_us, float(a.t_hw_us)))
+                for a in matched
+            ]
+            mean_ex = sum(excesses) / len(excesses) if excesses else 0.0
+            max_ex = max(excesses) if excesses else 0.0
+            high_excess_map[spec.regime_tag] = bool(excesses) and (
+                mean_ex > 5.0 or max_ex > 5.0
+            )
+
+        def _is_floor_deprioritized(spec: RegimeTargetSpec) -> int:
+            if not floor_saturated_map.get(spec.regime_tag, False):
+                return 0
+            other_high = any(
+                other_tag != spec.regime_tag and is_high
+                for other_tag, is_high in high_excess_map.items()
+            )
+            return 1 if other_high else 0
+
+        def _urgency_key(
+            spec: RegimeTargetSpec,
+        ) -> tuple[int, int, int, float, float, float, str]:
             rec = self._regime_mean_recoverable_excess_us(best_result, spec)
             has_excess = 1 if (rec is None or rec > 0.0) else 0
             rec_val = float(rec) if rec is not None else 0.0
@@ -5023,8 +5254,10 @@ class PerfTargetCampaignRunner:
                 headroom * anchor_weight * (1.0 + math.log1p(max(0.0, rec_val)))
             ) / math.sqrt(1.0 + float(stag))
             wall_yield = 1 if int(wall_map.get(spec.regime_tag, 0) or 0) >= 2 else 0
+            floor_dep = _is_floor_deprioritized(spec)
             return (
                 wall_yield,
+                floor_dep,
                 -has_excess,
                 -bandit_score,
                 -headroom,
@@ -5035,11 +5268,21 @@ class PerfTargetCampaignRunner:
         candidates.sort(key=_urgency_key)
         top_spec = candidates[0]
         candidate_tags = {spec.regime_tag for spec in candidates}
+        promoted_map = getattr(self, "_last_round_promoted_by_regime", {})
+        was_promoted = (
+            promoted_map.get(
+                current_regime, getattr(self, "_last_round_promoted", True)
+            )
+            if (current_regime and last_round_promoted is None)
+            else bool(last_round_promoted)
+        )
         if (
             current_regime
             and current_regime in candidate_tags
             and current_regime in by_tag
             and int(wall_map.get(current_regime, 0) or 0) < 2
+            and was_promoted
+            and _is_floor_deprioritized(by_tag[current_regime]) == 0
         ):
             top_headroom = best_result.regime_headroom(top_spec.regime_tag)
             cur_headroom = best_result.regime_headroom(current_regime)
@@ -5204,8 +5447,8 @@ class PerfTargetCampaignRunner:
             lines.extend(p2_lines)
         return "\n".join(lines) + "\n\n"
 
-    @staticmethod
     def _format_sil_live_policy_section(
+        self,
         *,
         live_plan: RegimePlanResult | None,
         active_mask: ConstraintRelaxationMask | None,
@@ -5213,6 +5456,8 @@ class PerfTargetCampaignRunner:
         pipe_gaps: object | None = None,
         cost_pred: object | None = None,
         escalated_trackb_tu: str = "",
+        parent_ledger: ObjectivePhysicalLedger | None = None,
+        parent_residual: StaticDynamicResidual | None = None,
     ) -> str:
         if live_plan is None and active_mask is None:
             return ""
@@ -5236,12 +5481,31 @@ class PerfTargetCampaignRunner:
             lines.append(f"- unlocked_facets: {', '.join(active_mask.unlocked_facets())}")
             locked = active_mask.locked_facets()
             lines.append(f"- locked_facets: {', '.join(locked) if locked else 'none (top)'}")
-        if cost_pred is not None:
-            lines.append(
-                f"- cost_model_pred_us: {float(getattr(cost_pred, 'pred_us', 0.0)):.2f} "
-                f"(dominant_bound={getattr(cost_pred, 'dominant_bound', '')}, "
-                f"tier1_penalty_us={float(getattr(cost_pred, 'tier1_penalty_us', 0.0)):.2f})"
+        resolved_bound = ""
+        if parent_ledger is not None or parent_residual is not None or cost_pred is not None:
+            resolved_bound = str(
+                self._cost_advisor.resolve_dominant_bound(
+                    parent_ledger,
+                    parent_residual,
+                    fallback_cost_pred=cost_pred,
+                )
+                or ""
             )
+        if cost_pred is not None:
+            pred_val = (
+                float(cost_pred)
+                if isinstance(cost_pred, (int, float)) and not isinstance(cost_pred, bool)
+                else float(getattr(cost_pred, "pred_us", 0.0) or 0.0)
+            )
+            bound_val = resolved_bound or str(getattr(cost_pred, "dominant_bound", "") or "")
+            penalty_val = float(getattr(cost_pred, "tier1_penalty_us", 0.0) or 0.0)
+            lines.append(
+                f"- cost_model_pred_us: {pred_val:.2f} "
+                f"(dominant_bound={bound_val}, "
+                f"tier1_penalty_us={penalty_val:.2f})"
+            )
+        elif resolved_bound:
+            lines.append(f"- dominant_bound: {resolved_bound}")
         if escalation is not None:
             should_esc = bool(getattr(escalation, "should_escalate", False))
             to_tier = getattr(escalation, "to_tier", "")
@@ -5450,9 +5714,9 @@ class PerfTargetCampaignRunner:
                 bn = bottleneck_anchor_for_regime(result, anc.regime_tag)
                 bn_by_regime[anc.regime_tag] = int(bn.case_num) if bn is not None else -1
 
-        observed_count = 0
-        delta_count = 0
-        msprof_count = 0
+        observations_batch: list[dict[str, object]] = []
+        msprof_batch: list[dict[str, object]] = []
+        pair_deltas_batch: list[dict[str, object]] = []
         for anc in result.anchors:
             if anc.cand_us <= 0.0:
                 continue
@@ -5479,13 +5743,21 @@ class PerfTargetCampaignRunner:
                 else {}
             )
             raw_ana = 0.0
+            analytical_pred_us = 0.0
             try:
-                pred_res = self._cost_model.predict(proj_wl, bisheng_res=bisheng_summary)
-                raw_ana = float(getattr(pred_res, "tier0_physics_us", 0.0) or 0.0) + float(
-                    getattr(pred_res, "tier1_penalty_us", 0.0) or 0.0
+                pred_res = self._cost_advisor.predict_candidate_us(
+                    proj_wl,
+                    bisheng_res=bisheng_summary,
                 )
-                calibrated_pred_us = float(getattr(pred_res, "pred_us", 0.0) or 0.0)
-                analytical_pred_us = calibrated_pred_us if calibrated_pred_us > 0.0 else raw_ana
+                if isinstance(pred_res, (int, float)) and not isinstance(pred_res, bool):
+                    raw_ana = float(pred_res)
+                    analytical_pred_us = raw_ana
+                elif pred_res is not None:
+                    raw_ana = float(getattr(pred_res, "tier0_physics_us", 0.0) or 0.0) + float(
+                        getattr(pred_res, "tier1_penalty_us", 0.0) or 0.0
+                    )
+                    calibrated_pred_us = float(getattr(pred_res, "pred_us", 0.0) or 0.0)
+                    analytical_pred_us = calibrated_pred_us if calibrated_pred_us > 0.0 else raw_ana
             except (TypeError, ValueError):
                 analytical_pred_us = 0.0
             ring_burst_k = max(1, int(getattr(anc, "ring_burst_k", 1) or 1))
@@ -5567,75 +5839,73 @@ class PerfTargetCampaignRunner:
                 except OSError as exc:
                     logger.debug("Appending unmodeled anomaly skipped: %s", exc)
 
-            try:
-                if attach_msprof:
-                    self._cost_model.observe_msprof(
-                        proj_wl,
-                        attach_msprof,
-                        measured_us=float(anc.cand_us),
-                        bisheng_res=bisheng_summary,
-                        persist=False,
-                    )
-                    msprof_count += 1
-                self._cost_model.observe(
-                    proj_wl,
-                    float(anc.cand_us),
-                    bisheng_res=bisheng_summary,
-                    persist=False,
-                    refit=False,
+            if attach_msprof:
+                msprof_batch.append(
+                    {
+                        "workload": proj_wl,
+                        "msprof_pmu": attach_msprof,
+                        "measured_us": float(anc.cand_us),
+                        "bisheng_res": bisheng_summary,
+                    }
                 )
-                self._cost_model.mark_online_observation_key(
-                    cand_sha=cand_sha,
-                    operator=self._config.operator_name,
-                    regime_tag=anc.regime_tag,
-                    case_num=int(anc.case_num),
-                    eval_tier=eval_tier,
-                    measured_us=float(anc.cand_us),
+            observations_batch.append(
+                {
+                    "workload": proj_wl,
+                    "measured_us": float(anc.cand_us),
+                    "bisheng_res": bisheng_summary,
+                    "cand_sha": cand_sha,
+                    "operator": self._config.operator_name,
+                    "regime_tag": anc.regime_tag,
+                    "case_num": int(anc.case_num),
+                    "eval_tier": eval_tier,
+                }
+            )
+            p_anc = parent_by_case.get(int(anc.case_num))
+            if (
+                p_anc is not None
+                and p_anc.cand_us > 0.0
+                and parent_sha
+                and parent_sha != cand_sha
+            ):
+                parent_proj = project_case_workload(
+                    parent_ledger.to_dict() if parent_ledger is not None else ledger_dict,
+                    microarch_profile=(
+                        parent_prof.to_dict()
+                        if parent_prof is not None and not parent_prof.is_empty
+                        else prof_dict
+                    ),
+                    case_dims=dims,
+                    policy=(dict(parent_policy) if parent_policy is not None else pol_dict),
+                    t_hw_us=p_anc.t_hw_us,
+                    axes=parent_axes or axes,
+                    target=self._target,
                 )
-                observed_count += 1
-                p_anc = parent_by_case.get(int(anc.case_num))
-                if (
-                    p_anc is not None
-                    and p_anc.cand_us > 0.0
-                    and parent_sha
-                    and parent_sha != cand_sha
-                ):
-                    parent_proj = project_case_workload(
-                        parent_ledger.to_dict() if parent_ledger is not None else ledger_dict,
-                        microarch_profile=(parent_prof.to_dict() if parent_prof is not None and not parent_prof.is_empty else prof_dict),
-                        case_dims=dims,
-                        policy=(dict(parent_policy) if parent_policy is not None else pol_dict),
-                        t_hw_us=p_anc.t_hw_us,
-                        axes=parent_axes or axes,
-                        target=self._target,
-                    )
-                    self._cost_model.observe_pair_delta(
-                        proj_wl,
-                        float(anc.cand_us),
-                        parent_proj,
-                        float(p_anc.cand_us),
-                        cand_bisheng_res=bisheng_summary,
-                        parent_bisheng_res=parent_bisheng_res,
-                        refit=False,
-                    )
-                    self._cost_model.mark_online_pair_key(
-                        cand_sha=cand_sha,
-                        parent_sha=parent_sha,
-                        operator=self._config.operator_name,
-                        regime_tag=anc.regime_tag,
-                        case_num=int(anc.case_num),
-                    )
-                    delta_count += 1
-            except (OSError, ValueError) as exc:
-                logger.debug("Cost model online observation skipped: %s", exc)
+                pair_deltas_batch.append(
+                    {
+                        "cand_workload": proj_wl,
+                        "cand_us": float(anc.cand_us),
+                        "parent_workload": parent_proj,
+                        "parent_us": float(p_anc.cand_us),
+                        "cand_bisheng_res": bisheng_summary,
+                        "parent_bisheng_res": parent_bisheng_res,
+                        "cand_sha": cand_sha,
+                        "parent_sha": parent_sha,
+                        "operator": self._config.operator_name,
+                        "regime_tag": anc.regime_tag,
+                        "case_num": int(anc.case_num),
+                    }
+                )
 
-        if delta_count > 0:
-            self._cost_model._refit_delta_ridge()
-        if observed_count > 0 or msprof_count > 0:
-            if observed_count > 0:
-                self._cost_model._refit_ridge()
-            if self._cost_calibration_path is not None:
-                self._cost_model.save_calibration(self._cost_calibration_path)
+        if observations_batch or msprof_batch or pair_deltas_batch:
+            try:
+                self._cost_advisor.observe_surrogate_batch(
+                    observations=observations_batch,
+                    msprof_records=msprof_batch,
+                    pair_deltas=pair_deltas_batch,
+                    refit=True,
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                logger.debug("Cost advisor online observation skipped: %s", exc)
 
     def _record_l4_observations(
         self,
@@ -5685,7 +5955,7 @@ class PerfTargetCampaignRunner:
                 logger.debug("ExperienceLake register L4 candidate skipped: %s", exc)
 
         by_case_anchor = {int(a.case_num): a for a in active_anchors}
-        observed = 0
+        l4_observations: list[dict[str, object]] = []
         for cnum_raw, elapsed_raw in sorted(l4_result.per_case_elapsed_us.items()):
             cnum = int(cnum_raw)
             elapsed_us = float(elapsed_raw or 0.0)
@@ -5758,28 +6028,27 @@ class PerfTargetCampaignRunner:
                     )
                 except (OSError, ValueError, json.JSONDecodeError) as exc:
                     logger.debug("ExperienceLake L4 append skipped: %s", exc)
+            l4_observations.append(
+                {
+                    "workload": proj_wl,
+                    "measured_us": elapsed_us,
+                    "cand_sha": cand_sha,
+                    "operator": self._config.operator_name,
+                    "regime_tag": rtag,
+                    "case_num": cnum,
+                    "eval_tier": "l4_official",
+                }
+            )
+        if l4_observations:
             try:
-                self._cost_model.observe(
-                    proj_wl,
-                    elapsed_us,
-                    persist=False,
-                    refit=False,
+                self._cost_advisor.observe_surrogate_batch(
+                    observations=l4_observations,
+                    msprof_records=[],
+                    pair_deltas=[],
+                    refit=True,
                 )
-                self._cost_model.mark_online_observation_key(
-                    cand_sha=cand_sha,
-                    operator=self._config.operator_name,
-                    regime_tag=rtag,
-                    case_num=cnum,
-                    eval_tier="l4_official",
-                    measured_us=elapsed_us,
-                )
-                observed += 1
-            except (OSError, ValueError) as exc:
-                logger.debug("Cost model L4 observe skipped: %s", exc)
-        if observed > 0:
-            self._cost_model._refit_ridge()
-            if self._cost_calibration_path is not None:
-                self._cost_model.save_calibration(self._cost_calibration_path)
+            except (OSError, ValueError, TypeError) as exc:
+                logger.debug("Cost advisor L4 observe skipped: %s", exc)
 
     @staticmethod
     def _touched_symbols_for_regime_snippet(
@@ -6185,7 +6454,9 @@ class PerfTargetCampaignRunner:
             mod_path = Path(tmp_dir) / "incumbent.py"
             mod_path.write_text(incumbent_source, encoding="utf-8")
             results, _run_ids = self._run_l2_batch(
-                [("incumbent_baseline", mod_path)], active_anchors
+                [("incumbent_baseline", mod_path)],
+                active_anchors,
+                include_guardrails=False,
             )
         if "incumbent_baseline" not in results:
             raise RuntimeError("Baseline evaluation missing incumbent_baseline result.")
@@ -6227,6 +6498,16 @@ class PerfTargetCampaignRunner:
             "baseline_result": baseline_result.to_dict(),
             "best_result": best_result.to_dict(),
             "active_anchors": [a.to_dict() for a in active_anchors],
+            "scoreboard_anchors": [a.to_dict() for a in self._scoreboard_anchors],
+            "guardrail_cases": [g.to_dict() for g in self._guardrail_cases],
+            "last_distilled_lat_by_regime": {
+                str(k): float(v)
+                for k, v in sorted(self._last_distilled_lat_by_regime.items())
+            },
+            "last_round_promoted_by_regime": {
+                str(k): bool(v)
+                for k, v in sorted(self._last_round_promoted_by_regime.items())
+            },
             "frozen_regimes": sorted(frozen_regimes),
             "current_regime": current_regime,
             "stagnation_rounds": stagnation_rounds,
@@ -6340,6 +6621,39 @@ class PerfTargetCampaignRunner:
         self._boundary_ledger = DeterministicSearchBoundaryLedger.from_dict(
             payload.get("search_boundary_ledger")
         )
+        raw_sb = payload.get("scoreboard_anchors")
+        if isinstance(raw_sb, Sequence) and not isinstance(raw_sb, (str, bytes)) and raw_sb:
+            self._scoreboard_anchors = tuple(
+                AnchorCaseSpec.from_dict(item)
+                for item in raw_sb
+                if isinstance(item, Mapping)
+            )
+        raw_gr = payload.get("guardrail_cases")
+        self._guardrail_cases = (
+            [
+                GuardrailCaseSpec.from_dict(item)
+                for item in raw_gr
+                if isinstance(item, Mapping)
+            ][:2]
+            if isinstance(raw_gr, Sequence) and not isinstance(raw_gr, (str, bytes))
+            else []
+        )
+        raw_distilled_lat = payload.get("last_distilled_lat_by_regime")
+        self._last_distilled_lat_by_regime = (
+            {
+                str(k): float(v)
+                for k, v in raw_distilled_lat.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            }
+            if isinstance(raw_distilled_lat, Mapping)
+            else {}
+        )
+        raw_promoted_map = payload.get("last_round_promoted_by_regime")
+        self._last_round_promoted_by_regime = (
+            {str(k): bool(v) for k, v in raw_promoted_map.items()}
+            if isinstance(raw_promoted_map, Mapping)
+            else {}
+        )
         rounds = [CampaignRoundRecord.from_dict(r) for r in payload.get("rounds", ())]
         self._last_local_rel_gain_by_regime = {}
         for rec in rounds:
@@ -6405,7 +6719,7 @@ class PerfTargetCampaignRunner:
             incumbent_source,
             CandidateSurrogateResult.from_dict(payload["baseline_result"]),
             CandidateSurrogateResult.from_dict(payload["best_result"]),
-            [AnchorCaseSpec.from_dict(item) for item in payload.get("active_anchors", ())],
+            list(self._scoreboard_anchors),
             set(str(x) for x in payload.get("frozen_regimes", ())),
             current_regime,
             int(payload.get("stagnation_rounds", 0)),
@@ -6823,6 +7137,7 @@ class PerfTargetCampaignRunner:
         active_anchors: Sequence[AnchorCaseSpec],
         topology_axes: TopologyAxes,
         rel_gain: float = 0.0,
+        local_rel_gain: float = 0.0,
         worker_kind: str = "",
         round_idx: int = 0,
         rule_id: str | None = None,
@@ -6848,7 +7163,11 @@ class PerfTargetCampaignRunner:
                     cpath.write_text(ablated_src, encoding="utf-8")
                     cand_files.append((chunk_id, cpath))
                 try:
-                    batch_res, _run_ids = self._run_l2_batch(cand_files, regime_anchors)
+                    batch_res, _run_ids = self._run_l2_batch(
+                        cand_files,
+                        regime_anchors,
+                        include_guardrails=False,
+                    )
                 except (
                     OSError,
                     subprocess.SubprocessError,
@@ -6865,23 +7184,29 @@ class PerfTargetCampaignRunner:
             return out
 
         allow_online = bool(self._config.allow_unreviewed_distilled_rules)
-        has_l2_executor = bool(
-            self._l2_batch_evaluator is not None
-            or self._env_file is not None
+        has_agent_gates_env = bool(
+            self._env_file is not None
             or getattr(self, "_agent_gates_bin", None) is not None
             or os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip()
             or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
         )
+        has_l2_executor = bool(self._l2_batch_evaluator is not None or has_agent_gates_env)
         real_npu_path = bool(
-            self._l2_batch_evaluator is None
-            and (
-                self._env_file is not None
-                or getattr(self, "_agent_gates_bin", None) is not None
-                or os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip()
-                or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
-            )
+            getattr(self._l2_batch_evaluator, "is_real_npu", False)
+            or (self._l2_batch_evaluator is None and has_agent_gates_env)
         )
-        verify_on_cand = bool(rel_gain >= 0.03 and has_l2_executor)
+        last_lat = self._last_distilled_lat_by_regime.get(
+            regime_spec.regime_tag, baseline_latency_us
+        )
+        cum_rel_gain = (
+            (last_lat - winner_latency_us) / max(last_lat, 1e-6)
+            if (last_lat > 0.0 and winner_latency_us > 0.0)
+            else 0.0
+        )
+        verify_on_cand = bool(
+            (max(float(rel_gain), float(local_rel_gain)) >= 0.03 or cum_rel_gain >= 0.08)
+            and has_l2_executor
+        )
         orig_tracker = self._flywheel._tracker
         staging_tracker = (
             orig_tracker
@@ -6921,6 +7246,7 @@ class PerfTargetCampaignRunner:
         if self._experience_lake_dir is not None:
             origin_ts = time.time()
             report_payload = distill_rep.to_dict()
+            any_verified_admitted = False
             for outcome in distill_rep.distilled_outcomes:
                 if outcome.rule is None or not outcome.admitted:
                     continue
@@ -6939,6 +7265,8 @@ class PerfTargetCampaignRunner:
                 outcome_verified = bool(
                     getattr(outcome, "verified_on_candidate", outcome.hardware_verified)
                 )
+                if outcome_verified:
+                    any_verified_admitted = True
                 if allow_online or (real_npu_path and verify_on_cand and outcome_verified):
                     try:
                         saved_rule_path = save_distilled_rule_file(
@@ -6961,6 +7289,10 @@ class PerfTargetCampaignRunner:
                             outcome.rule.rule_id,
                             exc,
                         )
+            if verify_on_cand and any_verified_admitted and winner_latency_us > 0.0:
+                self._last_distilled_lat_by_regime[regime_spec.regime_tag] = float(
+                    winner_latency_us
+                )
             try:
                 append_winning_edge(
                     self._experience_lake_dir,
@@ -7202,6 +7534,7 @@ class PerfTargetCampaignRunner:
             if current.round_idx not in promoted_rounds:
                 promoted_rounds.append(current.round_idx)
             stagnation_by_regime[current.regime_tag] = 0
+            self._refresh_guardrail_incumbent_refs(current.candidate_id)
             self._pending_promotion = None
             self._active_promotion = None
             self._persist_runtime_state("active_promotion", None)
@@ -8212,14 +8545,18 @@ class PerfTargetCampaignRunner:
         incumbent_source: str,
         new_specs: Sequence[AnchorCaseSpec],
     ) -> list[AnchorEvalMetrics]:
-        """Measure incumbent AnchorEvalMetrics on newly appended dynamic anchors."""
+        """Measure incumbent AnchorEvalMetrics on newly added probe cases."""
         if not new_specs or not incumbent_source.strip():
             return []
         try:
             with tempfile.TemporaryDirectory(prefix="tf_inc_dyn_anchor_") as tmp_dir:
                 inc_file = Path(tmp_dir) / "incumbent.py"
                 inc_file.write_text(incumbent_source, encoding="utf-8")
-                l2_probe, _ = self._run_l2_batch([("incumbent", inc_file)], list(new_specs))
+                l2_probe, _ = self._run_l2_batch(
+                    [("incumbent", inc_file)],
+                    list(new_specs),
+                    include_guardrails=False,
+                )
             inc_res = l2_probe.get("incumbent")
             if inc_res is not None and inc_res.anchors:
                 return list(inc_res.anchors)
@@ -8236,40 +8573,26 @@ class PerfTargetCampaignRunner:
             pass
         return []
 
-    def _merge_incumbent_anchor_metrics(
-        self,
-        best_result: CandidateSurrogateResult,
-        new_metrics: Sequence[AnchorEvalMetrics],
-    ) -> CandidateSurrogateResult:
-        """Re-aggregate best_result after adding incumbent metrics for new dynamic anchors."""
-        if not new_metrics:
-            return best_result
-        merged_by_case = {int(a.case_num): a for a in best_result.anchors}
-        for metric in new_metrics:
-            if metric.cand_us > 0.0:
-                merged_by_case[int(metric.case_num)] = metric
-        return aggregate_surrogate_result(
-            best_result.candidate_id,
-            self._config.operator_name,
-            tuple(merged_by_case.values()),
-            error_message=best_result.error_message,
-        )
-
-    def _promote_l3_counterexample_anchors(
+    def _record_l3_guardrail_cases(
         self,
         l3_res: L3AcceptanceResult,
         incumbent_source: str,
         regime_spec: RegimeTargetSpec,
-        active_anchors: list[AnchorCaseSpec],
         *,
         topology_axes: TopologyAxes | None = None,
-    ) -> tuple[list[int], list[AnchorEvalMetrics]]:
-        """Promote up to 2 L3 counterexample cases and measure incumbent metrics on them."""
+    ) -> list[GuardrailCaseSpec]:
+        """Record up to 2 non-scoreboard L3 failure probe cases as guardrails."""
         case_nums = self._extract_l3_failed_case_nums(l3_res)
-        existing_cases = {int(a.case_num) for a in active_anchors}
-        target_cases = [c for c in case_nums if c not in existing_cases][:2]
+        scoreboard_cases = {int(a.case_num) for a in self._scoreboard_anchors}
+        existing_guardrails = {int(g.case_num) for g in self._guardrail_cases}
+        remaining_slots = max(0, 2 - len(self._guardrail_cases))
+        target_cases = [
+            c
+            for c in case_nums
+            if c not in scoreboard_cases and c not in existing_guardrails
+        ][:remaining_slots]
         if not target_cases:
-            return [], []
+            return []
         try:
             task_name = get_operator_task(self._config.operator_name)
         except (FileNotFoundError, KeyError, ValueError):
@@ -8280,27 +8603,45 @@ class PerfTargetCampaignRunner:
             if bp is not None and bp.roofline.ideal_roofline_us > 0.0
             else 1.0
         )
-        regime_anchors = [a for a in active_anchors if a.regime_tag == regime_spec.regime_tag]
-        fallback_ref = (
-            max(1.0, float(regime_anchors[0].ref_perf_us))
-            if regime_anchors
-            else (max(1.0, float(active_anchors[0].ref_perf_us)) if active_anchors else 10.0)
-        )
-        fallback_hw = (
-            max(0.1, float(regime_anchors[0].t_hw_us))
-            if regime_anchors
-            else (max(0.1, float(active_anchors[0].t_hw_us)) if active_anchors else default_t_hw)
-        )
         axes_dict = (
             topology_axes.to_dict()
             if topology_axes is not None
             else (self._topology_axes.to_dict() if self._topology_axes is not None else {})
         )
         failure_stage = str(getattr(l3_res, "failure_stage", "") or "")
-        promoted_cases: list[int] = []
+        probe_specs: list[AnchorCaseSpec] = []
+        pending_specs: list[tuple[int, str, float, float]] = []
         for cnum in target_cases:
-            ref_perf_us: float | None = None
-            t_hw_us: float | None = None
+            dims: dict[str, object] = {}
+            try:
+                dims = dict(
+                    lookup_case_dims(
+                        self._config.operator_name,
+                        cnum,
+                        cannbench_repo=self._cannbench_repo,
+                        env_file=self._env_file,
+                    )
+                )
+            except (FileNotFoundError, OSError, KeyError, ValueError, TypeError):
+                if cnum in self._case_dims_cache:
+                    dims = dict(self._case_dims_cache[cnum])
+                elif (
+                    getattr(self._lookup_case_dims_safe, "__func__", None)
+                    is not PerfTargetCampaignRunner._lookup_case_dims_safe
+                ):
+                    dims = self._lookup_case_dims_safe(cnum, regime_spec.regime_tag)
+            true_regime_tag = regime_spec.regime_tag
+            if dims and self._regime_specs:
+                try:
+                    true_regime_tag = resolve_regime_for_case(
+                        self._config.operator_name,
+                        dims,
+                        self._regime_specs,
+                    ).regime_tag
+                except (KeyError, ValueError, TypeError):
+                    pass
+            ref_perf_us = 1.0
+            t_hw_us = default_t_hw
             try:
                 meta_ref, meta_hw = lookup_case_metadata(
                     self._config.operator_name,
@@ -8314,63 +8655,29 @@ class PerfTargetCampaignRunner:
                     t_hw_us = float(meta_hw)
             except (FileNotFoundError, OSError, KeyError, ValueError, json.JSONDecodeError):
                 pass
-            if t_hw_us is None:
-                t_hw_us = fallback_hw
-            if ref_perf_us is None and incumbent_source.strip():
-                probe_spec = AnchorCaseSpec(
-                    task=task_name,
-                    case_num=cnum,
-                    regime_tag=regime_spec.regime_tag,
-                    ref_perf_us=fallback_ref,
-                    t_hw_us=t_hw_us,
-                )
-                try:
-                    with tempfile.TemporaryDirectory(prefix="tf_l3_cx_anchor_") as tmp_dir:
-                        inc_file = Path(tmp_dir) / "incumbent.py"
-                        inc_file.write_text(incumbent_source, encoding="utf-8")
-                        l2_probe, _ = self._run_l2_batch([("incumbent", inc_file)], [probe_spec])
-                    inc_res = l2_probe.get("incumbent")
-                    if inc_res is not None:
-                        for anc_m in inc_res.anchors:
-                            if int(anc_m.case_num) == cnum and anc_m.cand_us > 0.0:
-                                ref_perf_us = float(anc_m.cand_us)
-                                break
-                except (
-                    OSError,
-                    subprocess.SubprocessError,
-                    TimeoutError,
-                    json.JSONDecodeError,
-                    RuntimeError,
-                    FileNotFoundError,
-                    KeyError,
-                    ValueError,
-                ):
-                    pass
-            if ref_perf_us is None or ref_perf_us <= 0.0:
-                ref_perf_us = fallback_ref
-            active_anchors.append(
+            probe_specs.append(
                 AnchorCaseSpec(
                     task=task_name,
                     case_num=cnum,
-                    regime_tag=regime_spec.regime_tag,
+                    regime_tag=true_regime_tag,
                     ref_perf_us=ref_perf_us,
                     t_hw_us=t_hw_us,
                 )
             )
-            promoted_cases.append(cnum)
+            pending_specs.append((cnum, true_regime_tag, ref_perf_us, t_hw_us))
             if self._experience_lake_dir is not None:
-                case_dims = self._lookup_case_dims_safe(cnum, regime_spec.regime_tag)
-                align_flags = self._case_dim_alignment_flags(case_dims)
+                eff_dims = dims or self._lookup_case_dims_safe(cnum, true_regime_tag)
+                align_flags = self._case_dim_alignment_flags(eff_dims)
                 try:
                     append_counterexample_boundary(
                         self._experience_lake_dir,
                         {
                             "run_id": self._run_id,
                             "operator": self._config.operator_name,
-                            "regime_tag": regime_spec.regime_tag,
+                            "regime_tag": true_regime_tag,
                             "topology_axes": axes_dict,
                             "case_num": int(cnum),
-                            "case_dims": case_dims,
+                            "case_dims": eff_dims,
                             "failure_stage": failure_stage,
                             "ref_perf_us": float(ref_perf_us),
                             "t_hw_us": float(t_hw_us),
@@ -8379,11 +8686,26 @@ class PerfTargetCampaignRunner:
                     )
                 except (OSError, ValueError) as exc:
                     logger.debug("Appending counterexample boundary skipped: %s", exc)
-        appended_specs = [a for a in active_anchors if int(a.case_num) in set(promoted_cases)]
-        incumbent_cx_metrics = self._evaluate_incumbent_on_new_anchors(
-            incumbent_source, appended_specs
-        )
-        return promoted_cases, incumbent_cx_metrics
+
+        inc_metrics = self._evaluate_incumbent_on_new_anchors(incumbent_source, probe_specs)
+        inc_us_by_case = {
+            int(m.case_num): float(m.cand_us) for m in inc_metrics if m.cand_us > 0.0
+        }
+        added: list[GuardrailCaseSpec] = []
+        for cnum, true_regime_tag, ref_perf_us, t_hw_us in pending_specs:
+            inc_ref = inc_us_by_case.get(cnum, 0.0)
+            if inc_ref <= 0.0 and ref_perf_us > 1.0:
+                inc_ref = ref_perf_us
+            spec = GuardrailCaseSpec(
+                task=task_name,
+                case_num=cnum,
+                regime_tag=true_regime_tag,
+                incumbent_ref_us=inc_ref,
+                t_hw_us=t_hw_us,
+            )
+            self._guardrail_cases.append(spec)
+            added.append(spec)
+        return added
 
     async def _attempt_l3_counterexample_repair(
         self,
@@ -8693,7 +9015,21 @@ class PerfTargetCampaignRunner:
         counting stagnation; a live or queued execution keeps the exact candidate
         bytes because replacing them would silently change the code under test.
         """
-        working_anchors = active_anchors if isinstance(active_anchors, list) else list(active_anchors)
+        working_anchors = list(self._scoreboard_anchors) if self._scoreboard_anchors else list(active_anchors)
+        start_advisor_preds = int(getattr(self._cost_advisor, "predictions_invoked", 0) or 0)
+        llm_gen_sec = 0.0
+        l0_l1_sec = 0.0
+        syntax_repair_sec = 0.0
+        l2_prewarm_sec = 0.0
+        l2_npu_sec = 0.0
+        l3_sec = 0.0
+        post_l3_sec = 0.0
+        round_prewarm_stats: dict[str, int] = {
+            "total_tasks": 0,
+            "cache_hits": 0,
+            "compiled_tasks": 0,
+            "failed_candidates": 0,
+        }
         backend = self._get_backend()
         self._active_incumbent_source = incumbent_source
         self._incumbent_anchor_us_by_case = {
@@ -8787,8 +9123,8 @@ class PerfTargetCampaignRunner:
         mean_recoverable_excess_us = self._regime_mean_recoverable_excess_us(
             best_result, regime_spec
         )
-        gate_decision = evaluate_cost_gate_policy(
-            mode=self._config.cost_model_mode,
+        gate_decision = self._invoke_with_optional_kwargs(
+            self._cost_advisor.evaluate_round_policy,
             enable_prescreen_flag=bool(self._config.enable_tilesize_prescreen),
             round_idx=round_idx,
             stagnation_rounds=stagnation_rounds,
@@ -8992,15 +9328,25 @@ class PerfTargetCampaignRunner:
             except (OSError, json.JSONDecodeError) as exc:
                 logger.debug("ExperienceLake per-round KB sync skipped: %s", exc)
             try:
-                self._cost_model.replay_experience_lake(
+                self._invoke_with_optional_kwargs(
+                    self._cost_advisor.sync_experience_lake,
                     self._experience_lake_dir,
+                    persist_calibration=False,
                     exclude_run_id=self._run_id,
                 )
             except (OSError, json.JSONDecodeError) as exc:
                 logger.debug("ExperienceLake per-round cost replay skipped: %s", exc)
-        parent_cost_pred = self._cost_model.predict(
+        parent_cost_pred = self._cost_advisor.predict_candidate_us(
             parent_workload,
             bisheng_res=parent_comp_summary,
+        )
+        parent_dominant_bound = str(
+            self._cost_advisor.resolve_dominant_bound(
+                parent_ledger,
+                parent_residual,
+                fallback_cost_pred=parent_cost_pred,
+            )
+            or ""
         )
         bp_semantics = getattr(blueprint, "semantics", None)
         op_semantics_for_shift = self._resolve_operator_semantics_for_gates()
@@ -9021,7 +9367,7 @@ class PerfTargetCampaignRunner:
         if escalated:
             active_mask = relax_facets_for_bottleneck(
                 active_mask,
-                dominant_bound=parent_cost_pred.dominant_bound,
+                dominant_bound=parent_dominant_bound,
                 residual=parent_residual,
                 compiler_summary=parent_comp_summary,
                 l1_overflow=l1_overflow,
@@ -9067,7 +9413,7 @@ class PerfTargetCampaignRunner:
                 roofline_eta=float(local_best.avg_roofline_eta),
                 target_eta=float(self._perf_target.target_roofline_eta),
                 stagnation_rounds=int(stagnation_rounds),
-                dominant_bound=parent_cost_pred.dominant_bound,
+                dominant_bound=parent_dominant_bound,
                 compiler_summary=parent_comp_summary,
                 structural_features=sf_ctx,
             )
@@ -9110,6 +9456,8 @@ class PerfTargetCampaignRunner:
             pipe_gaps=pipe_gap_report,
             cost_pred=parent_cost_pred,
             escalated_trackb_tu=escalated_trackb_tu,
+            parent_ledger=parent_ledger,
+            parent_residual=parent_residual,
         )
         ranked_rules = list(
             self._tracker.rank_applicable_rules(
@@ -9201,13 +9549,23 @@ class PerfTargetCampaignRunner:
                 dims=anchor_dims,
                 pass_configs=prescreen_pc or None,
                 compile_flags=prescreen_cf or None,
-                cost_model=self._cost_model,
+                cost_model=self._cost_advisor.underlying_cost_model,
                 axes=parent_axes,
                 live_plan=live_plan,
                 blueprint=blueprint,
                 sil_advisory=self._sil_advisory,
                 ordered_tensor_shapes=prescreen_shapes,
             )
+            if not prescreen_summary:
+                advisor_guidance = self._cost_advisor.build_prompt_guidance(
+                    decision=gate_decision,
+                    base_cfg=prescreen_kwargs,
+                    dims=anchor_dims,
+                    regime_tag=regime_spec.regime_tag,
+                    top_k=4,
+                )
+                if advisor_guidance:
+                    prescreen_summary = str(advisor_guidance)
         else:
             prescreen_summary = ""
         deficit = max(0, self._config.k_rule_workers - len(ranked_rules))
@@ -9285,12 +9643,14 @@ class PerfTargetCampaignRunner:
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 return wid, wkind, rule, None, "", f"llm_parse:{type(exc).__name__}:{exc}", False
 
+        llm_t0 = time.monotonic()
         worker_replies = await asyncio.gather(
             *(
                 _call_worker(slot_idx, wid, wkind, rule, req)
                 for slot_idx, (wid, wkind, rule, req) in enumerate(worker_specs)
             )
         )
+        llm_gen_sec = max(0.0, time.monotonic() - llm_t0)
 
         raw_candidates: list[tuple[str, str]] = []
         failed_entries: list[tuple[str, str, str]] = []
@@ -9345,13 +9705,15 @@ class PerfTargetCampaignRunner:
                     )
                     if non_creative_count >= 2:
                         prescreen_top_k = max(1, non_creative_count - 1)
-                stage_a_ranker = (
-                    (
-                        lambda passers: [
+                def _rank_stage_a_passers(
+                    passers: Sequence[tuple[str, str, StageAResult]],
+                ) -> list[tuple[str, float]]:
+                    if self._cost_advisor.underlying_cost_model is not None:
+                        return [
                             (item.candidate_id, item.pred_us)
                             for item in rank_stage_a_candidates_with_cost_model(
                                 passers,
-                                cost_model=self._cost_model,
+                                cost_model=self._cost_advisor.underlying_cost_model,
                                 live_plan=live_plan,
                                 axes=parent_axes,
                                 blueprint=blueprint,
@@ -9359,20 +9721,43 @@ class PerfTargetCampaignRunner:
                                 parent_ledger=parent_ledger,
                             )
                         ]
+                    filtered = self._cost_advisor.filter_stage_a_passers(
+                        passers,
+                        decision=gate_decision,
+                        live_plan=live_plan,
+                        axes=parent_axes,
+                        blueprint=blueprint,
+                        sil_advisory=self._sil_advisory,
+                        parent_ledger=parent_ledger,
+                        top_k=prescreen_top_k,
                     )
-                    if prescreen_top_k is not None
-                    else None
+                    out_pairs: list[tuple[str, float]] = []
+                    for item in filtered:
+                        if hasattr(item, "candidate_id") and hasattr(item, "pred_us"):
+                            out_pairs.append((str(item.candidate_id), float(item.pred_us)))
+                        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+                            out_pairs.append((str(item[0]), float(item[1])))
+                    return out_pairs
+
+                stage_a_ranker = _rank_stage_a_passers if prescreen_top_k is not None else None
+                parent_l0_pred = self._cost_advisor.predict_candidate_us(
+                    parent_workload,
+                    bisheng_res=None,
                 )
-                parent_l0_pred = self._cost_model.predict(parent_workload, bisheng_res=None)
-                calibrated_parent_us = float(getattr(parent_l0_pred, "pred_us", 0.0) or 0.0)
-                raw_parent_analytical_us = float(parent_l0_pred.tier0_physics_us) + float(
-                    parent_l0_pred.tier1_penalty_us
-                )
-                eff_parent_analytical_us = (
-                    calibrated_parent_us
-                    if calibrated_parent_us > 0.0
-                    else raw_parent_analytical_us
-                )
+                if isinstance(parent_l0_pred, (int, float)) and not isinstance(parent_l0_pred, bool):
+                    eff_parent_analytical_us = float(parent_l0_pred)
+                elif parent_l0_pred is not None:
+                    calibrated_parent_us = float(getattr(parent_l0_pred, "pred_us", 0.0) or 0.0)
+                    raw_parent_analytical_us = float(
+                        getattr(parent_l0_pred, "tier0_physics_us", 0.0) or 0.0
+                    ) + float(getattr(parent_l0_pred, "tier1_penalty_us", 0.0) or 0.0)
+                    eff_parent_analytical_us = (
+                        calibrated_parent_us
+                        if calibrated_parent_us > 0.0
+                        else raw_parent_analytical_us
+                    )
+                else:
+                    eff_parent_analytical_us = 0.0
                 parent_analytical_us = (
                     eff_parent_analytical_us if eff_parent_analytical_us > 0.0 else None
                 )
@@ -9397,13 +9782,19 @@ class PerfTargetCampaignRunner:
                         axes=cand_axes,
                         blueprint=blueprint,
                         sil_advisory=self._sil_advisory,
-                        target=self._cost_model.target,
+                        target=self._cost_advisor.target,
                     )
-                    pred = self._cost_model.predict(features)
+                    pred = self._cost_advisor.predict_candidate_us(features)
+                    if isinstance(pred, (int, float)) and not isinstance(pred, bool):
+                        return float(pred)
+                    if pred is None:
+                        return 0.0
                     calibrated_us = float(getattr(pred, "pred_us", 0.0) or 0.0)
                     if calibrated_us > 0.0:
                         return calibrated_us
-                    return float(pred.tier0_physics_us) + float(pred.tier1_penalty_us)
+                    return float(getattr(pred, "tier0_physics_us", 0.0) or 0.0) + float(
+                        getattr(pred, "tier1_penalty_us", 0.0) or 0.0
+                    )
 
                 score_stage_a_analytical_fn = _score_stage_a_analytical
 
@@ -9491,6 +9882,31 @@ class PerfTargetCampaignRunner:
                     active_kernel=round_active_kernel,
                 )
 
+            class _TimedRepairBackend:
+                def __init__(self, inner: KernelLLMBackend) -> None:
+                    self._inner = inner
+                    self.repair_sec = 0.0
+
+                async def generate(
+                    self,
+                    request: GenerationRequest,
+                    *,
+                    effort_override: object = None,
+                ) -> str:
+                    t0 = time.monotonic()
+                    try:
+                        if effort_override is not None:
+                            return await self._inner.generate(
+                                request, effort_override=effort_override
+                            )
+                        return await self._inner.generate(request)
+                    finally:
+                        self.repair_sec += max(0.0, time.monotonic() - t0)
+
+            timed_repair_backend = (
+                _TimedRepairBackend(backend) if self._config.max_syntax_repairs > 0 else None
+            )
+            l0_l1_t0 = time.monotonic()
             l0_l1_checks = await run_l0_l1_round_filter(
                 raw_candidates,
                 patch_fn=lambda snip: _patch_against(parent_module_source, snip),
@@ -9499,7 +9915,7 @@ class PerfTargetCampaignRunner:
                 ),
                 l0_checker=_candidate_l0_check,
                 l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),
-                repair_backend=backend if self._config.max_syntax_repairs > 0 else None,
+                repair_backend=timed_repair_backend,
                 max_syntax_repairs=self._config.max_syntax_repairs,
                 slice_hint=self._slice_contract_instruction(
                     func_name,
@@ -9530,6 +9946,11 @@ class PerfTargetCampaignRunner:
                 if sa.ledger is not None
                 else None,
             )
+            l0_l1_total_sec = max(0.0, time.monotonic() - l0_l1_t0)
+            syntax_repair_sec = (
+                timed_repair_backend.repair_sec if timed_repair_backend is not None else 0.0
+            )
+            l0_l1_sec = max(0.0, l0_l1_total_sec - syntax_repair_sec)
 
         passed_checks = [chk for chk in l0_l1_checks if chk.passed]
         infeasible_boundaries_added = 0
@@ -9566,14 +9987,19 @@ class PerfTargetCampaignRunner:
                         axes=c_axes,
                         blueprint=blueprint,
                         sil_advisory=self._sil_advisory,
-                        target=self._cost_model.target,
+                        target=self._cost_advisor.target,
                     )
-                    c_pred = self._cost_model.predict(c_feat)
-                    c_pred_val = float(getattr(c_pred, "pred_us", 0.0) or 0.0)
-                    if c_pred_val <= 0.0:
-                        c_pred_val = float(
-                            getattr(c_pred, "tier0_physics_us", 0.0) or 0.0
-                        ) + float(getattr(c_pred, "tier1_penalty_us", 0.0) or 0.0)
+                    c_pred = self._cost_advisor.predict_candidate_us(c_feat)
+                    if isinstance(c_pred, (int, float)) and not isinstance(c_pred, bool):
+                        c_pred_val = float(c_pred)
+                    elif c_pred is not None:
+                        c_pred_val = float(getattr(c_pred, "pred_us", 0.0) or 0.0)
+                        if c_pred_val <= 0.0:
+                            c_pred_val = float(
+                                getattr(c_pred, "tier0_physics_us", 0.0) or 0.0
+                            ) + float(getattr(c_pred, "tier1_penalty_us", 0.0) or 0.0)
+                    else:
+                        c_pred_val = 0.0
                     if c_pred_val > 0.0:
                         pred_by_cid[chk.candidate_id] = c_pred_val
                 except (TypeError, ValueError):
@@ -9644,8 +10070,13 @@ class PerfTargetCampaignRunner:
                     cand_file = Path(tmp_dir) / f"{chk.candidate_id}.py"
                     cand_file.write_text(chk.patched_module_source, encoding="utf-8")
                     cand_paths.append((chk.candidate_id, cand_file))
+                l2_t0 = time.monotonic()
                 try:
-                    l2_results, l2_run_ids = self._run_l2_batch(cand_paths, working_anchors)
+                    l2_results, l2_run_ids = self._run_l2_batch(
+                        cand_paths,
+                        working_anchors,
+                        include_guardrails=True,
+                    )
                 except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
                     logger.warning(
                         "Round %d L2 batch failed after retries: %s",
@@ -9656,6 +10087,24 @@ class PerfTargetCampaignRunner:
                     l2_run_ids = {}
                     for chk in passed_checks:
                         failed_entries.append((chk.candidate_id, "l2_error", str(exc)[:1500]))
+                l2_wall_sec = max(0.0, time.monotonic() - l2_t0)
+                raw_pw_stats = self._last_l2_timing_meta.get("prewarm_stats")
+                if isinstance(raw_pw_stats, Mapping):
+                    for pw_key in (
+                        "total_tasks",
+                        "cache_hits",
+                        "compiled_tasks",
+                        "failed_candidates",
+                    ):
+                        if pw_key in raw_pw_stats:
+                            round_prewarm_stats[pw_key] = int(raw_pw_stats[pw_key])
+                l2_prewarm_sec = float(self._last_l2_timing_meta.get("l2_prewarm_sec") or 0.0)
+                raw_npu_sec = self._last_l2_timing_meta.get("l2_npu_sec")
+                l2_npu_sec = (
+                    float(raw_npu_sec)
+                    if isinstance(raw_npu_sec, (int, float)) and not isinstance(raw_npu_sec, bool)
+                    else max(0.0, l2_wall_sec - l2_prewarm_sec)
+                )
 
         passing_candidates: list[tuple[L0L1CandidateCheck, CandidateSurrogateResult]] = [
             (chk, l2_results[chk.candidate_id])
@@ -9723,6 +10172,7 @@ class PerfTargetCampaignRunner:
                     ),
                 )
             if tail_guard_ok:
+                l3_t0 = time.monotonic()
                 _atomic_write_text(self._target_module_path, top_chk.patched_module_source)
                 candidate_sha = self._source_sha256(top_chk.patched_module_source)
 
@@ -9846,6 +10296,7 @@ class PerfTargetCampaignRunner:
                     stagnation_after = 0
                     if len(inline_attempts) > 1:
                         promotion_attempts = tuple(inline_attempts)
+                    self._refresh_guardrail_incumbent_refs(top_chk.candidate_id)
                     self._pending_promotion = None
                     self._persist_runtime_state("active_promotion", None)
                     self._persist_runtime_state("pending_promotion", None)
@@ -9906,22 +10357,12 @@ class PerfTargetCampaignRunner:
                 else:
                     l3_failed_cases = tuple(self._extract_l3_failed_case_nums(l3_res))
                     l3_failure_stage = str(getattr(l3_res, "failure_stage", "") or "")
-                    promoted_cx_cases, incumbent_cx_metrics = (
-                        self._promote_l3_counterexample_anchors(
-                            l3_res,
-                            incumbent_source,
-                            regime_spec,
-                            working_anchors,
-                            topology_axes=parent_axes,
-                        )
+                    self._record_l3_guardrail_cases(
+                        l3_res,
+                        incumbent_source,
+                        regime_spec,
+                        topology_axes=parent_axes,
                     )
-                    if promoted_cx_cases:
-                        self._active_anchors = list(working_anchors)
-                    if incumbent_cx_metrics:
-                        best_result = self._merge_incumbent_anchor_metrics(
-                            best_result, incumbent_cx_metrics
-                        )
-                        new_best = best_result
                     repaired_tuple = await self._attempt_l3_counterexample_repair(
                         backend=backend,
                         top_chk=top_chk,
@@ -9986,6 +10427,7 @@ class PerfTargetCampaignRunner:
                             new_best = repaired_res
                             stagnation_after = 0
                             promotion_attempts = tuple(inline_attempts)
+                            self._refresh_guardrail_incumbent_refs(repaired_chk.candidate_id)
                             self._pending_promotion = None
                             self._persist_runtime_state("active_promotion", None)
                             self._persist_runtime_state("pending_promotion", None)
@@ -10059,7 +10501,9 @@ class PerfTargetCampaignRunner:
                         self._pending_promotion = None
                         self._persist_runtime_state("active_promotion", None)
                         self._persist_runtime_state("pending_promotion", None)
+                l3_sec = max(0.0, time.monotonic() - l3_t0)
 
+        post_l3_t0 = time.monotonic()
         beam_updates: list[BeamCandidate] = []
         top_chk_id = top_chk.candidate_id if top_chk is not None else None
         for chk in passed_checks:
@@ -10366,7 +10810,17 @@ class PerfTargetCampaignRunner:
                 if top_local_eval.anchors
                 else top_res.mean_latency_us()
             )
-            if eff_gain >= self._config.min_flywheel_gain and self._flywheel is not None:
+            last_distilled_lat = self._last_distilled_lat_by_regime.get(
+                regime_spec.regime_tag, fly_base_lat
+            )
+            cum_lat_gain = (
+                (last_distilled_lat - fly_win_lat) / max(last_distilled_lat, 1e-6)
+                if (last_distilled_lat > 0.0 and fly_win_lat > 0.0)
+                else 0.0
+            )
+            if self._flywheel is not None and (
+                eff_gain >= self._config.min_flywheel_gain or cum_lat_gain >= 0.08
+            ):
                 try:
                     round_admitted.extend(
                         self._run_flywheel_distillation(
@@ -10379,6 +10833,7 @@ class PerfTargetCampaignRunner:
                             active_anchors=working_anchors,
                             topology_axes=parent_axes,
                             rel_gain=eff_gain,
+                            local_rel_gain=local_rel_gain,
                             worker_kind=top_wkind,
                             round_idx=round_idx,
                             rule_id=top_rule_id,
@@ -10515,6 +10970,21 @@ class PerfTargetCampaignRunner:
                 measured_by_cid[cid] = float(lat_val)
         round_spearman_rho = compute_spearman_rho(pred_by_cid, measured_by_cid)
         self._boundary_ledger.record_spearman_rho(bucket_key, round_spearman_rho)
+        post_l3_sec = max(0.0, time.monotonic() - post_l3_t0)
+        cost_advisor_predictions = max(
+            0,
+            int(getattr(self._cost_advisor, "predictions_invoked", 0) or 0)
+            - start_advisor_preds,
+        )
+        stage_timings_sec: dict[str, float] = {
+            "llm_gen_sec": round(llm_gen_sec, 6),
+            "l0_l1_sec": round(l0_l1_sec, 6),
+            "syntax_repair_sec": round(syntax_repair_sec, 6),
+            "l2_prewarm_sec": round(l2_prewarm_sec, 6),
+            "l2_npu_sec": round(l2_npu_sec, 6),
+            "l3_sec": round(l3_sec, 6),
+            "post_l3_sec": round(post_l3_sec, 6),
+        }
 
         if self._checkpoint_path is not None:
             telemetry_dir = self._checkpoint_path.parent / "telemetry"
@@ -10633,6 +11103,9 @@ class PerfTargetCampaignRunner:
                         if chk.stage_b is not None
                         else 0.0
                     ),
+                    stage_timings_sec=dict(stage_timings_sec),
+                    prewarm_stats=dict(round_prewarm_stats),
+                    cost_advisor_predictions=cost_advisor_predictions,
                 )
                 try:
                     append_round_funnel_event(telemetry_dir, event)
@@ -10658,6 +11131,9 @@ class PerfTargetCampaignRunner:
                     error_code_norm=normalize_compile_error_code(
                         fail_stage, fail_err, ""
                     ),
+                    stage_timings_sec=dict(stage_timings_sec),
+                    prewarm_stats=dict(round_prewarm_stats),
+                    cost_advisor_predictions=cost_advisor_predictions,
                 )
                 try:
                     append_round_funnel_event(telemetry_dir, fail_event)
@@ -10696,6 +11172,9 @@ class PerfTargetCampaignRunner:
             l3_failure_stage=l3_failure_stage,
             l3_cx_repair_passed=l3_cx_repair_passed,
             infeasible_boundaries_added=infeasible_boundaries_added,
+            stage_timings_sec=dict(stage_timings_sec),
+            prewarm_stats=dict(round_prewarm_stats),
+            cost_advisor_predictions=cost_advisor_predictions,
         )
         return (
             record,
@@ -10715,7 +11194,7 @@ class PerfTargetCampaignRunner:
         active_anchors: Sequence[AnchorCaseSpec],
     ) -> tuple[str, CandidateSurrogateResult]:
         """Run zero-LLM executable lattice sweep before Round 1 to warm-start incumbent."""
-        if not self._config.enable_tilesize_prescreen or not self._regime_specs:
+        if not self._config.enable_phase0_lattice_sweep or not self._regime_specs:
             return incumbent_source, best_result
         sweep_fn = getattr(_tilesize_prescreen_mod, "sweep_executable_lattice_zero_llm", None)
         if not callable(sweep_fn):
@@ -10751,12 +11230,15 @@ class PerfTargetCampaignRunner:
                 axes=parent_axes,
                 blueprint=blueprint,
                 sil_advisory=self._sil_advisory,
-                target=self._cost_model.target,
+                target=self._cost_advisor.target,
             )
-            parent_pred = self._cost_model.predict(parent_wl)
-            parent_pred_us = float(getattr(parent_pred, "pred_us", 0.0) or 0.0)
-            if parent_pred_us <= 0.0:
-                return incumbent_source, best_result
+            parent_pred = self._cost_advisor.predict_candidate_us(parent_wl)
+            if isinstance(parent_pred, (int, float)) and not isinstance(parent_pred, bool):
+                parent_pred_us = float(parent_pred)
+            elif parent_pred is not None:
+                parent_pred_us = float(getattr(parent_pred, "pred_us", 0.0) or 0.0)
+            else:
+                parent_pred_us = 0.0
 
             try:
                 tree = ast.parse(incumbent_source)
@@ -10785,7 +11267,7 @@ class PerfTargetCampaignRunner:
                     builder_fn_name=builder_fn,
                     sample_builder_kwargs=primary_regime.sample_builder_kwargs,
                     dims=dims,
-                    cost_model=self._cost_model,
+                    cost_model=self._cost_advisor.underlying_cost_model,
                     max_points=24,
                     top_k=3,
                 )
@@ -10793,7 +11275,9 @@ class PerfTargetCampaignRunner:
             if not lattice_cands:
                 return incumbent_source, best_result
             top_pred_us = float(getattr(lattice_cands[0], "pred_us", 0.0) or 0.0)
-            if top_pred_us <= 0.0 or top_pred_us >= parent_pred_us * 0.97:
+            if parent_pred_us > 0.0 and (
+                top_pred_us <= 0.0 or top_pred_us >= parent_pred_us * 0.97
+            ):
                 return incumbent_source, best_result
 
             top_two = [
@@ -10815,7 +11299,11 @@ class PerfTargetCampaignRunner:
                     cpath.write_text(cand.patched_source, encoding="utf-8")
                     cand_paths.append((cid, cpath))
                     source_by_cid[cid] = cand.patched_source
-                l2_results, _ = self._run_l2_batch(cand_paths, active_anchors)
+                l2_results, _ = self._run_l2_batch(
+                    cand_paths,
+                    active_anchors,
+                    include_guardrails=True,
+                )
 
             passing = [
                 (cid, res)
@@ -10844,6 +11332,7 @@ class PerfTargetCampaignRunner:
                 self._write_source_and_verify(self._target_module_path, incumbent_source)
                 return incumbent_source, best_result
 
+            self._refresh_guardrail_incumbent_refs(top_cid)
             self._active_incumbent_source = top_src
             self._incumbent_anchor_us_by_case = {
                 int(a.case_num): float(a.cand_us)
@@ -10897,9 +11386,23 @@ class PerfTargetCampaignRunner:
             self._regime_diag_stats = {}
             self._boundary_ledger = DeterministicSearchBoundaryLedger()
             incumbent_source = self._target_module_path.read_text(encoding="utf-8")
-            active_anchors = list(self._initial_anchors)
-            self._active_anchors = list(active_anchors)
+            active_anchors = list(self._scoreboard_anchors)
+            self._active_anchors = list(self._scoreboard_anchors)
+            self._guardrail_cases = []
+            self._last_guardrail_metrics_by_cid = {}
+            self._last_round_promoted = True
+            self._last_round_promoted_by_regime = {}
             baseline_result = self._evaluate_single_baseline(incumbent_source, active_anchors)
+            self._last_distilled_lat_by_regime = {}
+            for rspec in self._regime_specs:
+                reg_base = baseline_result.for_regime(rspec.regime_tag)
+                reg_lat = (
+                    reg_base.mean_latency_us()
+                    if reg_base.anchors
+                    else baseline_result.mean_latency_us()
+                )
+                if reg_lat > 0.0:
+                    self._last_distilled_lat_by_regime[rspec.regime_tag] = float(reg_lat)
             self._collect_msprof_for_regimes(
                 incumbent_source,
                 baseline_result,
@@ -11144,6 +11647,8 @@ class PerfTargetCampaignRunner:
             )
             rounds.append(rec)
             pending_promotion = self._pending_promotion
+            self._last_round_promoted = bool(promoted)
+            self._last_round_promoted_by_regime[active_tag] = bool(promoted)
             all_noop = bool(rec.l0_l1_failed) and all(
                 stage == "noop_identical" or "noop_identical" in err
                 for _cid, stage, err in rec.l0_l1_failed
@@ -11245,102 +11750,6 @@ class PerfTargetCampaignRunner:
                 l4_result=l4_result,
                 active_anchors=active_anchors,
             )
-            anchor_nums = {a.case_num for a in active_anchors}
-            regressed_nums = sorted(
-                cnum
-                for cnum, sp in l4_result.per_case_speedups.items()
-                if cnum not in anchor_nums and sp < self._config.l4_regression_ratio
-            )
-            if regressed_nums and l4_result.passed:
-                prev_len = len(active_anchors)
-                resolved_by_cnum: dict[int, RegimeTargetSpec] = {}
-                for cnum in regressed_nums:
-                    resolved = self._regime_specs[0]
-                    try:
-                        dims = lookup_case_dims(
-                            self._config.operator_name,
-                            cnum,
-                            cannbench_repo=self._cannbench_repo,
-                            env_file=self._env_file,
-                        )
-                        resolved = resolve_regime_for_case(
-                            self._config.operator_name,
-                            dims,
-                            self._regime_specs,
-                        )
-                    except (FileNotFoundError, OSError, KeyError, ValueError) as exc:
-                        logger.warning(
-                            "Failed to resolve regime for regressed case %s: %s",
-                            cnum,
-                            exc,
-                        )
-                    resolved_by_cnum[cnum] = resolved
-                    active_anchors = list(
-                        append_dynamic_anchor(
-                            active_anchors,
-                            operator_name=self._config.operator_name,
-                            case_num=cnum,
-                            regime_tag=resolved.regime_tag,
-                            cannbench_repo=self._cannbench_repo,
-                            env_file=self._env_file,
-                        )
-                    )
-                if len(active_anchors) > prev_len:
-                    self._active_anchors = list(active_anchors)
-                    dyn_metrics = self._evaluate_incumbent_on_new_anchors(
-                        incumbent_source, active_anchors[prev_len:]
-                    )
-                    best_result = self._merge_incumbent_anchor_metrics(
-                        best_result, dyn_metrics
-                    )
-                worst_cnum = min(
-                    regressed_nums,
-                    key=lambda c: (l4_result.per_case_speedups.get(c, float("inf")), c),
-                )
-                catch_regime = resolved_by_cnum[worst_cnum]
-                catch_tag = catch_regime.regime_tag
-                catch_idx = (rounds[-1].round_idx + 1) if rounds else 1
-                (
-                    rec,
-                    incumbent_source,
-                    best_result,
-                    stagnation_rounds,
-                    promoted,
-                    rolled_back,
-                    escalated,
-                    promotion_blocked,
-                ) = await self._execute_single_round(
-                    round_idx=catch_idx,
-                    regime_spec=catch_regime,
-                    incumbent_source=incumbent_source,
-                    best_result=best_result,
-                    active_anchors=active_anchors,
-                    stagnation_rounds=stagnation_by_regime.get(catch_tag, 0),
-                    admitted_rule_ids=admitted_rule_ids,
-                )
-                rounds.append(rec)
-                pending_promotion = self._pending_promotion
-                if promoted:
-                    stagnation_by_regime[catch_tag] = 0
-                    promoted_rounds.append(catch_idx)
-                else:
-                    stagnation_by_regime[catch_tag] = stagnation_rounds
-                if rolled_back:
-                    rolled_back_rounds.append(catch_idx)
-                if escalated:
-                    escalated_rounds.append(catch_idx)
-                if promotion_blocked:
-                    stop_reason = "promotion_blocked"
-                if l4_result.passed and not promotion_blocked:
-                    l4_result = self._run_final_l4_tracked(
-                        incumbent_source=incumbent_source,
-                        prior_stop_reason=stop_reason,
-                    )
-                    self._record_l4_observations(
-                        source=incumbent_source,
-                        l4_result=l4_result,
-                        active_anchors=active_anchors,
-                    )
 
         self._save_checkpoint(
             incumbent_source=incumbent_source,
@@ -11391,7 +11800,7 @@ class PerfTargetCampaignRunner:
             rolled_back_rounds=tuple(rolled_back_rounds),
             escalated_rounds=tuple(escalated_rounds),
             frozen_regimes=tuple(sorted(frozen_regimes)),
-            active_anchors=tuple(active_anchors),
+            active_anchors=tuple(self._scoreboard_anchors),
             admitted_rule_ids=tuple(admitted_rule_ids),
             l4_result=l4_result,
             l4_status=l4_status,
@@ -11401,6 +11810,8 @@ class PerfTargetCampaignRunner:
             pure_golden_mode=bool(self._config.pure_golden),
             blueprint_provenance=dict(self._blueprint_provenance),
             stagnation_diagnosis=stagnation_diagnosis,
+            scoreboard_anchor_count=len(self._scoreboard_anchors),
+            scoreboard_anchors=self._scoreboard_anchors,
         )
 
 
@@ -11481,8 +11892,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cost-model-mode",
         choices=("auto", "coarse_only", "off"),
-        default="auto",
+        default="off",
         help="Cost model prescreen gate policy mode.",
+    )
+    parser.add_argument(
+        "--enable-phase0-lattice-sweep",
+        action="store_true",
+        help="Enable zero-LLM Phase-0 lattice warm-start sweep before Round 1.",
     )
     parser.add_argument(
         "--cost-disengage-eta",
@@ -11538,6 +11954,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cost_model_mode=str(args.cost_model_mode),
         cost_disengage_eta=float(args.cost_disengage_eta),
         cost_slow_gain_threshold=float(args.cost_slow_gain_threshold),
+        enable_phase0_lattice_sweep=bool(args.enable_phase0_lattice_sweep),
         pure_golden=bool(args.pure_golden),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
