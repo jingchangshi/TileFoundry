@@ -107,7 +107,9 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     rank_stage_a_candidates_with_cost_model,
 )
 from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
+    ArtifactRecord,
     ArtifactStore,
+    compute_compile_task_key,
     resolve_unified_tl_cache_dir,
 )
 from tilefoundry_ascend.ascend.cost_model import (
@@ -946,6 +948,112 @@ class StageGateCoordinator:
         else:
             combine_kwargs = merged_kwargs
         return combine_fn, combine_kwargs
+
+    def _combine_covered_by_primary_anchor_plan(
+        self,
+        module_source: str,
+        combine_spec: tuple[str, dict[str, object]],
+        resolved: _ResolvedConfigLike,
+        regime_anchor_specs: Sequence[tuple[dict[str, object], _ResolvedConfigLike | None]],
+        env_vals: Mapping[str, str] | None,
+        l1_check_fn: object,
+    ) -> bool:
+        """Return whether primary_b already compiled the combine kernel via anchor planning."""
+        if self._owner_override("_run_l1") is not None or "_run_l1" in self.__dict__:
+            return False
+        if (
+            self._owner_override("_resolve_combine_gate_spec") is not None
+            or "_resolve_combine_gate_spec" in self.__dict__
+        ):
+            return False
+        if l1_check_fn is not _ORIG_CAMPAIGN_HOOKS["run_l1_compile_check"]:
+            return False
+        if not regime_anchor_specs:
+            return False
+        cann_setup = (
+            (env_vals or {}).get("TILEFOUNDRY_NPU_CANN_SETUP")
+            or os.environ.get("TILEFOUNDRY_NPU_CANN_SETUP")
+            or ""
+        ).strip()
+        tl_source = (
+            (env_vals or {}).get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
+            or os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
+            or ""
+        ).strip()
+        if not cann_setup and not tl_source:
+            return False
+        try:
+            mod_tree = ast.parse(module_source)
+        except SyntaxError:
+            return False
+        if self._find_top_level_func(mod_tree, ("_get_kernel",)) is None:
+            return False
+        comb_wrapper = self._find_top_level_func(mod_tree, ("_get_combine_kernel",))
+        if comb_wrapper is None:
+            return False
+        combine_fn, combine_kwargs = combine_spec
+        if combine_fn != "_get_combine_kernel" and not any(
+            isinstance(node, ast.Name) and node.id == combine_fn
+            for node in ast.walk(comb_wrapper)
+        ):
+            return False
+        target_splits = int(resolved.builder_kwargs.get("num_kv_splits", 1) or 1)
+        for a_spec, a_resolved in regime_anchor_specs:
+            if a_resolved is None:
+                continue
+            a_splits = int(a_resolved.builder_kwargs.get("num_kv_splits", 1) or 1)
+            if a_splits <= 1:
+                continue
+            if target_splits > 1 and a_splits != target_splits:
+                continue
+            if dict(a_resolved.combine_kwargs or {}) != dict(resolved.combine_kwargs or {}):
+                continue
+            if dict(a_resolved.pass_configs or {}) != dict(resolved.pass_configs or {}):
+                continue
+            if tuple(a_resolved.compile_flags or ()) != tuple(resolved.compile_flags or ()):
+                continue
+            if any(
+                k != "num_kv_splits"
+                and (k in a_resolved.builder_kwargs or k in a_spec)
+                and a_resolved.builder_kwargs.get(k, a_spec.get(k)) != v
+                for k, v in combine_kwargs.items()
+            ):
+                continue
+            return True
+        return False
+
+    def _lookup_verified_hybrid_trackb_artifact(
+        self,
+        instantiated_tu: str,
+        selector_flags: Sequence[str] | None,
+        eff_store: ArtifactStore,
+        regime_tag: str,
+    ) -> ArtifactRecord | None:
+        """Return verified Track-B artifact when TU and effective flags are already cached."""
+        if (
+            self._owner_override("_compile_trackb_stage_b") is not None
+            or "_compile_trackb_stage_b" in self.__dict__
+        ):
+            return None
+        norm_tu = _normalize_trackb_unit_source(instantiated_tu, regime_tag=regime_tag)
+        base_flags = list(resolve_trackb_compile_flags(instantiated_tu, selector_flags))
+        cann_root = self._resolve_cann_root_from_env_file(self._env_file)
+        full_flags = list(base_flags)
+        if cann_root is not None and (cann_root / "include").is_dir():
+            full_flags.append(f"-I{cann_root / 'include'}")
+        flag_variants = (full_flags, base_flags) if full_flags != base_flags else (base_flags,)
+        for flags in flag_variants:
+            t_key = compute_compile_task_key(
+                normalized_kernel_unit_src=norm_tu,
+                cann_target="dav-3510",
+                pass_configs=None,
+                compile_flags=flags,
+                static_spec_signature="",
+            )
+            rec = eff_store.get_verified_artifact(t_key)
+            if rec is not None:
+                return rec
+        return None
 
     def _instantiate_trackb_tu(
         self,
@@ -1884,7 +1992,12 @@ class StageGateCoordinator:
                 w_resolved = resolved
             if self._width_covered_by_anchor_specs(w_dims, w_resolved, regime_anchor_specs):
                 continue
-            if w_resolved == resolved and eff_width_fn is None:
+            if (
+                eff_width_fn is None
+                and w_resolved.builder_name == resolved.builder_name
+                and tuple(w_resolved.compile_flags or ()) == tuple(resolved.compile_flags or ())
+                and dict(w_resolved.pass_configs or {}) == dict(resolved.pass_configs or {})
+            ):
                 same_cfg_widths.append(w_dims)
             else:
                 extra_width_checks.append((w_dims, w_resolved))
@@ -1974,7 +2087,14 @@ class StageGateCoordinator:
 
         combine_elapsed_sec = 0.0
         combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
-        if combine_spec is not None:
+        if combine_spec is not None and not self._combine_covered_by_primary_anchor_plan(
+            module_source,
+            combine_spec,
+            resolved,
+            regime_anchor_specs,
+            env_vals,
+            l1_check_fn,
+        ):
             combine_fn, combine_kwargs = combine_spec
             combine_b = self._invoke_with_optional_kwargs(
                 l1_check_fn,
@@ -2000,6 +2120,23 @@ class StageGateCoordinator:
         if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
             tb_sym, tb_cpp = tb_extracted
             instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
+            cached_tb_rec = self._lookup_verified_hybrid_trackb_artifact(
+                instantiated_tu,
+                resolved.compile_flags or None,
+                eff_store,
+                regime_spec.regime_tag,
+            )
+            if cached_tb_rec is not None:
+                return StageBResult(
+                    passed=True,
+                    elapsed_sec=total_elapsed + combine_elapsed_sec,
+                    spill_bytes=final_b.spill_bytes,
+                    vloopv2_hit=final_b.vloopv2_hit,
+                    compiler_summary=final_b.compiler_summary,
+                    microarch_profile=final_b.microarch_profile,
+                    artifact_id=cached_tb_rec.artifact_id,
+                    binary_paths=cached_tb_rec.binary_paths,
+                )
             tb_b = self._invoke_with_optional_kwargs(
                 self._compile_trackb_stage_b,
                 instantiated_tu,

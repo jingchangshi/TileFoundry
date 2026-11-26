@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib
 import json
@@ -72,9 +73,14 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: E40
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (  # noqa: E402
     StageAResult,
     StageBResult,
+    _normalize_trackb_unit_source,
+    resolve_trackb_compile_flags,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest  # noqa: E402
-from tilefoundry_ascend.ascend.compile_cache.artifact_store import ArtifactStore  # noqa: E402
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import (  # noqa: E402
+    ArtifactStore,
+    compute_compile_task_key,
+)
 from tilefoundry_ascend.ascend.cost_model import BishengResourceSummary  # noqa: E402
 from tilefoundry_ascend.ascend.passes import (  # noqa: E402
     build_objective_physical_ledger,
@@ -994,7 +1000,11 @@ def test_run_l1_trackb_dedups_and_records_anchor_plan(
         recorded_payloads.append(dict(kwargs))
         return len(list(kwargs["anchor_entries"]))
 
-    monkeypatch.setattr(stage_gate_coordinator, "run_stage_b_ascendc_compile", _fake_ascendc_compile)
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "run_stage_b_ascendc_compile",
+        _fake_ascendc_compile,
+    )
     monkeypatch.setattr(
         stage_gate_coordinator,
         "resolve_cannbench_repo",
@@ -1030,5 +1040,371 @@ def test_run_l1_trackb_dedups_and_records_anchor_plan(
     assert len(recorded_payloads) == 1
     entries = recorded_payloads[0]["anchor_entries"]
     assert [e[0] for e in entries] == [0, 1, 2]
+
+
+def test_run_l1_folds_same_builder_widths_with_differing_selector_knobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fold same-builder widths with differing selector knobs into primary_b."""
+    captured_calls: list[dict[str, object]] = []
+
+    def _fake_l1_check(
+        _src: str,
+        *,
+        builder_name: str = "",
+        dims: Mapping[str, object] | None = None,
+        static_spec_dims_list: Sequence[Mapping[str, object]] | None = None,
+        **_kw: object,
+    ) -> StageBResult:
+        captured_calls.append(
+            {
+                "builder_name": builder_name,
+                "dims": dict(dims) if dims else {},
+                "static_spec_dims_list": [dict(d) for d in (static_spec_dims_list or ())],
+            }
+        )
+        return StageBResult(passed=True, elapsed_sec=0.25)
+
+    def _fake_resolve_cfg(
+        _src: str,
+        _reg: RegimeTargetSpec,
+        *,
+        dims: Mapping[str, object] | None = None,
+    ) -> types.SimpleNamespace:
+        d_val = int((dims or {}).get("D", 128))
+        if d_val == 512:
+            return types.SimpleNamespace(
+                builder_name="_build_main",
+                builder_kwargs={"tile_m": 32, "num_stages": 1},
+                pass_configs={},
+                compile_flags=(),
+                selector_name="_sel",
+                combine_kwargs={},
+            )
+        if d_val == 1024:
+            return types.SimpleNamespace(
+                builder_name="_build_main",
+                builder_kwargs={"tile_m": 16, "num_stages": 1},
+                pass_configs={},
+                compile_flags=("--extra-flag",),
+                selector_name="_sel",
+                combine_kwargs={},
+            )
+        if d_val == 2048:
+            return types.SimpleNamespace(
+                builder_name="_build_alt",
+                builder_kwargs={"tile_m": 16, "num_stages": 1},
+                pass_configs={},
+                compile_flags=(),
+                selector_name="_sel",
+                combine_kwargs={},
+            )
+        return types.SimpleNamespace(
+            builder_name="_build_main",
+            builder_kwargs={"tile_m": 64, "num_stages": 2},
+            pass_configs={},
+            compile_flags=(),
+            selector_name="_sel",
+            combine_kwargs={},
+        )
+
+    monkeypatch.setattr(stage_gate_coordinator, "run_l1_compile_check", _fake_l1_check)
+    monkeypatch.setattr(stage_gate_coordinator, "resolve_regime_config", _fake_resolve_cfg)
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "collect_distinct_static_width_dims",
+        lambda *_a, **_kw: ({"D": 128}, {"D": 512}, {"D": 1024}, {"D": 2048}),
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_cannbench_repo",
+        lambda **_kw: (_ for _ in ()).throw(FileNotFoundError("isolated")),
+    )
+
+    coord = StageGateCoordinator(
+        operator_name="add_rms_norm_dynamic_quant",
+        source_root=tmp_path,
+        target_module_path=tmp_path / "kernel.py",
+        regime_specs=(_make_regime_spec(),),
+        scoreboard_anchors=_make_anchors(),
+    )
+    res = coord._run_l1(_PARENT_MODULE_SRC, _make_regime_spec())
+    assert res.passed is True
+    assert len(captured_calls) == 3
+    assert captured_calls[0]["static_spec_dims_list"] == [{"D": 512}]
+    extra_dims = [call["dims"]["D"] for call in captured_calls[1:]]
+    assert extra_dims == [1024, 2048]
+    assert res.elapsed_sec == pytest.approx(0.75)
+
+
+def test_run_l1_skips_redundant_combine_when_covered_by_primary_anchor_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip sequential combine_b when primary_b already compiles _get_combine_kernel."""
+    mla_mod_base = (
+        "def _select_mla_decode_config(D=128, num_kv_splits=4, **_kw):\n"
+        "    return {'num_kv_splits': num_kv_splits, 'pass_configs': {}, 'compile_flags': ()}\n"
+        "def _build_mla_split_kv_decode_func(D=128, num_kv_splits=4):\n"
+        "    return (D, num_kv_splits)\n"
+        "def _build_mla_split_kv_combine_func(d_nope=512, tl_dtype='float16', num_kv_splits=4):\n"
+        "    return (d_nope, tl_dtype, num_kv_splits)\n"
+        "def _get_kernel(*args, **kwargs):\n"
+        "    return None\n"
+        "def _get_combine_kernel(d_nope=512, tl_dtype='float16', num_kv_splits=4, **_kw):\n"
+        "    return _build_mla_split_kv_combine_func(d_nope, tl_dtype, num_kv_splits)\n"
+    )
+    mla_mod_cand = mla_mod_base.replace(
+        "return (d_nope, tl_dtype, num_kv_splits)",
+        "return (d_nope, tl_dtype, num_kv_splits + 0)",
+    )
+    target_path = tmp_path / "mla_kernels.py"
+    target_path.write_text(mla_mod_base, encoding="utf-8")
+
+    tl_stub = tmp_path / "tl_stub"
+    tl_stub.mkdir()
+    monkeypatch.setenv("TILEFOUNDRY_NPU_TILELANG_SOURCE", str(tl_stub))
+    monkeypatch.setenv("TILELANG_CACHE_DIR", str(tmp_path / "tl_cache"))
+    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
+
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_cannbench_repo",
+        lambda **_kw: (_ for _ in ()).throw(FileNotFoundError("isolated")),
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "lookup_case_static_spec",
+        lambda _op, _cnum, **_kw: {"D": 512, "d_nope": 512, "tl_dtype": "float16"},
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "collect_distinct_static_width_dims",
+        lambda *_a, **_kw: (),
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_regime_config",
+        lambda _src, _reg, dims=None: types.SimpleNamespace(
+            builder_name="_build_mla_split_kv_decode_func",
+            builder_kwargs={
+                "d_nope": 512,
+                "tl_dtype": "float16",
+                "num_kv_splits": int((dims or {}).get("num_kv_splits", 4)),
+            },
+            pass_configs={},
+            compile_flags=(),
+            selector_name="_select_mla_decode_config",
+            combine_kwargs={},
+        ),
+    )
+
+    subproc_scripts: list[str] = []
+    driver_factories: list[str] = []
+
+    def _fake_subproc_run(
+        argv: Sequence[str],
+        **_kw: object,
+    ) -> types.SimpleNamespace:
+        script_path = Path(argv[-1])
+        subproc_scripts.append(script_path.name)
+        if script_path.name == "anchor_plan.py":
+            tasks = [
+                {
+                    "case_num": 7,
+                    "regime_tag": "split_kv_decode",
+                    "mode": "_get_combine_kernel",
+                    "builder_name": "_get_combine_kernel",
+                    "selector_name": "",
+                    "factory_kwargs": {"d_nope": 512, "tl_dtype": "float16", "num_kv_splits": 4},
+                    "dims": {},
+                    "kwargs": {"d_nope": 512, "tl_dtype": "float16", "num_kv_splits": 4},
+                    "pass_configs": {},
+                    "compile_flags": [],
+                }
+            ]
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"tasks": tasks}) + "\n",
+                stderr="",
+            )
+        if script_path.name == "compile_driver.py":
+            src_txt = script_path.read_text(encoding="utf-8")
+            for line in src_txt.splitlines():
+                if line.startswith("_cfg = json.loads("):
+                    raw_json = ast.literal_eval(line[len("_cfg = json.loads(") : -1])
+                    payload = json.loads(raw_json)
+                    driver_factories.append(str(payload.get("factory_name", "")))
+            (script_path.parent / "emit_cache_bins.json").write_text("[]", encoding="utf-8")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_subproc_run)
+
+    split_spec = RegimeTargetSpec(
+        regime_tag="split_kv_decode",
+        builder_candidates=("_build_mla_split_kv_decode_func",),
+        sample_builder_kwargs={"d_nope": 512, "tl_dtype": "float16", "num_kv_splits": 4},
+        representative_anchor_dims={"D": 512, "d_nope": 512, "tl_dtype": "float16"},
+        config_selector_fn="_select_mla_decode_config",
+        editable_symbols=(
+            "_select_mla_decode_config",
+            "_build_mla_split_kv_decode_func",
+            "_build_mla_split_kv_combine_func",
+        ),
+    )
+    coord = StageGateCoordinator(
+        operator_name="mla",
+        source_root=tmp_path,
+        target_module_path=target_path,
+        regime_specs=(split_spec,),
+        scoreboard_anchors=(
+            AnchorCaseSpec("level4/mla", 7, "split_kv_decode", 4.5, 1.5),
+        ),
+        active_incumbent_source=mla_mod_base,
+    )
+    res = coord._run_l1(mla_mod_cand, split_spec)
+    assert res.passed is True
+    assert subproc_scripts.count("anchor_plan.py") == 1
+    assert "diag_driver.py" in subproc_scripts
+    assert "_get_combine_kernel" in driver_factories
+    assert "_build_mla_split_kv_combine_func" not in driver_factories
+
+    subproc_scripts.clear()
+    driver_factories.clear()
+    coord_no_anchors = StageGateCoordinator(
+        operator_name="",
+        source_root=tmp_path,
+        target_module_path=target_path,
+        regime_specs=(split_spec,),
+        active_incumbent_source=mla_mod_base,
+    )
+    res_no_anc = coord_no_anchors._run_l1(mla_mod_cand, split_spec)
+    assert res_no_anc.passed is True
+    assert "_build_mla_split_kv_combine_func" in driver_factories
+
+
+def test_run_l1_hybrid_trackb_skips_compile_when_verified_in_eff_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip hybrid_trackb bisheng compile on verified eff_store hit unless missing/overridden."""
+    unified_cache = tmp_path / "unified_tl_cache"
+    monkeypatch.setenv("TILELANG_CACHE_DIR", str(unified_cache))
+    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
+
+    cpp_body = 'extern "C" __global__ void hyb_tb_kernel() {}'
+    hyb_src = (
+        f'_HYB_CPP = """\n{cpp_body}\n"""\n'
+        "def _build_hyb_prim(tile_m=16):\n"
+        "    return int(tile_m)\n"
+    )
+    hyb_spec = RegimeTargetSpec(
+        regime_tag="decode",
+        builder_candidates=("_build_hyb_prim",),
+        sample_builder_kwargs={"tile_m": 16},
+        editable_symbols=("_build_hyb_prim", "_HYB_CPP"),
+        runtime_backend="hybrid_trackb",
+        trackb_symbols=("_HYB_CPP",),
+        representative_anchor_dims={"D": 128},
+    )
+
+    bin_file = tmp_path / "prebuilt.o"
+    bin_file.write_bytes(b"ELF_HYB_TEST")
+    coord = StageGateCoordinator(
+        operator_name="mla",
+        source_root=tmp_path,
+        target_module_path=tmp_path / "kernel.py",
+        regime_specs=(hyb_spec,),
+        scoreboard_anchors=_make_anchors(),
+        static_width_dims_fn=lambda _s: (),
+    )
+    instantiated = coord._instantiate_trackb_tu(hyb_src, cpp_body, hyb_spec)
+    norm_tu = _normalize_trackb_unit_source(instantiated, regime_tag="decode")
+    eff_flags = list(resolve_trackb_compile_flags(instantiated, ()))
+    t_key = compute_compile_task_key(
+        normalized_kernel_unit_src=norm_tu,
+        cann_target="dav-3510",
+        pass_configs=None,
+        compile_flags=eff_flags,
+        static_spec_signature="",
+    )
+    store = ArtifactStore(unified_cache)
+    store.record_verified_artifact(
+        t_key,
+        binary_paths=(bin_file,),
+        backend_kind="ascendc",
+        flags=" ".join(eff_flags),
+        closure_src=norm_tu,
+    )
+
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "run_l1_compile_check",
+        lambda *_a, **_kw: StageBResult(passed=True, elapsed_sec=0.25),
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_regime_config",
+        lambda *_a, **_kw: types.SimpleNamespace(
+            builder_name="_build_hyb_prim",
+            builder_kwargs={"tile_m": 16},
+            pass_configs={},
+            compile_flags=(),
+            selector_name="",
+            combine_kwargs={},
+        ),
+    )
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "resolve_cannbench_repo",
+        lambda **_kw: (_ for _ in ()).throw(FileNotFoundError("isolated")),
+    )
+
+    tb_compile_calls: list[str] = []
+
+    def _fake_ascendc_compile(cpp_source: str, **_kw: object) -> StageBResult:
+        tb_compile_calls.append(cpp_source)
+        return StageBResult(passed=True, elapsed_sec=0.5, binary_paths=(str(bin_file),))
+
+    monkeypatch.setattr(
+        stage_gate_coordinator,
+        "run_stage_b_ascendc_compile",
+        _fake_ascendc_compile,
+    )
+
+    cached_res = coord._run_l1(hyb_src, hyb_spec)
+    assert cached_res.passed is True
+    assert tb_compile_calls == []
+    assert cached_res.artifact_id == t_key
+    assert cached_res.elapsed_sec == pytest.approx(0.25)
+
+    edited_src = hyb_src.replace("hyb_tb_kernel()", "hyb_tb_kernel_v2()")
+    miss_res = coord._run_l1(edited_src, hyb_spec)
+    assert miss_res.passed is True
+    assert len(tb_compile_calls) == 1
+    assert miss_res.elapsed_sec == pytest.approx(0.75)
+
+    owner_calls: list[str] = []
+    owner_obj = types.SimpleNamespace(
+        _compile_trackb_stage_b=lambda cpp: (
+            owner_calls.append(cpp),
+            StageBResult(passed=True, elapsed_sec=0.1),
+        )[1]
+    )
+    coord_with_owner = StageGateCoordinator(
+        operator_name="mla",
+        source_root=tmp_path,
+        target_module_path=tmp_path / "kernel.py",
+        regime_specs=(hyb_spec,),
+        scoreboard_anchors=_make_anchors(),
+        static_width_dims_fn=lambda _s: (),
+        owner=owner_obj,
+    )
+    overridden_res = coord_with_owner._run_l1(hyb_src, hyb_spec)
+    assert overridden_res.passed is True
+    assert len(owner_calls) == 1
+    assert overridden_res.elapsed_sec == pytest.approx(0.35)
+
 
 
