@@ -8,11 +8,16 @@ from pathlib import Path
 import pytest
 
 import tilefoundry_ascend.agent.campaign.promotion_coordinator as pc_mod
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec, RegimeTargetSpec
+from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    AnchorCaseSpec,
+    GuardrailCaseSpec,
+    RegimeTargetSpec,
+)
 from tilefoundry_ascend.agent.campaign.fault_types import L3Resolution
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import (
     PromotionCoordinator,
     RankedL2Candidate,
+    evaluate_promotion_gate,
     select_top_two_l2_survivors,
     to_conservation_point,
 )
@@ -300,3 +305,154 @@ def test_select_top_two_l2_survivors_and_l3_fallback_matrix(tmp_path: Path) -> N
     assert deferred.pending_promotion is not None
     assert deferred.pending_promotion.candidate_id == "c_fast"
     assert target_path.read_text(encoding="utf-8") == incumbent_src
+
+
+def test_paired_guardrail_uses_live_incumbent_over_vendor_ref_fallback() -> None:
+    """Verify paired guardrails compare against live incumbent rather than vendor ref."""
+    regime_spec = RegimeTargetSpec("main", ("_build",), {})
+    best_result = aggregate_surrogate_result(
+        "inc",
+        "mla",
+        (
+            _anchor_metric(1, 50.0, ref_us=35.0, t_hw_us=10.0),
+            _anchor_metric(2, 60.0, ref_us=40.0, t_hw_us=12.0),
+        ),
+    )
+    cand_result = aggregate_surrogate_result(
+        "cand_fast",
+        "mla",
+        (
+            AnchorEvalMetrics(
+                case_num=1,
+                regime_tag="main",
+                accuracy_passed=True,
+                cand_us=45.0,
+                ref_perf_us=35.0,
+                t_hw_us=10.0,
+                speedup=35.0 / 45.0,
+                roofline_eta=10.0 / 45.0,
+                eq3_score=35.0 / 45.0,
+                ring_burst_k=24,
+                burst_batch_cv=0.01,
+                paired_speedup_vs_incumbent=50.0 / 45.0,
+                paired_rel_mad=0.01,
+            ),
+            AnchorEvalMetrics(
+                case_num=2,
+                regime_tag="main",
+                accuracy_passed=True,
+                cand_us=54.0,
+                ref_perf_us=40.0,
+                t_hw_us=12.0,
+                speedup=40.0 / 54.0,
+                roofline_eta=12.0 / 54.0,
+                eq3_score=40.0 / 54.0,
+                ring_burst_k=24,
+                burst_batch_cv=0.01,
+                paired_speedup_vs_incumbent=60.0 / 54.0,
+                paired_rel_mad=0.01,
+            ),
+        ),
+    )
+    guardrail = GuardrailCaseSpec(
+        task="level4/mla",
+        case_num=3,
+        regime_tag="main",
+        incumbent_ref_us=42.39,
+        t_hw_us=10.3,
+    )
+    anchors = (
+        AnchorCaseSpec(task="level4/mla", case_num=1, regime_tag="main", ref_perf_us=35.0, t_hw_us=10.0),
+        AnchorCaseSpec(task="level4/mla", case_num=2, regime_tag="main", ref_perf_us=40.0, t_hw_us=12.0),
+    )
+
+    faster_paired_guardrail = AnchorEvalMetrics(
+        case_num=3,
+        regime_tag="main",
+        accuracy_passed=True,
+        cand_us=52.0,
+        ref_perf_us=42.39,
+        t_hw_us=10.3,
+        speedup=42.39 / 52.0,
+        roofline_eta=10.3 / 52.0,
+        eq3_score=42.39 / 52.0,
+        ring_burst_k=24,
+        burst_batch_cv=0.01,
+        paired_speedup_vs_incumbent=1.05,
+        paired_rel_mad=0.01,
+    )
+    ok, _res, reason = evaluate_promotion_gate(
+        candidate_id="cand_fast",
+        cur_res=cand_result,
+        best_result=best_result,
+        regime_spec=regime_spec,
+        guardrail_cases=(guardrail,),
+        cand_guardrail_metrics={3: faster_paired_guardrail},
+        unchanged_siblings=set(),
+        active_anchors=anchors,
+    )
+    assert ok is True
+    assert reason == ""
+
+    regressed_paired_guardrail = AnchorEvalMetrics(
+        case_num=3,
+        regime_tag="main",
+        accuracy_passed=True,
+        cand_us=65.0,
+        ref_perf_us=42.39,
+        t_hw_us=10.3,
+        speedup=42.39 / 65.0,
+        roofline_eta=10.3 / 65.0,
+        eq3_score=42.39 / 65.0,
+        ring_burst_k=24,
+        burst_batch_cv=0.01,
+        paired_speedup_vs_incumbent=0.80,
+        paired_rel_mad=0.01,
+    )
+    ok_reg, _res_reg, reason_reg = evaluate_promotion_gate(
+        candidate_id="cand_fast",
+        cur_res=cand_result,
+        best_result=best_result,
+        regime_spec=regime_spec,
+        guardrail_cases=(guardrail,),
+        cand_guardrail_metrics={3: regressed_paired_guardrail},
+        unchanged_siblings=set(),
+        active_anchors=anchors,
+    )
+    assert ok_reg is False
+    assert reason_reg == "guardrail_latency_regression"
+
+    unpaired_guardrail = GuardrailCaseSpec(
+        task="level4/mla",
+        case_num=3,
+        regime_tag="main",
+        incumbent_ref_us=20.0,
+        t_hw_us=10.3,
+    )
+    unpaired_regressed = AnchorEvalMetrics(
+        case_num=3,
+        regime_tag="main",
+        accuracy_passed=True,
+        cand_us=25.0,
+        ref_perf_us=20.0,
+        t_hw_us=10.3,
+        speedup=20.0 / 25.0,
+        roofline_eta=10.3 / 25.0,
+        eq3_score=20.0 / 25.0,
+        ring_burst_k=1,
+        burst_batch_cv=0.0,
+        paired_speedup_vs_incumbent=0.0,
+        paired_rel_mad=0.02,
+    )
+    ok_unpaired, _res_unp, reason_unp = evaluate_promotion_gate(
+        candidate_id="cand_fast",
+        cur_res=cand_result,
+        best_result=best_result,
+        regime_spec=regime_spec,
+        guardrail_cases=(unpaired_guardrail,),
+        cand_guardrail_metrics={3: unpaired_regressed},
+        unchanged_siblings=set(),
+        active_anchors=anchors,
+    )
+    assert ok_unpaired is False
+    assert reason_unp == "guardrail_latency_regression"

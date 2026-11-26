@@ -195,7 +195,39 @@ def evaluate_promotion_gate(
         if not g_metric.accuracy_passed:
             return False, cur_res, "guardrail_accuracy_failed"
         inc_ref = float(guardrail.incumbent_ref_us)
-        if inc_ref > 0.0:
+        paired_sp = float(getattr(g_metric, "paired_speedup_vs_incumbent", 0.0) or 0.0)
+        if paired_sp > 0.0 and float(g_metric.cand_us) > 0.0:
+            eff_cand_us = float(g_metric.cand_us)
+            eff_inc_us = eff_cand_us * paired_sp
+            point_fields = {f.name for f in fields(AnchorConservationPoint)}
+            if {"cand_burst_cv", "ref_burst_cv", "burst_count"} <= point_fields:
+                g_point = AnchorConservationPoint(
+                    case_num=int(g_metric.case_num),
+                    regime_tag=str(g_metric.regime_tag),
+                    ref_us=float(g_metric.ref_perf_us),
+                    inc_us=eff_inc_us,
+                    cand_us=eff_cand_us,
+                    t_roof_us=float(g_metric.t_hw_us),
+                    paired_rel_mad=float(getattr(g_metric, "paired_rel_mad", 0.0) or 0.0),
+                    accuracy_passed=bool(g_metric.accuracy_passed),
+                    cand_burst_cv=float(g_metric.burst_batch_cv),
+                    ref_burst_cv=0.0,
+                    burst_count=max(1, int(g_metric.ring_burst_k)),
+                )
+            else:
+                g_point = AnchorConservationPoint(
+                    case_num=int(g_metric.case_num),
+                    regime_tag=str(g_metric.regime_tag),
+                    ref_us=float(g_metric.ref_perf_us),
+                    inc_us=eff_inc_us,
+                    cand_us=eff_cand_us,
+                    t_roof_us=float(g_metric.t_hw_us),
+                    paired_rel_mad=float(getattr(g_metric, "paired_rel_mad", 0.0) or 0.0),
+                    accuracy_passed=bool(g_metric.accuracy_passed),
+                )
+            if not check_guardrail_non_regression(g_point, sigma_mult=3.0):
+                return False, cur_res, "guardrail_latency_regression"
+        elif inc_ref > 0.0:
             g_point = AnchorConservationPoint(
                 case_num=int(g_metric.case_num),
                 regime_tag=str(g_metric.regime_tag),
