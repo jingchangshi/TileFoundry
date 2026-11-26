@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -765,6 +766,223 @@ def _default_batch_request(source_root: Path, cannbench_repo: Path) -> dict[str,
     }
 
 
+_INCUMBENT_CANDIDATE_IDS = frozenset({"incumbent_slot", "__incumbent__", "incumbent_baseline"})
+
+
+_POISON_PILL_WORKER_SCRIPT = """import importlib
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import torch
+
+from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    AnchorCaseSpec,
+    load_anchor_harness_and_cases,
+    load_cannbench_contract_module,
+)
+from tests.ascend.agent.test_surrogate_batch_npu import _load_candidate_entrypoint
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+out_path = Path(sys.argv[2])
+op_name = str(payload["operator_name"])
+entrypoint = str(payload["entrypoint"])
+cid = str(payload["candidate_id"])
+mod_path = Path(str(payload["module_path"]))
+source_root = Path(str(payload["source_root"]))
+cannbench_repo = Path(str(payload["cannbench_repo"]))
+anchors = [AnchorCaseSpec.from_dict(item) for item in payload["anchors"]]
+
+if hasattr(torch, "npu") and torch.npu.is_available():
+    torch.npu.set_device(0)
+
+contract_mod = load_cannbench_contract_module(source_root=source_root)
+harness, cases = load_anchor_harness_and_cases(
+    op_name,
+    anchors,
+    cannbench_repo=cannbench_repo,
+    source_root=source_root,
+)
+case_by_num = {int(c.case_num): c for c in cases}
+fn, mod_obj = _load_candidate_entrypoint(
+    mod_path, entrypoint, f"pill_{op_name}_{int(time.monotonic_ns())}"
+)
+
+case_results = {}
+all_passed = True
+first_error = ""
+
+with contract_mod.ReferenceCache(harness) as cache:
+    for spec in anchors:
+        cnum = int(spec.case_num)
+        case = case_by_num[cnum]
+
+        def _prep(c=case, h=harness):
+            ts = h.prepare(c)
+            return {"inputs": ts, "oracle": h.reference_output(c, ts)}
+
+        bundle = cache.get(case, "oracle", _prep)
+        tensors = bundle["inputs"]
+        oracle = bundle["oracle"]
+
+        def _native_fn(c=case, ts=tensors, h=harness, ch=cache):
+            return ch.get(c, "native", lambda: h.reference_output(c, ts, native=True))
+
+        npu_tensors = None
+        params = None
+        actual = None
+        try:
+            npu_tensors = contract_mod.map_tensors(tensors, lambda x: x.npu())
+            params = harness.params(case, npu_tensors)
+            actual = fn(**params)
+            if hasattr(torch, "npu") and hasattr(torch.npu, "synchronize"):
+                torch.npu.synchronize()
+            passed, details = harness.compare(case, actual, oracle, tensors, _native_fn)
+            if passed:
+                case_results[str(cnum)] = {"passed": True, "error": ""}
+            else:
+                err_msg = json.dumps(details)[:300]
+                case_results[str(cnum)] = {"passed": False, "error": err_msg}
+                all_passed = False
+                if not first_error:
+                    first_error = err_msg
+        except Exception as exc:
+            err_msg = f"{type(exc).__name__}: {exc}"[:300]
+            case_results[str(cnum)] = {"passed": False, "error": err_msg}
+            all_passed = False
+            if not first_error:
+                first_error = err_msg
+        finally:
+            actual = None
+            params = None
+            npu_tensors = None
+            if hasattr(torch, "npu") and hasattr(torch.npu, "empty_cache"):
+                torch.npu.empty_cache()
+
+cache_obj = getattr(mod_obj, "_KERNEL_CACHE", None)
+if isinstance(cache_obj, dict):
+    cache_obj.clear()
+
+tmp_out = out_path.with_suffix(".tmp")
+tmp_out.write_text(
+    json.dumps({"all_passed": all_passed, "error": first_error, "cases": case_results}),
+    encoding="utf-8",
+)
+os.replace(tmp_out, out_path)
+"""
+
+
+def _build_poison_pill_worker_env(source_root: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    pp_entries: list[str] = []
+    for candidate_dir in (
+        str(source_root),
+        str(source_root / "src"),
+        str(source_root / "targets" / "ascend"),
+    ):
+        if candidate_dir not in pp_entries:
+            pp_entries.append(candidate_dir)
+    for entry in sys.path:
+        if entry and (Path(entry) / "npu_compare.py").is_file() and entry not in pp_entries:
+            pp_entries.insert(0, entry)
+    existing_pp = env.get("PYTHONPATH", "").strip()
+    if existing_pp:
+        for item in existing_pp.split(os.pathsep):
+            if item and item not in pp_entries:
+                pp_entries.append(item)
+    env["PYTHONPATH"] = os.pathsep.join(pp_entries)
+    return env
+
+
+def _screen_candidate_isolated(
+    *,
+    operator_name: str,
+    entrypoint: str,
+    candidate_id: str,
+    module_path: Path,
+    anchors: Sequence[AnchorCaseSpec],
+    source_root: Path,
+    cannbench_repo: Path,
+    timeout_sec: float = 30.0,
+) -> tuple[bool, str, dict[int, tuple[bool, str]]]:
+    """Run one-shot accuracy verification for a candidate in an isolated subprocess."""
+    eff_timeout = max(0.05, float(timeout_sec))
+    worker_env = _build_poison_pill_worker_env(source_root)
+    with tempfile.TemporaryDirectory(prefix="tf_poison_pill_") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        req_path = tmp_root / "req.json"
+        out_path = tmp_root / "out.json"
+        script_path = tmp_root / "worker.py"
+        req_path.write_text(
+            json.dumps(
+                {
+                    "operator_name": operator_name,
+                    "entrypoint": entrypoint,
+                    "candidate_id": candidate_id,
+                    "module_path": str(module_path),
+                    "source_root": str(source_root),
+                    "cannbench_repo": str(cannbench_repo),
+                    "anchors": [a.to_dict() for a in anchors],
+                }
+            ),
+            encoding="utf-8",
+        )
+        script_path.write_text(_POISON_PILL_WORKER_SCRIPT, encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, str(script_path), str(req_path), str(out_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(source_root),
+            env=worker_env,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=eff_timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.communicate()
+            return (
+                False,
+                f"poison_pill_timeout_or_crash: timeout after {eff_timeout:g}s",
+                {},
+            )
+
+        if proc.returncode != 0:
+            detail = (stderr or stdout or "").strip()[-300:]
+            msg = f"poison_pill_timeout_or_crash: exit_code={proc.returncode}"
+            if detail:
+                msg = f"{msg} ({detail})"
+            return False, msg[:300], {}
+
+        if not out_path.is_file():
+            return False, "poison_pill_timeout_or_crash: missing worker output", {}
+        try:
+            raw = json.loads(out_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return False, f"poison_pill_timeout_or_crash: invalid worker json: {exc}"[:300], {}
+
+        per_case: dict[int, tuple[bool, str]] = {}
+        raw_cases = raw.get("cases")
+        if isinstance(raw_cases, Mapping):
+            for k, row in raw_cases.items():
+                if isinstance(row, Mapping):
+                    per_case[int(k)] = (bool(row.get("passed", False)), str(row.get("error", "")))
+        all_passed = bool(raw.get("all_passed", False))
+        err_msg = str(raw.get("error", ""))
+        return all_passed, err_msg[:300], per_case
+
+
+_ORIG_LOAD_CANDIDATE_ENTRYPOINT = _load_candidate_entrypoint
+_ORIG_LOAD_HARNESS_AND_CASES = load_anchor_harness_and_cases
+_ORIG_SCREEN_CANDIDATE_ISOLATED = _screen_candidate_isolated
+
+
 def _evaluate_operator_batch(
     batch: dict[str, object],
     *,
@@ -774,6 +992,8 @@ def _evaluate_operator_batch(
     repeat: int,
     collect_msprof_detail: bool = False,
     msprof_out: dict[str, dict[str, dict[str, object]]] | None = None,
+    poison_pill_isolation: bool | None = None,
+    poison_pill_timeout_sec: float = 30.0,
 ) -> dict[str, CandidateSurrogateResult]:
     op_name = str(batch["operator_name"])
     entrypoint = str(batch.get("entrypoint") or get_operator_entrypoint(op_name))
@@ -788,6 +1008,7 @@ def _evaluate_operator_batch(
         msprof_case_set = set()
     msprof_warmup = int(batch.get("msprof_warmup", 1))
     msprof_repeat = int(batch.get("msprof_repeat", 3))
+    eff_pill_timeout = float(batch.get("poison_pill_timeout_sec", poison_pill_timeout_sec))
 
     contract_mod = load_cannbench_contract_module(source_root=source_root)
     harness, cases = load_anchor_harness_and_cases(
@@ -798,21 +1019,97 @@ def _evaluate_operator_batch(
     )
     case_by_num = {int(c.case_num): c for c in cases}
 
-    loaded_cands: list[tuple[str, object, object]] = []
-    cand_paths: dict[str, Path] = {}
-    for idx, cand in enumerate(candidates):
-        cid = str(cand["candidate_id"])
-        mod_path = Path(str(cand["module_path"]))
-        tag = f"{op_name}_{idx}_{int(time.monotonic_ns())}"
-        fn, mod_obj = _load_candidate_entrypoint(mod_path, entrypoint, tag)
-        loaded_cands.append((cid, fn, mod_obj))
-        cand_paths[cid] = mod_path
+    has_npu_event = hasattr(getattr(torch, "npu", None), "Event")
+    non_incumbents = [
+        cand for cand in candidates if str(cand["candidate_id"]) not in _INCUMBENT_CANDIDATE_IDS
+    ]
+    if poison_pill_isolation is not None:
+        use_poison_pill = bool(poison_pill_isolation) and bool(non_incumbents)
+    else:
+        use_poison_pill = (
+            len(candidates) >= 2
+            and bool(non_incumbents)
+            and (
+                (_screen_candidate_isolated is not _ORIG_SCREEN_CANDIDATE_ISOLATED)
+                or (
+                    has_npu_event
+                    and _load_candidate_entrypoint is _ORIG_LOAD_CANDIDATE_ENTRYPOINT
+                    and load_anchor_harness_and_cases is _ORIG_LOAD_HARNESS_AND_CASES
+                )
+            )
+        )
 
     per_cand_metrics: dict[str, list[AnchorEvalMetrics]] = {
-        cid: [] for cid, _fn, _mod in loaded_cands
+        str(cand["candidate_id"]): [] for cand in candidates
     }
+    phase_a_passed_ids: set[str] = set()
+    loaded_cands: list[tuple[str, object, object]] = []
+    cand_paths: dict[str, Path] = {}
 
     with contract_mod.ReferenceCache(harness) as cache:
+        if use_poison_pill:
+            for spec in anchors:
+                case = case_by_num[int(spec.case_num)]
+
+                def _warm_prep(c=case, h=harness):
+                    ts = h.prepare(c)
+                    return {"inputs": ts, "oracle": h.reference_output(c, ts)}
+
+                cache.get(case, "oracle", _warm_prep)
+
+            for cand in candidates:
+                cid = str(cand["candidate_id"])
+                mod_path = Path(str(cand["module_path"]))
+                if cid in _INCUMBENT_CANDIDATE_IDS:
+                    continue
+                passed_iso, batch_err, per_case = _screen_candidate_isolated(
+                    operator_name=op_name,
+                    entrypoint=entrypoint,
+                    candidate_id=cid,
+                    module_path=mod_path,
+                    anchors=anchors,
+                    source_root=source_root,
+                    cannbench_repo=cannbench_repo,
+                    timeout_sec=eff_pill_timeout,
+                )
+                if passed_iso:
+                    phase_a_passed_ids.add(cid)
+                else:
+                    fallback_err = batch_err or "poison_pill_timeout_or_crash"
+                    for spec in anchors:
+                        case_entry = per_case.get(int(spec.case_num))
+                        case_err = (
+                            case_entry[1]
+                            if case_entry is not None and not case_entry[0] and case_entry[1]
+                            else fallback_err
+                        )
+                        per_cand_metrics[cid].append(
+                            build_anchor_metrics(
+                                spec,
+                                accuracy_passed=False,
+                                cand_us=0.0,
+                                error_message=case_err[:300],
+                            )
+                        )
+
+            for idx, cand in enumerate(candidates):
+                cid = str(cand["candidate_id"])
+                if cid not in _INCUMBENT_CANDIDATE_IDS and cid not in phase_a_passed_ids:
+                    continue
+                mod_path = Path(str(cand["module_path"]))
+                tag = f"{op_name}_{idx}_{int(time.monotonic_ns())}"
+                fn, mod_obj = _load_candidate_entrypoint(mod_path, entrypoint, tag)
+                loaded_cands.append((cid, fn, mod_obj))
+                cand_paths[cid] = mod_path
+        else:
+            for idx, cand in enumerate(candidates):
+                cid = str(cand["candidate_id"])
+                mod_path = Path(str(cand["module_path"]))
+                tag = f"{op_name}_{idx}_{int(time.monotonic_ns())}"
+                fn, mod_obj = _load_candidate_entrypoint(mod_path, entrypoint, tag)
+                loaded_cands.append((cid, fn, mod_obj))
+                cand_paths[cid] = mod_path
+
         for spec in anchors:
             case = case_by_num[int(spec.case_num)]
 
@@ -828,11 +1125,13 @@ def _evaluate_operator_batch(
                 return ch.get(c, "native", lambda: h.reference_output(c, ts, native=True))
 
             paired_interleaved = bool(batch.get("paired_interleaved", True))
-            has_npu_event = hasattr(getattr(torch, "npu", None), "Event")
             passed_cands: list[tuple[int, str, object, object]] = []
             metrics_by_cid: dict[str, AnchorEvalMetrics] = {}
 
             for orig_idx, (cid, fn, mod_obj) in enumerate(loaded_cands):
+                if use_poison_pill and cid in phase_a_passed_ids:
+                    passed_cands.append((orig_idx, cid, fn, mod_obj))
+                    continue
                 npu_tensors = None
                 params = None
                 actual = None
@@ -1004,8 +1303,12 @@ def _evaluate_operator_batch(
     torch.npu.empty_cache()
 
     return {
-        cid: aggregate_surrogate_result(cid, op_name, per_cand_metrics[cid])
-        for cid, _fn, _mod in loaded_cands
+        str(cand["candidate_id"]): aggregate_surrogate_result(
+            str(cand["candidate_id"]),
+            op_name,
+            per_cand_metrics[str(cand["candidate_id"])],
+        )
+        for cand in candidates
     }
 
 

@@ -242,7 +242,7 @@ class MarathonConfig:
     repeat: int = 5
     enable_tilesize_prescreen: bool = True
     cost_prescreen_top_k: int | None = None
-    cost_model_mode: str = "auto"
+    cost_model_mode: str = "off"
     cost_disengage_eta: float = 0.65
     cost_slow_gain_threshold: float = 0.03
     allow_unreviewed_distilled_rules: bool = False
@@ -1442,6 +1442,38 @@ class ExtremeCampaignRunner(PerfTargetCampaignRunner):
             )
 
 
+def _is_non_fallback_l2_env_error(exc: BaseException) -> bool:
+    """Return True when an L2 failure reflects NPU occupancy or device rejection."""
+    low = str(exc).lower()
+    return (
+        "occupancy" in low
+        or "blocked_env" in low
+        or "blocked_exit_code: 75" in low
+        or "device_rejected" in low
+    )
+
+
+def _extract_l2_telemetry(
+    res_obj: object,
+) -> tuple[dict[str, int], float, float]:
+    if isinstance(res_obj, L2BatchResults):
+        return (
+            dict(res_obj.prewarm_stats),
+            float(res_obj.l2_prewarm_sec),
+            float(res_obj.l2_npu_sec),
+        )
+    return (
+        {
+            "total_tasks": 0,
+            "cache_hits": 0,
+            "compiled_tasks": 0,
+            "failed_candidates": 0,
+        },
+        0.0,
+        0.0,
+    )
+
+
 def build_resilient_l2_evaluator(
     *,
     operator_name: str,
@@ -1454,7 +1486,7 @@ def build_resilient_l2_evaluator(
     batch_fn: Callable[..., tuple[dict[str, CandidateSurrogateResult], str, str]] | None = None,
     op_logger: logging.Logger | None = None,
 ) -> Callable[[Sequence[tuple[str, Path]], Sequence[AnchorCaseSpec]], L2BatchResults]:
-    """Build batched L2 evaluator with single-candidate isolation fallback on failures."""
+    """Build batched L2 evaluator with paired-incumbent fallback on non-env failures."""
     log = op_logger or logger
     eval_fn = batch_fn or run_surrogate_batch_via_agent_gates
 
@@ -1464,7 +1496,7 @@ def build_resilient_l2_evaluator(
     ) -> L2BatchResults:
         cand_list = list(cands)
         pool_kwargs: dict[str, object] = (
-            {"device_pool": device_pool} if batch_fn is None and len(device_pool) > 1 else {}
+            {"device_pool": device_pool} if batch_fn is None and device_pool else {}
         )
         try:
             res, run_id, _rcp = eval_fn(
@@ -1480,26 +1512,53 @@ def build_resilient_l2_evaluator(
                 timeout_sec=660,
                 **pool_kwargs,
             )
-            return L2BatchResults(res, {cid: run_id for cid in res})
+            p_stats, p_sec, n_sec = _extract_l2_telemetry(res)
+            return L2BatchResults(
+                res,
+                {cid: run_id for cid in res},
+                prewarm_stats=p_stats,
+                l2_prewarm_sec=p_sec,
+                l2_npu_sec=n_sec,
+            )
         except FileNotFoundError:
             raise
         except Exception as exc:
-            if len(cand_list) <= 1:
+            if _is_non_fallback_l2_env_error(exc) or len(cand_list) <= 1:
                 raise
+            inc_entry = next(
+                ((cid, p) for cid, p in cand_list if cid == "incumbent_slot"),
+                None,
+            )
+            non_inc = [(cid, p) for cid, p in cand_list if cid != "incumbent_slot"]
+            if inc_entry is not None and not non_inc:
+                raise
+            fallback_batches: list[list[tuple[str, Path]]] = (
+                [[inc_entry, (cid, mod_path)] for cid, mod_path in non_inc]
+                if inc_entry is not None
+                else [[(cid, mod_path)] for cid, mod_path in cand_list]
+            )
             log.warning(
-                "Batched L2 failed (%s: %s); falling back to single-candidate evaluation for %s",
+                "Batched L2 failed (%s: %s); falling back to isolated evaluation for %s",
                 type(exc).__name__,
                 exc,
-                [cid for cid, _ in cand_list],
+                [cid for cid, _ in non_inc] if inc_entry is not None else [cid for cid, _ in cand_list],
             )
             merged: dict[str, CandidateSurrogateResult] = {}
             run_ids: dict[str, str] = {}
+            agg_stats: dict[str, int] = {
+                "total_tasks": 0,
+                "cache_hits": 0,
+                "compiled_tasks": 0,
+                "failed_candidates": 0,
+            }
+            agg_prewarm_sec = 0.0
+            agg_npu_sec = 0.0
             last_exc: Exception | None = None
-            for cid, mod_path in cand_list:
+            for sub_batch in fallback_batches:
                 try:
                     one_res, run_id, _rcp = eval_fn(
                         operator_name,
-                        [(cid, mod_path)],
+                        sub_batch,
                         anc_seq,
                         source_root=worktree,
                         env_file=env_file,
@@ -1512,21 +1571,35 @@ def build_resilient_l2_evaluator(
                     )
                     merged.update(one_res)
                     run_ids.update({cand_id: run_id for cand_id in one_res})
+                    sub_stats, sub_p_sec, sub_n_sec = _extract_l2_telemetry(one_res)
+                    for key in agg_stats:
+                        agg_stats[key] += int(sub_stats.get(key, 0))
+                    agg_prewarm_sec += sub_p_sec
+                    agg_npu_sec += sub_n_sec
                 except FileNotFoundError:
                     raise
                 except Exception as sub_exc:
+                    if _is_non_fallback_l2_env_error(sub_exc):
+                        raise
                     last_exc = sub_exc
                     log.warning(
-                        "Single-candidate L2 fallback failed for %s: %s: %s",
-                        cid,
+                        "Isolated L2 fallback failed for %s: %s: %s",
+                        [cid for cid, _ in sub_batch],
                         type(sub_exc).__name__,
                         sub_exc,
                     )
             if merged:
-                return L2BatchResults(merged, run_ids)
+                return L2BatchResults(
+                    merged,
+                    run_ids,
+                    prewarm_stats=agg_stats,
+                    l2_prewarm_sec=agg_prewarm_sec,
+                    l2_npu_sec=agg_npu_sec,
+                )
             assert last_exc is not None
             raise last_exc
 
+    setattr(_eval, "is_real_npu", True)
     return _eval
 
 
@@ -1980,7 +2053,7 @@ def run_operator_marathon(
     ) -> L3AcceptanceResult:
         l3_kwargs: dict[str, object] = (
             {"device_pool": device_pool}
-            if len(device_pool) > 1 and not resume_execution_id and not resume_run_id
+            if device_pool and not resume_execution_id and not resume_run_id
             else {}
         )
         result = run_l3_full_contract_via_agent_gates(
@@ -2086,7 +2159,7 @@ def run_operator_marathon(
             device_id=primary_device_id,
             min_speedup=1.08,
             timeout_sec=360,
-            **({"device_pool": device_pool} if len(device_pool) > 1 else {}),
+            **({"device_pool": device_pool} if device_pool else {}),
         ),
     )
     pure_anchors: tuple[AnchorCaseSpec, ...] | None = None
@@ -2113,7 +2186,7 @@ def run_operator_marathon(
             env_file=env_file,
             device_id=primary_device_id,
             timeout_sec=600,
-            **({"device_pool": device_pool} if len(device_pool) > 1 else {}),
+            **({"device_pool": device_pool} if device_pool else {}),
         )
 
     def _l4_fn(mod_path: Path, **kwargs: object) -> object:
@@ -2724,8 +2797,8 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cost-model-mode",
-        choices=("auto", "coarse_only", "off"),
-        default="auto",
+        choices=("off", "shadow", "auto", "coarse_only"),
+        default="off",
         help="Cost model prescreen gate policy mode.",
     )
     parser.add_argument(
