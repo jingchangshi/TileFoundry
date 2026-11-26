@@ -48,7 +48,7 @@ class StreamWatchdogConfig:
     idle_stall_timeout_sec: float = 60.0
     active_ceiling_timeout_sec: float = 360.0
     max_503_hits: int = 2
-    max_sandbox_tool_calls: int = 2
+    max_sandbox_tool_calls: int = 0
     max_retries: int = 1
     retry_backoff_sec: float = 1.0
     capacity_503_max_retries: int | None = None
@@ -334,10 +334,62 @@ _BROKEN_PYTHON_HEAD_RE = re.compile(
     re.MULTILINE,
 )
 
-_PROSE_REFUSAL_ERROR = (
+class LLMGenerationError(RuntimeError):
+    """Structured LLM generation error carrying fault plane, code, and retriability."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        fault_plane: str = "LLM_TRANSPORT",
+        fault_code: str = "LLM_TIMEOUT_OR_503",
+        retriable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.fault_plane = fault_plane
+        self.fault_code = fault_code
+        self.retriable = retriable
+
+
+class LLMTimeoutError(TimeoutError, LLMGenerationError):
+    """Structured LLM timeout error preserving TimeoutError and LLMGenerationError identity."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        fault_plane: str = "LLM_TRANSPORT",
+        fault_code: str = "LLM_TIMEOUT_OR_503",
+        retriable: bool = False,
+    ) -> None:
+        TimeoutError.__init__(self, message)
+        self.fault_plane = fault_plane
+        self.fault_code = fault_code
+        self.retriable = retriable
+
+
+class _ProseRefusalMessage(str):
+    """String message carrying structured prose-refusal fault attributes."""
+
+    fault_plane: str = "SYNTAX_AST"
+    fault_code: str = "LLM_PROSE_NO_CODE"
+    retriable: bool = False
+
+
+_PROSE_REFUSAL_ERROR = _ProseRefusalMessage(
     "llm_prose_refusal_no_code: "
     "response contains prose without executable DSL or SEARCH/REPLACE hunks"
 )
+
+
+class ProseRefusalError(ValueError, LLMGenerationError):
+    """Raised when an LLM reply contains prose without executable DSL or patch hunks."""
+
+    def __init__(self, message: str = _PROSE_REFUSAL_ERROR) -> None:
+        ValueError.__init__(self, message)
+        self.fault_plane = "SYNTAX_AST"
+        self.fault_code = "LLM_PROSE_NO_CODE"
+        self.retriable = False
 
 CREATIVE_RESPONSE_SCHEMA: dict[str, object] = {
     "type": "object",
@@ -380,12 +432,12 @@ def extract_python_dsl(raw_response: str) -> str:
                         inner = dsl.strip()
                         if inner and inner != stripped:
                             return extract_python_dsl(inner)
-                        raise ValueError(_PROSE_REFUSAL_ERROR)
+                        raise ProseRefusalError(_PROSE_REFUSAL_ERROR)
                 if isinstance(payload.get("dsl_source"), str):
                     inner = payload["dsl_source"].strip()
                     if inner and inner != stripped:
                         return extract_python_dsl(inner)
-                    raise ValueError(_PROSE_REFUSAL_ERROR)
+                    raise ProseRefusalError(_PROSE_REFUSAL_ERROR)
                 if isinstance(payload.get("response"), str) and payload["response"].strip():
                     stripped = payload["response"].strip()
         except json.JSONDecodeError:
@@ -395,9 +447,9 @@ def extract_python_dsl(raw_response: str) -> str:
         valid_matches = [m.strip() for m in matches if _has_code_or_patch_structure(m)]
         if valid_matches:
             return max(valid_matches, key=len)
-        raise ValueError(_PROSE_REFUSAL_ERROR)
+        raise ProseRefusalError(_PROSE_REFUSAL_ERROR)
     if not _has_code_or_patch_structure(stripped):
-        raise ValueError(_PROSE_REFUSAL_ERROR)
+        raise ProseRefusalError(_PROSE_REFUSAL_ERROR)
     return stripped
 
 
@@ -555,6 +607,7 @@ class _AttemptFailure(Exception):
         timeout_stage: _TimeoutStage | None = None,
         since_last_activity_sec: float | None = None,
         is_503: bool = False,
+        is_tool_loop: bool = False,
     ) -> None:
         super().__init__(str(exc))
         self.exc = exc
@@ -563,6 +616,7 @@ class _AttemptFailure(Exception):
         self.timeout_stage = timeout_stage
         self.since_last_activity_sec = since_last_activity_sec
         self.is_503 = is_503
+        self.is_tool_loop = is_tool_loop
 
 
 async def _terminate_process_group(proc: asyncio.subprocess.Process) -> None:
@@ -576,6 +630,45 @@ async def _terminate_process_group(proc: asyncio.subprocess.Process) -> None:
     with suppress(ProcessLookupError):
         os.killpg(proc.pid, signal.SIGKILL)
     await proc.wait()
+
+
+_HARD_NO_TOOL_DIRECTIVE = (
+    "[CRITICAL HARD DIRECTIVE: ZERO TOOL CALLS ALLOWED. Your previous attempt was "
+    "terminated immediately for attempting a tool call. Do NOT invoke ANY tool "
+    "(forbid read_file, view_file, write_file, write_to_file, run_command, "
+    "grep_search, list_dir, and invoke_subagent). Output your final answer directly "
+    "in plain text or JSON right now.]"
+)
+
+
+def _finalize_exhausted_failure(failure: _AttemptFailure) -> Exception:
+    """Attach non-retriable structured fault attributes onto exhausted transport failures."""
+    exc = failure.exc
+    if isinstance(exc, LLMGenerationError):
+        exc.retriable = False
+        return exc
+    if isinstance(exc, TimeoutError):
+        return LLMTimeoutError(
+            str(exc),
+            fault_plane="LLM_TRANSPORT",
+            fault_code="LLM_TIMEOUT_OR_503",
+            retriable=False,
+        )
+    detail = str(exc)
+    is_timeout_or_503 = (
+        failure.is_503
+        or failure.timeout_stage is not None
+        or "stream_idle_timeout" in detail
+        or bool(RE_STREAM_IDLE_LOG.search(detail))
+        or bool(RE_503_CAPACITY.search(detail))
+    )
+    fault_code = "LLM_TIMEOUT_OR_503" if is_timeout_or_503 else "LLM_CLI_ERROR"
+    return LLMGenerationError(
+        detail,
+        fault_plane="LLM_TRANSPORT",
+        fault_code=fault_code,
+        retriable=False,
+    )
 
 
 class AgyCliLLMBackend:
@@ -976,15 +1069,24 @@ class AgyCliLLMBackend:
                                                 step_idx, bool
                                             ):
                                                 active_tool_steps.add(step_idx)
-                                            elif su.get("state") != "DONE":
+                                            elif (
+                                                su.get("state") != "DONE"
+                                                or cfg.max_sandbox_tool_calls == 0
+                                            ):
                                                 anon_tool_calls += 1
                                             if (
                                                 len(active_tool_steps) + anon_tool_calls
                                             ) > cfg.max_sandbox_tool_calls:
                                                 await _terminate_process_group(proc)
                                                 raise _AttemptFailure(
-                                                    RuntimeError("sandbox_tool_loop_aborted"),
+                                                    LLMGenerationError(
+                                                        "sandbox_tool_loop_aborted",
+                                                        fault_plane="LLM_TRANSPORT",
+                                                        fault_code="SANDBOX_TOOL_LOOP_ABORTED",
+                                                        retriable=False,
+                                                    ),
                                                     retriable=True,
+                                                    is_tool_loop=True,
                                                 )
                                         delta = su.get("text_delta")
                                         if isinstance(delta, str) and delta:
@@ -1100,32 +1202,53 @@ class AgyCliLLMBackend:
         eff_effort_override = "medium" if used_cooldown else effort_override
         base_model = self.select_model(req.role)
 
+        tool_retry_used = False
+
         async def _attempt(retry_model_override: str | None) -> str:
+            nonlocal tool_retry_used
             active_override = retry_model_override or cooldown_model
             active_model = (
                 self._agy_model_id(active_override) if active_override else base_model
             )
-            try:
-                result = await self._run_single_attempt(
-                    req,
-                    full_prompt,
-                    effort_override=eff_effort_override,
-                    model_override=active_override,
-                )
-            except _AttemptFailure as failure:
-                if (
-                    failure.timeout_stage == "active_ceiling"
-                    and not used_cooldown
-                    and _is_creative_request(req)
-                    and active_model.lower() == "gemini-4-hydrogen-high"
-                ):
-                    count = self._consecutive_active_ceiling_timeouts.get(scope_key, 0) + 1
-                    if count >= 2:
-                        self._active_ceiling_cooldown.add(scope_key)
-                        self._consecutive_active_ceiling_timeouts[scope_key] = 0
-                    else:
-                        self._consecutive_active_ceiling_timeouts[scope_key] = count
-                raise
+            prompt_for_attempt = full_prompt
+            while True:
+                try:
+                    result = await self._run_single_attempt(
+                        req,
+                        prompt_for_attempt,
+                        effort_override=eff_effort_override,
+                        model_override=active_override,
+                    )
+                    break
+                except _AttemptFailure as failure:
+                    if failure.is_tool_loop:
+                        if not tool_retry_used and cfg.max_retries > 0:
+                            tool_retry_used = True
+                            prompt_for_attempt = f"{_HARD_NO_TOOL_DIRECTIVE}\n\n{full_prompt}"
+                            continue
+                        raise _AttemptFailure(
+                            LLMGenerationError(
+                                str(failure.exc),
+                                fault_plane="LLM_TRANSPORT",
+                                fault_code="SANDBOX_TOOL_LOOP_ABORTED",
+                                retriable=False,
+                            ),
+                            retriable=False,
+                            is_tool_loop=True,
+                        ) from None
+                    if (
+                        failure.timeout_stage == "active_ceiling"
+                        and not used_cooldown
+                        and _is_creative_request(req)
+                        and active_model.lower() == "gemini-4-hydrogen-high"
+                    ):
+                        count = self._consecutive_active_ceiling_timeouts.get(scope_key, 0) + 1
+                        if count >= 2:
+                            self._active_ceiling_cooldown.add(scope_key)
+                            self._consecutive_active_ceiling_timeouts[scope_key] = 0
+                        else:
+                            self._consecutive_active_ceiling_timeouts[scope_key] = count
+                    raise
             self._consecutive_active_ceiling_timeouts[scope_key] = 0
             return result
 
@@ -1160,10 +1283,10 @@ async def _run_with_503_retry(
                 return await attempt_fn(next_model_override)
             except _AttemptFailure as failure:
                 if not failure.retriable:
-                    raise failure.exc from None
+                    raise _finalize_exhausted_failure(failure) from None
                 if failure.is_503 and cfg.capacity_503_max_retries is not None:
                     if retries_503 >= max_503_retries:
-                        raise failure.exc from None
+                        raise _finalize_exhausted_failure(failure) from None
                     sched = cfg.capacity_503_backoff_sec
                     base_wait = (
                         sched[min(retries_503, len(sched) - 1)]
@@ -1186,7 +1309,7 @@ async def _run_with_503_retry(
                     if cfg.retry_backoff_sec > 0.0:
                         await asyncio.sleep(cfg.retry_backoff_sec)
                     continue
-                raise failure.exc from None
+                raise _finalize_exhausted_failure(failure) from None
 
 
 _STATELESS_INSTRUCTION = (
@@ -2133,8 +2256,11 @@ __all__ = [
     "CREATIVE_RESPONSE_SCHEMA",
     "GenerationRequest",
     "KernelLLMBackend",
+    "LLMGenerationError",
+    "LLMTimeoutError",
     "MockLLMBackend",
     "OpenAICompatHTTPBackend",
+    "ProseRefusalError",
     "RE_503_CAPACITY",
     "RE_STREAM_IDLE_LOG",
     "RoleRoutingConfig",

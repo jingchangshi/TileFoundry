@@ -12,11 +12,23 @@ from tilefoundry_ascend.ascend.target.dialect_surface import CCE_CPP20_SURFACE
 
 _SEARCH_REPLACE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"<<<<<<<\s*SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>>\s*REPLACE",
+        r"<<<<<<<\s*SEARCH(?:\s*\[L?\d+\s*-\s*L?\d+\])?\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>>\s*REPLACE",
         re.DOTALL,
     ),
     re.compile(
-        r"<<<\s*SEARCH\s*\n(.*?)\n===\s*\n(.*?)\n>>>\s*REPLACE",
+        r"<<<\s*SEARCH(?:\s*\[L?\d+\s*-\s*L?\d+\])?\s*\n(.*?)\n===\s*\n(.*?)\n>>>\s*REPLACE",
+        re.DOTALL,
+    ),
+)
+_SEARCH_REPLACE_WINDOW_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"<<<<<<<\s*SEARCH(?:\s*\[L?(?P<start>\d+)\s*-\s*L?(?P<end>\d+)\])?\s*\n"
+        r"(?P<search>.*?)\n=======\s*\n(?P<replace>.*?)\n>>>>>>>\s*REPLACE",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"<<<\s*SEARCH(?:\s*\[L?(?P<start>\d+)\s*-\s*L?(?P<end>\d+)\])?\s*\n"
+        r"(?P<search>.*?)\n===\s*\n(?P<replace>.*?)\n>>>\s*REPLACE",
         re.DOTALL,
     ),
 )
@@ -32,7 +44,9 @@ _CALL_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}()]*>)?\s*\("
 _TEMPLATE_CALL_ARGS_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*<([^;{}()]+)>\s*\(")
 _IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
 _C_CONTROL_KEYWORDS = frozenset({"if", "for", "while", "switch", "return", "sizeof", "alignof"})
-_SIBLING_MARKER_RE = re.compile(r"/\*\s*\[READ-ONLY SIBLING KERNEL:")
+_SIBLING_MARKER_RE = re.compile(
+    r"(?:/\*\s*\[READ-ONLY SIBLING KERNEL:|//\s*\[READONLY_SIBLING_DECLARATION\])"
+)
 _LAUNCH_CONFIG_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}]*>)?\s*<<<")
 _MARKDOWN_FENCE_LINE_RE = re.compile(r"^\s*```[A-Za-z0-9_+.-]*\s*$")
 _DEVICE_QUALIFIER_RE = re.compile(
@@ -46,6 +60,43 @@ _DIAG_WORD_LINE_RE = re.compile(r"\bline\s+(\d+)\b")
 
 class PatchAnchorMissError(ValueError):
     """Raised when a Track-B C++ patch fails to match or produces zero effective change."""
+
+    fault_plane: str = "SYNTAX_AST"
+    fault_code: str = "PATCH_ANCHOR_MISS"
+
+
+class AmbiguousPatchAnchorError(PatchAnchorMissError):
+    """Raised when a SEARCH hunk matches multiple spans without unique window resolution."""
+
+    fault_plane: str = "SYNTAX_AST"
+    fault_code: str = "PATCH_AMBIGUOUS_ANCHOR"
+
+
+class NoopIdenticalPatchError(PatchAnchorMissError):
+    """Raised when an applied Track-B patch produces normalized-identical C++ source."""
+
+    fault_plane: str = "NOOP_IDENTICAL"
+    fault_code: str = "NOOP_IDENTICAL"
+
+
+TRACKB_REPLY_CONTRACT_PROMPT = (
+    "### TRACK-B REPLY CONTRACT\n"
+    "- Prefer Mode A (complete bare C++20 definition of the active target kernel or exclusive "
+    "helper, keeping exact symbol name and signature) or Mode B (line-window anchored "
+    "`<<<<<<< SEARCH [Lstart-Lend]` / `=======` / `>>>>>>> REPLACE` hunks using `[L0001]` line "
+    "numbers from the active closure view).\n"
+    "- Never edit or echo `// [READONLY_SIBLING_DECLARATION]` or `/* [READ-ONLY HELPER] */` lines."
+)
+
+
+def format_trackb_reply_contract(active_kernel: str | None = None) -> str:
+    """Render Track-B patch instructions preferring Mode A symbol defs or Mode B [Lstart-Lend]."""
+    if active_kernel:
+        return (
+            f"{TRACKB_REPLY_CONTRACT_PROMPT}\n"
+            f"- Active editable kernel scope: `{active_kernel}` and its exclusive helpers."
+        )
+    return TRACKB_REPLY_CONTRACT_PROMPT
 
 
 def extract_cpp_diagnostic_lines(diagnostic_text: str) -> tuple[int, ...]:
@@ -485,209 +536,144 @@ def resolve_instantiated_trackb_kernel(
     return None
 
 
-def _merge_line_spans(spans: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
-    ordered = sorted((s, e) for s, e in spans if s < e)
-    if not ordered:
-        return []
-    merged: list[tuple[int, int]] = [ordered[0]]
-    for start, end in ordered[1:]:
-        prev_start, prev_end = merged[-1]
-        if start <= prev_end:
-            merged[-1] = (prev_start, max(prev_end, end))
-        else:
-            merged.append((start, end))
-    return merged
+def _extract_directive_lines(
+    cpp_source: str,
+    units: Sequence[_CppUnit],
+) -> list[tuple[int, str]]:
+    """Return 1-indexed preprocessor directive lines outside parsed C++ units."""
+    unit_ranges = [(u.start_line, u.end_line) for u in units]
+    directives: list[tuple[int, str]] = []
+    for lineno, raw_line in enumerate(cpp_source.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped.startswith("#"):
+            continue
+        if any(start <= lineno <= end for start, end in unit_ranges):
+            continue
+        directives.append((lineno, raw_line.rstrip("\r\n")))
+    return directives
 
 
-def _render_line_spans(
-    lines: Sequence[str],
-    spans: Sequence[tuple[int, int]],
-    marker: str,
-) -> str:
-    if not spans:
-        return ""
-    chunks: list[str] = []
-    last_idx = len(spans) - 1
-    for idx, (start, end) in enumerate(spans):
-        seg = "".join(lines[start:end])
-        if idx < last_idx:
-            chunks.append(seg.rstrip("\r\n"))
-        else:
-            chunks.append(seg)
-    return marker.join(chunks)
-
-
-def _truncate_kernel_body(
-    kernel_text: str,
-    max_bytes: int,
+def _format_closure_block(
+    lines_with_nums: Sequence[tuple[int, str]],
     *,
-    unit_start_line: int = 1,
-    focus_lines: Sequence[int] = (),
-    focus_window: int = 25,
+    include_line_numbers: bool,
+    out_lines: list[str],
+    line_map: dict[int, int],
+) -> None:
+    """Append a lossless TU block and record output-to-TU line mappings."""
+    for tu_lineno, raw_line in lines_with_nums:
+        rendered = f"[L{tu_lineno:04d}] {raw_line}" if include_line_numbers else raw_line
+        out_lines.append(rendered)
+        line_map[len(out_lines)] = tu_lineno
+
+
+def render_active_symbol_closure_with_line_map(
+    cpp_source: str,
+    active_kernel: str,
+    *,
+    include_line_numbers: bool = True,
+) -> tuple[str, dict[int, int]]:
+    """Render 100% lossless active closure with line numbers and single-line sibling decls."""
+    clean_cpp = strip_markdown_fence_lines(cpp_source)
+    _, units = _split_cpp_units(clean_cpp)
+    kernels = [u for u in units if u.kind == "kernel"]
+    helpers = [u for u in units if u.kind == "helper"]
+
+    target_unit = next((u for u in kernels if u.name == active_kernel), None)
+    if target_unit is None:
+        target_unit = next((u for u in units if u.name == active_kernel), None)
+    if target_unit is None:
+        raise ValueError(f"Active kernel {active_kernel!r} not found in C++ source")
+
+    helpers_by_name = {h.name: h for h in helpers if h.name}
+    reached_names = _helper_call_closure(target_unit, helpers_by_name)
+    directives = _extract_directive_lines(clean_cpp, units)
+
+    entries: list[tuple[int, str, object]] = []
+    for d_lineno, d_text in directives:
+        entries.append((d_lineno, "directive", (d_lineno, d_text)))
+    for unit in units:
+        if unit.kind == "global_decl":
+            entries.append((unit.start_line, "unit", unit))
+        elif unit.kind == "helper":
+            if unit.start_char == target_unit.start_char or (
+                unit.name and unit.name in reached_names
+            ):
+                entries.append((unit.start_line, "unit", unit))
+            else:
+                entries.append((unit.start_line, "ro_helper", unit))
+        elif unit.kind == "kernel":
+            if unit.start_char == target_unit.start_char:
+                entries.append((unit.start_line, "unit", unit))
+            else:
+                entries.append((unit.start_line, "ro_sibling", unit))
+
+    entries.sort(key=lambda item: item[0])
+
+    out_lines: list[str] = []
+    line_map: dict[int, int] = {}
+    prev_kind = ""
+    for _, kind, payload in entries:
+        if kind == "directive":
+            if out_lines and prev_kind != "directive":
+                out_lines.append("")
+            d_pair = payload
+            assert isinstance(d_pair, tuple)
+            _format_closure_block(
+                [d_pair],
+                include_line_numbers=include_line_numbers,
+                out_lines=out_lines,
+                line_map=line_map,
+            )
+        elif kind == "unit":
+            unit = payload
+            assert isinstance(unit, _CppUnit)
+            if out_lines:
+                out_lines.append("")
+            unit_lines = [
+                (unit.start_line + idx, raw_ln)
+                for idx, raw_ln in enumerate(unit.text.rstrip("\r\n").splitlines())
+            ]
+            _format_closure_block(
+                unit_lines,
+                include_line_numbers=include_line_numbers,
+                out_lines=out_lines,
+                line_map=line_map,
+            )
+        elif kind == "ro_helper":
+            unit = payload
+            assert isinstance(unit, _CppUnit)
+            sig = unit.signature.rstrip(";").strip()
+            if sig:
+                if out_lines and prev_kind != "ro_helper":
+                    out_lines.append("")
+                out_lines.append(f"/* [READ-ONLY HELPER] */ {sig};")
+        elif kind == "ro_sibling":
+            unit = payload
+            assert isinstance(unit, _CppUnit)
+            sig = unit.signature.rstrip(";").strip()
+            decl = f"{sig};" if sig else f"void {unit.name}();"
+            if out_lines and prev_kind != "ro_sibling":
+                out_lines.append("")
+            out_lines.append(f"// [READONLY_SIBLING_DECLARATION] {decl}")
+        prev_kind = kind
+
+    return "\n".join(out_lines).strip(), line_map
+
+
+def render_active_symbol_closure_view(
+    cpp_source: str,
+    active_kernel: str,
+    *,
+    include_line_numbers: bool = True,
 ) -> str:
-    """Truncate a C++ body to *max_bytes* while optionally preserving focused line windows."""
-    if len(kernel_text.encode("utf-8")) <= max_bytes:
-        return kernel_text
-    lines = kernel_text.splitlines(keepends=True)
-    if len(lines) <= 20:
-        encoded = kernel_text.encode("utf-8")[: max(128, max_bytes - 48)]
-        return encoded.decode("utf-8", errors="ignore").rstrip() + "\n}"
-    middle_marker = (
-        "\n    /* [MIDDLE BODY OMITTED TO FIT SCOPED VIEW; PATCH VISIBLE LINES] */\n"
+    """Render 100% lossless active closure with optional [L0001] line-number anchors."""
+    view_text, _ = render_active_symbol_closure_with_line_map(
+        cpp_source,
+        active_kernel,
+        include_line_numbers=include_line_numbers,
     )
-    budget = max(256, max_bytes - len(middle_marker.encode("utf-8")))
-    head_budget = budget // 2
-    tail_budget = budget - head_budget
-
-    head_lines: list[str] = []
-    used = 0
-    for ln in lines:
-        b = len(ln.encode("utf-8"))
-        if used + b > head_budget and head_lines:
-            break
-        head_lines.append(ln)
-        used += b
-
-    tail_lines: list[str] = []
-    used_tail = 0
-    for ln in reversed(lines[len(head_lines) :]):
-        b = len(ln.encode("utf-8"))
-        if used_tail + b > tail_budget and tail_lines:
-            break
-        tail_lines.append(ln)
-        used_tail += b
-    tail_lines.reverse()
-
-    rel_indices = sorted(
-        {
-            int(ln) - int(unit_start_line)
-            for ln in focus_lines
-            if 0 <= int(ln) - int(unit_start_line) < len(lines)
-        }
-    )
-    omitted_start = len(head_lines)
-    omitted_end = len(lines) - len(tail_lines)
-    if not any(omitted_start <= rel < omitted_end for rel in rel_indices):
-        return "".join(head_lines).rstrip() + middle_marker + "".join(tail_lines).lstrip("\n")
-
-    focus_marker = "\n    /* [LINES OMITTED OUTSIDE FOCUS WINDOW; PATCH VISIBLE LINES] */\n"
-    total_lines = len(lines)
-    line_bytes = [len(ln.encode("utf-8")) for ln in lines]
-    win = max(0, int(focus_window))
-
-    def _pick_head(budget_limit: int, min_lines: int) -> int:
-        end = 0
-        acc = 0
-        while end < total_lines:
-            nb = acc + line_bytes[end]
-            if end >= min_lines and nb > budget_limit:
-                break
-            if end > 0 and nb > int(max_bytes * 0.35):
-                break
-            acc = nb
-            end += 1
-        return max(1, end)
-
-    def _pick_tail(budget_limit: int, min_lines: int, floor_idx: int) -> int:
-        start = total_lines
-        acc = 0
-        while start > floor_idx:
-            nb = acc + line_bytes[start - 1]
-            if (total_lines - start) >= min_lines and nb > budget_limit:
-                break
-            if start < total_lines and nb > int(max_bytes * 0.25):
-                break
-            acc = nb
-            start -= 1
-        return min(total_lines - 1, start) if total_lines > floor_idx else floor_idx
-
-    min_head = min(6, total_lines)
-    head_end = _pick_head(int(max_bytes * 0.20), min_head)
-    min_tail = min(4, max(0, total_lines - head_end))
-    tail_start = _pick_tail(int(max_bytes * 0.15), min_tail, head_end)
-
-    full_spans = _merge_line_spans(
-        [
-            (0, head_end),
-            *((max(0, rel - win), min(total_lines, rel + win + 1)) for rel in rel_indices),
-            (tail_start, total_lines),
-        ]
-    )
-    rendered = _render_line_spans(lines, full_spans, focus_marker)
-    if len(rendered.encode("utf-8")) <= max_bytes:
-        return rendered
-
-    head_end = min(head_end, min_head)
-    tail_start = max(tail_start, total_lines - min(4, max(0, total_lines - head_end)))
-    trimmed_spans = _merge_line_spans(
-        [
-            (0, head_end),
-            *((max(0, rel - win), min(total_lines, rel + win + 1)) for rel in rel_indices),
-            (tail_start, total_lines),
-        ]
-    )
-    rendered = _render_line_spans(lines, trimmed_spans, focus_marker)
-    if len(rendered.encode("utf-8")) <= max_bytes:
-        return rendered
-
-    best_rendered = ""
-    for r in range(win, -1, -1):
-        cand_spans = _merge_line_spans(
-            [
-                (0, head_end),
-                *((max(0, rel - r), min(total_lines, rel + r + 1)) for rel in rel_indices),
-                (tail_start, total_lines),
-            ]
-        )
-        cand = _render_line_spans(lines, cand_spans, focus_marker)
-        if len(cand.encode("utf-8")) <= max_bytes:
-            return cand
-        if r == 0:
-            best_rendered = cand
-
-    for h_lim, t_lim in ((2, 2), (1, 1)):
-        cand_spans = _merge_line_spans(
-            [
-                (0, min(h_lim, total_lines)),
-                *((rel, rel + 1) for rel in rel_indices),
-                (max(total_lines - t_lim, min(h_lim, total_lines)), total_lines),
-            ]
-        )
-        cand = _render_line_spans(lines, cand_spans, focus_marker)
-        if len(cand.encode("utf-8")) <= max_bytes:
-            return cand
-        best_rendered = cand
-
-    encoded = best_rendered.encode("utf-8")[: max(128, max_bytes - 48)]
-    return encoded.decode("utf-8", errors="ignore").rstrip() + "\n}"
-
-
-def _joined_utf8_bytes(parts: Sequence[str]) -> int:
-    text = "\n\n".join(p for p in parts if p).strip()
-    return len(text.encode("utf-8")) if text else 0
-
-
-def _pick_summary_budget_tier(
-    base_parts: Sequence[str],
-    core_parts: Sequence[str],
-    sibling_tiers: Sequence[str],
-    helper_tiers: Sequence[str],
-    max_bytes: int,
-) -> tuple[str, str]:
-    """Select the richest sibling/helper summary tier that fits *core_parts* within *max_bytes*."""
-    sib_full, sib_compact, sib_folded = sibling_tiers
-    hlp_full, hlp_folded = helper_tiers
-    candidates = (
-        (sib_full, hlp_full),
-        (sib_full, hlp_folded),
-        (sib_compact, hlp_folded),
-        (sib_folded, ""),
-        ("", ""),
-    )
-    for sib_blk, hlp_blk in candidates:
-        if _joined_utf8_bytes([*base_parts, sib_blk, *core_parts, hlp_blk]) <= max_bytes:
-            return sib_blk, hlp_blk
-    return "", ""
+    return view_text
 
 
 def build_trackb_context_view(
@@ -702,302 +688,110 @@ def build_trackb_context_view(
     focus_lines: Sequence[int] = (),
     focus_window: int = 25,
     diagnostic_text: str = "",
+    include_line_numbers: bool = True,
 ) -> str:
-    """Build a bounded (48 KB default) scoped C++20 context view for Track-B editing."""
-    diag_lines = extract_cpp_diagnostic_lines(diagnostic_text) if diagnostic_text else ()
-    resolved_focus = tuple(
-        sorted({int(ln) for ln in (*focus_lines, *diag_lines) if int(ln) > 0})
-    )
-    directives, units = _split_cpp_units(cpp_source)
+    """Build a lossless active-closure C++20 context view with single-line sibling decls."""
+    _ = (max_bytes, focus_lines, focus_window, diagnostic_text)
+    clean_cpp = strip_markdown_fence_lines(cpp_source)
+    _, units = _split_cpp_units(clean_cpp)
+    kernels = [u for u in units if u.kind == "kernel"]
     target_name = select_active_trackb_kernel(
-        cpp_source,
+        clean_cpp,
         active_kernel=active_kernel,
         regime_tag=regime_tag,
         module_source=module_source,
     )
-    global_decls = [u.text.strip() for u in units if u.kind == "global_decl"]
-    kernels = [u for u in units if u.kind == "kernel"]
-    helpers = [u for u in units if u.kind == "helper"]
-
-    target_unit = next((u for u in kernels if u.name == target_name), None)
-    if target_unit is None and kernels:
-        target_unit = kernels[0]
-        target_name = target_unit.name
+    if target_name is None and kernels:
+        target_name = kernels[0].name
 
     preview = launcher_preview.strip() or extract_trackb_launcher_preview(module_source)
-
-    base_parts: list[str] = []
+    header_parts: list[str] = []
     if trackb_symbol:
-        base_parts.append(f"/* TRACK-B SCOPED SLICE: symbol={trackb_symbol} active={target_name} */")
-    if directives:
-        base_parts.append("\n".join(directives))
-    if global_decls:
-        base_parts.append("\n\n".join(global_decls))
+        header_parts.append(
+            f"/* TRACK-B SCOPED SLICE: symbol={trackb_symbol} active={target_name} */"
+        )
     if preview:
-        base_parts.append(f"/* LAUNCHER BINDING PREVIEW */\n{preview}")
+        header_parts.append(f"/* LAUNCHER BINDING PREVIEW */\n{preview}")
 
-    sibling_kernels = [
-        k for k in kernels if target_unit is None or k.name != target_unit.name
-    ]
-    sibling_full = "\n\n".join(
-        f"/* [READ-ONLY SIBLING KERNEL: {k.name} ({k.line_count} lines; edits forbidden)] */\n"
-        f"{k.signature};"
-        for k in sibling_kernels
-    )
-    sibling_compact = "\n".join(
-        f"/* [READ-ONLY SIBLING KERNEL: {k.name} ({k.line_count} lines; edits forbidden)] */"
-        for k in sibling_kernels
-    )
-    sibling_folded = (
-        f"/* [{len(sibling_kernels)} READ-ONLY SIBLING KERNELS OMITTED] */"
-        if sibling_kernels
-        else ""
-    )
-    sibling_tiers = (sibling_full, sibling_compact, sibling_folded)
-
-    helpers_by_name = {h.name: h for h in helpers if h.name}
-    helper_calls: set[str] = set()
-    if target_unit is not None:
-        helper_calls = _helper_call_closure(target_unit, helpers_by_name)
-    ref_helpers = [h for h in helpers if h.name and h.name in helper_calls]
-    other_helpers = [h for h in helpers if h not in ref_helpers]
-
-    helper_full = "\n\n".join(
-        f"/* [READ-ONLY HELPER] */ {h.signature};" for h in other_helpers if h.signature
-    )
-    helper_folded = (
-        f"/* [{len(other_helpers)} READ-ONLY HELPERS OMITTED] */"
-        if other_helpers
-        else ""
-    )
-    helper_tiers = (helper_full, helper_folded)
-    ref_summaries = [
-        f"/* [HELPER SUMMARY] */ {h.signature};" for h in ref_helpers if h.signature
-    ]
-
-    body_parts: list[tuple[str, _CppUnit | None]] = []
-    chosen_sib = sibling_full
-    chosen_hlp = helper_full
-
-    if target_unit is not None:
-        target_text = target_unit.text.strip()
-        ref_texts = [h.text.strip() for h in ref_helpers if h.text.strip()]
-        all_core = [*ref_texts, target_text]
-        sib_all, hlp_all = _pick_summary_budget_tier(
-            base_parts, all_core, sibling_tiers, helper_tiers, max_bytes
+    if target_name is not None:
+        closure_body = render_active_symbol_closure_view(
+            clean_cpp,
+            target_name,
+            include_line_numbers=include_line_numbers,
         )
-        if _joined_utf8_bytes([*base_parts, sib_all, *all_core, hlp_all]) <= max_bytes:
-            chosen_sib, chosen_hlp = sib_all, hlp_all
-            for p in base_parts:
-                body_parts.append((p, None))
-            if chosen_sib:
-                body_parts.append((chosen_sib, None))
-            for rh in ref_helpers:
-                rh_text = rh.text.strip()
-                if rh_text:
-                    body_parts.append((rh_text, rh))
-            body_parts.append((target_text, target_unit))
-        else:
-            focused_helpers = [
-                h
-                for h in ref_helpers
-                if any(h.start_line <= fl <= h.end_line for fl in resolved_focus)
-            ]
-            unfocused_ref_helpers = [h for h in ref_helpers if h not in focused_helpers]
-            focused_texts = [h.text.strip() for h in focused_helpers if h.text.strip()]
-            unfocused_sum_lines = [
-                f"/* [HELPER SUMMARY] */ {h.signature};"
-                for h in unfocused_ref_helpers
-                if h.signature
-            ]
-            unfocused_sum_text = "\n".join(unfocused_sum_lines)
-            min_core = [
-                *( [unfocused_sum_text] if unfocused_sum_text else [] ),
-                *focused_texts,
-                target_text,
-            ]
-            chosen_sib, chosen_hlp = _pick_summary_budget_tier(
-                base_parts, min_core, sibling_tiers, helper_tiers, max_bytes
-            )
-            if _joined_utf8_bytes([*base_parts, chosen_sib, *min_core, chosen_hlp]) <= max_bytes:
-                for p in base_parts:
-                    body_parts.append((p, None))
-                if chosen_sib:
-                    body_parts.append((chosen_sib, None))
-                kept_unfocused: list[_CppUnit] = []
-                rem_unfocused: list[_CppUnit] = list(unfocused_ref_helpers)
-                for candidate_h in unfocused_ref_helpers:
-                    cand_text = candidate_h.text.strip()
-                    if not cand_text:
-                        rem_unfocused.remove(candidate_h)
-                        continue
-                    trial_kept = [*kept_unfocused, candidate_h]
-                    trial_rem = [h for h in unfocused_ref_helpers if h not in trial_kept]
-                    trial_sum = "\n".join(
-                        f"/* [HELPER SUMMARY] */ {h.signature};"
-                        for h in trial_rem
-                        if h.signature
-                    )
-                    trial_parts = [
-                        *base_parts,
-                        chosen_sib,
-                        *( [trial_sum] if trial_sum else [] ),
-                        *(h.text.strip() for h in trial_kept if h.text.strip()),
-                        *focused_texts,
-                        target_text,
-                        chosen_hlp,
-                    ]
-                    if _joined_utf8_bytes(trial_parts) <= max_bytes:
-                        kept_unfocused = trial_kept
-                        rem_unfocused = trial_rem
-                rem_sum = "\n".join(
-                    f"/* [HELPER SUMMARY] */ {h.signature};"
-                    for h in rem_unfocused
-                    if h.signature
-                )
-                if rem_sum:
-                    body_parts.append((rem_sum, None))
-                for uh in kept_unfocused:
-                    body_parts.append((uh.text.strip(), uh))
-                for fh in focused_helpers:
-                    fh_text = fh.text.strip()
-                    if fh_text:
-                        body_parts.append((fh_text, fh))
-                body_parts.append((target_text, target_unit))
-            else:
-                chosen_sib, chosen_hlp = _pick_summary_budget_tier(
-                    base_parts,
-                    [*( [unfocused_sum_text] if unfocused_sum_text else [] ), *focused_texts],
-                    sibling_tiers,
-                    helper_tiers,
-                    max_bytes,
-                )
-                for p in base_parts:
-                    body_parts.append((p, None))
-                if chosen_sib:
-                    body_parts.append((chosen_sib, None))
-                if unfocused_sum_text:
-                    body_parts.append((unfocused_sum_text, None))
-
-                target_has_focus = any(
-                    target_unit.start_line <= fl <= target_unit.end_line for fl in resolved_focus
-                )
-                if focused_helpers:
-                    fixed_bytes = (
-                        _joined_utf8_bytes([p for p, _ in body_parts if p] + ([chosen_hlp] if chosen_hlp else []))
-                        + 8
-                    )
-                    avail_code = max(512, max_bytes - fixed_bytes)
-                    helper_cap = max(
-                        256,
-                        int(avail_code * (0.45 if target_has_focus else 0.65)),
-                    )
-                    raw_focused = [h.text.strip() for h in focused_helpers if h.text.strip()]
-                    raw_focused_bytes = sum(len(t.encode("utf-8")) for t in raw_focused)
-                    if raw_focused_bytes + 4 * len(raw_focused) <= helper_cap:
-                        for fh in focused_helpers:
-                            fh_text = fh.text.strip()
-                            if fh_text:
-                                body_parts.append((fh_text, fh))
-                    else:
-                        per_helper_budget = max(
-                            256,
-                            (helper_cap - 4 * len(focused_helpers)) // len(focused_helpers),
-                        )
-                        for fh in focused_helpers:
-                            fh_text = fh.text.strip()
-                            if not fh_text:
-                                continue
-                            body_parts.append(
-                                (
-                                    _truncate_kernel_body(
-                                        fh_text,
-                                        per_helper_budget,
-                                        unit_start_line=fh.start_line,
-                                        focus_lines=resolved_focus,
-                                        focus_window=focus_window,
-                                    ),
-                                    fh,
-                                )
-                            )
-
-                used_parts = [p for p, _ in body_parts if p]
-                if chosen_hlp:
-                    used_parts.append(chosen_hlp)
-                used_now = _joined_utf8_bytes(used_parts) + 2
-                remaining = max(256, max_bytes - used_now)
-                body_parts.append(
-                    (
-                        _truncate_kernel_body(
-                            target_text,
-                            remaining,
-                            unit_start_line=target_unit.start_line,
-                            focus_lines=resolved_focus,
-                            focus_window=focus_window,
-                        ),
-                        target_unit,
-                    )
-                )
     else:
-        for p in base_parts:
-            body_parts.append((p, None))
-        if sibling_full:
-            body_parts.append((sibling_full, None))
-        if ref_helpers:
-            body_parts.append(("\n".join(ref_summaries), None))
+        directives = _extract_directive_lines(clean_cpp, units)
+        out_lines: list[str] = []
+        line_map: dict[int, int] = {}
+        if directives:
+            _format_closure_block(
+                directives,
+                include_line_numbers=include_line_numbers,
+                out_lines=out_lines,
+                line_map=line_map,
+            )
+        for unit in units:
+            if out_lines:
+                out_lines.append("")
+            unit_lines = [
+                (unit.start_line + idx, raw_ln)
+                for idx, raw_ln in enumerate(unit.text.rstrip("\r\n").splitlines())
+            ]
+            _format_closure_block(
+                unit_lines,
+                include_line_numbers=include_line_numbers,
+                out_lines=out_lines,
+                line_map=line_map,
+            )
+        closure_body = "\n".join(out_lines).strip()
 
-    if chosen_hlp:
-        body_parts.append((chosen_hlp, None))
+    all_parts = [p for p in (*header_parts, closure_body) if p]
+    return "\n\n".join(all_parts).strip()
 
-    non_empty_parts = [(p, unit) for p, unit in body_parts if p]
-    result = "\n\n".join(p for p, _ in non_empty_parts).strip()
-    if len(result.encode("utf-8")) > max_bytes:
-        remapped_focus: list[int] = []
-        if resolved_focus:
-            cpp_lines = cpp_source.splitlines()
-            cur_line = 1
-            for part_idx, (part_text, unit) in enumerate(non_empty_parts):
-                p_text = part_text.strip() if part_idx in (0, len(non_empty_parts) - 1) else part_text
-                p_lines = p_text.splitlines()
-                if unit is not None:
-                    for fl in resolved_focus:
-                        if not (unit.start_line <= fl <= unit.end_line) or not (1 <= fl <= len(cpp_lines)):
-                            continue
-                        orig_line = cpp_lines[fl - 1].rstrip()
-                        raw_rel = fl - unit.start_line
-                        if 0 <= raw_rel < len(p_lines) and p_lines[raw_rel].rstrip() == orig_line:
-                            remapped_focus.append(cur_line + raw_rel)
-                            continue
-                        matches = [
-                            idx
-                            for idx, pln in enumerate(p_lines)
-                            if pln.rstrip() == orig_line
-                        ]
-                        if matches:
-                            best_idx = min(matches, key=lambda idx: abs(idx - raw_rel))
-                            remapped_focus.append(cur_line + best_idx)
-                cur_line += len(p_lines) + 1
-        result = _truncate_kernel_body(
-            result,
-            max_bytes,
-            unit_start_line=1,
-            focus_lines=tuple(sorted(set(remapped_focus))),
-            focus_window=focus_window,
-        )
-    return result
+
+extract_scoped_trackb_kernel_view = build_trackb_context_view
+
+
+@dataclass(frozen=True)
+class _SearchReplaceHunk:
+    """Parsed SEARCH/REPLACE patch hunk with optional [Lstart-Lend] line window."""
+
+    search_block: str
+    replace_block: str
+    line_window: tuple[int, int] | None = None
+
+
+def _parse_scoped_search_replace_hunks(patch_text: str) -> list[_SearchReplaceHunk]:
+    """Parse SEARCH/REPLACE hunks including optional [Lstart-Lend] anchor windows."""
+    cleaned_patch = strip_markdown_fence_lines(patch_text)
+    for pat in _SEARCH_REPLACE_WINDOW_PATTERNS:
+        hunks: list[_SearchReplaceHunk] = []
+        for m in pat.finditer(cleaned_patch):
+            start_raw = m.group("start")
+            end_raw = m.group("end")
+            window: tuple[int, int] | None = None
+            if start_raw is not None and end_raw is not None:
+                a = int(start_raw)
+                b = int(end_raw)
+                window = (min(a, b), max(a, b))
+            hunks.append(
+                _SearchReplaceHunk(
+                    search_block=strip_markdown_fence_lines(m.group("search")),
+                    replace_block=strip_markdown_fence_lines(m.group("replace")),
+                    line_window=window,
+                )
+            )
+        if hunks:
+            return hunks
+    return []
 
 
 def parse_scoped_search_replace_blocks(patch_text: str) -> list[tuple[str, str]]:
     """Parse SEARCH/REPLACE patch hunks from scoped Track-B candidate output."""
-    cleaned_patch = strip_markdown_fence_lines(patch_text)
-    for pat in _SEARCH_REPLACE_PATTERNS:
-        matches = [
-            (strip_markdown_fence_lines(m.group(1)), strip_markdown_fence_lines(m.group(2)))
-            for m in pat.finditer(cleaned_patch)
-        ]
-        if matches:
-            return matches
-    return []
+    return [
+        (h.search_block, h.replace_block)
+        for h in _parse_scoped_search_replace_hunks(patch_text)
+    ]
 
 
 def _reject_introduced_forbidden_tokens(search_block: str, replace_block: str) -> None:
@@ -1123,6 +917,82 @@ def _scoped_editable_units(
     return sorted(editable, key=lambda u: u.start_char)
 
 
+def _find_all_substring_spans(text: str, needle: str) -> list[tuple[int, int]]:
+    """Return all non-overlapping (start_char, end_char) spans of *needle* in *text*."""
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    step = max(1, len(needle))
+    while True:
+        idx = text.find(needle, pos)
+        if idx < 0:
+            break
+        spans.append((idx, idx + len(needle)))
+        pos = idx + step
+    return spans
+
+
+def _char_span_to_line_span(text: str, start_char: int, end_char: int) -> tuple[int, int]:
+    """Convert a character range into an inclusive 1-indexed (start_line, end_line) span."""
+    start_line = text.count("\n", 0, start_char) + 1
+    adj_end = end_char - 1 if end_char > start_char and text[end_char - 1] == "\n" else end_char
+    end_line = text.count("\n", 0, max(start_char, adj_end)) + 1
+    return start_line, end_line
+
+
+def _disambiguate_matches_by_line_window(
+    text: str,
+    spans: Sequence[tuple[int, int]],
+    line_window: tuple[int, int] | None,
+) -> int:
+    """Select the unique match matching *line_window*, else raise AmbiguousPatchAnchorError."""
+    line_spans = [_char_span_to_line_span(text, s, e) for s, e in spans]
+    if line_window is not None:
+        w_start, w_end = line_window
+        win_center = (w_start + w_end) / 2.0
+        qualifying: list[tuple[int, float]] = []
+        for idx, (ma, mb) in enumerate(line_spans):
+            ov_start = max(ma, w_start)
+            ov_end = min(mb, w_end)
+            overlap_lines = max(0, ov_end - ov_start + 1)
+            match_lines = max(1, mb - ma + 1)
+            if (overlap_lines / match_lines) >= 0.5:
+                dist = abs(((ma + mb) / 2.0) - win_center)
+                qualifying.append((idx, dist))
+        if qualifying:
+            min_dist = min(dist for _, dist in qualifying)
+            best = [idx for idx, dist in qualifying if dist == min_dist]
+            if len(best) == 1:
+                return best[0]
+    formatted = ", ".join(f"[L{la}-L{lb}]" for la, lb in line_spans)
+    raise AmbiguousPatchAnchorError(
+        f"Ambiguous SEARCH block matched {len(spans)} locations at {formatted}; "
+        "provide [Lstart-Lend] or more context"
+    )
+
+
+def _is_normalized_identical(a: str, b: str) -> bool:
+    """Return True when *a* and *b* are identical after whitespace normalization."""
+    if a.strip() == b.strip():
+        return True
+    return " ".join(a.split()) == " ".join(b.split())
+
+
+def _is_bare_cpp_symbol_patch(patch_text: str) -> bool:
+    """Return True when *patch_text* is a bare Mode-A C++ kernel/helper definition."""
+    if "<<<<<<< SEARCH" in patch_text or "<<< SEARCH" in patch_text:
+        return False
+    clean_patch = strip_markdown_fence_lines(patch_text)
+    if _find_python_cpp_literal_spans(clean_patch, require_cpp_tokens=False):
+        return False
+    _, units = _split_cpp_units(clean_patch)
+    return any(
+        u.kind in ("kernel", "helper")
+        and bool(u.name)
+        and bool(_DEVICE_QUALIFIER_RE.search(u.signature))
+        for u in units
+    )
+
+
 def apply_scoped_trackb_patch(
     cpp_source: str,
     patch_text: str,
@@ -1130,25 +1000,32 @@ def apply_scoped_trackb_patch(
     active_kernel: str | None = None,
     allow_exclusive_helpers: bool = True,
 ) -> tuple[str, int]:
-    """Apply scoped SEARCH/REPLACE hunks to *cpp_source*, forbidding read-only sibling edits.
+    """Apply Mode-A symbol replacement or Mode-B SEARCH/REPLACE hunks to *cpp_source*.
 
-    With *active_kernel* set, hunks must match the active kernel body or a helper
-    reachable only from that kernel; helpers shared with sibling kernels stay
-    read-only. When the exact substring lookup misses, a unique match ignoring
-    line-tail whitespace and common indentation is accepted.
+    With *active_kernel* set, edits must stay within the active kernel and its
+    exclusive helpers. Ambiguous SEARCH hunks require a `[Lstart-Lend]` window
+    and raise AmbiguousPatchAnchorError listing every `[La-Lb]` span otherwise.
     """
     if _SIBLING_MARKER_RE.search(patch_text):
         raise ValueError("Patch attempted to copy or edit a read-only sibling kernel marker")
 
-    hunks = parse_scoped_search_replace_blocks(patch_text)
+    hunks = _parse_scoped_search_replace_hunks(patch_text)
     if not hunks:
+        if _is_bare_cpp_symbol_patch(patch_text):
+            return splice_cpp_units_into_tu(
+                cpp_source,
+                patch_text,
+                active_kernel=active_kernel,
+            )
         raise PatchAnchorMissError(
             "patch_text must contain at least one valid SEARCH/REPLACE block"
         )
 
     updated = cpp_source
     applied = 0
-    for search_block, replace_block in hunks:
+    for hunk in hunks:
+        search_block = hunk.search_block
+        replace_block = hunk.replace_block
         if not search_block.strip():
             raise PatchAnchorMissError("Empty SEARCH block is forbidden")
         _reject_introduced_forbidden_tokens(search_block, replace_block)
@@ -1166,17 +1043,20 @@ def apply_scoped_trackb_patch(
         def _in_scope(start_char: int, end_char: int) -> bool:
             return any(start_char >= start and end_char <= end for start, end in scope)
 
-        match_count = updated.count(search_block)
-        if match_count == 0:
+        exact_spans = _find_all_substring_spans(updated, search_block)
+        if not exact_spans:
             fallback = _normalized_line_matches(updated, search_block)
             if not fallback:
                 raise PatchAnchorMissError("SEARCH block did not match target C++ source")
             if len(fallback) > 1:
-                raise ValueError(
-                    f"Ambiguous SEARCH block matched {len(fallback)} locations; "
-                    "provide more context"
+                picked_idx = _disambiguate_matches_by_line_window(
+                    updated,
+                    [(s, e) for s, e, _ in fallback],
+                    hunk.line_window,
                 )
-            match_start, match_end, window_indent = fallback[0]
+            else:
+                picked_idx = 0
+            match_start, match_end, window_indent = fallback[picked_idx]
             if not _in_scope(match_start, match_end):
                 raise ValueError(
                     f"Scoped patch targets read-only code outside active kernel {active_kernel!r}"
@@ -1188,12 +1068,15 @@ def apply_scoped_trackb_patch(
             applied += 1
             continue
 
-        if match_count > 1:
-            raise ValueError(
-                f"Ambiguous SEARCH block matched {match_count} locations; provide more context"
+        if len(exact_spans) > 1:
+            picked_idx = _disambiguate_matches_by_line_window(
+                updated,
+                exact_spans,
+                hunk.line_window,
             )
-        match_start = updated.index(search_block)
-        match_end = match_start + len(search_block)
+        else:
+            picked_idx = 0
+        match_start, match_end = exact_spans[picked_idx]
         if not _in_scope(match_start, match_end):
             raise ValueError(
                 f"Scoped patch targets read-only code outside active kernel {active_kernel!r}"
@@ -1202,8 +1085,8 @@ def apply_scoped_trackb_patch(
         updated = updated[:match_start] + replace_block + updated[match_end:]
         applied += 1
 
-    if applied == 0 or updated.strip() == cpp_source.strip():
-        raise PatchAnchorMissError(
+    if applied == 0 or _is_normalized_identical(updated, cpp_source):
+        raise NoopIdenticalPatchError(
             "Track-B patch applied zero effective changes to target C++ source"
         )
     return updated, applied
@@ -1289,11 +1172,14 @@ def splice_cpp_units_into_tu(
         helper_blob = "\n\n".join(h.text.strip() for h in new_helpers)
         prefix = "" if (min_start == 0 or updated[min_start - 1] == "\n") else "\n"
         updated = updated[:min_start] + prefix + helper_blob + "\n\n" + updated[min_start:]
-    if updated.strip() == cpp_source.strip():
-        raise PatchAnchorMissError(
+    if _is_normalized_identical(updated, cpp_source):
+        raise NoopIdenticalPatchError(
             "Spliced C++ units are identical to parent Track-B translation unit"
         )
     return updated, len(targets) + len(new_helpers)
+
+
+splice_cpp_units_by_symbol = splice_cpp_units_into_tu
 
 
 def escalate_primfunc_to_trackb_tu(prim_func: object) -> str:
@@ -1323,22 +1209,6 @@ _TRACKB_CPP_QUALIFIERS: tuple[str, ...] = (
     "__aicore__",
     "__simd_vf__",
     "__simt_vf__",
-)
-
-_OMITTED_SPAN_MARKER_RE = re.compile(
-    r"^\s*/\*\s*(?:"
-    r"\.\.\.\s*(?P<count>\d+)\s+lines?\s+omitted\s*\.\.\."
-    r"|\[MIDDLE BODY OMITTED[^\n]*\]"
-    r"|\[LINES OMITTED OUTSIDE FOCUS WINDOW[^\n]*\]"
-    r")\s*\*/\s*$"
-)
-
-_ANY_FOLDING_MARKER_RE = re.compile(
-    r"/\*\s*\.\.\.\s*(?:\d+\s+)?lines?\s+omitted\s*\.\.\.\s*\*/"
-    r"|READ-ONLY SIBLING KERNEL"
-    r"|READ-ONLY HELPER"
-    r"|MIDDLE BODY OMITTED"
-    r"|LINES OMITTED OUTSIDE FOCUS WINDOW"
 )
 
 
@@ -1447,42 +1317,39 @@ def _find_python_cpp_literal_spans(
     return hits
 
 
-def _compact_trackb_repair_source(
-    raw_src: str,
+def _scope_trackb_python_or_cpp(
+    source: str,
     diag: str,
-    max_bytes: int = 14800,
     *,
     parent_source: str = "",
     prologue_line_offset: int = 0,
     focus_lines: Sequence[int] = (),
     active_kernel: str | None = None,
 ) -> str:
-    """Slice oversized Track-B repair source while keeping hybrid Python AST valid."""
-    if len(raw_src.encode("utf-8")) <= max_bytes:
-        return raw_src
+    """Scope Track-B C++ or hybrid Python source using lossless active-symbol closure."""
     diag_focus = extract_cpp_diagnostic_lines(diag)
     merged_focus = tuple(sorted({*diag_focus, *(int(ln) for ln in focus_lines if int(ln) > 0)}))
     try:
-        ast.parse(raw_src)
+        ast.parse(source)
     except SyntaxError:
-        if "__global__" in raw_src or "__aicore__" in raw_src or "__simd_vf__" in raw_src:
+        if any(tok in source for tok in _TRACKB_CPP_QUALIFIERS):
             return build_trackb_context_view(
-                raw_src,
+                source,
                 active_kernel=active_kernel,
-                max_bytes=max_bytes,
                 focus_lines=merged_focus,
                 diagnostic_text=diag,
+                include_line_numbers=False,
             )
-        return raw_src
+        return source
 
-    hits = _find_python_cpp_literal_spans(raw_src, require_cpp_tokens=True)
+    hits = _find_python_cpp_literal_spans(source, require_cpp_tokens=True)
     if not hits:
-        return raw_src
+        return source
 
     prologue_offset = (
         int(prologue_line_offset)
         if prologue_line_offset > 0
-        else _detect_trackb_prologue_line_offset(raw_src, parent_source=parent_source)
+        else _detect_trackb_prologue_line_offset(source, parent_source=parent_source)
     )
     adjusted_focus = (
         tuple(ln - prologue_offset for ln in merged_focus if ln > prologue_offset)
@@ -1490,235 +1357,25 @@ def _compact_trackb_repair_source(
         else merged_focus
     )
     diag_for_view = "" if prologue_offset > 0 else diag
-
-    raw_hit_bytes = [len(raw_src[s:e].encode("utf-8")) for _, _, s, e in hits]
-    non_cpp_outer_bytes = max(0, len(raw_src.encode("utf-8")) - sum(raw_hit_bytes))
-    avail_total = max(0, max_bytes - non_cpp_outer_bytes - 16 * len(hits))
-    for _pass in range(2):
-        per_hit_budget = max(256, avail_total // len(hits))
-        small_used = sum(b for b in raw_hit_bytes if b <= per_hit_budget)
-        large_count = sum(1 for b in raw_hit_bytes if b > per_hit_budget)
-        large_budget = (
-            max(per_hit_budget, (avail_total - small_used) // large_count)
-            if large_count > 0
-            else per_hit_budget
+    replacements: list[tuple[int, int, str]] = []
+    for sym_name, cpp_text, start_pos, end_pos in hits:
+        view = build_trackb_context_view(
+            cpp_text,
+            active_kernel=active_kernel,
+            module_source=source,
+            trackb_symbol=sym_name,
+            focus_lines=adjusted_focus,
+            diagnostic_text=diag_for_view,
+            include_line_numbers=False,
         )
+        wrapped = view if view.startswith("\n") else f"\n{view}\n"
+        replacements.append((start_pos, end_pos, _format_cpp_string_literal(wrapped)))
 
-        replacements: list[tuple[int, int, str]] = []
-        for idx, (sym_name, cpp_text, start_pos, end_pos) in enumerate(hits):
-            cpp_budget = per_hit_budget if raw_hit_bytes[idx] <= per_hit_budget else large_budget
-            view = build_trackb_context_view(
-                cpp_text,
-                active_kernel=active_kernel,
-                module_source=raw_src,
-                trackb_symbol=sym_name,
-                max_bytes=cpp_budget,
-                focus_lines=adjusted_focus,
-                diagnostic_text=diag_for_view,
-            )
-            wrapped = view if view.startswith("\n") else f"\n{view}\n"
-            replacements.append((start_pos, end_pos, _format_cpp_string_literal(wrapped)))
-
-        updated = raw_src
-        for start_pos, end_pos, literal in reversed(replacements):
-            updated = updated[:start_pos] + literal + updated[end_pos:]
-        ast.parse(updated)
-        actual_bytes = len(updated.encode("utf-8"))
-        if actual_bytes <= max_bytes or avail_total <= 512:
-            return updated
-        avail_total = max(256, avail_total - (actual_bytes - max_bytes) - 32 * len(hits))
+    updated = source
+    for start_pos, end_pos, literal in reversed(replacements):
+        updated = updated[:start_pos] + literal + updated[end_pos:]
+    ast.parse(updated)
     return updated
-
-
-def _match_omitted_anchor_span(
-    orig_lines: Sequence[str],
-    pre_anchor: Sequence[str],
-    post_anchor: Sequence[str],
-    *,
-    orig_cursor: int,
-    expected_count: int | None,
-    post_reaches_eof: bool,
-) -> tuple[int, int] | None:
-    n_pre = len(pre_anchor)
-    n_post = len(post_anchor)
-    orig_norm = [ln.rstrip() for ln in orig_lines]
-    pre_starts = [
-        idx
-        for idx in range(orig_cursor, len(orig_norm) - n_pre + 1)
-        if orig_norm[idx : idx + n_pre] == list(pre_anchor)
-    ]
-    post_starts = [
-        idx
-        for idx in range(orig_cursor + n_pre + 1, len(orig_norm) - n_post + 1)
-        if orig_norm[idx : idx + n_post] == list(post_anchor)
-    ]
-    pairs: list[tuple[int, int]] = []
-    for pre_i in pre_starts:
-        pre_end = pre_i + n_pre
-        for post_j in post_starts:
-            if pre_end >= post_j:
-                continue
-            if expected_count is not None and (post_j - pre_end) != expected_count:
-                continue
-            pairs.append((pre_end, post_j))
-    if len(pairs) == 1:
-        return pairs[0]
-    if len(pairs) > 1 and post_reaches_eof:
-        eof_pairs = [pair for pair in pairs if pair[1] + n_post == len(orig_norm)]
-        if len(eof_pairs) == 1:
-            return eof_pairs[0]
-    return None
-
-
-def _splice_cpp_omitted_spans(cand_cpp: str, orig_cpp: str) -> tuple[str, bool]:
-    """Restore omitted C++ spans using exact anchor lines from pre-compaction source."""
-    cand_lines = cand_cpp.splitlines()
-    orig_lines = orig_cpp.splitlines()
-    marker_hits: list[tuple[int, int | None]] = []
-    for idx, line in enumerate(cand_lines):
-        m = _OMITTED_SPAN_MARKER_RE.match(line)
-        if m is not None:
-            raw_count = m.group("count")
-            marker_hits.append((idx, int(raw_count) if raw_count is not None else None))
-    if not marker_hits:
-        return cand_cpp, not bool(_ANY_FOLDING_MARKER_RE.search(cand_cpp))
-
-    rebuilt: list[str] = []
-    cand_cursor = 0
-    orig_cursor = 0
-    for k, (m_idx, expected_count) in enumerate(marker_hits):
-        prev_limit = (marker_hits[k - 1][0] + 1) if k > 0 else 0
-        next_limit = marker_hits[k + 1][0] if k + 1 < len(marker_hits) else len(cand_lines)
-
-        b_end = m_idx
-        while b_end > prev_limit and not cand_lines[b_end - 1].strip():
-            b_end -= 1
-        a_start = m_idx + 1
-        while a_start < next_limit and not cand_lines[a_start].strip():
-            a_start += 1
-        if b_end <= prev_limit or a_start >= next_limit:
-            return cand_cpp, False
-
-        avail_pre = b_end - prev_limit
-        avail_post = next_limit - a_start
-        anchor_sizes = sorted(
-            (
-                (np_pre, np_post)
-                for np_pre in range(1, min(4, avail_pre) + 1)
-                for np_post in range(1, min(4, avail_post) + 1)
-            ),
-            key=lambda pair: (pair[0] + pair[1], min(pair[0], pair[1])),
-            reverse=True,
-        )
-        matched_span: tuple[int, int] | None = None
-        for np_pre, np_post in anchor_sizes:
-            pre_anchor = [ln.rstrip() for ln in cand_lines[b_end - np_pre : b_end]]
-            post_anchor = [ln.rstrip() for ln in cand_lines[a_start : a_start + np_post]]
-            if not any(s.strip() for s in pre_anchor) or not any(s.strip() for s in post_anchor):
-                continue
-            post_reaches_eof = (k + 1 == len(marker_hits)) and (
-                a_start + np_post == len(cand_lines)
-            )
-            matched_span = _match_omitted_anchor_span(
-                orig_lines,
-                pre_anchor,
-                post_anchor,
-                orig_cursor=orig_cursor,
-                expected_count=expected_count,
-                post_reaches_eof=post_reaches_eof,
-            )
-            if matched_span is not None:
-                break
-        if matched_span is None:
-            return cand_cpp, False
-
-        orig_pre_end, orig_post_start = matched_span
-        rebuilt.extend(cand_lines[cand_cursor:b_end])
-        rebuilt.extend(orig_lines[orig_pre_end:orig_post_start])
-        cand_cursor = a_start
-        orig_cursor = orig_post_start
-
-    rebuilt.extend(cand_lines[cand_cursor:])
-    restored = "\n".join(rebuilt)
-    if cand_cpp.endswith("\n"):
-        restored += "\n"
-    if _ANY_FOLDING_MARKER_RE.search(restored):
-        return cand_cpp, False
-    return restored, True
-
-
-def _collect_orig_cpp_map(sources: Sequence[str]) -> tuple[dict[str, str], list[str]]:
-    by_sym: dict[str, str] = {}
-    bare_list: list[str] = []
-    for src in sources:
-        if not src or not src.strip():
-            continue
-        hits = _find_python_cpp_literal_spans(src, require_cpp_tokens=False)
-        if hits:
-            for sym_name, cpp_text, _, _ in hits:
-                if sym_name not in by_sym:
-                    by_sym[sym_name] = cpp_text
-                bare_list.append(cpp_text)
-        else:
-            bare_list.append(src)
-    return by_sym, bare_list
-
-
-def _resplice_trackb_omitted_spans(
-    repaired_src: str,
-    *,
-    pre_compaction_source: str,
-    parent_source: str = "",
-    extra_sources: Sequence[str] = (),
-) -> str:
-    """Splice unchanged omitted C++ spans back into a repair reply when resolvable."""
-    if not repaired_src or parse_scoped_search_replace_blocks(repaired_src):
-        return repaired_src
-    if not _ANY_FOLDING_MARKER_RE.search(repaired_src):
-        return repaired_src
-
-    by_sym, bare_list = _collect_orig_cpp_map(
-        (pre_compaction_source, *extra_sources, parent_source)
-    )
-    if not by_sym and not bare_list:
-        return repaired_src
-
-    rep_hits = _find_python_cpp_literal_spans(repaired_src, require_cpp_tokens=False)
-    if rep_hits:
-        replacements: list[tuple[int, int, str]] = []
-        for sym_name, cpp_text, start_pos, end_pos in rep_hits:
-            if not _ANY_FOLDING_MARKER_RE.search(cpp_text):
-                continue
-            candidates: list[str] = []
-            if sym_name in by_sym:
-                candidates.append(by_sym[sym_name])
-            for raw_cand in bare_list:
-                if raw_cand not in candidates:
-                    candidates.append(raw_cand)
-            spliced_val: str | None = None
-            for orig_cpp in candidates:
-                res, ok = _splice_cpp_omitted_spans(cpp_text, orig_cpp)
-                if ok:
-                    spliced_val = res
-                    break
-            if spliced_val is not None:
-                replacements.append((start_pos, end_pos, _format_cpp_string_literal(spliced_val)))
-        if not replacements:
-            return repaired_src
-        updated = repaired_src
-        for start_pos, end_pos, literal in reversed(replacements):
-            updated = updated[:start_pos] + literal + updated[end_pos:]
-        try:
-            ast.parse(updated)
-        except SyntaxError:
-            return repaired_src
-        return updated
-
-    for orig_cpp in bare_list:
-        res, ok = _splice_cpp_omitted_spans(repaired_src, orig_cpp)
-        if ok:
-            return res
-    return repaired_src
 
 
 def _looks_like_python_primfunc_slice(source: str) -> bool:
@@ -1911,22 +1568,18 @@ def compact_creative_source_slice(
     parent_source: str = "",
     prologue_line_offset: int = 0,
 ) -> str:
-    """Fold oversized creative-exploration parent source into an AST-safe <=14KB focus view."""
+    """Scope Track-B C++ sources losslessly or fold oversized pure-Python parent sources."""
     if len(source.encode("utf-8")) <= max_bytes:
         return source
     if any(tok in source for tok in _TRACKB_CPP_QUALIFIERS):
-        compacted = _compact_trackb_repair_source(
+        return _scope_trackb_python_or_cpp(
             source,
             diagnostic_text,
-            max_bytes=max_bytes,
             parent_source=parent_source,
             prologue_line_offset=prologue_line_offset,
             focus_lines=focus_lines,
             active_kernel=active_kernel,
         )
-        if len(compacted.encode("utf-8")) <= max_bytes:
-            return compacted
-        source = compacted
     return _compact_python_source_slice(
         source,
         max_bytes=max_bytes,
@@ -1936,27 +1589,30 @@ def compact_creative_source_slice(
 
 
 __all__ = [
+    "AmbiguousPatchAnchorError",
     "CREATIVE_SOURCE_MAX_BYTES",
+    "NoopIdenticalPatchError",
     "PatchAnchorMissError",
-    "_ANY_FOLDING_MARKER_RE",
-    "_OMITTED_SPAN_MARKER_RE",
+    "TRACKB_REPLY_CONTRACT_PROMPT",
     "_TRACKB_CPP_QUALIFIERS",
-    "_compact_trackb_repair_source",
     "_detect_trackb_prologue_line_offset",
     "_find_python_cpp_literal_spans",
     "_looks_like_python_primfunc_slice",
-    "_resplice_trackb_omitted_spans",
-    "_splice_cpp_omitted_spans",
     "apply_scoped_trackb_patch",
     "build_trackb_context_view",
     "compact_creative_source_slice",
     "escalate_primfunc_to_trackb_tu",
     "extract_cpp_diagnostic_lines",
     "extract_reachable_trackb_source",
+    "extract_scoped_trackb_kernel_view",
     "extract_trackb_launcher_preview",
+    "format_trackb_reply_contract",
     "parse_scoped_search_replace_blocks",
+    "render_active_symbol_closure_view",
+    "render_active_symbol_closure_with_line_map",
     "resolve_instantiated_trackb_kernel",
     "select_active_trackb_kernel",
+    "splice_cpp_units_by_symbol",
     "splice_cpp_units_into_tu",
     "strip_cpp_comments_and_strings",
     "strip_markdown_fence_lines",
