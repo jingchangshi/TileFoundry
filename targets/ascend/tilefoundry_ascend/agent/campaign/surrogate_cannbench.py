@@ -4470,6 +4470,7 @@ print(json.dumps({{"tasks": tasks, "errors": errors, "cand_errors": cand_errors}
 
 _PREWARM_TL_WORKER_TEMPLATE = """import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -4488,9 +4489,16 @@ kwargs = dict(task["kwargs"])
 compiled_obj = None
 if mode == "_get_kernel":
     fn = getattr(mod, "_get_kernel")
-    kwargs["builder_fn"] = getattr(mod, task["builder_name"])
     if "compile_flags" in kwargs and isinstance(kwargs["compile_flags"], list):
         kwargs["compile_flags"] = tuple(kwargs["compile_flags"])
+    fn_params = inspect.signature(fn).parameters
+    has_varkw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in fn_params.values()
+    )
+    if "builder_fn" in fn_params or has_varkw:
+        kwargs["builder_fn"] = getattr(mod, task["builder_name"])
+    else:
+        kwargs.pop("builder_fn", None)
     compiled_obj = fn(**kwargs)
 elif mode == "_get_combine_kernel":
     fn = getattr(mod, "_get_combine_kernel")
@@ -4630,9 +4638,21 @@ if emit_bins_raw:
         for attr in (
             "kernel_path", "libpath", "lib_path", "so_path",
             "binary_path", "artifact_path", "path", "_name",
+            "_tilelang_cache_path",
         ):
-            _add_bin(getattr(cur, attr, None))
-        ckey = getattr(cur, "cache_key", None)
+            attr_val = getattr(cur, attr, None)
+            _add_bin(attr_val)
+            if attr == "_tilelang_cache_path" and attr_val:
+                try:
+                    tdir = Path(str(attr_val))
+                    if tdir.is_dir():
+                        for cand in sorted(tdir.rglob("*")):
+                            _add_bin(cand)
+                except OSError:
+                    pass
+        ckey = getattr(cur, "cache_key", None) or getattr(
+            cur, "_tilelang_cache_key", None
+        )
         if ckey and tl_cache_res:
             cdir = Path(tl_cache_res)
             kdir = cdir / str(ckey)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -1271,5 +1272,46 @@ def test_anchor_and_prewarm_plans_propagate_entrypoint_and_kernel_defaults(
     assert len(pw_k_plan["tasks"]) == 1
     assert pw_k_plan["tasks"][0]["mode"] == "_get_kernel"
     assert pw_k_plan["tasks"][0]["kwargs"]["schedule_mode"] == "tuned"
+
+
+def test_prewarm_worker_skips_builder_fn_when_get_kernel_omits_param(
+    tmp_path: Path,
+) -> None:
+    cand_no_bfn = tmp_path / "cand_no_bfn.py"
+    cand_no_bfn.write_text(
+        "def _build_op(d_dim, schedule_mode):\n"
+        "    return None\n"
+        "def _get_kernel(d_dim, schedule_mode):\n"
+        "    return {'_tilelang_cache_key': f'{d_dim}_{schedule_mode}'}\n",
+        encoding="utf-8",
+    )
+    emit_path = tmp_path / "emit_bins.json"
+    task_payload = {
+        "mode": "_get_kernel",
+        "mod_path": str(cand_no_bfn),
+        "builder_name": "_build_op",
+        "kwargs": {"d_dim": 8192, "schedule_mode": "tuned"},
+        "emit_cache_bins_path": str(emit_path),
+    }
+    worker_script = tmp_path / "compile_task_no_bfn.py"
+    worker_script.write_text(
+        surrogate_cannbench._PREWARM_TL_WORKER_TEMPLATE.format(
+            task_json=json.dumps(task_payload, sort_keys=True)
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "tilelang.py").write_text("", encoding="utf-8")
+    env = dict(os.environ)
+    prev_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{tmp_path}:{prev_pp}" if prev_pp else str(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, str(worker_script)],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(emit_path.read_text(encoding="utf-8")) == []
 
 
