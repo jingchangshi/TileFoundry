@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -296,7 +297,47 @@ class KernelLLMBackend(Protocol):
         ...
 
 
-_CODE_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+_CODE_FENCE_RE = re.compile(
+    r"```(?:python|cpp|c\+\+|cce|diff)?\s*\n(.*?)```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+_EXECUTABLE_AST_NODES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Assign,
+    ast.AnnAssign,
+    ast.Import,
+    ast.ImportFrom,
+)
+
+_CPP_CODE_MARKERS: tuple[str, ...] = (
+    "__aicore__",
+    "__global__",
+    "__simd_vf__",
+    "__simt_vf__",
+    "__simd_callee__",
+    "__simt_callee__",
+    "#include",
+    "constexpr",
+)
+
+_BROKEN_PYTHON_HEAD_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*\s*\("
+    r"|class\s+[A-Za-z_][A-Za-z0-9_]*\s*[:(]"
+    r"|import\s+[A-Za-z_][A-Za-z0-9_.]*(?:\s*,|\s+as|\s*$)"
+    r"|from\s+[A-Za-z_.][A-Za-z0-9_.]*\s+import\s+"
+    r"|@[A-Za-z_][A-Za-z0-9_.]*(?:\s*\(|\s*$)"
+    r")",
+    re.MULTILINE,
+)
+
+_PROSE_REFUSAL_ERROR = (
+    "llm_prose_refusal_no_code: "
+    "response contains prose without executable DSL or SEARCH/REPLACE hunks"
+)
 
 CREATIVE_RESPONSE_SCHEMA: dict[str, object] = {
     "type": "object",
@@ -310,8 +351,24 @@ CREATIVE_RESPONSE_SCHEMA: dict[str, object] = {
 }
 
 
+def _has_code_or_patch_structure(text: str) -> bool:
+    """Return True if *text* has executable Python, SEARCH/REPLACE hunks, or C++ markers."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if "<<<<<<< SEARCH" in stripped or "<<< SEARCH" in stripped:
+        return True
+    if any(marker in stripped for marker in _CPP_CODE_MARKERS):
+        return True
+    try:
+        tree = ast.parse(stripped)
+    except SyntaxError:
+        return bool(_BROKEN_PYTHON_HEAD_RE.search(stripped))
+    return any(isinstance(node, _EXECUTABLE_AST_NODES) for node in ast.walk(tree))
+
+
 def extract_python_dsl(raw_response: str) -> str:
-    """Extract clean Python DSL source from markdown fences, JSON envelope, or raw text."""
+    """Extract clean DSL or Track-B patch text, rejecting pure natural-language refusals."""
     stripped = raw_response.strip()
     if stripped.startswith("{"):
         try:
@@ -319,17 +376,28 @@ def extract_python_dsl(raw_response: str) -> str:
             if isinstance(payload, dict):
                 if isinstance(payload.get("structured_output"), dict):
                     dsl = payload["structured_output"].get("dsl_source")
-                    if isinstance(dsl, str) and dsl.strip():
-                        return dsl.strip()
-                if isinstance(payload.get("dsl_source"), str) and payload["dsl_source"].strip():
-                    return payload["dsl_source"].strip()
+                    if isinstance(dsl, str):
+                        inner = dsl.strip()
+                        if inner and inner != stripped:
+                            return extract_python_dsl(inner)
+                        raise ValueError(_PROSE_REFUSAL_ERROR)
+                if isinstance(payload.get("dsl_source"), str):
+                    inner = payload["dsl_source"].strip()
+                    if inner and inner != stripped:
+                        return extract_python_dsl(inner)
+                    raise ValueError(_PROSE_REFUSAL_ERROR)
                 if isinstance(payload.get("response"), str) and payload["response"].strip():
                     stripped = payload["response"].strip()
         except json.JSONDecodeError:
             pass
     matches = _CODE_FENCE_RE.findall(stripped)
     if matches:
-        return max(matches, key=len).strip()
+        valid_matches = [m.strip() for m in matches if _has_code_or_patch_structure(m)]
+        if valid_matches:
+            return max(valid_matches, key=len)
+        raise ValueError(_PROSE_REFUSAL_ERROR)
+    if not _has_code_or_patch_structure(stripped):
+        raise ValueError(_PROSE_REFUSAL_ERROR)
     return stripped
 
 
