@@ -240,13 +240,13 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.SimdVF",
             "PIPE_V",
             "exec_mode_and_spr",
-            "T.SimdVF()",
+            "T.SimdVF(latency=...)",
         ),
         PrimitiveEntry(
             "T.SimtVF",
             "PIPE_V",
             "exec_mode_and_spr",
-            "T.SimtVF(threads=128)",
+            "T.SimtVF(threads=128, latency=...)",
         ),
         PrimitiveEntry(
             "T.alloc_shared",
@@ -288,7 +288,15 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.copy",
             "PIPE_MTE2",
             "dma_and_cache_hierarchy",
-            "T.copy(src, dst) | T.copy(src, dst, transpose=True)",
+            (
+                "T.copy(src, dst) | T.copy(src, dst, transpose=True) | "
+                "T.copy(src, dst, transpose=..., pad_value=..., data_select=..., "
+                "l2_cache_ctrl=..., sub_blockid=...)"
+            ),
+            pitfall=(
+                "pad_value and data_select are mutually exclusive on GM->UB; "
+                "sub_blockid must match enclosing sub-core guard."
+            ),
         ),
         PrimitiveEntry(
             "T.dual_copy",
@@ -340,6 +348,36 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "PIPE_V",
             "alg_compute_and_monoid",
             "T.reduce_absmax(src, dst, dim=...)",
+        ),
+        PrimitiveEntry(
+            "T.alloc_reducer",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            'T.alloc_reducer(shape, dtype, op="sum" | "max" | "min")',
+            facets=("alg_compute_and_monoid", "exec_mode_and_spr"),
+            pitfall="Use inside T.SimtVF; keep init and finalize in the same scope.",
+        ),
+        PrimitiveEntry(
+            "T.reducer_init",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.reducer_init(acc, init=None)",
+            facets=("alg_compute_and_monoid", "exec_mode_and_spr"),
+        ),
+        PrimitiveEntry(
+            "T.reducer_update",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.reducer_update(acc[indices], value)",
+            facets=("alg_compute_and_monoid", "exec_mode_and_spr"),
+        ),
+        PrimitiveEntry(
+            "T.finalize_reducer",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.finalize_reducer(acc, dst)",
+            facets=("alg_compute_and_monoid", "exec_mode_and_spr"),
+            pitfall="Read dst after finalization; never finalize in place.",
         ),
         PrimitiveEntry(
             "T.simd.alloc_var",
@@ -541,6 +579,10 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "SCALAR",
             "pipeline_and_sync_graph",
             "T.annotate_buffer_versions({buf: stages})",
+            pitfall=(
+                "4-mode semantics: {buf: 1 | count | (count, mode) | mode} where mode is "
+                "'auto', 'iteration', 'counter', or 'write_counter'."
+            ),
         ),
         PrimitiveEntry(
             "T.annotate_unlimit_memory",
@@ -549,17 +591,45 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.annotate_unlimit_memory(\"shared\")",
         ),
         PrimitiveEntry(
+            "T.Task",
+            "PIPE_SYNC",
+            "pipeline_and_sync_graph",
+            "with T.Task(latency=..., ii=...):",
+            facets=("pipeline_and_sync_graph", "tile_and_stage_knobs"),
+            pitfall="Requires latency >= ii > 0 and single hardware PIPE/core affinity.",
+        ),
+        PrimitiveEntry(
+            "T.PerCoreTask",
+            "PIPE_SYNC",
+            "pipeline_and_sync_graph",
+            "with T.PerCoreTask():",
+            facets=("pipeline_and_sync_graph", "grid_and_workspace_topology"),
+            pitfall="Branches must be mutually exclusive and exhaustive by bx/core ID.",
+        ),
+        PrimitiveEntry(
             "T.Stage",
             "PIPE_SYNC",
             "pipeline_and_sync_graph",
             "with T.Stage(stage_id):",
             facets=("pipeline_and_sync_graph",),
+            pitfall=(
+                "Nonzero stage_id requires enclosing T.Pipelined(..., "
+                "annotations={'enable_offset': True}); never nest inside T.Task, "
+                "T.SimdVF, T.SimtVF, or T.Parallel."
+            ),
         ),
         PrimitiveEntry(
             "T.assume_no_conflict",
             "PIPE_SYNC",
             "sram_layout_and_aliasing",
-            "T.assume_no_conflict(buf)",
+            "T.assume_no_conflict(a, b=None, cross=..., level=..., group=...)",
+            facets=("sram_layout_and_aliasing", "pipeline_and_sync_graph"),
+        ),
+        PrimitiveEntry(
+            "T.assume_conflict",
+            "PIPE_SYNC",
+            "sram_layout_and_aliasing",
+            "T.assume_conflict(a, b=None, cross=..., level=..., group=...)",
             facets=("sram_layout_and_aliasing", "pipeline_and_sync_graph"),
         ),
         PrimitiveEntry(
@@ -658,6 +728,23 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "to a shared GM/workspace buffer must write disjoint `sid`-partitioned slices "
             "(e.g., `sid * half_m : (sid + 1) * half_m`, paired with `T.assume(...)` when needed) "
             "so AIV0 and AIV1 never collide on `PIPE_MTE3`."
+        ),
+        (
+            "Prefer compiler-managed multibuffering (T.Pipelined + T.Stage + "
+            "T.annotate_buffer_versions) and never hand-roll manual multi-buffers in TileLang."
+        ),
+        (
+            "Use T.annotate_buffer_versions({buf: 1 | count | (count, mode) | mode}) with mode in "
+            "('auto', 'iteration', 'counter', 'write_counter'); {buf: 1} opts out while "
+            "(1, 'auto') retains owner-based scheduling."
+        ),
+        (
+            "Never nest `def` inside `@T.prim_func`; lift helpers to outer builder scope and "
+            "pass buffers and scalars explicitly."
+        ),
+        (
+            "T.simd.vld, T.simd.vsts, T.simd.pld, and T.simd.pst do not take `off=`; encode "
+            "displacement in the buffer slice (`buf[offset]`)."
         ),
     ),
 )
@@ -1260,6 +1347,8 @@ def _core_symbols_for(
     topology_axes: "TopologyAxes | None",
     simt_allowed: bool,
     is_subatom: bool,
+    *,
+    unlocked_facets: set[str] | None = None,
 ) -> set[str]:
     engine = topology_axes.compute_engine if topology_axes is not None else "aiv_only"
     ring = topology_axes.memory_ring if topology_axes is not None else ""
@@ -1269,6 +1358,8 @@ def _core_symbols_for(
     )
     if dialect_id in ("tilelang_dsl", "inline_cce_vf"):
         core = {"T.Kernel", "T.Pipelined", "T.serial", "T.copy"}
+        if unlocked_facets is None or "pipeline_and_sync_graph" in unlocked_facets:
+            core.update({"T.Stage", "T.Task", "T.annotate_buffer_versions"})
         if engine == "aic_only":
             core.update({"T.alloc_l1", "T.alloc_l0a", "T.alloc_l0b", "T.alloc_l0c", "T.gemm"})
         elif engine == "coupled_1c2v":
@@ -1373,6 +1464,7 @@ def filter_primitives_on_demand(
         topology_axes,
         simt_allowed,
         is_subatom,
+        unlocked_facets=unlocked,
     )
 
     stage1: list[PrimitiveEntry] = []
@@ -1428,15 +1520,19 @@ def _priority_sort_key(entry: PrimitiveEntry) -> tuple[int, str]:
         return (len(_CRITICAL_SIGNATURE_SYMBOLS), entry.symbol)
 
 
+def _is_safety_prohibition_note(note: str) -> bool:
+    low = note.lower()
+    return any(tok in low for tok in ("do not", "never", "must", "forbid"))
+
+
 def _note_relevant(
     note: str,
     entries: Sequence[PrimitiveEntry],
     has_simt: bool,
     has_cube: bool,
 ) -> bool:
+    _ = entries
     low = note.lower()
-    if "do not emit" in low:
-        return True
     if ("__simt_vf__" in low or "t.simtvf" in low) and not has_simt:
         return False
     if any(tok in low for tok in ("t.gemm", "ascend_gemm_l1", "asc_mmad", "t.mixedkernel")):
@@ -1474,23 +1570,11 @@ def render_layer2_surface(
         for note in surface.prompt_notes
         if _note_relevant(note, entries, has_simt, has_cube)
     ]
-    prioritized_notes = sorted(
-        relevant_notes,
-        key=lambda n: (
-            0
-            if "Do NOT emit" in n
-            else (
-                1
-                if ("__simt_vf__" in n or "T.SimtVF" in n)
-                else (2 if len(n) <= 180 else 3)
-            )
-        ),
-    )
-    must_keep_notes = [n for n in prioritized_notes if "Do NOT emit" in n]
-    optional_notes = [n for n in prioritized_notes if "Do NOT emit" not in n]
-    must_keep_lines = [f"- {n}" for n in must_keep_notes]
+    safety_notes = [n for n in relevant_notes if _is_safety_prohibition_note(n)]
+    other_notes = [n for n in relevant_notes if not _is_safety_prohibition_note(n)]
+    prioritized_notes = [*safety_notes, *other_notes]
 
-    fixed_block = "\n".join([*header_lines, *tail_lines, *must_keep_lines])
+    fixed_block = "\n".join([*header_lines, *tail_lines])
     if len(fixed_block) >= max_chars:
         return fixed_block[:max_chars]
 
@@ -1509,14 +1593,13 @@ def render_layer2_surface(
         key=lambda line: entry_order.get(line.split("`", 2)[1], len(entries))
     )
 
-    notes_budget = min(remaining, 700)
-    selected_note_lines = list(must_keep_lines)
-    for note in optional_notes:
+    selected_note_lines: list[str] = []
+    for note in prioritized_notes:
         line = f"- {note}"
         cost = len(line) + 1
-        if cost <= notes_budget:
+        if cost <= remaining:
             selected_note_lines.append(line)
-            notes_budget -= cost
+            remaining -= cost
 
     rendered = "\n".join(
         [*header_lines, *selected_prim_lines, *tail_lines, *selected_note_lines]
