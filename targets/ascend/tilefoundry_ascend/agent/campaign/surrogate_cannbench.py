@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import errno
 import fcntl
 import hashlib
+import importlib.util
 import inspect
 import json
 import logging
@@ -314,20 +316,37 @@ class CandidateSurrogateResult:
 
 
 class L2BatchResults(dict[str, CandidateSurrogateResult]):
-    """L2 candidate results that also carry the AgentGates run id of their measuring execution.
+    """L2 candidate results carrying AgentGates run ids and prewarm/NPU telemetry.
 
     The mapping protocol is unchanged so legacy evaluators can keep returning plain
-    dictionaries; ``run_ids`` maps each candidate that was actually measured to the
-    AgentGates run that produced its L2 result.
+    dictionaries; ``run_ids`` maps each measured candidate to its AgentGates run id,
+    and ``prewarm_stats``, ``l2_prewarm_sec``, ``l2_npu_sec`` capture L2 timing.
     """
 
     def __init__(
         self,
         results: Mapping[str, CandidateSurrogateResult],
         run_ids: Mapping[str, str],
+        *,
+        prewarm_stats: Mapping[str, int] | None = None,
+        l2_prewarm_sec: float = 0.0,
+        l2_npu_sec: float = 0.0,
     ) -> None:
         super().__init__(results)
         self.run_ids: dict[str, str] = dict(run_ids)
+        stats: dict[str, int] = {
+            "total_tasks": 0,
+            "cache_hits": 0,
+            "compiled_tasks": 0,
+            "failed_candidates": 0,
+        }
+        if prewarm_stats is not None:
+            for key in stats:
+                if key in prewarm_stats:
+                    stats[key] = int(prewarm_stats[key])
+        self.prewarm_stats: dict[str, int] = stats
+        self.l2_prewarm_sec: float = float(l2_prewarm_sec)
+        self.l2_npu_sec: float = float(l2_npu_sec)
 
 
 @dataclass(frozen=True)
@@ -1141,6 +1160,15 @@ def _resolve_env_values(env_file: str | Path | None = None) -> dict[str, str]:
     return {}
 
 
+def _has_distinct_tail_dims(
+    dims: Mapping[str, object] | None,
+    tail_anchor_dims: Mapping[str, object] | None,
+) -> bool:
+    if not tail_anchor_dims:
+        return False
+    return dict(tail_anchor_dims) != dict(dims or {})
+
+
 def run_l1_compile_check(
     module_source: str,
     *,
@@ -1150,6 +1178,7 @@ def run_l1_compile_check(
     pass_configs: Mapping[str, object] | None = None,
     compile_flags: Sequence[str] | str | None = None,
     dims: Mapping[str, object] | None = None,
+    tail_anchor_dims: Mapping[str, object] | None = None,
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     timeout_sec: int = 120,
@@ -1171,8 +1200,9 @@ def run_l1_compile_check(
         or os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
         or ""
     ).strip()
+    has_tail = _has_distinct_tail_dims(dims, tail_anchor_dims)
     if not cann_setup and not tl_source:
-        return run_stage_b_compile(
+        primary_res = run_stage_b_compile(
             module_source,
             factory_name=builder_name,
             factory_kwargs=builder_kwargs,
@@ -1182,6 +1212,38 @@ def run_l1_compile_check(
             dims=dims,
             python_bin=python_bin,
             timeout_sec=timeout_sec,
+        )
+        if not primary_res.passed or not has_tail:
+            return primary_res
+        tail_res = run_stage_b_compile(
+            module_source,
+            factory_name=builder_name,
+            factory_kwargs=builder_kwargs,
+            config_selector_name=config_selector_name,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+            dims=tail_anchor_dims,
+            python_bin=python_bin,
+            timeout_sec=timeout_sec,
+        )
+        if not tail_res.passed:
+            return StageBResult(
+                passed=False,
+                error_message=f"stage_b_tail_anchor_failed: {tail_res.error_message}",
+                elapsed_sec=primary_res.elapsed_sec + tail_res.elapsed_sec,
+                spill_bytes=primary_res.spill_bytes,
+                vloopv2_hit=primary_res.vloopv2_hit,
+                compiler_summary=primary_res.compiler_summary,
+                microarch_profile=primary_res.microarch_profile,
+                full_diagnostic=tail_res.full_diagnostic,
+            )
+        return StageBResult(
+            passed=True,
+            elapsed_sec=primary_res.elapsed_sec + tail_res.elapsed_sec,
+            spill_bytes=primary_res.spill_bytes,
+            vloopv2_hit=primary_res.vloopv2_hit,
+            compiler_summary=primary_res.compiler_summary,
+            microarch_profile=primary_res.microarch_profile,
         )
 
     t0 = time.monotonic()
@@ -1204,20 +1266,46 @@ def run_l1_compile_check(
         cand_path.write_text(module_source, encoding="utf-8")
         kernel_dump_path = tmp / "lowered_kernel.cce"
         driver_path = tmp / "compile_driver.py"
-        driver_path.write_text(
-            build_stage_b_driver_source(
+        driver_src = build_stage_b_driver_source(
+            cand_path,
+            factory_name=builder_name,
+            factory_kwargs=builder_kwargs,
+            config_selector_name=config_selector_name,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+            dims=dims,
+            enable_device_compile=True,
+            kernel_dump_path=kernel_dump_path,
+        )
+        if has_tail and tail_anchor_dims is not None:
+            tail_driver_src = build_stage_b_driver_source(
                 cand_path,
                 factory_name=builder_name,
                 factory_kwargs=builder_kwargs,
                 config_selector_name=config_selector_name,
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
-                dims=dims,
+                dims=tail_anchor_dims,
                 enable_device_compile=True,
-                kernel_dump_path=kernel_dump_path,
-            ),
-            encoding="utf-8",
-        )
+                kernel_dump_path=None,
+            )
+            tail_dims_json = json.dumps(dict(tail_anchor_dims), sort_keys=True, default=str)
+            driver_src = (
+                driver_src
+                + "\n"
+                + f"_tf_tail_driver_src = {tail_driver_src!r}\n"
+                + f"_tf_tail_dims_json = {tail_dims_json!r}\n"
+                + "try:\n"
+                + "    exec(compile(_tf_tail_driver_src, '<stage_b_tail>', 'exec'), {})\n"
+                + "except Exception as _tf_tail_exc:\n"
+                + "    import sys as _tf_sys\n"
+                + "    _tf_sys.stderr.write(\n"
+                + "        f'stage_b_tail_anchor_failed dims={_tf_tail_dims_json}: '\n"
+                + "        f'{type(_tf_tail_exc).__name__}: {_tf_tail_exc}\\n'\n"
+                + "    )\n"
+                + "    raise\n"
+            )
+        driver_path.write_text(driver_src, encoding="utf-8")
         if cann_setup and Path(cann_setup).is_file() and shutil.which("bisheng") is None:
             bash_cmd = (
                 f"set +u && source {shlex.quote(cann_setup)} >/dev/null 2>&1 "
@@ -2059,6 +2147,7 @@ for cid_num in case_ids:
 
 tasks = []
 errors = []
+cand_errors = []
 
 for idx, (cid, mod_path) in enumerate(cand_paths):
     try:
@@ -2069,7 +2158,9 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     except Exception as exc:
-        errors.append(f"candidate={{cid}} module_load_failed: {{type(exc).__name__}}: {{exc}}")
+        msg = f"candidate={{cid}} module_load_failed: {{type(exc).__name__}}: {{exc}}"
+        errors.append(msg)
+        cand_errors.append({{"candidate_id": cid, "case_num": -1, "error": msg}})
         continue
 
     get_kernel_fn = getattr(mod, "_get_kernel", None)
@@ -2188,11 +2279,11 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
                     "compile_flags": cf_list,
                 }})
         except Exception as exc:
-            errors.append(
-                f"candidate={{cid}} case={{cid_num}} plan_failed: {{type(exc).__name__}}: {{exc}}"
-            )
+            msg = f"candidate={{cid}} case={{cid_num}} plan_failed: {{type(exc).__name__}}: {{exc}}"
+            errors.append(msg)
+            cand_errors.append({{"candidate_id": cid, "case_num": int(cid_num), "error": msg}})
 
-print(json.dumps({{"tasks": tasks, "errors": errors}}), flush=True)
+print(json.dumps({{"tasks": tasks, "errors": errors, "cand_errors": cand_errors}}), flush=True)
 """
 
 
@@ -2235,12 +2326,172 @@ else:
 """
 
 
+_PREWARM_MANIFEST_FILENAME = "prewarm_manifest_v1.json"
+_INCUMBENT_CANDIDATE_IDS = frozenset({"incumbent_slot", "__incumbent__", "incumbent_baseline"})
+
+
+@dataclass(frozen=True)
+class PrewarmTileLangResult:
+    """Result and cache telemetry from content-addressed TileLang prewarming."""
+
+    tl_cache_dir: Path
+    prewarm_stats: dict[str, int]
+    failed_by_cid: dict[str, str]
+    elapsed_sec: float
+
+
+def _compute_tilelang_lib_stamp(env_vals: Mapping[str, str]) -> str:
+    """Derive a fast stamp from loaded or configured TileLang libraries."""
+    parts: list[str] = []
+    tl_build = (
+        env_vals.get("TILEFOUNDRY_NPU_TILELANG_BUILD")
+        or os.environ.get("TILEFOUNDRY_NPU_TILELANG_BUILD")
+        or ""
+    ).strip()
+    tl_source = (
+        env_vals.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
+        or os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
+        or ""
+    ).strip()
+
+    lib_dirs: list[Path] = []
+    if tl_build:
+        b_path = Path(tl_build)
+        lib_dirs.extend([b_path / "lib", b_path])
+    if tl_source:
+        s_path = Path(tl_source)
+        lib_dirs.extend([s_path / "build" / "lib", s_path / "tilelang" / "lib"])
+        for marker in (s_path / "tilelang.py", s_path / "tilelang" / "__init__.py"):
+            if marker.is_file():
+                try:
+                    st = marker.stat()
+                    parts.append(f"src:{marker.resolve()}:{st.st_mtime_ns}:{st.st_size}")
+                except OSError:
+                    pass
+
+    seen_so: set[Path] = set()
+    for lib_dir in lib_dirs:
+        if not lib_dir.is_dir():
+            continue
+        so_files = sorted(lib_dir.glob("*.so*"))
+        for so_path in so_files:
+            resolved_so = so_path.resolve()
+            if resolved_so in seen_so or not resolved_so.is_file():
+                continue
+            seen_so.add(resolved_so)
+            try:
+                st = resolved_so.stat()
+                parts.append(f"so:{resolved_so.name}:{st.st_mtime_ns}:{st.st_size}")
+            except OSError:
+                continue
+        if seen_so:
+            break
+
+    if not parts:
+        mod = sys.modules.get("tilelang")
+        origin = getattr(mod, "__file__", None) if mod is not None else None
+        if origin is None:
+            try:
+                spec = importlib.util.find_spec("tilelang")
+                origin = spec.origin if spec is not None else None
+            except (ImportError, ValueError, AttributeError):
+                origin = None
+        if mod is not None:
+            ver = getattr(mod, "__version__", "")
+            if ver:
+                parts.append(f"ver:{ver}")
+        if origin:
+            origin_path = Path(origin).resolve()
+            if origin_path.is_file():
+                try:
+                    st = origin_path.stat()
+                    parts.append(f"mod:{origin_path}:{st.st_mtime_ns}:{st.st_size}")
+                except OSError:
+                    pass
+                pkg_dir = origin_path.parent
+                for sub_dir in (pkg_dir / "lib", pkg_dir.parent / "build" / "lib"):
+                    if sub_dir.is_dir():
+                        for so_path in sorted(sub_dir.glob("*.so*")):
+                            if so_path.is_file():
+                                try:
+                                    st = so_path.stat()
+                                    parts.append(f"so:{so_path.name}:{st.st_mtime_ns}:{st.st_size}")
+                                except OSError:
+                                    continue
+                        break
+
+    if not parts:
+        return "none"
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _tl_cache_has_artifacts(cache_dir: Path) -> bool:
+    """Return True when the TileLang cache contains compiled binary or stub artifacts."""
+    if not cache_dir.is_dir():
+        return False
+    for item in cache_dir.rglob("*"):
+        if not item.is_file():
+            continue
+        if item.name == _PREWARM_MANIFEST_FILENAME or item.name.startswith(".prewarm_manifest_v1."):
+            continue
+        if item.suffix == ".so":
+            return True
+        if item.name == "compiled_entries.jsonl":
+            try:
+                if item.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _seed_prewarm_cache_tree(src_dir: Path, dst_dir: Path) -> None:
+    """Seed an isolated worker cache from the shared cache via hardlinks or copy fallback."""
+    if not src_dir.is_dir():
+        return
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for item in sorted(src_dir.rglob("*")):
+        rel = item.relative_to(src_dir)
+        if item.name == _PREWARM_MANIFEST_FILENAME or item.name.startswith(".prewarm_manifest_v1."):
+            continue
+        if item.name == "compiled_entries.jsonl":
+            continue
+        target = dst_dir / rel
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(item, target)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                continue
+            shutil.copy2(item, target)
+
+
+def _atomic_copy_into_cache(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{dst.name}.")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        shutil.copy2(src, tmp_path)
+        os.replace(tmp_path, dst)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
 def _merge_prewarm_cache_tree(src_dir: Path, dst_dir: Path) -> None:
     """Merge an isolated worker's TileLang cache outputs into the shared session cache."""
     if not src_dir.is_dir():
         return
     dst_dir.mkdir(parents=True, exist_ok=True)
     for item in sorted(src_dir.rglob("*")):
+        if item.name == _PREWARM_MANIFEST_FILENAME or item.name.startswith(".prewarm_manifest_v1."):
+            continue
         rel = item.relative_to(src_dir)
         target = dst_dir / rel
         if item.is_dir():
@@ -2252,9 +2503,61 @@ def _merge_prewarm_cache_tree(src_dir: Path, dst_dir: Path) -> None:
             addition = item.read_text(encoding="utf-8")
             if existing and not existing.endswith("\n"):
                 existing += "\n"
-            target.write_text(existing + addition, encoding="utf-8")
+            fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".compiled_entries.")
+            tmp_path = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(existing + addition)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, target)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
         elif not target.exists():
-            shutil.copy2(item, target)
+            _atomic_copy_into_cache(item, target)
+
+
+def _load_prewarm_manifest(manifest_path: Path) -> dict[str, dict[str, object]]:
+    if not manifest_path.is_file():
+        return {"tasks": {}, "plan_index": {}}
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"tasks": {}, "plan_index": {}}
+    if not isinstance(raw, Mapping):
+        return {"tasks": {}, "plan_index": {}}
+    raw_tasks = raw.get("tasks")
+    raw_plan = raw.get("plan_index")
+    return {
+        "tasks": dict(raw_tasks) if isinstance(raw_tasks, Mapping) else {},
+        "plan_index": dict(raw_plan) if isinstance(raw_plan, Mapping) else {},
+    }
+
+
+def _save_prewarm_manifest(
+    manifest_path: Path,
+    tasks_map: Mapping[str, object],
+    plan_index_map: Mapping[str, object],
+) -> None:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "tasks": dict(tasks_map),
+        "plan_index": dict(plan_index_map),
+    }
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(dir=str(manifest_path.parent), prefix=".prewarm_manifest_v1.")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(encoded)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, manifest_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
 
 
 def lookup_case_static_spec(
@@ -2311,7 +2614,32 @@ def lookup_case_static_spec(
     return spec
 
 
-def prewarm_surrogate_tilelang_cache(
+def _build_prewarm_task_key(
+    *,
+    cand_sha256: str,
+    builder_name: str,
+    canonical_kwargs_json: str,
+    compile_flags: Sequence[str],
+    tilelang_lib_stamp: str,
+) -> str:
+    flags_json = json.dumps(list(compile_flags), separators=(",", ":"))
+    raw = f"{cand_sha256}|{builder_name}|{canonical_kwargs_json}|{flags_json}|{tilelang_lib_stamp}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _build_prewarm_plan_key(
+    *,
+    operator_name: str,
+    cand_sha256: str,
+    case_num: int,
+    cases_yaml_sha256: str,
+    tilelang_lib_stamp: str,
+) -> str:
+    raw = f"{operator_name}|{cand_sha256}|{case_num}|{cases_yaml_sha256}|{tilelang_lib_stamp}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def prewarm_surrogate_tilelang_cache_with_stats(
     operator_name: str,
     candidates: Sequence[tuple[str, str | Path]],
     anchors: Sequence[AnchorCaseSpec],
@@ -2322,8 +2650,10 @@ def prewarm_surrogate_tilelang_cache(
     tl_cache_dir: str | Path | None = None,
     source_root: str | Path | None = None,
     timeout_sec: int = 300,
-) -> Path:
-    """Pre-compile deduplicated candidate anchor kernels into TileLang disk cache on Host CPU."""
+    isolate_non_incumbent: bool = True,
+) -> PrewarmTileLangResult:
+    """Content-addressed TileLang prewarm with per-candidate fault isolation and stats."""
+    t0 = time.monotonic()
     root = Path(source_root).resolve() if source_root is not None else default_source_root()
     repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
     resolved_ref_cache = Path(cache_dir) if cache_dir is not None else _default_surrogate_cache_dir()
@@ -2333,9 +2663,94 @@ def prewarm_surrogate_tilelang_cache(
     )
     resolved_tl_cache.mkdir(parents=True, exist_ok=True)
     if not candidates or not anchors:
-        return resolved_tl_cache
+        return PrewarmTileLangResult(
+            tl_cache_dir=resolved_tl_cache,
+            prewarm_stats={
+                "total_tasks": 0,
+                "cache_hits": 0,
+                "compiled_tasks": 0,
+                "failed_candidates": 0,
+            },
+            failed_by_cid={},
+            elapsed_sec=time.monotonic() - t0,
+        )
 
     env_vals = _resolve_env_values(env_file)
+    tl_lib_stamp = _compute_tilelang_lib_stamp(env_vals)
+    cases_yaml_sha256 = ""
+    try:
+        cases_path = resolve_cannbench_tasks_root(repo) / get_operator_task(operator_name) / "cases.yaml"
+        if cases_path.is_file():
+            cases_yaml_sha256 = _sha256_file(cases_path)
+    except (OSError, ValueError, KeyError, RuntimeError):
+        cases_yaml_sha256 = ""
+
+    manifest_path = resolved_tl_cache / _PREWARM_MANIFEST_FILENAME
+    manifest = _load_prewarm_manifest(manifest_path)
+    manifest_tasks: dict[str, object] = dict(manifest["tasks"])
+    manifest_plan: dict[str, object] = dict(manifest["plan_index"])
+    has_artifacts = _tl_cache_has_artifacts(resolved_tl_cache)
+
+    failed_by_cid: dict[str, str] = {}
+    cand_shas: dict[str, str] = {}
+    cand_resolved_paths: dict[str, str] = {}
+    valid_candidates: list[tuple[str, str]] = []
+    for raw_cid, raw_path in candidates:
+        cid = str(raw_cid)
+        try:
+            resolved_p = Path(raw_path).resolve()
+            cand_shas[cid] = _sha256_file(resolved_p)
+            cand_resolved_paths[cid] = str(resolved_p)
+            valid_candidates.append((cid, str(resolved_p)))
+        except OSError as exc:
+            err = f"candidate={cid} module_read_failed: {type(exc).__name__}: {exc}"
+            if cid == "incumbent_slot" or not isolate_non_incumbent:
+                raise RuntimeError(f"prewarm_surrogate_tilelang_cache failed: {err}") from exc
+            failed_by_cid[cid] = err
+
+    case_ids = [int(a.case_num) for a in anchors]
+    cache_hits = 0
+    compiled_tasks = 0
+    failed_task_count = 0
+    missed_cands: dict[str, str] = {}
+    missed_cases_by_cid: dict[str, set[int]] = {}
+    hit_cases_by_cid: dict[str, set[int]] = {}
+
+    for cid, mod_path_str in valid_candidates:
+        c_sha = cand_shas[cid]
+        for cnum in case_ids:
+            p_key = _build_prewarm_plan_key(
+                operator_name=operator_name,
+                cand_sha256=c_sha,
+                case_num=cnum,
+                cases_yaml_sha256=cases_yaml_sha256,
+                tilelang_lib_stamp=tl_lib_stamp,
+            )
+            entry_keys = manifest_plan.get(p_key) if has_artifacts else None
+            if (
+                isinstance(entry_keys, list)
+                and all(isinstance(tk, str) and tk in manifest_tasks for tk in entry_keys)
+            ):
+                cache_hits += len(entry_keys)
+                hit_cases_by_cid.setdefault(cid, set()).add(cnum)
+            else:
+                missed_cands[cid] = mod_path_str
+                missed_cases_by_cid.setdefault(cid, set()).add(cnum)
+
+    if not missed_cands:
+        stats = {
+            "total_tasks": cache_hits,
+            "cache_hits": cache_hits,
+            "compiled_tasks": 0,
+            "failed_candidates": len(failed_by_cid),
+        }
+        return PrewarmTileLangResult(
+            tl_cache_dir=resolved_tl_cache,
+            prewarm_stats=stats,
+            failed_by_cid=failed_by_cid,
+            elapsed_sec=time.monotonic() - t0,
+        )
+
     python_bin = (
         env_vals.get("TILEFOUNDRY_NPU_PYTHON")
         or os.environ.get("TILEFOUNDRY_NPU_PYTHON")
@@ -2381,8 +2796,16 @@ def prewarm_surrogate_tilelang_cache(
             return ["/bin/bash", "-c", bash_cmd]
         return [python_bin, str(script_path)]
 
-    case_ids = [int(a.case_num) for a in anchors]
-    cand_paths = [(str(cid), str(Path(p).resolve())) for cid, p in candidates]
+    missed_cand_paths = [
+        (cid, missed_cands[cid])
+        for cid, _p in valid_candidates
+        if cid in missed_cands
+    ]
+    missed_case_ids = [
+        cnum
+        for cnum in case_ids
+        if any(cnum in missed_cases_by_cid.get(cid, set()) for cid in missed_cands)
+    ]
 
     with tempfile.TemporaryDirectory(prefix="tf_tl_prewarm_") as tmp_dir:
         tmp_root = Path(tmp_dir)
@@ -2391,8 +2814,8 @@ def prewarm_surrogate_tilelang_cache(
             _PREWARM_TL_PLAN_TEMPLATE.format(
                 ascend_target_dir=str(root / "targets" / "ascend"),
                 op_name=operator_name,
-                case_ids_json=json.dumps(case_ids),
-                cand_paths_json=json.dumps(cand_paths),
+                case_ids_json=json.dumps(missed_case_ids),
+                cand_paths_json=json.dumps(missed_cand_paths),
                 repo=str(repo),
             ),
             encoding="utf-8",
@@ -2415,16 +2838,41 @@ def prewarm_surrogate_tilelang_cache(
             )
 
         plan_payload = json.loads((plan_proc.stdout or "{}").strip().splitlines()[-1])
+        cand_errors_raw = plan_payload.get("cand_errors") or ()
         plan_errors = [str(e) for e in plan_payload.get("errors", ())]
-        if plan_errors:
+        if cand_errors_raw:
+            for item in cand_errors_raw:
+                if not isinstance(item, Mapping):
+                    continue
+                err_cid = str(item.get("candidate_id", ""))
+                err_msg = str(item.get("error", ""))
+                if err_cid == "incumbent_slot" or not isolate_non_incumbent:
+                    raise RuntimeError(
+                        f"prewarm_surrogate_tilelang_cache failed: {'; '.join(plan_errors)[:1000]}"
+                    )
+                if err_cid and err_cid not in failed_by_cid:
+                    failed_by_cid[err_cid] = err_msg
+        elif plan_errors:
             raise RuntimeError(
                 f"prewarm_surrogate_tilelang_cache failed: {'; '.join(plan_errors)[:1000]}"
             )
 
-        deduped_tasks: list[dict[str, object]] = []
-        seen_keys: set[tuple[str, str, tuple[str, ...]]] = set()
+        unique_miss_tasks: list[dict[str, object]] = []
+        unique_miss_keys: list[str] = []
+        seen_miss_idx: dict[str, int] = {}
+        task_cids_by_idx: dict[int, set[str]] = {}
+        planned_plan_keys: dict[tuple[str, int], list[str]] = {}
+        seen_hit_task_keys: set[str] = set()
+
         for task in plan_payload.get("tasks", ()):
             if not isinstance(task, Mapping):
+                continue
+            raw_cid = str(task.get("candidate_id", ""))
+            cid = raw_cid or (valid_candidates[0][0] if len(valid_candidates) == 1 else "")
+            if cid in failed_by_cid:
+                continue
+            case_num = int(task.get("case_num", -1))
+            if case_num in hit_cases_by_cid.get(cid, set()):
                 continue
             builder_name = str(task.get("builder_name", ""))
             canonical_kwargs_json = json.dumps(
@@ -2434,67 +2882,210 @@ def prewarm_surrogate_tilelang_cache(
                     "pass_configs": task.get("pass_configs", {}),
                 },
                 sort_keys=True,
+                separators=(",", ":"),
             )
             compile_flags = tuple(str(f) for f in (task.get("compile_flags") or ()))
-            dedup_key = (builder_name, canonical_kwargs_json, compile_flags)
-            if dedup_key in seen_keys:
+            c_sha = cand_shas.get(cid)
+            if c_sha is None:
+                if raw_cid:
+                    continue
+                c_sha = "unknown"
+            t_key = _build_prewarm_task_key(
+                cand_sha256=c_sha,
+                builder_name=builder_name,
+                canonical_kwargs_json=canonical_kwargs_json,
+                compile_flags=compile_flags,
+                tilelang_lib_stamp=tl_lib_stamp,
+            )
+            if cid in cand_shas and case_num >= 0:
+                planned_plan_keys.setdefault((cid, case_num), []).append(t_key)
+            if has_artifacts and t_key in manifest_tasks:
+                if t_key not in seen_hit_task_keys:
+                    seen_hit_task_keys.add(t_key)
+                    cache_hits += 1
                 continue
-            seen_keys.add(dedup_key)
-            deduped_tasks.append(dict(task))
+            if t_key in seen_miss_idx:
+                if cid:
+                    task_cids_by_idx[seen_miss_idx[t_key]].add(cid)
+                continue
+            idx = len(unique_miss_tasks)
+            seen_miss_idx[t_key] = idx
+            unique_miss_tasks.append(dict(task))
+            unique_miss_keys.append(t_key)
+            task_cids_by_idx[idx] = {cid} if cid else set()
 
-        if not deduped_tasks:
-            return resolved_tl_cache
-
-        def _compile_one(idx: int, task: dict[str, object]) -> tuple[int, Path]:
-            worker_dir = tmp_root / f"worker_{idx}"
-            worker_cache = worker_dir / "tl_cache"
-            worker_cache.mkdir(parents=True, exist_ok=True)
-            worker_script = worker_dir / "compile_task.py"
-            worker_script.write_text(
-                _PREWARM_TL_WORKER_TEMPLATE.format(task_json=json.dumps(task, sort_keys=True)),
-                encoding="utf-8",
-            )
-            worker_env = dict(run_env)
-            worker_env["TILELANG_CACHE_DIR"] = str(worker_cache)
-            proc = subprocess.run(
-                _build_argv(worker_script),
-                text=True,
-                capture_output=True,
-                cwd=str(root),
-                env=worker_env,
-                timeout=timeout_sec,
-            )
-            if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "").strip()[-800:]
-                raise RuntimeError(
-                    f"candidate={task.get('candidate_id')} case={task.get('case_num')} "
-                    f"builder={task.get('builder_name')}: {detail}"
+        if unique_miss_tasks:
+            def _compile_one(idx: int, task: dict[str, object]) -> tuple[int, Path]:
+                worker_dir = tmp_root / f"worker_{idx}"
+                worker_cache = worker_dir / "tl_cache"
+                worker_cache.mkdir(parents=True, exist_ok=True)
+                _seed_prewarm_cache_tree(resolved_tl_cache, worker_cache)
+                worker_script = worker_dir / "compile_task.py"
+                worker_script.write_text(
+                    _PREWARM_TL_WORKER_TEMPLATE.format(task_json=json.dumps(task, sort_keys=True)),
+                    encoding="utf-8",
                 )
-            return idx, worker_cache
+                worker_env = dict(run_env)
+                worker_env["TILELANG_CACHE_DIR"] = str(worker_cache)
+                proc = subprocess.run(
+                    _build_argv(worker_script),
+                    text=True,
+                    capture_output=True,
+                    cwd=str(root),
+                    env=worker_env,
+                    timeout=timeout_sec,
+                )
+                if proc.returncode != 0:
+                    detail = (proc.stderr or proc.stdout or "").strip()[-800:]
+                    raise RuntimeError(
+                        f"candidate={task.get('candidate_id')} case={task.get('case_num')} "
+                        f"builder={task.get('builder_name')}: {detail}"
+                    )
+                return idx, worker_cache
 
-        max_workers = min(4, len(deduped_tasks))
-        compile_errors: list[str] = []
-        worker_caches: dict[int, Path] = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [
-                pool.submit(_compile_one, idx, task)
-                for idx, task in enumerate(deduped_tasks)
-            ]
-            for fut in futures:
+            max_workers = min(4, len(unique_miss_tasks))
+            incumbent_or_fatal_errors: list[str] = []
+            worker_caches: dict[int, Path] = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [
+                    (idx, pool.submit(_compile_one, idx, task))
+                    for idx, task in enumerate(unique_miss_tasks)
+                ]
+                for idx, fut in futures:
+                    try:
+                        res_idx, worker_cache = fut.result()
+                        worker_caches[res_idx] = worker_cache
+                    except Exception as exc:
+                        err_text = str(exc)
+                        assoc_cids = task_cids_by_idx.get(idx, set())
+                        failed_task_count += 1
+                        if "incumbent_slot" in assoc_cids or not isolate_non_incumbent:
+                            incumbent_or_fatal_errors.append(err_text)
+                        for err_cid in assoc_cids:
+                            if err_cid not in failed_by_cid:
+                                failed_by_cid[err_cid] = err_text
+
+            if incumbent_or_fatal_errors:
+                raise RuntimeError(
+                    f"prewarm_surrogate_tilelang_cache failed: "
+                    f"{'; '.join(incumbent_or_fatal_errors)[:1000]}"
+                )
+
+            lock_path = resolved_tl_cache / ".prewarm_manifest_v1.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+", encoding="utf-8") as lock_fh:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
                 try:
-                    idx, worker_cache = fut.result()
-                    worker_caches[idx] = worker_cache
-                except Exception as exc:
-                    compile_errors.append(str(exc))
+                    latest = _load_prewarm_manifest(manifest_path)
+                    merged_tasks = dict(latest["tasks"])
+                    merged_plan = dict(latest["plan_index"])
+                    for idx in sorted(worker_caches):
+                        _merge_prewarm_cache_tree(worker_caches[idx], resolved_tl_cache)
+                        compiled_tasks += 1
+                        task = unique_miss_tasks[idx]
+                        t_key = unique_miss_keys[idx]
+                        cid = str(task.get("candidate_id", ""))
+                        merged_tasks[t_key] = {
+                            "builder_name": str(task.get("builder_name", "")),
+                            "cand_sha256": cand_shas.get(cid, ""),
+                            "tilelang_lib_stamp": tl_lib_stamp,
+                        }
+                    for (cid, case_num), t_keys in planned_plan_keys.items():
+                        if cid in failed_by_cid:
+                            continue
+                        if all(tk in merged_tasks for tk in t_keys):
+                            p_key = _build_prewarm_plan_key(
+                                operator_name=operator_name,
+                                cand_sha256=cand_shas[cid],
+                                case_num=case_num,
+                                cases_yaml_sha256=cases_yaml_sha256,
+                                tilelang_lib_stamp=tl_lib_stamp,
+                            )
+                            merged_plan[p_key] = list(t_keys)
+                    for cid in list(missed_cases_by_cid):
+                        if cid in failed_by_cid:
+                            continue
+                        for cnum in missed_cases_by_cid[cid]:
+                            if (cid, cnum) not in planned_plan_keys:
+                                p_key = _build_prewarm_plan_key(
+                                    operator_name=operator_name,
+                                    cand_sha256=cand_shas[cid],
+                                    case_num=cnum,
+                                    cases_yaml_sha256=cases_yaml_sha256,
+                                    tilelang_lib_stamp=tl_lib_stamp,
+                                )
+                                merged_plan[p_key] = []
+                    _save_prewarm_manifest(manifest_path, merged_tasks, merged_plan)
+                finally:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        else:
+            lock_path = resolved_tl_cache / ".prewarm_manifest_v1.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+", encoding="utf-8") as lock_fh:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    latest = _load_prewarm_manifest(manifest_path)
+                    merged_tasks = dict(latest["tasks"])
+                    merged_plan = dict(latest["plan_index"])
+                    for (cid, case_num), t_keys in planned_plan_keys.items():
+                        if cid in failed_by_cid:
+                            continue
+                        if all(tk in merged_tasks for tk in t_keys):
+                            p_key = _build_prewarm_plan_key(
+                                operator_name=operator_name,
+                                cand_sha256=cand_shas[cid],
+                                case_num=case_num,
+                                cases_yaml_sha256=cases_yaml_sha256,
+                                tilelang_lib_stamp=tl_lib_stamp,
+                            )
+                            merged_plan[p_key] = list(t_keys)
+                    _save_prewarm_manifest(manifest_path, merged_tasks, merged_plan)
+                finally:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
-        if compile_errors:
-            raise RuntimeError(
-                f"prewarm_surrogate_tilelang_cache failed: {'; '.join(compile_errors)[:1000]}"
-            )
-        for idx in range(len(deduped_tasks)):
-            _merge_prewarm_cache_tree(worker_caches[idx], resolved_tl_cache)
+    stats = {
+        "total_tasks": cache_hits + compiled_tasks + failed_task_count,
+        "cache_hits": cache_hits,
+        "compiled_tasks": compiled_tasks,
+        "failed_candidates": len(failed_by_cid),
+    }
+    return PrewarmTileLangResult(
+        tl_cache_dir=resolved_tl_cache,
+        prewarm_stats=stats,
+        failed_by_cid=failed_by_cid,
+        elapsed_sec=time.monotonic() - t0,
+    )
 
-    return resolved_tl_cache
+
+def prewarm_surrogate_tilelang_cache(
+    operator_name: str,
+    candidates: Sequence[tuple[str, str | Path]],
+    anchors: Sequence[AnchorCaseSpec],
+    *,
+    cannbench_repo: str | Path | None = None,
+    env_file: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    tl_cache_dir: str | Path | None = None,
+    source_root: str | Path | None = None,
+    timeout_sec: int = 300,
+) -> Path:
+    """Pre-compile deduplicated candidate anchor kernels into TileLang disk cache on Host CPU."""
+    result = prewarm_surrogate_tilelang_cache_with_stats(
+        operator_name,
+        candidates,
+        anchors,
+        cannbench_repo=cannbench_repo,
+        env_file=env_file,
+        cache_dir=cache_dir,
+        tl_cache_dir=tl_cache_dir,
+        source_root=source_root,
+        timeout_sec=timeout_sec,
+        isolate_non_incumbent=False,
+    )
+    return result.tl_cache_dir
+
+
+_ORIG_PREWARM_SURROGATE_TILELANG_CACHE = prewarm_surrogate_tilelang_cache
 
 
 _LLM_API_KEY_ENV = "TILEFOUNDRY_NPU_LLM_API_KEY_ENV"
@@ -2903,6 +3494,35 @@ def select_idle_campaign_device(
     return ordered[0] if ordered else str(device_id or "").strip()
 
 
+def _failed_prewarm_candidate_result(
+    candidate_id: str,
+    operator_name: str,
+    anchors: Sequence[AnchorCaseSpec],
+    error_detail: str,
+) -> CandidateSurrogateResult:
+    msg = f"prewarm_compile_failed: {error_detail}"
+    anchor_metrics = tuple(
+        build_anchor_metrics(
+            anchor,
+            accuracy_passed=False,
+            cand_us=0.0,
+            error_message=msg[:300],
+        )
+        for anchor in anchors
+    )
+    return CandidateSurrogateResult(
+        candidate_id=candidate_id,
+        operator_name=operator_name,
+        all_passed=False,
+        avg_speedup=0.0,
+        min_case_speedup=0.0,
+        avg_roofline_eta=0.0,
+        surrogate_score=0.0,
+        anchors=anchor_metrics,
+        error_message=msg[:500],
+    )
+
+
 def run_multi_operator_surrogate_batch_via_agent_gates(
     batches: Sequence[tuple[str, Sequence[tuple[str, str | Path]], Sequence[AnchorCaseSpec]]],
     *,
@@ -2927,7 +3547,18 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
     )
     cache_dir, tl_cache_dir = _fast_cache_roots(root, env_vals)
 
+    prewarm_stats: dict[str, int] = {
+        "total_tasks": 0,
+        "cache_hits": 0,
+        "compiled_tasks": 0,
+        "failed_candidates": 0,
+    }
+    failed_by_cid_by_op: dict[str, dict[str, str]] = {}
+    t_prewarm0 = time.monotonic()
     if prewarm_cache:
+        use_stats_prewarm = (
+            prewarm_surrogate_tilelang_cache is _ORIG_PREWARM_SURROGATE_TILELANG_CACHE
+        )
         for op_name, cands, op_anchors in batches:
             prewarm_anchor_reference_cache(
                 op_name,
@@ -2937,16 +3568,34 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
                 cache_dir=cache_dir,
                 source_root=root,
             )
-            prewarm_surrogate_tilelang_cache(
-                op_name,
-                cands,
-                op_anchors,
-                cannbench_repo=cann_repo,
-                env_file=resolved_env,
-                cache_dir=cache_dir,
-                tl_cache_dir=tl_cache_dir,
-                source_root=root,
-            )
+            if use_stats_prewarm:
+                pw_res = prewarm_surrogate_tilelang_cache_with_stats(
+                    op_name,
+                    cands,
+                    op_anchors,
+                    cannbench_repo=cann_repo,
+                    env_file=resolved_env,
+                    cache_dir=cache_dir,
+                    tl_cache_dir=tl_cache_dir,
+                    source_root=root,
+                    isolate_non_incumbent=True,
+                )
+                for key in prewarm_stats:
+                    prewarm_stats[key] += int(pw_res.prewarm_stats.get(key, 0))
+                if pw_res.failed_by_cid:
+                    failed_by_cid_by_op[op_name] = dict(pw_res.failed_by_cid)
+            else:
+                prewarm_surrogate_tilelang_cache(
+                    op_name,
+                    cands,
+                    op_anchors,
+                    cannbench_repo=cann_repo,
+                    env_file=resolved_env,
+                    cache_dir=cache_dir,
+                    tl_cache_dir=tl_cache_dir,
+                    source_root=root,
+                )
+    l2_prewarm_sec = time.monotonic() - t_prewarm0
 
     request_root = _fast_request_root(root, env_vals)
     request_id = uuid.uuid4().hex
@@ -2959,6 +3608,10 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
     request_batches: list[dict[str, object]] = []
     seen_operators: set[str] = set()
     seen_wire_ops: set[str] = set()
+    failed_results_by_op: dict[str, dict[str, CandidateSurrogateResult]] = {}
+    valid_cands_by_op: dict[str, list[tuple[str, str | Path]]] = {}
+    failures: list[str] = []
+
     for op_name, cands, op_anchors in batches:
         if op_name in seen_operators:
             raise ValueError(f"duplicate operator_name {op_name!r} in one fast batch")
@@ -2970,13 +3623,48 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
             )
         seen_wire_ops.add(wire_op)
         wire_ops[op_name] = wire_op
-        bindings: dict[str, dict[str, str]] = {}
-        entries: list[dict[str, str]] = []
-        for index, (candidate_id, module_path) in enumerate(cands):
-            if candidate_id in bindings:
+
+        op_failed_map = failed_by_cid_by_op.get(op_name, {})
+        if "incumbent_slot" in op_failed_map:
+            raise RuntimeError(
+                f"prewarm_surrogate_tilelang_cache failed for incumbent_slot: "
+                f"{op_failed_map['incumbent_slot']}"
+            )
+
+        op_failed_res: dict[str, CandidateSurrogateResult] = {}
+        valid_cands: list[tuple[str, str | Path]] = []
+        seen_cids: set[str] = set()
+        for candidate_id, module_path in cands:
+            if candidate_id in seen_cids:
                 raise ValueError(
                     f"duplicate candidate_id {candidate_id!r} for operator {op_name!r}"
                 )
+            seen_cids.add(candidate_id)
+            if candidate_id in op_failed_map:
+                op_failed_res[candidate_id] = _failed_prewarm_candidate_result(
+                    candidate_id,
+                    op_name,
+                    op_anchors,
+                    op_failed_map[candidate_id],
+                )
+                failures.append(f"{op_name}/{candidate_id}")
+            else:
+                valid_cands.append((candidate_id, module_path))
+
+        failed_results_by_op[op_name] = op_failed_res
+        had_non_inc = any(cid not in _INCUMBENT_CANDIDATE_IDS for cid, _p in cands)
+        has_valid_non_inc = any(cid not in _INCUMBENT_CANDIDATE_IDS for cid, _p in valid_cands)
+        if had_non_inc and not has_valid_non_inc:
+            valid_cands_by_op[op_name] = []
+            continue
+
+        valid_cands_by_op[op_name] = valid_cands
+        if not valid_cands:
+            continue
+
+        bindings: dict[str, dict[str, str]] = {}
+        entries: list[dict[str, str]] = []
+        for index, (candidate_id, module_path) in enumerate(valid_cands):
             relative, digest = _stage_fast_candidate(
                 request_dir,
                 root,
@@ -2999,6 +3687,28 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
             }
         )
 
+    if not request_batches:
+        out_empty: dict[str, dict[str, CandidateSurrogateResult]] = {}
+        for op_name, cands, _anchors in batches:
+            op_failed_res = failed_results_by_op.get(op_name, {})
+            ordered_failed = {
+                cid: op_failed_res[cid]
+                for cid, _p in cands
+                if cid in op_failed_res
+            }
+            out_empty[op_name] = L2BatchResults(
+                ordered_failed,
+                {},
+                prewarm_stats=prewarm_stats,
+                l2_prewarm_sec=l2_prewarm_sec,
+                l2_npu_sec=0.0,
+            )
+        if require_all_passed and failures:
+            raise RuntimeError(
+                "AgentGates L2 batch rejected candidate(s): " + ", ".join(failures)
+            )
+        return out_empty, "", "", 0.0
+
     payload: dict[str, object] = {
         "schema": FAST_REQUEST_SCHEMA,
         "request_id": request_id,
@@ -3012,6 +3722,7 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
     }
     request_sha256 = _write_fast_request(request_path, payload)
     workspace = _agent_gates_workspace_name(root)
+    t_npu0 = time.monotonic()
     raw_resp, execution = _submit_fast_gate(
         agent_gates_bin=ag_bin,
         root=root,
@@ -3027,10 +3738,11 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
         device_pool=device_pool,
         env_vals=env_vals,
     )
+    l2_npu_sec = time.monotonic() - t_npu0
     _verify_fast_bindings(raw_resp, staged)
     _verify_fast_coverage(
         raw_resp,
-        expected_candidates=sum(len(cands) for _op, cands, _anchors in batches),
+        expected_candidates=sum(len(valid_cands_by_op[op_name]) for op_name, _c, _a in batches),
         expected_msprof_targets=0,
     )
     raw_ext_hbm = raw_resp.get("_selected_card_ext_hbm_mb", 0)
@@ -3041,36 +3753,52 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
     )
     operators_raw = _fast_response_mapping(raw_resp, "operators")
     out_by_op: dict[str, dict[str, CandidateSurrogateResult]] = {}
-    failures: list[str] = []
     for op_name, cands, _anchors in batches:
-        wire_op = wire_ops[op_name]
-        cands_raw = operators_raw.get(wire_op)
-        if cands_raw is None and wire_op != op_name:
-            cands_raw = operators_raw.get(op_name)
-        if not isinstance(cands_raw, Mapping):
-            raise RuntimeError(f"fast response has no results for operator {op_name!r}")
+        op_failed_res = failed_results_by_op.get(op_name, {})
+        valid_cands = valid_cands_by_op.get(op_name, [])
         parsed_candidates: dict[str, CandidateSurrogateResult] = {}
+        run_ids_for_op: dict[str, str] = {}
+        if valid_cands:
+            wire_op = wire_ops[op_name]
+            cands_raw = operators_raw.get(wire_op)
+            if cands_raw is None and wire_op != op_name:
+                cands_raw = operators_raw.get(op_name)
+            if not isinstance(cands_raw, Mapping):
+                raise RuntimeError(f"fast response has no results for operator {op_name!r}")
+            for candidate_id, _module_path in valid_cands:
+                item = cands_raw.get(candidate_id)
+                if not isinstance(item, Mapping):
+                    raise RuntimeError(
+                        f"fast response has no result for {op_name}/{candidate_id}"
+                    )
+                result = CandidateSurrogateResult.from_dict(item)
+                if selected_card_ext_hbm_mb > 0 and any(
+                    anc.card_ext_hbm_mb == 0 for anc in result.anchors
+                ):
+                    updated_anchors = tuple(
+                        replace(anc, card_ext_hbm_mb=selected_card_ext_hbm_mb)
+                        if anc.card_ext_hbm_mb == 0
+                        else anc
+                        for anc in result.anchors
+                    )
+                    result = replace(result, anchors=updated_anchors)
+                parsed_candidates[candidate_id] = result
+                run_ids_for_op[candidate_id] = execution.run_id
+                if not result.all_passed:
+                    failures.append(f"{op_name}/{candidate_id}")
+        merged_ordered: dict[str, CandidateSurrogateResult] = {}
         for candidate_id, _module_path in cands:
-            item = cands_raw.get(candidate_id)
-            if not isinstance(item, Mapping):
-                raise RuntimeError(
-                    f"fast response has no result for {op_name}/{candidate_id}"
-                )
-            result = CandidateSurrogateResult.from_dict(item)
-            if selected_card_ext_hbm_mb > 0 and any(
-                anc.card_ext_hbm_mb == 0 for anc in result.anchors
-            ):
-                updated_anchors = tuple(
-                    replace(anc, card_ext_hbm_mb=selected_card_ext_hbm_mb)
-                    if anc.card_ext_hbm_mb == 0
-                    else anc
-                    for anc in result.anchors
-                )
-                result = replace(result, anchors=updated_anchors)
-            parsed_candidates[candidate_id] = result
-            if not result.all_passed:
-                failures.append(f"{op_name}/{candidate_id}")
-        out_by_op[op_name] = parsed_candidates
+            if candidate_id in parsed_candidates:
+                merged_ordered[candidate_id] = parsed_candidates[candidate_id]
+            elif candidate_id in op_failed_res:
+                merged_ordered[candidate_id] = op_failed_res[candidate_id]
+        out_by_op[op_name] = L2BatchResults(
+            merged_ordered,
+            run_ids_for_op,
+            prewarm_stats=prewarm_stats,
+            l2_prewarm_sec=l2_prewarm_sec,
+            l2_npu_sec=l2_npu_sec,
+        )
     if require_all_passed and failures:
         raise RuntimeError(
             "AgentGates L2 batch rejected candidate(s): " + ", ".join(failures)
@@ -3110,7 +3838,10 @@ def run_surrogate_batch_via_agent_gates(
         require_all_passed=require_all_passed,
         timeout_sec=timeout_sec,
     )
-    return by_op.get(operator_name, {}), run_id, receipt_path
+    op_res = by_op.get(operator_name)
+    if op_res is None:
+        return L2BatchResults({}, {}), run_id, receipt_path
+    return op_res, run_id, receipt_path
 
 
 def bottleneck_anchor_for_regime(
@@ -5670,8 +6401,10 @@ __all__ = [
     "FAILURE_KIND_CANDIDATE",
     "FAILURE_KIND_INFRASTRUCTURE",
     "L0L1CandidateCheck",
+    "L2BatchResults",
     "L3AcceptanceResult",
     "L4CannbenchResult",
+    "PrewarmTileLangResult",
     "aggregate_surrogate_result",
     "bottleneck_anchor_for_regime",
     "build_anchor_metrics",
@@ -5685,6 +6418,7 @@ __all__ = [
     "order_candidates_by_idle_preflight",
     "prewarm_anchor_reference_cache",
     "prewarm_surrogate_tilelang_cache",
+    "prewarm_surrogate_tilelang_cache_with_stats",
     "run_l0_l1_round_filter",
     "run_l0_static_precheck",
     "run_l1_compile_check",
