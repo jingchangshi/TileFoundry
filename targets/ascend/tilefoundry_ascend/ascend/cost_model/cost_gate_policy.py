@@ -11,9 +11,10 @@ from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 class CostModelMode(StrEnum):
     """Execution mode for the stage-A cost-model prescreen gate."""
 
+    OFF = "off"
+    SHADOW = "shadow"
     AUTO = "auto"
     COARSE_ONLY = "coarse_only"
-    OFF = "off"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +49,7 @@ def is_paradigm_shift_exempt(
 
 def evaluate_cost_gate_policy(
     *,
-    mode: CostModelMode | str = CostModelMode.AUTO,
+    mode: CostModelMode | str = CostModelMode.OFF,
     enable_prescreen_flag: bool = True,
     round_idx: int = 1,
     stagnation_rounds: int = 0,
@@ -72,6 +73,15 @@ def evaluate_cost_gate_policy(
             mode=resolved_mode,
             engaged=False,
             reason="disabled_by_config",
+            coarse_reject_ratio=float("inf"),
+            allow_prompt_guidance=False,
+            allow_candidate_pruning=False,
+        )
+    if resolved_mode == CostModelMode.SHADOW:
+        return CostGateDecision(
+            mode=resolved_mode,
+            engaged=False,
+            reason="shadow_observation_only",
             coarse_reject_ratio=float("inf"),
             allow_prompt_guidance=False,
             allow_candidate_pruning=False,

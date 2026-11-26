@@ -1872,15 +1872,31 @@ class HybridAscendCostModel:
             )
         )
 
+    @staticmethod
+    def _matches_operator_filter(record_op: str, operator_filter: str | None) -> bool:
+        tgt_norm = str(operator_filter or "").strip().lower()
+        if not tgt_norm:
+            return True
+        rec_norm = str(record_op or "").strip().lower()
+        if rec_norm == tgt_norm:
+            return True
+        if "/" not in tgt_norm or "/" not in rec_norm:
+            return rec_norm.rsplit("/", 1)[-1] == tgt_norm.rsplit("/", 1)[-1]
+        return False
+
     def replay_experience_lake(
         self,
         lake_dir: ExperienceLake | str | Path,
         *,
         persist_calibration: bool = False,
         exclude_run_id: str | None = None,
+        operator_filter: str | None = None,
     ) -> dict[str, int]:
         """Idempotently replay candidates, case observations, MSProf PMU, and pairwise deltas."""
         lake = lake_dir if isinstance(lake_dir, ExperienceLake) else ExperienceLake(lake_dir)
+        eff_operator_filter = (
+            str(operator_filter).strip() if operator_filter is not None else ""
+        ) or None
         candidates_by_regime, observations = lake.load_records_by_regime()
         flat_candidates: dict[str, CandidateArtifactRecord] = {}
         for (_sha, _rtag), art in sorted(candidates_by_regime.items()):
@@ -1939,6 +1955,8 @@ class HybridAscendCostModel:
                 continue
             if exclude_run_id and obs.run_id == exclude_run_id:
                 continue
+            if not self._matches_operator_filter(obs.operator, eff_operator_filter):
+                continue
             obs_key = self._obs_dedup_key(
                 obs.cand_sha,
                 obs.operator,
@@ -1969,6 +1987,8 @@ class HybridAscendCostModel:
         for cand_art, cand_obs, parent_art, parent_obs in lake.extract_pairwise_deltas(
             exclude_run_id=exclude_run_id
         ):
+            if not self._matches_operator_filter(cand_obs.operator, eff_operator_filter):
+                continue
             pkey = self._pair_dedup_key(
                 cand_obs.cand_sha,
                 parent_obs.cand_sha,
