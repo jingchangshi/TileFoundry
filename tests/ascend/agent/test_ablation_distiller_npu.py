@@ -128,8 +128,6 @@ def test_live_flywheel_micro_probe_verification_and_kb_admission(tmp_path: Path)
         funnel=funnel,
         tracker=tracker,
         probe_runner=None,
-        min_edit_gain=0.01,
-        min_probe_speedup=1.05,
     )
     report = distiller.distill_from_pair(
         baseline_dsl=_AR_BASE,

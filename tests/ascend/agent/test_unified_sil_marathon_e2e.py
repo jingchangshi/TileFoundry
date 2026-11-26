@@ -579,8 +579,6 @@ def test_multi_round_marathon_portfolio_kb_cost_oracle_non_ar_mla(
     flywheel = FlywheelDistiller(
         funnel=GateFunnel(skip_stage_b=True),
         tracker=tracker,
-        min_edit_gain=0.0,
-        min_probe_speedup=1.0,
     )
 
     runner = ExtremeCampaignRunner(
