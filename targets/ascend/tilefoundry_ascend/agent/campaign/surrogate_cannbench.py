@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -58,6 +57,11 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
     _bounded_compile_diagnostic,
+    _classify_stage_b_overflow_fault_code,
+    _has_vf_stack_overflow_signal,
+    _merge_dims_into_kwargs,
+    _merge_pass_configs_and_flags,
+    _normalize_trackb_unit_source,
     _parse_cce_res_usage_with_summary,
     build_stage_b_driver_source,
     check_repair_monotonicity,
@@ -76,8 +80,14 @@ from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
 )
 from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
     ArtifactStore,
-    compute_artifact_id,
+    collect_new_tl_cache_binaries,
+    compute_compile_task_key,
     extract_reachable_closure_source,
+    is_verified_binary_file,
+    merge_tl_cache_tree,
+    resolve_unified_tl_cache_dir,
+    seed_tl_cache_tree,
+    snapshot_tl_cache_binaries,
 )
 from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (
     is_paradigm_shift_exempt,
@@ -337,6 +347,7 @@ class L2BatchResults(dict[str, CandidateSurrogateResult]):
         prewarm_stats: Mapping[str, int] | None = None,
         l2_prewarm_sec: float = 0.0,
         l2_npu_sec: float = 0.0,
+        null_launch_us: float | None = None,
     ) -> None:
         super().__init__(results)
         self.run_ids: dict[str, str] = dict(run_ids)
@@ -353,6 +364,11 @@ class L2BatchResults(dict[str, CandidateSurrogateResult]):
         self.prewarm_stats: dict[str, int] = stats
         self.l2_prewarm_sec: float = float(l2_prewarm_sec)
         self.l2_npu_sec: float = float(l2_npu_sec)
+        self.null_launch_us: float | None = (
+            float(null_launch_us)
+            if null_launch_us is not None and not isinstance(null_launch_us, bool)
+            else None
+        )
 
 
 @dataclass(frozen=True)
@@ -412,6 +428,20 @@ class AgentGatesDeviceFaultError(RuntimeError):
         self.failed_tier = failed_tier
         self.device_id = device_id
         self.rejected_cards = tuple(sorted(str(c) for c in rejected_cards))
+
+
+class OccupancyExhaustedError(RuntimeError):
+    """Raised when NPU host-gate contention or BLOCKED_ENV (rc=75) exhausts retries."""
+
+    def __init__(self, attempts: int, receipt_reasons: tuple[str, ...]) -> None:
+        self.fault_plane = "INFRA_OCCUPANCY"
+        self.exit_code = 75
+        self.attempts = attempts
+        self.receipt_reasons = receipt_reasons
+        joined = ", ".join(receipt_reasons)
+        super().__init__(
+            f"NPU occupancy/env blocked after {attempts} attempts (rc=75): [{joined}]"
+        )
 
 
 @dataclass(frozen=True)
@@ -1219,6 +1249,215 @@ def _has_distinct_tail_dims(
     return dict(tail_anchor_dims) != dict(dims or {})
 
 
+_EXCLUDED_TRACKA_SIG_KEYS: frozenset[str] = frozenset(
+    {
+        "pass_configs",
+        "compile_flags",
+        "builder_fn",
+        "extra_builder_kwargs",
+        "extra_combine_kwargs",
+    }
+)
+_RUNTIME_ONLY_TRACKB_DIM_KEYS: frozenset[str] = frozenset(
+    {
+        "B",
+        "S",
+        "S_kv",
+        "S1",
+        "S2",
+        "b_dim",
+        "s_dim",
+        "s_kv",
+        "s1_dim",
+        "s2_dim",
+        "m_rows",
+        "input_shape",
+        "output_shape",
+        "input_shapes",
+        "output_shapes",
+        "ordered_tensor_shapes",
+        "attrs",
+    }
+)
+
+
+def _json_safe_value(val: object) -> object:
+    if isinstance(val, Mapping):
+        return {str(k): _json_safe_value(v) for k, v in sorted(val.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(val, (list, tuple)):
+        return [_json_safe_value(item) for item in val]
+    if isinstance(val, set):
+        return sorted(
+            (_json_safe_value(item) for item in val),
+            key=lambda x: json.dumps(x, sort_keys=True, separators=(",", ":")),
+        )
+    if isinstance(val, (str, int, float, bool)) or val is None:
+        return val
+    return str(val)
+
+
+def _filter_eff_kwargs_for_builder_source(
+    module_source: str,
+    builder_name: str,
+    eff_kwargs: Mapping[str, object],
+) -> dict[str, object]:
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError:
+        return dict(eff_kwargs)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == builder_name:
+            if node.args.kwarg is not None:
+                return dict(eff_kwargs)
+            params = [
+                arg.arg
+                for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+            ]
+            filtered = {k: v for k, v in eff_kwargs.items() if k in params}
+            lowered = {str(k).lower(): v for k, v in eff_kwargs.items()}
+            for pname in params:
+                if pname not in filtered and pname.lower() in lowered:
+                    filtered[pname] = lowered[pname.lower()]
+            return filtered
+    return dict(eff_kwargs)
+
+
+def _canonical_tracka_spec_signature(
+    builder_name: str,
+    kwargs: Mapping[str, object] | None,
+    *,
+    spec_key: str = "",
+) -> str:
+    if spec_key:
+        return str(spec_key)
+    filtered = {
+        str(k): _json_safe_value(v)
+        for k, v in sorted((kwargs or {}).items(), key=lambda kv: str(kv[0]))
+        if str(k) not in _EXCLUDED_TRACKA_SIG_KEYS
+    }
+    return json.dumps(
+        {"builder_name": str(builder_name), "kwargs": filtered},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _canonical_trackb_spec_signature(
+    dims: Mapping[str, object] | None,
+    *,
+    regime_tag: str = "",
+    spec_key: str = "",
+) -> str:
+    if spec_key:
+        return str(spec_key)
+    filtered = {
+        str(k): _json_safe_value(v)
+        for k, v in sorted((dims or {}).items(), key=lambda kv: str(kv[0]))
+        if str(k) not in _RUNTIME_ONLY_TRACKB_DIM_KEYS
+    }
+    return json.dumps(
+        {"regime_tag": str(regime_tag), "spec": filtered},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _resolve_l1_cache_store(
+    env_vals: Mapping[str, str],
+    tl_cache_dir: str | Path | None,
+    artifact_store: ArtifactStore | None,
+    source_root: Path | None,
+) -> tuple[Path, ArtifactStore]:
+    if artifact_store is not None:
+        return artifact_store.root, artifact_store
+    if tl_cache_dir is not None and str(tl_cache_dir).strip():
+        resolved = Path(tl_cache_dir).expanduser().resolve()
+        return resolved, ArtifactStore(resolved)
+    has_env_dir = any(
+        str(env_vals.get(k, "") or os.environ.get(k, "")).strip()
+        for k in (
+            "TILELANG_CACHE_DIR",
+            "TF_SURROGATE_TL_CACHE_DIR",
+            "TILEFOUNDRY_NPU_ARTIFACT_STORE",
+            "TILEFOUNDRY_NPU_WORK_ROOT",
+        )
+    )
+    if has_env_dir:
+        resolved = resolve_unified_tl_cache_dir(
+            None,
+            env_vals=env_vals,
+            source_root=source_root,
+        )
+        return resolved, ArtifactStore(resolved)
+    resolved = _default_surrogate_tl_cache_dir().resolve()
+    return resolved, ArtifactStore(resolved)
+
+
+def _record_l1_artifacts_and_manifest(
+    *,
+    resolved_tl_cache: Path,
+    resolved_store: ArtifactStore,
+    task_entries: Sequence[tuple[str, str, Mapping[str, object]]],
+    binary_paths: Sequence[Path],
+    builder_name: str,
+    closure_src: str,
+    cand_sha256: str,
+    tl_lib_stamp: str,
+    norm_cf: Sequence[str],
+    plan_key: str,
+) -> tuple[str, tuple[str, ...]]:
+    recorded_aid = ""
+    recorded_bins: tuple[str, ...] = ()
+    task_keys: list[str] = []
+    manifest_path = resolved_tl_cache / _PREWARM_MANIFEST_FILENAME
+    lock_path = resolved_tl_cache / ".prewarm_manifest_v1.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            latest = _load_prewarm_manifest(manifest_path)
+            merged_tasks = dict(latest["tasks"])
+            merged_plan = dict(latest["plan_index"])
+            for t_key, v_spec_sig, _v_dims in task_entries:
+                task_keys.append(t_key)
+                if binary_paths:
+                    rec = resolved_store.record_verified_artifact(
+                        t_key,
+                        binary_paths=binary_paths,
+                        backend_kind="tilelang",
+                        flags=" ".join(norm_cf),
+                        spec_key=v_spec_sig,
+                        compiler_stamp=tl_lib_stamp,
+                        closure_src=closure_src,
+                        copy_binaries=True,
+                    )
+                    if not recorded_aid:
+                        recorded_aid = rec.artifact_id
+                        recorded_bins = rec.binary_paths
+                    merged_tasks[t_key] = {
+                        "builder_name": str(builder_name),
+                        "cand_sha256": cand_sha256,
+                        "tilelang_lib_stamp": tl_lib_stamp,
+                    }
+                else:
+                    existing = resolved_store.get_verified_artifact(t_key)
+                    if existing is not None:
+                        if not recorded_aid:
+                            recorded_aid = existing.artifact_id
+                            recorded_bins = existing.binary_paths
+                        merged_tasks[t_key] = {
+                            "builder_name": str(builder_name),
+                            "cand_sha256": cand_sha256,
+                            "tilelang_lib_stamp": tl_lib_stamp,
+                        }
+            if task_keys and all(tk in merged_tasks for tk in task_keys):
+                merged_plan[plan_key] = list(task_keys)
+            _save_prewarm_manifest(manifest_path, merged_tasks, merged_plan)
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+    return recorded_aid, recorded_bins
+
+
 def run_l1_compile_check(
     module_source: str,
     *,
@@ -1229,6 +1468,7 @@ def run_l1_compile_check(
     compile_flags: Sequence[str] | str | None = None,
     dims: Mapping[str, object] | None = None,
     tail_anchor_dims: Mapping[str, object] | None = None,
+    static_spec_dims_list: Sequence[Mapping[str, object]] | None = None,
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     timeout_sec: int = 120,
@@ -1236,9 +1476,71 @@ def run_l1_compile_check(
     artifact_id: str = "",
     regime_tag: str = "",
     spec_key: str = "",
+    tl_cache_dir: str | Path | None = None,
 ) -> StageBResult:
     """Run Tier L1 TileLang + bisheng device compilation on Host CPU without NPU locks."""
     env_vals = _resolve_env_values(env_file)
+    root = Path(source_root).resolve() if source_root is not None else default_source_root()
+    resolved_tl_cache, resolved_store = _resolve_l1_cache_store(
+        env_vals, tl_cache_dir, artifact_store, root
+    )
+    resolved_tl_cache.mkdir(parents=True, exist_ok=True)
+    tl_lib_stamp = _compute_tilelang_lib_stamp(env_vals)
+    norm_pc, norm_cf = _merge_pass_configs_and_flags(None, None, pass_configs, compile_flags)
+    if regime_tag:
+        closure_src = extract_reachable_closure_source(module_source, regime_tag=regime_tag)
+    else:
+        syms = tuple(s for s in (config_selector_name, builder_name, "_get_kernel") if s)
+        closure_src = (
+            extract_reachable_closure_source(module_source, active_symbols=syms)
+            if syms
+            else module_source
+        )
+    cand_sha = hashlib.sha256(closure_src.encode("utf-8")).hexdigest()
+
+    primary_dims: dict[str, object] = dict(dims) if dims else {}
+    all_dims_variants: list[dict[str, object]] = [primary_dims]
+    seen_dims_json: set[str] = {json.dumps(primary_dims, sort_keys=True, default=str)}
+    has_tail = _has_distinct_tail_dims(dims, tail_anchor_dims)
+    if has_tail and tail_anchor_dims is not None:
+        tail_dict = dict(tail_anchor_dims)
+        tail_json = json.dumps(tail_dict, sort_keys=True, default=str)
+        seen_dims_json.add(tail_json)
+        all_dims_variants.append(tail_dict)
+    if static_spec_dims_list:
+        for raw_spec_dims in static_spec_dims_list:
+            spec_dict = dict(raw_spec_dims)
+            spec_json = json.dumps(spec_dict, sort_keys=True, default=str)
+            if spec_json not in seen_dims_json:
+                seen_dims_json.add(spec_json)
+                all_dims_variants.append(spec_dict)
+
+    task_entries: list[tuple[str, str, dict[str, object]]] = []
+    for idx, v_dims in enumerate(all_dims_variants):
+        eff_kw = _merge_dims_into_kwargs(builder_kwargs, v_dims)
+        filtered_kw = _filter_eff_kwargs_for_builder_source(module_source, builder_name, eff_kw)
+        v_spec_sig = _canonical_tracka_spec_signature(
+            builder_name,
+            filtered_kw,
+            spec_key=spec_key if (idx == 0 and len(all_dims_variants) == 1) else "",
+        )
+        t_key = (
+            artifact_id
+            if (idx == 0 and artifact_id)
+            else compute_compile_task_key(
+                normalized_kernel_unit_src=closure_src,
+                cann_target="dav-3510",
+                pass_configs=norm_pc,
+                compile_flags=norm_cf,
+                static_spec_signature=v_spec_sig,
+                compiler_stamp=tl_lib_stamp,
+            )
+        )
+        task_entries.append((t_key, v_spec_sig, v_dims))
+
+    primary_t_key = task_entries[0][0]
+    plan_key = f"l1:{builder_name}:{primary_t_key}"
+
     python_bin = (
         env_vals.get("TILEFOUNDRY_NPU_PYTHON")
         or os.environ.get("TILEFOUNDRY_NPU_PYTHON")
@@ -1254,8 +1556,9 @@ def run_l1_compile_check(
         or os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
         or ""
     ).strip()
-    has_tail = _has_distinct_tail_dims(dims, tail_anchor_dims)
+
     if not cann_setup and not tl_source:
+        primary_t_key, primary_spec_sig, primary_v_dims = task_entries[0]
         primary_res = run_stage_b_compile(
             module_source,
             factory_name=builder_name,
@@ -1263,57 +1566,99 @@ def run_l1_compile_check(
             config_selector_name=config_selector_name,
             pass_configs=pass_configs,
             compile_flags=compile_flags,
-            dims=dims,
+            dims=primary_v_dims or None,
             python_bin=python_bin,
             timeout_sec=timeout_sec,
-            artifact_store=artifact_store,
-            artifact_id=artifact_id,
+            artifact_store=resolved_store,
+            artifact_id=primary_t_key,
             regime_tag=regime_tag,
-            spec_key=spec_key,
+            spec_key=primary_spec_sig,
         )
-        if not primary_res.passed or not has_tail:
+        if not primary_res.passed:
             return primary_res
-        tail_res = run_stage_b_compile(
-            module_source,
-            factory_name=builder_name,
-            factory_kwargs=builder_kwargs,
-            config_selector_name=config_selector_name,
-            pass_configs=pass_configs,
-            compile_flags=compile_flags,
-            dims=tail_anchor_dims,
-            python_bin=python_bin,
-            timeout_sec=timeout_sec,
-            artifact_store=artifact_store,
-            regime_tag=regime_tag,
-            spec_key=spec_key,
-        )
-        if not tail_res.passed:
-            return StageBResult(
-                passed=False,
-                error_message=f"stage_b_tail_anchor_failed: {tail_res.error_message}",
-                elapsed_sec=primary_res.elapsed_sec + tail_res.elapsed_sec,
-                spill_bytes=primary_res.spill_bytes,
-                vloopv2_hit=primary_res.vloopv2_hit,
-                compiler_summary=primary_res.compiler_summary,
-                microarch_profile=primary_res.microarch_profile,
-                full_diagnostic=tail_res.full_diagnostic,
-                fault_plane="STAGE_B_COMPILE",
-                fault_code="STAGE_B_TAIL_ANCHOR_FAILED",
-                failed_tier="stage_b",
+        total_elapsed = primary_res.elapsed_sec
+        all_bins: list[Path] = [Path(p) for p in primary_res.binary_paths if Path(p).is_file()]
+        for idx, (t_key, v_spec_sig, v_dims) in enumerate(task_entries[1:], start=1):
+            extra_res = run_stage_b_compile(
+                module_source,
+                factory_name=builder_name,
+                factory_kwargs=builder_kwargs,
+                config_selector_name=config_selector_name,
+                pass_configs=pass_configs,
+                compile_flags=compile_flags,
+                dims=v_dims,
+                python_bin=python_bin,
+                timeout_sec=timeout_sec,
+                artifact_store=resolved_store,
+                artifact_id=t_key,
+                regime_tag=regime_tag,
+                spec_key=v_spec_sig,
             )
+            total_elapsed += extra_res.elapsed_sec
+            if not extra_res.passed:
+                is_tail = has_tail and idx == 1 and dict(v_dims) == dict(tail_anchor_dims or {})
+                default_code = (
+                    "STAGE_B_TAIL_ANCHOR_FAILED"
+                    if is_tail
+                    else "STAGE_B_STATIC_SPEC_FAILED"
+                )
+                err_prefix = (
+                    "stage_b_tail_anchor_failed"
+                    if is_tail
+                    else "stage_b_static_spec_failed"
+                )
+                eff_code = (
+                    extra_res.fault_code
+                    if extra_res.fault_code
+                    in {
+                        "VF_STACK_OVERFLOW",
+                        "UB_SRAM_OVERFLOW",
+                        "L1_SRAM_OVERFLOW",
+                        "L0C_SRAM_OVERFLOW",
+                    }
+                    else default_code
+                )
+                return StageBResult(
+                    passed=False,
+                    error_message=f"{err_prefix}: {extra_res.error_message}",
+                    elapsed_sec=total_elapsed,
+                    spill_bytes=max(primary_res.spill_bytes, extra_res.spill_bytes),
+                    vloopv2_hit=primary_res.vloopv2_hit and extra_res.vloopv2_hit,
+                    compiler_summary=extra_res.compiler_summary or primary_res.compiler_summary,
+                    microarch_profile=primary_res.microarch_profile,
+                    full_diagnostic=extra_res.full_diagnostic,
+                    fault_plane="STAGE_B_COMPILE",
+                    fault_code=eff_code,
+                    failed_tier="stage_b",
+                )
+            for p_str in extra_res.binary_paths:
+                p_obj = Path(p_str)
+                if p_obj.is_file() and p_obj not in all_bins:
+                    all_bins.append(p_obj)
+        _record_l1_artifacts_and_manifest(
+            resolved_tl_cache=resolved_tl_cache,
+            resolved_store=resolved_store,
+            task_entries=task_entries,
+            binary_paths=all_bins,
+            builder_name=builder_name,
+            closure_src=closure_src,
+            cand_sha256=cand_sha,
+            tl_lib_stamp=tl_lib_stamp,
+            norm_cf=norm_cf,
+            plan_key=plan_key,
+        )
         return StageBResult(
             passed=True,
-            elapsed_sec=primary_res.elapsed_sec + tail_res.elapsed_sec,
+            elapsed_sec=total_elapsed,
             spill_bytes=primary_res.spill_bytes,
             vloopv2_hit=primary_res.vloopv2_hit,
             compiler_summary=primary_res.compiler_summary,
             microarch_profile=primary_res.microarch_profile,
-            artifact_id=primary_res.artifact_id,
+            artifact_id=primary_res.artifact_id or primary_t_key,
             binary_paths=primary_res.binary_paths,
         )
 
     t0 = time.monotonic()
-    root = Path(source_root).resolve() if source_root is not None else default_source_root()
     pp_parts = [str(root / "src"), str(root / "targets" / "ascend")]
     if tl_source:
         pp_parts.insert(0, tl_source)
@@ -1322,12 +1667,18 @@ def run_l1_compile_check(
 
     run_env = dict(os.environ)
     run_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
-    run_env["TILELANG_DISABLE_CACHE"] = "1"
+    run_env["TILELANG_DISABLE_CACHE"] = "0"
+    run_env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
     run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     run_env.setdefault("USE_CUDA", "0")
 
     with tempfile.TemporaryDirectory(prefix="tf_l1_compile_") as tmp_dir:
         tmp = Path(tmp_dir)
+        worker_cache = tmp / "tl_cache"
+        seed_tl_cache_tree(resolved_tl_cache, worker_cache)
+        pre_bins = snapshot_tl_cache_binaries(worker_cache)
+        run_env["TILELANG_CACHE_DIR"] = str(worker_cache)
+
         cand_path = tmp / "candidate_dsl.py"
         cand_path.write_text(module_source, encoding="utf-8")
         kernel_dump_path = tmp / "lowered_kernel.cce"
@@ -1343,31 +1694,36 @@ def run_l1_compile_check(
             enable_device_compile=True,
             kernel_dump_path=kernel_dump_path,
         )
-        if has_tail and tail_anchor_dims is not None:
-            tail_driver_src = build_stage_b_driver_source(
+        for extra_idx, extra_dims in enumerate(all_dims_variants[1:], start=1):
+            extra_driver_src = build_stage_b_driver_source(
                 cand_path,
                 factory_name=builder_name,
                 factory_kwargs=builder_kwargs,
                 config_selector_name=config_selector_name,
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
-                dims=tail_anchor_dims,
+                dims=extra_dims,
                 enable_device_compile=True,
                 kernel_dump_path=None,
             )
-            tail_dims_json = json.dumps(dict(tail_anchor_dims), sort_keys=True, default=str)
+            extra_dims_json = json.dumps(extra_dims, sort_keys=True, default=str)
+            label = (
+                "stage_b_tail_anchor_failed"
+                if (has_tail and extra_idx == 1 and extra_dims == dict(tail_anchor_dims or {}))
+                else "stage_b_static_spec_failed"
+            )
             driver_src = (
                 driver_src
                 + "\n"
-                + f"_tf_tail_driver_src = {tail_driver_src!r}\n"
-                + f"_tf_tail_dims_json = {tail_dims_json!r}\n"
+                + f"_tf_extra_driver_src_{extra_idx} = {extra_driver_src!r}\n"
+                + f"_tf_extra_dims_json_{extra_idx} = {extra_dims_json!r}\n"
                 + "try:\n"
-                + "    exec(compile(_tf_tail_driver_src, '<stage_b_tail>', 'exec'), {})\n"
-                + "except Exception as _tf_tail_exc:\n"
+                + f"    exec(compile(_tf_extra_driver_src_{extra_idx}, '<stage_b_spec_{extra_idx}>', 'exec'), {{}})\n"
+                + f"except Exception as _tf_extra_exc_{extra_idx}:\n"
                 + "    import sys as _tf_sys\n"
                 + "    _tf_sys.stderr.write(\n"
-                + "        f'stage_b_tail_anchor_failed dims={_tf_tail_dims_json}: '\n"
-                + "        f'{type(_tf_tail_exc).__name__}: {_tf_tail_exc}\\n'\n"
+                + f"        f'{label} dims={{_tf_extra_dims_json_{extra_idx}}}: '\n"
+                + f"        f'{{type(_tf_extra_exc_{extra_idx}).__name__}}: {{_tf_extra_exc_{extra_idx}}}\\n'\n"
                 + "    )\n"
                 + "    raise\n"
             )
@@ -1407,31 +1763,88 @@ def run_l1_compile_check(
             if kernel_dump_path.is_file()
             else ""
         )
-    combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
-        combined_out,
-        asm_or_dump_text=lowered_dump,
-    )
-    ma_profile = (
-        extract_microarch_profile_from_cce(lowered_dump).to_dict()
-        if lowered_dump.strip()
-        else None
-    )
-    if proc.returncode != 0:
-        raw_diagnostic = proc.stderr or proc.stdout or ""
-        detail = _bounded_compile_diagnostic(raw_diagnostic)
-        return StageBResult(
-            passed=False,
-            error_message=f"l1_compile_failed (rc={proc.returncode}): {detail}",
-            elapsed_sec=time.monotonic() - t0,
-            spill_bytes=spill_bytes,
-            vloopv2_hit=vloopv2_hit,
-            compiler_summary=summary,
-            microarch_profile=ma_profile,
-            full_diagnostic=raw_diagnostic,
-            fault_plane="STAGE_B_COMPILE",
-            fault_code="L1_COMPILE_FAILED",
-            failed_tier="stage_b",
+        combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
+            combined_out,
+            asm_or_dump_text=lowered_dump,
+        )
+        ma_profile = (
+            extract_microarch_profile_from_cce(lowered_dump).to_dict()
+            if lowered_dump.strip()
+            else None
+        )
+        if proc.returncode != 0:
+            raw_diagnostic = proc.stderr or proc.stdout or ""
+            detail = _bounded_compile_diagnostic(raw_diagnostic)
+            fault_code = _classify_stage_b_overflow_fault_code(
+                f"{raw_diagnostic}\n{lowered_dump}",
+                summary,
+                "L1_COMPILE_FAILED",
+            )
+            return StageBResult(
+                passed=False,
+                error_message=f"l1_compile_failed (rc={proc.returncode}): {detail}",
+                elapsed_sec=time.monotonic() - t0,
+                spill_bytes=spill_bytes,
+                vloopv2_hit=vloopv2_hit,
+                compiler_summary=summary,
+                microarch_profile=ma_profile,
+                full_diagnostic=raw_diagnostic,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code=fault_code,
+                failed_tier="stage_b",
+            )
+        if _has_vf_stack_overflow_signal(combined_out, summary, norm_cf, norm_pc):
+            return StageBResult(
+                passed=False,
+                error_message=f"l1_vf_stack_overflow: stack_bytes={summary.stack_bytes}",
+                elapsed_sec=time.monotonic() - t0,
+                spill_bytes=spill_bytes,
+                vloopv2_hit=vloopv2_hit,
+                compiler_summary=summary,
+                microarch_profile=ma_profile,
+                full_diagnostic=combined_out,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code="VF_STACK_OVERFLOW",
+                failed_tier="stage_b",
+            )
+
+        lock_path = resolved_tl_cache / ".prewarm_manifest_v1.lock"
+        with lock_path.open("a+", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                merge_tl_cache_tree(worker_cache, resolved_tl_cache)
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        post_new_rels = [
+            rel
+            for rel in collect_new_tl_cache_binaries(worker_cache, pre_bins)
+            if rel not in pre_bins
+            or worker_cache.joinpath(rel).stat().st_size != pre_bins[rel][0]
+            or worker_cache.joinpath(rel).stat().st_mtime_ns != pre_bins[rel][1]
+        ]
+        cache_bins = [
+            resolved_tl_cache / rel
+            for rel in post_new_rels
+            if is_verified_binary_file(resolved_tl_cache / rel)
+        ]
+        tmp_bins = [
+            p
+            for p in sorted(tmp.rglob("*"))
+            if not p.is_relative_to(worker_cache) and is_verified_binary_file(p)
+        ]
+        built_bins = [*cache_bins, *tmp_bins]
+        recorded_aid, recorded_bins = _record_l1_artifacts_and_manifest(
+            resolved_tl_cache=resolved_tl_cache,
+            resolved_store=resolved_store,
+            task_entries=task_entries,
+            binary_paths=built_bins,
+            builder_name=builder_name,
+            closure_src=closure_src,
+            cand_sha256=cand_sha,
+            tl_lib_stamp=tl_lib_stamp,
+            norm_cf=norm_cf,
+            plan_key=plan_key,
         )
     return StageBResult(
         passed=True,
@@ -1440,6 +1853,8 @@ def run_l1_compile_check(
         vloopv2_hit=vloopv2_hit,
         compiler_summary=summary,
         microarch_profile=ma_profile,
+        artifact_id=recorded_aid or primary_t_key,
+        binary_paths=recorded_bins,
     )
 
 
@@ -1550,6 +1965,22 @@ def _extract_candidate_topology_axes(
         ):
             return TopologyAxes.from_dict(r_axes)
     return None
+
+
+_NON_SYNTAX_REPAIR_FAULT_CODES: frozenset[str] = frozenset(
+    {
+        "NOOP_IDENTICAL",
+        "UB_SRAM_OVERFLOW",
+        "UB_OVERFLOW",
+        "L1_SRAM_OVERFLOW",
+        "L0C_SRAM_OVERFLOW",
+        "VF_STACK_OVERFLOW",
+    }
+)
+
+
+def _should_skip_syntax_repair(fault_code: str) -> bool:
+    return str(fault_code or "").strip().upper() in _NON_SYNTAX_REPAIR_FAULT_CODES
 
 
 def _is_noop_identical_failure(
@@ -1797,7 +2228,11 @@ async def run_l0_l1_round_filter(
                     )
                 fp = str(getattr(stage_a, "fault_plane", "") or "STAGE_A_STATIC")
                 fc = str(getattr(stage_a, "fault_code", "") or "STAGE_A_FAILED")
-                if repair_backend is None or attempt >= max_attempts:
+                if (
+                    repair_backend is None
+                    or attempt >= max_attempts
+                    or _should_skip_syntax_repair(fc)
+                ):
                     return (
                         L0L1CandidateCheck(
                             candidate_id=cand_id,
@@ -1894,7 +2329,11 @@ async def run_l0_l1_round_filter(
                 )
             fp = str(getattr(stage_b, "fault_plane", "") or "STAGE_B_COMPILE")
             fc = str(getattr(stage_b, "fault_code", "") or "STAGE_B_FAILED")
-            if repair_backend is None or cur_attempt >= max_attempts:
+            if (
+                repair_backend is None
+                or cur_attempt >= max_attempts
+                or _should_skip_syntax_repair(fc)
+            ):
                 return L0L1CandidateCheck(
                     candidate_id=cand_id,
                     passed=False,
@@ -2257,7 +2696,15 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     resolve_regime_config,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+    _RUNTIME_ONLY_TRACKB_DIM_KEYS,
     lookup_case_static_spec,
+)
+from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+    extract_reachable_trackb_source,
+)
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    _normalize_trackb_unit_source,
+    resolve_trackb_compile_flags,
 )
 
 logging.basicConfig(
@@ -2402,6 +2849,37 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
                 tb_builder_name = "_render_trackb_tu" if callable(render_tb_fn) else (
                     resolved.builder_name if (resolved is not None and callable(builder_fn)) else "_trackb_tu"
                 )
+                cpp_src = ""
+                if callable(render_tb_fn):
+                    cpp_src = str(render_tb_fn(**_filter_callable_kwargs(render_tb_fn, pool)))
+                if not cpp_src.strip() and callable(builder_fn):
+                    maybe = builder_fn(**_filter_callable_kwargs(builder_fn, pool))
+                    if isinstance(maybe, str) and ("__global__" in maybe or "#include" in maybe):
+                        cpp_src = maybe
+                if not cpp_src.strip():
+                    syms = tb_syms or list(discover_module_trackb_symbols(mod_src))
+                    extracted = extract_trackb_cpp_source(mod_src, syms)
+                    if extracted is not None:
+                        _kname, cpp_src = extract_reachable_trackb_source(
+                            extracted[1],
+                            module_source=mod_src,
+                            regime_tag=r_tag,
+                        )
+                eff_flags = (
+                    list(resolve_trackb_compile_flags(cpp_src, cf_list))
+                    if cpp_src.strip()
+                    else list(cf_list)
+                )
+                norm_unit = (
+                    _normalize_trackb_unit_source(cpp_src, regime_tag=r_tag)
+                    if cpp_src.strip()
+                    else ""
+                )
+                static_dims = {{
+                    str(dk): dv
+                    for dk, dv in pool.items()
+                    if str(dk) not in _RUNTIME_ONLY_TRACKB_DIM_KEYS
+                }}
                 tasks.append({{
                     "candidate_id": cid,
                     "case_num": int(cid_num),
@@ -2409,12 +2887,14 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
                     "mode": "trackb",
                     "builder_name": tb_builder_name,
                     "kwargs": {{
-                        "dims": _json_safe(pool),
+                        "dims": _json_safe(static_dims),
                         "regime_tag": r_tag,
                         "trackb_symbols": tb_syms,
                     }},
+                    "cpp_src": cpp_src,
+                    "normalized_cpp_unit": norm_unit,
                     "pass_configs": _json_safe(pc_safe),
-                    "compile_flags": cf_list,
+                    "compile_flags": eff_flags,
                 }})
                 continue
 
@@ -2551,10 +3031,11 @@ elif mode == "trackb":
     regime_tag = str(kwargs.get("regime_tag") or "")
     tb_syms = list(kwargs.get("trackb_symbols") or [])
     mod_src = Path(task["mod_path"]).read_text(encoding="utf-8")
-    cpp_src = ""
-    render_fn = getattr(mod, "_render_trackb_tu", None)
-    if callable(render_fn):
-        cpp_src = str(render_fn(**_filter_callable_kwargs(render_fn, dims_pool)))
+    cpp_src = str(task.get("cpp_src") or "")
+    if not cpp_src.strip():
+        render_fn = getattr(mod, "_render_trackb_tu", None)
+        if callable(render_fn):
+            cpp_src = str(render_fn(**_filter_callable_kwargs(render_fn, dims_pool)))
     if not cpp_src.strip():
         builder_fn = getattr(mod, task.get("builder_name", ""), None)
         if callable(builder_fn):
@@ -2725,99 +3206,6 @@ _ARTIFACT_STORE_INTERNAL_FILES = frozenset(
 )
 
 
-def _is_prewarm_internal_file(item: Path) -> bool:
-    name = item.name
-    if name == _PREWARM_MANIFEST_FILENAME or name.startswith(".prewarm_manifest_v1."):
-        return True
-    return name in _ARTIFACT_STORE_INTERNAL_FILES or name.startswith(".artifact_manifest.")
-
-
-def _is_compiled_binary_file(item: Path) -> bool:
-    try:
-        return (
-            item.is_file()
-            and (item.suffix in (".so", ".o", ".bin") or ".so" in item.suffixes)
-            and item.stat().st_size > 0
-        )
-    except OSError:
-        return False
-
-
-def _seed_prewarm_cache_tree(src_dir: Path, dst_dir: Path) -> None:
-    """Seed an isolated worker cache from the shared cache via hardlinks or copy fallback."""
-    if not src_dir.is_dir():
-        return
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    for item in sorted(src_dir.rglob("*")):
-        rel = item.relative_to(src_dir)
-        if _is_prewarm_internal_file(item):
-            continue
-        if item.name == "compiled_entries.jsonl":
-            continue
-        if rel.parts and rel.parts[0] == "artifact_blobs":
-            continue
-        target = dst_dir / rel
-        if item.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-        if target.exists():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.link(item, target)
-        except OSError as exc:
-            if exc.errno == errno.EEXIST:
-                continue
-            shutil.copy2(item, target)
-
-
-def _atomic_copy_into_cache(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{dst.name}.")
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    try:
-        shutil.copy2(src, tmp_path)
-        os.replace(tmp_path, dst)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-
-
-def _merge_prewarm_cache_tree(src_dir: Path, dst_dir: Path) -> None:
-    """Merge an isolated worker's TileLang cache outputs into the shared session cache."""
-    if not src_dir.is_dir():
-        return
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    for item in sorted(src_dir.rglob("*")):
-        if _is_prewarm_internal_file(item):
-            continue
-        rel = item.relative_to(src_dir)
-        target = dst_dir / rel
-        if item.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if item.name == "compiled_entries.jsonl" and target.is_file():
-            existing = target.read_text(encoding="utf-8")
-            addition = item.read_text(encoding="utf-8")
-            if existing and not existing.endswith("\n"):
-                existing += "\n"
-            fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".compiled_entries.")
-            tmp_path = Path(tmp_name)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(existing + addition)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp_path, target)
-            finally:
-                if tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
-        elif not target.exists():
-            _atomic_copy_into_cache(item, target)
-
-
 def _load_prewarm_manifest(manifest_path: Path) -> dict[str, dict[str, object]]:
     if not manifest_path.is_file():
         return {"tasks": {}, "plan_index": {}}
@@ -2914,19 +3302,6 @@ def lookup_case_static_spec(
     return spec
 
 
-def _build_prewarm_task_key(
-    *,
-    cand_sha256: str,
-    builder_name: str,
-    canonical_kwargs_json: str,
-    compile_flags: Sequence[str],
-    tilelang_lib_stamp: str,
-) -> str:
-    flags_json = json.dumps(list(compile_flags), separators=(",", ":"))
-    raw = f"{cand_sha256}|{builder_name}|{canonical_kwargs_json}|{flags_json}|{tilelang_lib_stamp}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
 def _build_prewarm_plan_key(
     *,
     operator_name: str,
@@ -2958,8 +3333,9 @@ def prewarm_surrogate_tilelang_cache_with_stats(
     repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
     resolved_ref_cache = Path(cache_dir) if cache_dir is not None else _default_surrogate_cache_dir()
     resolved_ref_cache.mkdir(parents=True, exist_ok=True)
-    resolved_tl_cache = (
-        Path(tl_cache_dir) if tl_cache_dir is not None else _default_surrogate_tl_cache_dir()
+    env_vals = _resolve_env_values(env_file)
+    resolved_tl_cache, artifact_store = _resolve_l1_cache_store(
+        env_vals, tl_cache_dir, None, root
     )
     resolved_tl_cache.mkdir(parents=True, exist_ok=True)
     if not candidates or not anchors:
@@ -2975,7 +3351,6 @@ def prewarm_surrogate_tilelang_cache_with_stats(
             elapsed_sec=time.monotonic() - t0,
         )
 
-    env_vals = _resolve_env_values(env_file)
     tl_lib_stamp = _compute_tilelang_lib_stamp(env_vals)
     cases_yaml_sha256 = ""
     try:
@@ -2989,7 +3364,6 @@ def prewarm_surrogate_tilelang_cache_with_stats(
     manifest = _load_prewarm_manifest(manifest_path)
     manifest_tasks: dict[str, object] = dict(manifest["tasks"])
     manifest_plan: dict[str, object] = dict(manifest["plan_index"])
-    artifact_store = ArtifactStore(resolved_tl_cache)
 
     failed_by_cid: dict[str, str] = {}
     cand_sources: dict[str, str] = {}
@@ -3018,11 +3392,12 @@ def prewarm_surrogate_tilelang_cache_with_stats(
             cnum = int(anchor.case_num)
             rtag = str(anchor.regime_tag or "")
             c_src = extract_reachable_closure_source(mod_src, regime_tag=rtag)
-            c_id = compute_artifact_id(
-                closure_src=c_src,
-                arch="dav-3510",
-                cann_series="cann_9_3",
-                spec_key=f"{operator_name}:{rtag}:{cases_yaml_sha256}",
+            c_id = compute_compile_task_key(
+                normalized_kernel_unit_src=c_src,
+                cann_target="dav-3510",
+                pass_configs=None,
+                compile_flags=(),
+                static_spec_signature=f"{operator_name}:{rtag}:{cases_yaml_sha256}",
                 compiler_stamp=tl_lib_stamp,
             )
             case_closure_srcs[(cid, cnum)] = c_src
@@ -3189,6 +3564,7 @@ def prewarm_surrogate_tilelang_cache_with_stats(
         task_cids_by_idx: dict[int, set[str]] = {}
         planned_plan_keys: dict[tuple[str, int], list[str]] = {}
         seen_hit_task_keys: set[str] = set()
+        backfill_tasks: dict[str, dict[str, object]] = {}
 
         for task in plan_payload.get("tasks", ()):
             if not isinstance(task, Mapping):
@@ -3200,35 +3576,64 @@ def prewarm_surrogate_tilelang_cache_with_stats(
             case_num = int(task.get("case_num", -1))
             if case_num in hit_cases_by_cid.get(cid, set()):
                 continue
+            mode = str(task.get("mode", ""))
             builder_name = str(task.get("builder_name", ""))
-            canonical_kwargs_json = json.dumps(
-                {
-                    "mode": task.get("mode", ""),
-                    "kwargs": task.get("kwargs", {}),
-                    "pass_configs": task.get("pass_configs", {}),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
             compile_flags = tuple(str(f) for f in (task.get("compile_flags") or ()))
+            raw_pc = task.get("pass_configs")
+            pass_configs = dict(raw_pc) if isinstance(raw_pc, Mapping) else {}
             c_sha = case_closure_shas.get((cid, case_num))
             if c_sha is None:
                 if raw_cid:
                     continue
                 c_sha = "unknown"
-            t_key = _build_prewarm_task_key(
-                cand_sha256=c_sha,
-                builder_name=builder_name,
-                canonical_kwargs_json=canonical_kwargs_json,
-                compile_flags=compile_flags,
-                tilelang_lib_stamp=tl_lib_stamp,
-            )
+            task_kwargs = task.get("kwargs")
+            kwargs_map = dict(task_kwargs) if isinstance(task_kwargs, Mapping) else {}
+            if mode == "trackb":
+                norm_unit = str(task.get("normalized_cpp_unit") or "").strip()
+                if norm_unit:
+                    t_key = compute_compile_task_key(
+                        normalized_kernel_unit_src=norm_unit,
+                        cann_target="dav-3510",
+                        pass_configs=None,
+                        compile_flags=compile_flags,
+                        static_spec_signature="",
+                        compiler_stamp="",
+                    )
+                else:
+                    tb_dims = kwargs_map.get("dims")
+                    tb_sig = _canonical_trackb_spec_signature(
+                        tb_dims if isinstance(tb_dims, Mapping) else {},
+                        regime_tag=str(kwargs_map.get("regime_tag", "")),
+                    )
+                    t_key = compute_compile_task_key(
+                        normalized_kernel_unit_src=case_closure_srcs.get((cid, case_num), ""),
+                        cann_target="dav-3510",
+                        pass_configs=pass_configs,
+                        compile_flags=compile_flags,
+                        static_spec_signature=tb_sig,
+                        compiler_stamp="",
+                    )
+            else:
+                ta_sig = _canonical_tracka_spec_signature(builder_name, kwargs_map)
+                t_key = compute_compile_task_key(
+                    normalized_kernel_unit_src=case_closure_srcs.get((cid, case_num), ""),
+                    cann_target="dav-3510",
+                    pass_configs=pass_configs,
+                    compile_flags=compile_flags,
+                    static_spec_signature=ta_sig,
+                    compiler_stamp=tl_lib_stamp,
+                )
             if (cid, case_num) in case_closure_shas and case_num >= 0:
                 planned_plan_keys.setdefault((cid, case_num), []).append(t_key)
-            if t_key in manifest_tasks and artifact_store.has_verified_artifact(t_key):
+            if artifact_store.has_verified_artifact(t_key):
                 if t_key not in seen_hit_task_keys:
                     seen_hit_task_keys.add(t_key)
                     cache_hits += 1
+                backfill_tasks[t_key] = {
+                    "builder_name": builder_name,
+                    "cand_sha256": c_sha,
+                    "tilelang_lib_stamp": tl_lib_stamp,
+                }
                 continue
             if t_key in seen_miss_idx:
                 if cid:
@@ -3247,12 +3652,8 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 worker_dir = tmp_root / f"worker_{idx}"
                 worker_cache = worker_dir / "tl_cache"
                 worker_cache.mkdir(parents=True, exist_ok=True)
-                _seed_prewarm_cache_tree(resolved_tl_cache, worker_cache)
-                pre_bins: dict[Path, tuple[int, int]] = {}
-                for item in worker_cache.rglob("*"):
-                    if _is_compiled_binary_file(item):
-                        st = item.stat()
-                        pre_bins[item.relative_to(worker_cache)] = (st.st_size, st.st_mtime_ns)
+                seed_tl_cache_tree(resolved_tl_cache, worker_cache)
+                pre_bins = snapshot_tl_cache_binaries(worker_cache)
                 worker_script = worker_dir / "compile_task.py"
                 worker_script.write_text(
                     _PREWARM_TL_WORKER_TEMPLATE.format(task_json=json.dumps(task, sort_keys=True)),
@@ -3274,18 +3675,7 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                         f"candidate={task.get('candidate_id')} case={task.get('case_num')} "
                         f"builder={task.get('builder_name')}: {detail}"
                     )
-                post_new_rels: list[Path] = []
-                all_post_rels: list[Path] = []
-                for item in sorted(worker_cache.rglob("*")):
-                    if not _is_compiled_binary_file(item):
-                        continue
-                    rel = item.relative_to(worker_cache)
-                    all_post_rels.append(rel)
-                    st = item.stat()
-                    prev = pre_bins.get(rel)
-                    if prev is None or prev != (st.st_size, st.st_mtime_ns):
-                        post_new_rels.append(rel)
-                return idx, worker_cache, tuple(post_new_rels or all_post_rels)
+                return idx, worker_cache, collect_new_tl_cache_binaries(worker_cache, pre_bins)
 
             max_workers = min(4, len(unique_miss_tasks))
             incumbent_or_fatal_errors: list[str] = []
@@ -3322,38 +3712,43 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 try:
                     latest = _load_prewarm_manifest(manifest_path)
                     merged_tasks = dict(latest["tasks"])
+                    merged_tasks.update(backfill_tasks)
                     merged_plan = dict(latest["plan_index"])
                     for idx in sorted(worker_caches):
                         worker_cache, bin_rels = worker_caches[idx]
-                        _merge_prewarm_cache_tree(worker_cache, resolved_tl_cache)
+                        merge_tl_cache_tree(worker_cache, resolved_tl_cache)
                         compiled_tasks += 1
                         task = unique_miss_tasks[idx]
                         t_key = unique_miss_keys[idx]
                         cid = str(task.get("candidate_id", ""))
                         cnum = int(task.get("case_num", -1))
                         c_sha = case_closure_shas.get((cid, cnum), "")
+                        is_trackb = task.get("mode") == "trackb"
                         merged_bins = [
                             resolved_tl_cache / rel
                             for rel in bin_rels
-                            if _is_compiled_binary_file(resolved_tl_cache / rel)
+                            if is_verified_binary_file(resolved_tl_cache / rel)
                         ]
                         if not merged_bins:
                             merged_bins = [
                                 item
                                 for item in sorted(resolved_tl_cache.rglob("*"))
-                                if _is_compiled_binary_file(item)
+                                if is_verified_binary_file(item)
                             ]
                         if merged_bins:
+                            unit_src = (
+                                str(task.get("normalized_cpp_unit") or "")
+                                if is_trackb
+                                else ""
+                            ) or case_closure_srcs.get((cid, cnum), "")
                             artifact_store.record_verified_artifact(
                                 t_key,
                                 binary_paths=merged_bins,
-                                backend_kind="ascendc_trackb"
-                                if task.get("mode") == "trackb"
-                                else "tilelang",
+                                backend_kind="ascendc_trackb" if is_trackb else "tilelang",
                                 flags=" ".join(str(f) for f in (task.get("compile_flags") or ())),
-                                spec_key=f"{operator_name}:{cnum}",
-                                compiler_stamp=tl_lib_stamp,
-                                closure_src=case_closure_srcs.get((cid, cnum), ""),
+                                spec_key="" if is_trackb else f"{operator_name}:{cnum}",
+                                compiler_stamp="" if is_trackb else tl_lib_stamp,
+                                closure_src=unit_src,
                             )
                         merged_tasks[t_key] = {
                             "builder_name": str(task.get("builder_name", "")),
@@ -3396,6 +3791,7 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 try:
                     latest = _load_prewarm_manifest(manifest_path)
                     merged_tasks = dict(latest["tasks"])
+                    merged_tasks.update(backfill_tasks)
                     merged_plan = dict(latest["plan_index"])
                     for (cid, case_num), t_keys in planned_plan_keys.items():
                         if cid in failed_by_cid:
@@ -4282,6 +4678,12 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
         if isinstance(raw_ext_hbm, (int, float)) and not isinstance(raw_ext_hbm, bool)
         else 0
     )
+    raw_null_launch = raw_resp.get("null_launch_us")
+    null_launch_us: float | None = (
+        float(raw_null_launch)
+        if isinstance(raw_null_launch, (int, float)) and not isinstance(raw_null_launch, bool)
+        else None
+    )
     operators_raw = _fast_response_mapping(raw_resp, "operators")
     out_by_op: dict[str, dict[str, CandidateSurrogateResult]] = {}
     for op_name, cands, _anchors in batches:
@@ -4329,6 +4731,7 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
             prewarm_stats=prewarm_stats,
             l2_prewarm_sec=l2_prewarm_sec,
             l2_npu_sec=l2_npu_sec,
+            null_launch_us=null_launch_us,
         )
     if require_all_passed and failures:
         raise RuntimeError(
@@ -5308,6 +5711,44 @@ def _is_fast_transient_build_lock(execution: _V2GateExecution) -> bool:
     return "resource busy" in failures_txt and "build:" in failures_txt
 
 
+def _is_fast_occupancy_blocked(
+    execution: _V2GateExecution,
+    blocked_category: str,
+    receipt_cat: str,
+    eff_dev_fault: bool,
+) -> tuple[bool, str]:
+    if eff_dev_fault:
+        return False, ""
+    row, _ = _gate_observation(execution.report, AGENT_GATES_DEVICE_FAST_GATE)
+    row_status = _gate_recorded_status(row).upper()
+    report_status = str(execution.report.get("status") or "").upper()
+    fail_txt = _gate_failure_text(row) if row is not None else ""
+    ver_fail = str(execution.verification.get("failures") or "")
+    transport = str(execution.transport_error or "")
+    is_occ = (
+        blocked_category == "occupancy"
+        or receipt_cat == "occupancy"
+        or row_status == "BLOCKED_ENV"
+        or report_status == "BLOCKED_ENV"
+        or "BLOCKED_EXIT_CODE: 75" in fail_txt
+        or "BLOCKED_EXIT_CODE: 75" in ver_fail
+        or "BLOCKED_EXIT_CODE: 75" in transport
+        or "BLOCKED_ENV" in transport
+    )
+    if not is_occ:
+        return False, ""
+    reason = (
+        blocked_category
+        or receipt_cat
+        or fail_txt.strip()
+        or ver_fail.strip()
+        or transport.strip()
+        or report_status
+        or "BLOCKED_ENV(75)"
+    )
+    return True, reason[:200]
+
+
 def _submit_fast_gate(
     *,
     agent_gates_bin: str,
@@ -5336,6 +5777,8 @@ def _submit_fast_gate(
     rejected_cards: set[str] = set()
     selected_card = ""
     saw_device_fault = False
+    occupancy_attempts = 0
+    occupancy_reasons: list[str] = []
     execution: _V2GateExecution | None = None
     for pass_idx in range(max_pool_passes):
         candidates = _call_order_candidates_by_idle_preflight(
@@ -5388,12 +5831,22 @@ def _submit_fast_gate(
                 is_dev_fault or blocked_category == "device_fault" or receipt_cat == "device_fault"
             )
             eff_rejected = bool(attempt_exec.device_rejected or is_dev_rejected or eff_dev_fault)
-            if eff_rejected or blocked_category == "occupancy":
+            is_occ_blocked, occ_reason = _is_fast_occupancy_blocked(
+                attempt_exec,
+                blocked_category,
+                receipt_cat,
+                eff_dev_fault,
+            )
+            if eff_rejected or is_occ_blocked:
                 response_path.unlink(missing_ok=True)
                 if eff_rejected:
                     rejected_cards.add(card)
                 if eff_dev_fault:
                     saw_device_fault = True
+                if is_occ_blocked and not eff_rejected:
+                    occupancy_attempts += 1
+                    if occ_reason and occ_reason not in occupancy_reasons:
+                        occupancy_reasons.append(occ_reason)
                 reason = (
                     "device_fault"
                     if eff_dev_fault
@@ -5430,6 +5883,8 @@ def _submit_fast_gate(
                     continue
         break
     assert execution is not None
+    if not selected_card and occupancy_attempts > 0 and not saw_device_fault:
+        raise OccupancyExhaustedError(occupancy_attempts, tuple(occupancy_reasons))
     if not selected_card and (saw_device_fault or rejected_cards):
         raise AgentGatesDeviceFaultError(
             "AgentGates device-fast rejected all candidate NPU cards "
@@ -6964,6 +7419,7 @@ __all__ = [
     "L2BatchResults",
     "L3AcceptanceResult",
     "L4CannbenchResult",
+    "OccupancyExhaustedError",
     "PrewarmTileLangResult",
     "aggregate_surrogate_result",
     "bottleneck_anchor_for_regime",

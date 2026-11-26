@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -26,8 +27,14 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
 )
 from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
     ArtifactStore,
-    compute_artifact_id,
+    collect_new_tl_cache_binaries,
+    compute_compile_task_key,
     extract_reachable_closure_source,
+    is_verified_binary_file,
+    merge_tl_cache_tree,
+    resolve_unified_tl_cache_dir,
+    seed_tl_cache_tree,
+    snapshot_tl_cache_binaries,
 )
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     BishengResourceSummary,
@@ -93,13 +100,118 @@ class StageBResult:
     binary_paths: tuple[str, ...] = ()
 
 
-def _resolve_artifact_store(artifact_store: ArtifactStore | None) -> ArtifactStore | None:
+def _resolve_artifact_store(artifact_store: ArtifactStore | None) -> ArtifactStore:
     if artifact_store is not None:
         return artifact_store
-    raw_dir = os.environ.get("TILEFOUNDRY_NPU_ARTIFACT_STORE", "").strip()
-    if raw_dir:
-        return ArtifactStore(Path(raw_dir))
-    return None
+    return ArtifactStore(resolve_unified_tl_cache_dir())
+
+
+def _classify_stage_b_overflow_fault_code(
+    combined_diag: str,
+    summary: BishengResourceSummary | None,
+    default_code: str,
+) -> str:
+    low = (combined_diag or "").lower()
+    if summary is not None and int(summary.stack_bytes) > 0:
+        return "VF_STACK_OVERFLOW"
+    if any(
+        tok in low
+        for tok in (
+            "exceeded vf stack size",
+            "vf_stack",
+            "vf stack",
+            "stack frame size",
+            "stack overflow",
+        )
+    ):
+        return "VF_STACK_OVERFLOW"
+    cap_tokens = ("overflow", "exceed", "capacity", "out of memory", "insufficient")
+    if any(
+        tok in low
+        for tok in (
+            "l0c_sram_overflow",
+            "l0c overflow",
+            "l0c_overflow",
+            "l0c capacity",
+            "exceeds l0c",
+            "exceeded l0c",
+        )
+    ) or (("l0c" in low or "__cc__" in low) and any(cap in low for cap in cap_tokens)):
+        return "L0C_SRAM_OVERFLOW"
+    if any(
+        tok in low
+        for tok in (
+            "l1_sram_overflow",
+            "l1 overflow",
+            "l1_overflow",
+            "cbuf overflow",
+            "l1 capacity",
+            "cbuf capacity",
+            "exceeds l1",
+            "exceeded l1",
+        )
+    ) or (
+        ("l1 " in low or "l1_" in low or "cbuf" in low or "__cbuf__" in low)
+        and any(cap in low for cap in cap_tokens)
+    ):
+        return "L1_SRAM_OVERFLOW"
+    if any(
+        tok in low
+        for tok in (
+            "ub_sram_overflow",
+            "ub_overflow",
+            "ubuf_overflow",
+            "ub overflow",
+            "ubuf overflow",
+            "ub capacity",
+            "ubuf capacity",
+            "exceeds ub",
+            "exceeded ub",
+            "exceeds ubuf",
+            "exceeded ubuf",
+        )
+    ) or (
+        ("ubuf" in low or "__ubuf__" in low or re.search(r"\bub\b", low) is not None)
+        and any(cap in low for cap in cap_tokens)
+    ):
+        return "UB_SRAM_OVERFLOW"
+    return default_code
+
+
+def _uses_unreserved_ubuf_flags(
+    compile_flags: Sequence[str] | str | None = None,
+    pass_configs: Mapping[str, object] | None = None,
+) -> bool:
+    flags = _normalize_flag_list(compile_flags)
+    if pass_configs and "tl.device_compile_flags" in pass_configs:
+        flags.extend(_normalize_flag_list(pass_configs["tl.device_compile_flags"]))
+    return any("--cce-disable-vf-stack-reserved-ubuf" in fl for fl in flags)
+
+
+def _has_vf_stack_overflow_signal(
+    combined_diag: str,
+    summary: BishengResourceSummary | None,
+    compile_flags: Sequence[str] | str | None = None,
+    pass_configs: Mapping[str, object] | None = None,
+) -> bool:
+    low = (combined_diag or "").lower()
+    if any(tok in low for tok in ("exceeded vf stack size", "vf_stack", "stack overflow")):
+        return True
+    if summary is not None and int(summary.stack_bytes) > 0:
+        return _uses_unreserved_ubuf_flags(compile_flags, pass_configs)
+    return False
+
+
+def _normalize_trackb_unit_source(cpp_source: str, *, regime_tag: str = "") -> str:
+    stripped = cpp_source.strip()
+    if not regime_tag or not stripped:
+        return stripped
+    masked = strip_cpp_comments_and_strings(stripped)
+    kernel_count = len(re.findall(r"\b__global__\b", masked))
+    if kernel_count > 1 and "<<<" not in masked:
+        _kname, extracted = extract_reachable_trackb_source(stripped, regime_tag=regime_tag)
+        return extracted.strip()
+    return stripped
 
 
 def _classify_ascendc_stage_a_fault(errors: Sequence[str]) -> tuple[str, str, str]:
@@ -3662,14 +3774,33 @@ def run_stage_b_compile(
     t0 = time.monotonic()
     py_exe = _resolve_conda_python(python_bin)
     env = dict(os.environ)
-    env["TILELANG_DISABLE_CACHE"] = "1"
     env.setdefault("USE_CUDA", "0")
     _inject_cann_cpath_env(env)
     resolved_store = _resolve_artifact_store(artifact_store)
+    resolved_store.root.mkdir(parents=True, exist_ok=True)
     recorded_aid = ""
     recorded_bins: tuple[str, ...] = ()
+    norm_pc, norm_cf = _merge_pass_configs_and_flags(None, None, pass_configs, compile_flags)
+    closure_src = (
+        extract_reachable_closure_source(dsl_source, regime_tag=regime_tag)
+        if regime_tag
+        else dsl_source
+    )
+    target_aid = artifact_id or compute_compile_task_key(
+        normalized_kernel_unit_src=closure_src,
+        cann_target="dav-3510",
+        pass_configs=norm_pc,
+        compile_flags=norm_cf,
+        static_spec_signature=spec_key,
+    )
     with tempfile.TemporaryDirectory(prefix="tf_stage_b_") as tmp_dir:
         tmp_root = Path(tmp_dir)
+        worker_cache = tmp_root / "tl_cache"
+        seed_tl_cache_tree(resolved_store.root, worker_cache)
+        pre_bins = snapshot_tl_cache_binaries(worker_cache)
+        env["TILELANG_DISABLE_CACHE"] = "0"
+        env["TILELANG_CACHE_DIR"] = str(worker_cache)
+        env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
         cand_path = tmp_root / "candidate_dsl.py"
         cand_path.write_text(dsl_source, encoding="utf-8")
         kernel_dump_path = tmp_root / "lowered_kernel.cce"
@@ -3725,64 +3856,102 @@ def run_stage_b_compile(
             if tir_dump_path.is_file()
             else ""
         )
-        if proc.returncode == 0 and resolved_store is not None:
-            built_bins = [
-                p
-                for p in sorted(tmp_root.rglob("*"))
-                if p.is_file()
-                and (p.suffix in (".so", ".o", ".bin") or ".so" in p.suffixes)
-                and p.stat().st_size > 0
-            ]
-            if built_bins:
-                closure_src = (
-                    extract_reachable_closure_source(dsl_source, regime_tag=regime_tag)
-                    if regime_tag
-                    else dsl_source
-                )
-                flags_str = " ".join(_normalize_flag_list(compile_flags))
-                recorded_aid = artifact_id or compute_artifact_id(
-                    closure_src=closure_src,
-                    flags=flags_str,
-                    spec_key=spec_key,
-                )
-                rec = resolved_store.record_verified_artifact(
-                    recorded_aid,
-                    binary_paths=built_bins,
-                    backend_kind="tilelang",
-                    flags=flags_str,
-                    spec_key=spec_key,
-                    closure_src=closure_src,
-                    copy_binaries=True,
-                )
-                recorded_bins = rec.binary_paths
-    combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
-        combined_out,
-        asm_or_dump_text=lowered_dump,
-    )
-    ma_profile = (
-        extract_microarch_profile_from_cce(lowered_dump).to_dict()
-        if lowered_dump.strip()
-        else None
-    )
-    if proc.returncode != 0:
-        raw_detail = proc.stderr or proc.stdout or ""
-        detail = _bounded_compile_diagnostic(raw_detail)
-        return StageBResult(
-            passed=False,
-            error_message=f"stage_b_compile_failed (rc={proc.returncode}): {detail}",
-            elapsed_sec=time.monotonic() - t0,
-            spill_bytes=spill_bytes,
-            vloopv2_hit=vloopv2_hit,
-            compiler_summary=summary,
-            microarch_profile=ma_profile,
-            full_diagnostic=raw_detail,
-            generated_cce=lowered_dump,
-            lowered_tir=lowered_tir_dump,
-            fault_plane="STAGE_B_COMPILE",
-            fault_code="STAGE_B_COMPILE_FAILED",
-            failed_tier="stage_b",
+        combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
+            combined_out,
+            asm_or_dump_text=lowered_dump,
         )
+        ma_profile = (
+            extract_microarch_profile_from_cce(lowered_dump).to_dict()
+            if lowered_dump.strip()
+            else None
+        )
+        if proc.returncode != 0:
+            raw_detail = proc.stderr or proc.stdout or ""
+            detail = _bounded_compile_diagnostic(raw_detail)
+            fault_code = _classify_stage_b_overflow_fault_code(
+                f"{raw_detail}\n{lowered_dump}",
+                summary,
+                "STAGE_B_COMPILE_FAILED",
+            )
+            return StageBResult(
+                passed=False,
+                error_message=f"stage_b_compile_failed (rc={proc.returncode}): {detail}",
+                elapsed_sec=time.monotonic() - t0,
+                spill_bytes=spill_bytes,
+                vloopv2_hit=vloopv2_hit,
+                compiler_summary=summary,
+                microarch_profile=ma_profile,
+                full_diagnostic=raw_detail,
+                generated_cce=lowered_dump,
+                lowered_tir=lowered_tir_dump,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code=fault_code,
+                failed_tier="stage_b",
+            )
+        if _has_vf_stack_overflow_signal(combined_out, summary, norm_cf, norm_pc):
+            return StageBResult(
+                passed=False,
+                error_message=f"stage_b_vf_stack_overflow: stack_bytes={summary.stack_bytes}",
+                elapsed_sec=time.monotonic() - t0,
+                spill_bytes=spill_bytes,
+                vloopv2_hit=vloopv2_hit,
+                compiler_summary=summary,
+                microarch_profile=ma_profile,
+                full_diagnostic=combined_out,
+                generated_cce=lowered_dump,
+                lowered_tir=lowered_tir_dump,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code="VF_STACK_OVERFLOW",
+                failed_tier="stage_b",
+            )
+        lock_path = resolved_store.root / ".prewarm_manifest_v1.lock"
+        with lock_path.open("a+", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                merge_tl_cache_tree(worker_cache, resolved_store.root)
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        existing_rec = resolved_store.get_verified_artifact(target_aid)
+        post_new_rels = [
+            rel
+            for rel in collect_new_tl_cache_binaries(worker_cache, pre_bins)
+            if rel not in pre_bins or worker_cache.joinpath(rel).stat().st_size != pre_bins[rel][0]
+            or worker_cache.joinpath(rel).stat().st_mtime_ns != pre_bins[rel][1]
+        ]
+        cache_bins = [
+            resolved_store.root / rel
+            for rel in post_new_rels
+            if is_verified_binary_file(resolved_store.root / rel)
+        ]
+        tmp_bins = [
+            p
+            for p in sorted(tmp_root.rglob("*"))
+            if not p.is_relative_to(worker_cache) and is_verified_binary_file(p)
+        ]
+        built_bins = [*cache_bins, *tmp_bins]
+        if not built_bins and existing_rec is None:
+            built_bins = [
+                resolved_store.root / rel
+                for rel in collect_new_tl_cache_binaries(worker_cache, pre_bins)
+                if is_verified_binary_file(resolved_store.root / rel)
+            ]
+        if built_bins:
+            flags_str = " ".join(norm_cf)
+            recorded_aid = target_aid
+            rec = resolved_store.record_verified_artifact(
+                recorded_aid,
+                binary_paths=built_bins,
+                backend_kind="tilelang",
+                flags=flags_str,
+                spec_key=spec_key,
+                closure_src=closure_src,
+                copy_binaries=True,
+            )
+            recorded_bins = rec.binary_paths
+        elif existing_rec is not None:
+            recorded_aid = existing_rec.artifact_id
+            recorded_bins = existing_rec.binary_paths
     return StageBResult(
         passed=True,
         elapsed_sec=time.monotonic() - t0,
@@ -4389,6 +4558,11 @@ def run_stage_b_ascendc_compile(
                 proc.stderr or proc.stdout or "bisheng failed without diagnostics"
             )
             detail = _bounded_compile_diagnostic(raw_detail)
+            fault_code = _classify_stage_b_overflow_fault_code(
+                raw_detail,
+                summary,
+                "STAGE_B_ASCENDC_COMPILE_FAILED",
+            )
             return StageBResult(
                 passed=False,
                 error_message=f"stage_b_ascendc_compile_failed (rc={proc.returncode}): {detail}",
@@ -4400,7 +4574,7 @@ def run_stage_b_ascendc_compile(
                 microarch_profile=ma_profile,
                 full_diagnostic=raw_detail,
                 fault_plane="STAGE_B_COMPILE",
-                fault_code="STAGE_B_ASCENDC_COMPILE_FAILED",
+                fault_code=fault_code,
                 failed_tier="stage_b",
             )
 
@@ -4427,6 +4601,23 @@ def run_stage_b_ascendc_compile(
                 microarch_profile=ma_profile,
                 fault_plane="STAGE_B_COMPILE",
                 fault_code="STAGE_B_ASCENDC_UNINSTANTIATED_TEMPLATE",
+                failed_tier="stage_b",
+            )
+        if _has_vf_stack_overflow_signal(telemetry_out, summary, extra_flags):
+            return StageBResult(
+                passed=False,
+                error_message=(
+                    f"stage_b_ascendc_vf_stack_overflow: stack_bytes={summary.stack_bytes}"
+                ),
+                elapsed_sec=time.monotonic() - t0,
+                generated_cce=cpp_source,
+                spill_bytes=spill_bytes,
+                vloopv2_hit=vloopv2_hit,
+                compiler_summary=summary,
+                microarch_profile=ma_profile,
+                full_diagnostic=telemetry_out,
+                fault_plane="STAGE_B_COMPILE",
+                fault_code="VF_STACK_OVERFLOW",
                 failed_tier="stage_b",
             )
 
@@ -4480,6 +4671,11 @@ def run_stage_b_ascendc_compile(
             link_raw = (link_proc.stderr or "") + "\n" + (link_proc.stdout or "")
             if link_proc.returncode != 0 or not so_path.is_file():
                 link_detail = _bounded_compile_diagnostic(link_raw)
+                link_fault_code = _classify_stage_b_overflow_fault_code(
+                    link_raw,
+                    summary,
+                    "STAGE_B_ASCENDC_SHARED_LINK_FAILED",
+                )
                 return StageBResult(
                     passed=False,
                     error_message=(
@@ -4493,41 +4689,37 @@ def run_stage_b_ascendc_compile(
                     microarch_profile=ma_profile,
                     full_diagnostic=link_raw,
                     fault_plane="STAGE_B_COMPILE",
-                    fault_code="STAGE_B_ASCENDC_SHARED_LINK_FAILED",
+                    fault_code=link_fault_code,
                     failed_tier="stage_b",
                 )
             so_path_opt = so_path
 
-        if resolved_store is not None:
-            built_bins = [
-                p
-                for p in (obj_path, so_path_opt)
-                if p is not None and p.is_file() and p.stat().st_size > 0
-            ]
-            if built_bins:
-                closure_src = (
-                    extract_reachable_closure_source(cpp_source, regime_tag=regime_tag)
-                    if regime_tag
-                    else cpp_source
-                )
-                flags_str = " ".join(extra_flags)
-                recorded_aid = artifact_id or compute_artifact_id(
-                    closure_src=closure_src,
-                    flags=flags_str,
-                    arch=arch,
-                    spec_key=spec_key,
-                )
-                rec = resolved_store.record_verified_artifact(
-                    recorded_aid,
-                    binary_paths=built_bins,
-                    backend_kind="ascendc",
-                    arch=arch,
-                    flags=flags_str,
-                    spec_key=spec_key,
-                    closure_src=closure_src,
-                    copy_binaries=True,
-                )
-                recorded_bins = rec.binary_paths
+        built_bins = [
+            p
+            for p in (obj_path, so_path_opt)
+            if p is not None and p.is_file() and p.stat().st_size > 0
+        ]
+        if built_bins:
+            closure_src = _normalize_trackb_unit_source(cpp_source, regime_tag=regime_tag)
+            flags_str = " ".join(extra_flags)
+            recorded_aid = artifact_id or compute_compile_task_key(
+                normalized_kernel_unit_src=closure_src,
+                cann_target=arch,
+                pass_configs=None,
+                compile_flags=extra_flags,
+                static_spec_signature=spec_key,
+            )
+            rec = resolved_store.record_verified_artifact(
+                recorded_aid,
+                binary_paths=built_bins,
+                backend_kind="ascendc",
+                arch=arch,
+                flags=flags_str,
+                spec_key=spec_key,
+                closure_src=closure_src,
+                copy_binaries=True,
+            )
+            recorded_bins = rec.binary_paths
 
     return StageBResult(
         passed=True,
