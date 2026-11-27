@@ -1094,7 +1094,10 @@ class StageGateCoordinator:
                     default_builder_kwargs=dict(resolved.builder_kwargs), default_pass_configs=dict(resolved.pass_configs or {}),
                     default_compile_flags=tuple(resolved.compile_flags or ()),
                 )
-                plan = build_post_selector_regime_plan(module_source, regime_spec.regime_tag or "default", cases_by_id, ext)
+                plan = build_post_selector_regime_plan(
+                    module_source, regime_spec.regime_tag or "default", cases_by_id, ext,
+                    env_file=self._env_file, source_root=self._source_root,
+                )
             except (SyntaxError, AttributeError, ImportError, KeyError, NameError, RuntimeError, TypeError, ValueError):
                 plan = None
         cann_setup = ((env_vals or {}).get("TILEFOUNDRY_NPU_CANN_SETUP") or os.environ.get("TILEFOUNDRY_NPU_CANN_SETUP") or "").strip()

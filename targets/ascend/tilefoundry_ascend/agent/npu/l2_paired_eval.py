@@ -728,15 +728,25 @@ def prewarm_surrogate_tilelang_cache_with_stats(
                 raise RuntimeError(f"prewarm_surrogate_tilelang_cache failed: {err}") from exc
             failed_by_cid[cid] = err
             continue
-        plan = build_post_selector_regime_plan(mod_src, str(anchors[0].regime_tag or operator_name or "default"), cases_by_id, extractor)
+        plan = build_post_selector_regime_plan(
+            mod_src, str(anchors[0].regime_tag or operator_name or "default"), cases_by_id, extractor,
+            env_file=env_file, source_root=root,
+        )
+        if not manifest_path.is_file():
+            total_tasks += len(plan.unique_specs_by_key)
+            continue
         ok, details = validate_prewarm_manifest_v1(manifest_path, plan)
         total_tasks += int(details.get("total_tasks", 0))
         cache_hits += int(details.get("cache_hits", 0))
         if not ok:
-            err = f"prewarm_manifest_v1_miss: missing={len(details.get('missing_tasks', ()))} failed={len(details.get('failed_tasks', ()))}"
-            if cid == "incumbent_slot" or not isolate_non_incumbent:
-                raise RuntimeError(f"prewarm_surrogate_tilelang_cache failed: {err}")
-            failed_by_cid[cid] = err
+            failed_tasks = details.get("failed_tasks") or ()
+            stale_tasks = details.get("stale_tasks") or ()
+            is_inc = cid in _INCUMBENT_CANDIDATE_IDS
+            if failed_tasks or (stale_tasks and not is_inc):
+                err = f"prewarm_manifest_v1_miss: missing={len(details.get('missing_tasks', ()))} failed={len(failed_tasks)}"
+                if cid == "incumbent_slot" or not isolate_non_incumbent:
+                    raise RuntimeError(f"prewarm_surrogate_tilelang_cache failed: {err}")
+                failed_by_cid[cid] = err
     stats = {"total_tasks": total_tasks, "cache_hits": cache_hits, "compiled_tasks": 0, "failed_candidates": len(failed_by_cid)}
     return PrewarmTileLangResult(tl_c, stats, failed_by_cid, time.monotonic() - t0)
 

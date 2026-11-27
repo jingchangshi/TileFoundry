@@ -692,3 +692,82 @@ def test_trackb_shared_so_cache_and_stage_b_callback_injection(
         run_stage_b_ascendc_compile(tu, enable_device_compile=False)
     with pytest.raises(ValueError, match="enable_device_compile=False"):
         run_stage_b_compile("def kernel():\n    pass\n", enable_device_compile=False)
+
+
+def test_load_plan_module_resolves_tilelang_source_without_pythonpath(tmp_path: Path) -> None:
+    """Resolve TILEFOUNDRY_NPU_TILELANG_SOURCE and sibling tilelang without machine paths."""
+    import os
+    import sys
+
+    tl_env_dir = tmp_path / "tl_from_env"
+    (tl_env_dir / "tilelang").mkdir(parents=True)
+    (tl_env_dir / "tilelang" / "__init__.py").write_text("SOURCE_TAG = 'env'\n", encoding="utf-8")
+    env_file = tmp_path / "env.sh"
+    env_file.write_text(f"TILEFOUNDRY_NPU_TILELANG_SOURCE={tl_env_dir}\n", encoding="utf-8")
+
+    sib_ws = tmp_path / "ws"
+    fake_root = sib_ws / "TileFoundry"
+    fake_root.mkdir(parents=True)
+    tl_sib_dir = sib_ws / "tilelang"
+    (tl_sib_dir / "tilelang").mkdir(parents=True)
+    (tl_sib_dir / "tilelang" / "__init__.py").write_text("SOURCE_TAG = 'sib'\n", encoding="utf-8")
+
+    clean_pp = os.pathsep.join([str(_REPO_ROOT / "src"), str(_REPO_ROOT / "targets" / "ascend")])
+    clean_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in (
+            "PYTHONPATH",
+            "TILEFOUNDRY_NPU_ENV_FILE",
+            "TILEFOUNDRY_NPU_TILELANG_SOURCE",
+            "TILEFOUNDRY_NPU_TILELANG_REPO",
+            "TORCH_DEVICE_BACKEND_AUTOLOAD",
+        )
+    }
+    clean_env["PYTHONPATH"] = clean_pp
+
+    script = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from tilefoundry_ascend.agent.orchestrator.stage_b_gate import ModuleSelectorPlanExtractor, build_post_selector_regime_plan\n"
+        f"src = {(_SYNTHETIC_SELECTOR_MODULE)!r}\n"
+        "cases = {'c0': {'m_rows': 16, 'd_dim': 2048, 'tl_dtype': 'bfloat16'}}\n"
+        "ext = ModuleSelectorPlanExtractor(target='dav-3510', builder_name='_build_synth_prim_func', config_selector_name='_select_synth_config')\n"
+        f"plan = build_post_selector_regime_plan(src, 'synth', cases, ext, env_file=Path({str(env_file)!r}))\n"
+        "assert len(plan.unique_specs_by_key) == 1\n"
+        "assert os.environ.get('TORCH_DEVICE_BACKEND_AUTOLOAD') == '0'\n"
+        "import tilelang\n"
+        "assert tilelang.SOURCE_TAG == 'env'\n"
+    )
+    proc_env = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(tmp_path),
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_env.returncode == 0, proc_env.stderr or proc_env.stdout
+
+    script_sib = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from tilefoundry_ascend.agent.orchestrator.stage_b_gate import ModuleSelectorPlanExtractor, build_post_selector_regime_plan\n"
+        f"src = {(_SYNTHETIC_SELECTOR_MODULE)!r}\n"
+        "cases = {'c0': {'m_rows': 16, 'd_dim': 2048, 'tl_dtype': 'bfloat16'}}\n"
+        "ext = ModuleSelectorPlanExtractor(target='dav-3510', builder_name='_build_synth_prim_func', config_selector_name='_select_synth_config')\n"
+        f"plan = build_post_selector_regime_plan(src, 'synth', cases, ext, source_root=Path({str(fake_root)!r}))\n"
+        "assert len(plan.unique_specs_by_key) == 1\n"
+        "import tilelang\n"
+        "assert tilelang.SOURCE_TAG == 'sib'\n"
+    )
+    proc_sib = subprocess.run(
+        [sys.executable, "-c", script_sib],
+        cwd=str(tmp_path),
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_sib.returncode == 0, proc_sib.stderr or proc_sib.stdout

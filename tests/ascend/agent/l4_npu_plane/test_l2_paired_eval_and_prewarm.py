@@ -155,6 +155,7 @@ def _populate_manifest(
     tl_cache: Path,
     fake_root: Path,
     env_file: Path,
+    compile_ok: bool = True,
 ) -> None:
     ar_regs = {r.regime_tag: r for r in get_default_regime_specs("attention_residual")}
     case_dims: dict[str, dict[str, object]] = {}
@@ -174,6 +175,8 @@ def _populate_manifest(
     plan = stage_b_gate.build_post_selector_regime_plan(cand_src, "small_decode", case_dims, ext)
 
     def _compile_stub(spec: object, _src: str, work_dir: Path) -> tuple[bool, int, str, list[Path]]:
+        if not compile_ok:
+            return False, 0, "simulated_bisheng_compile_failure", []
         so_path = work_dir / f"{spec.task_key[:10]}.so"
         so_path.write_bytes(b"\x7fELF-stub")
         return True, 0, "", [so_path]
@@ -181,7 +184,7 @@ def _populate_manifest(
     res = stage_b_gate.StageBCompileGate(
         plan, store, compile_fn=_compile_stub, source_root=fake_root, env_file=env_file
     ).run(cand_src)
-    assert res.passed is True
+    assert res.passed is compile_ok
 
 
 def test_poison_pill_adaptive_timeout_and_boot_handshake(tmp_path: Path) -> None:
@@ -507,6 +510,15 @@ def test_batch_isolation_paired_guardrail_and_response_tamper_rejection(
         fake_root=fake_root,
         env_file=env_file,
     )
+    _populate_manifest(
+        bad_cand,
+        anchors=anchors,
+        cann_repo=cann_repo,
+        tl_cache=tl_cache,
+        fake_root=fake_root,
+        env_file=env_file,
+        compile_ok=False,
+    )
 
     ref_dir = work_root / "surrogate" / "reference" / "operators" / "level4__attention_residual"
     ref_dir.mkdir(parents=True, exist_ok=True)
@@ -687,3 +699,81 @@ def test_shim_creation_ast_signature_and_l0_precheck(tmp_path: Path) -> None:
     st_a = l2_paired_eval.run_l0_static_precheck(py_mod, builder_name="kernel", builder_kwargs={})
     assert st_a.passed is False
     assert "stage_a_non_kernel_callable" in st_a.error_message
+
+
+def test_prewarm_allows_unwarmed_baseline_and_multi_regime_but_rejects_explicit_failure(
+    tmp_path: Path,
+) -> None:
+    """Allow absent or unwarmed manifest entries while rejecting explicit Stage-B failures."""
+    fake_root, cann_repo, _tl, work_root, env_file = _setup_prewarm_fixture(tmp_path)
+    inc_cand = _write_ar_candidate(tmp_path / "inc.py", tag="inc")
+    good_cand = _write_ar_candidate(tmp_path / "good.py", tag="good")
+    bad_cand = _write_ar_candidate(tmp_path / "bad.py", tag="bad", fail_compile=True)
+    anchors = (
+        AnchorCaseSpec("level4/attention_residual", 2, "small_decode", 1.5, 0.5),
+        AnchorCaseSpec("level4/attention_residual", 4, "unaligned_d", 9.9, 3.3),
+    )
+    ref_cache = work_root / "surrogate" / "reference"
+    tl_cache = work_root / "surrogate" / "tilelang"
+
+    res_absent = l2_paired_eval.prewarm_surrogate_tilelang_cache_with_stats(
+        "attention_residual",
+        [("incumbent_baseline", inc_cand)],
+        anchors,
+        cannbench_repo=cann_repo,
+        env_file=env_file,
+        cache_dir=ref_cache,
+        tl_cache_dir=tl_cache,
+        source_root=fake_root,
+        isolate_non_incumbent=True,
+    )
+    assert res_absent.failed_by_cid == {}
+    assert res_absent.prewarm_stats["failed_candidates"] == 0
+    assert res_absent.prewarm_stats["total_tasks"] == 2
+    assert res_absent.prewarm_stats["cache_hits"] == 0
+
+    l2_paired_eval.prewarm_surrogate_tilelang_cache(
+        "attention_residual",
+        [("incumbent_baseline", inc_cand)],
+        anchors,
+        cannbench_repo=cann_repo,
+        env_file=env_file,
+        cache_dir=ref_cache,
+        tl_cache_dir=tl_cache,
+        source_root=fake_root,
+    )
+
+    _populate_manifest(
+        good_cand,
+        anchors=(anchors[0],),
+        cann_repo=cann_repo,
+        tl_cache=tl_cache,
+        fake_root=fake_root,
+        env_file=env_file,
+    )
+    _populate_manifest(
+        bad_cand,
+        anchors=(anchors[0],),
+        cann_repo=cann_repo,
+        tl_cache=tl_cache,
+        fake_root=fake_root,
+        env_file=env_file,
+        compile_ok=False,
+    )
+
+    res_multi = l2_paired_eval.prewarm_surrogate_tilelang_cache_with_stats(
+        "attention_residual",
+        [("incumbent_slot", inc_cand), ("c_good", good_cand), ("c_bad", bad_cand)],
+        anchors,
+        cannbench_repo=cann_repo,
+        env_file=env_file,
+        cache_dir=ref_cache,
+        tl_cache_dir=tl_cache,
+        source_root=fake_root,
+        isolate_non_incumbent=True,
+    )
+    assert "incumbent_slot" not in res_multi.failed_by_cid
+    assert "c_good" not in res_multi.failed_by_cid
+    assert "c_bad" in res_multi.failed_by_cid
+    assert res_multi.prewarm_stats["failed_candidates"] == 1
+    assert res_multi.prewarm_stats["cache_hits"] >= 1

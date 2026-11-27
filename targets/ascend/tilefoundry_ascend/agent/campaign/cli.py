@@ -17,6 +17,7 @@ from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistill
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import GateFunnel
 from tilefoundry_ascend.agent.orchestrator.llm_client import create_llm_backend_from_env
+from tilefoundry_ascend.agent.orchestrator.stage_b_gate import _ensure_tilelang_on_sys_path
 from tilefoundry_ascend.agent.probes import LocalHardwareProbePort
 from tilefoundry_ascend.agent.specs.anchor_specs import parse_simple_env_file
 
@@ -43,6 +44,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not ops and not args.operator:
         parser.error("one of --operator or --operators is required")
     primary_op = str(args.operator or ops[0])
+    os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    os.environ.setdefault("USE_CUDA", "0")
+    ehint = args.env_file or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
+    evals = parse_simple_env_file(Path(ehint).expanduser()) if ehint else {}
+    for k in ("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "TILEFOUNDRY_NPU_CANNBENCH_REPO", "TILEFOUNDRY_NPU_TILELANG_SOURCE", "TILEFOUNDRY_NPU_TILELANG_BUILD"):
+        if (val := evals.get(k, "").strip()):
+            os.environ.setdefault(k, val)
+    _ensure_tilelang_on_sys_path(env_vals=evals, env_file=ehint or None, source_root=args.source_root)
     eff_cost_mode = str(args.cost_model_mode).strip().lower()
     eff_prescreen = bool(args.enable_tilesize_prescreen) and eff_cost_mode != "off"
     if args.marathon or len(ops) > 1:
@@ -66,8 +75,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_operators_marathon(ops, base_config=cfg, mode=str(args.marathon_mode)) if len(ops) > 1 else run_operator_marathon(cfg)
     if not args.checkpoint:
         parser.error("--checkpoint is required unless --marathon is set")
-    ehint = args.env_file or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
-    evals = parse_simple_env_file(Path(ehint).expanduser()) if ehint else {}
     pdev, pool = resolve_campaign_device_plan(
         device_id=str(args.device_id), device_ids=tuple(args.device_ids),
         env_device_ids=parse_device_ids(evals.get(CAMPAIGN_DEVICE_IDS_ENV_KEY, "")),

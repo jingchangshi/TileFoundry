@@ -24,6 +24,7 @@ from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistill
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import GateFunnel
 from tilefoundry_ascend.agent.orchestrator.llm_client import AgyCliLLMBackend, create_llm_backend_from_env
+from tilefoundry_ascend.agent.orchestrator.stage_b_gate import _ensure_tilelang_on_sys_path
 from tilefoundry_ascend.agent.probes import LocalHardwareProbePort
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     CannbenchOpsRegistry, PerfTargetSpec, RegimeTargetSpec, default_source_root,
@@ -147,6 +148,7 @@ def run_operator_marathon(config: MarathonConfig | None = None, **overrides: obj
     env_file = ensure_marathon_env_file(operator_name=cfg.operator_name, worktree=worktree, state_dir=state_dir, env_file=cfg.env_file, source_root=src_root)
     vis = parse_device_ids(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""))
     env_vals = configure_marathon_process_env(operator_name=cfg.operator_name, env_file=env_file, worktree=worktree, source_root=src_root)
+    _ensure_tilelang_on_sys_path(env_vals=env_vals, env_file=env_file, source_root=src_root)
     pdev, dpool = resolve_campaign_device_plan(device_id=str(cfg.device_id), device_ids=tuple(cfg.device_ids), env_device_ids=parse_device_ids(env_vals.get(CAMPAIGN_DEVICE_IDS_ENV_KEY, "")), visible_device_ids=vis)
     llm = create_llm_backend_from_env(overrides=_llm_backend_overrides(env_vals, cfg))
     rcb = env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip() or os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()

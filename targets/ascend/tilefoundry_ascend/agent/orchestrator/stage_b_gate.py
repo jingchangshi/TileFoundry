@@ -194,11 +194,16 @@ def has_unreserved_vf_stack_overflow(spec: CompileTaskSpec, stack_bytes: int, co
 
 def build_post_selector_regime_plan(
     module_source: str, regime_tag: str, cases_by_id: Mapping[Any, Mapping[str, Any]], extractor: CasePlanExtractor,
+    *, env_file: str | Path | None = None, source_root: str | Path | None = None,
 ) -> RegimeCompilePlan:
     """Evaluate extractor over all regime cases first, then quotient by task_key."""
     tasks_by_case: dict[str, tuple[CompileTaskSpec, ...]] = {}
     unique_specs: dict[str, CompileTaskSpec] = {}
-    fast_loaded = _load_plan_module(module_source) if isinstance(extractor, ModuleSelectorPlanExtractor) else None
+    fast_loaded = (
+        _load_plan_module(module_source, env_file=env_file, source_root=source_root)
+        if isinstance(extractor, ModuleSelectorPlanExtractor)
+        else None
+    )
     for case_id in sorted(cases_by_id, key=str):
         cid_str, case_spec = str(case_id), cases_by_id[case_id]
         emitted = (
@@ -463,7 +468,46 @@ _PLAN_MODULE_LOCK = threading.Lock()
 _LAST_PLAN_ENTRY: tuple[str, _LoadedPlanModule] | None = None
 
 
-def _load_plan_module(module_source: str) -> _LoadedPlanModule:
+def _resolve_tilelang_source_dir(
+    *, env_vals: Mapping[str, str] | None = None, env_file: str | Path | None = None, source_root: str | Path | None = None,
+) -> str | None:
+    vals = env_vals if env_vals is not None else _resolve_env_values(env_file)
+    cands: list[Path] = []
+    for raw in (
+        vals.get("TILEFOUNDRY_NPU_TILELANG_SOURCE", ""), vals.get("TILEFOUNDRY_NPU_TILELANG_REPO", ""),
+        os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE", ""), os.environ.get("TILEFOUNDRY_NPU_TILELANG_REPO", ""),
+    ):
+        if txt := str(raw or "").strip():
+            cands.append(Path(txt).expanduser())
+    if source_root is not None:
+        cands.append(Path(source_root).expanduser().resolve().parent / "tilelang")
+    cands.append(Path(__file__).resolve().parents[5].parent / "tilelang")
+    for cand in cands:
+        if (cand / "tilelang").is_dir():
+            return str(cand.resolve())
+    return None
+
+
+def _ensure_tilelang_on_sys_path(
+    *, env_vals: Mapping[str, str] | None = None, env_file: str | Path | None = None, source_root: str | Path | None = None,
+) -> str | None:
+    """Ensure host CPU autoload guard and resolved tilelang source root are on sys.path."""
+    os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    os.environ.setdefault("USE_CUDA", "0")
+    if (tl_dir := _resolve_tilelang_source_dir(env_vals=env_vals, env_file=env_file, source_root=source_root)) is None:
+        return None
+    if tl_dir not in sys.path:
+        if importlib.util.find_spec("tilelang") is None:
+            sys.path.insert(0, tl_dir)
+        else:
+            sys.path.append(tl_dir)
+        importlib.invalidate_caches()
+    return tl_dir
+
+
+def _load_plan_module(
+    module_source: str, *, env_file: str | Path | None = None, source_root: str | Path | None = None,
+) -> _LoadedPlanModule:
     global _LAST_PLAN_ENTRY
     last = _LAST_PLAN_ENTRY
     if last is not None and (last[0] is module_source or last[0] == module_source):
@@ -474,6 +518,7 @@ def _load_plan_module(module_source: str) -> _LoadedPlanModule:
             _LAST_PLAN_ENTRY = (module_source, cached)
             return cached
 
+    _ensure_tilelang_on_sys_path(env_file=env_file, source_root=source_root)
     mod_filename = f"<tf_plan_{mod_sha[:12]}>"
     linecache.cache[mod_filename] = (len(module_source), None, module_source.splitlines(keepends=True), mod_filename)
     mod = types.ModuleType(f"_tf_plan_{mod_sha[:12]}")
@@ -1571,8 +1616,8 @@ def validate_prewarm_manifest_v1(manifest_path: str | Path, plan: RegimeCompileP
     manifest = _load_manifest_dict(mpath)
     tasks = manifest.get("tasks")
     if not mpath.is_file() or not isinstance(tasks, Mapping):
-        return False, {"manifest_path": str(mpath), "regime_tag": plan.regime_tag, "total_tasks": len(plan.unique_specs_by_key), "cache_hits": 0, "missing_tasks": sorted(plan.unique_specs_by_key), "failed_tasks": []}
-    missing, failed, hits = [], [], 0
+        return False, {"manifest_path": str(mpath), "regime_tag": plan.regime_tag, "total_tasks": len(plan.unique_specs_by_key), "cache_hits": 0, "missing_tasks": sorted(plan.unique_specs_by_key), "failed_tasks": [], "stale_tasks": []}
+    missing, failed, stale, hits = [], [], [], 0
     for tkey, spec in plan.unique_specs_by_key.items():
         if not isinstance(entry := tasks.get(tkey), Mapping):
             missing.append(tkey)
@@ -1584,11 +1629,12 @@ def validate_prewarm_manifest_v1(manifest_path: str | Path, plan: RegimeCompileP
             )
             if not raw_bins or not any(is_verified_binary_file(Path(b)) for b in raw_bins):
                 missing.append(tkey)
+                stale.append(tkey)
             else:
                 hits += 1
     return (hits == len(plan.unique_specs_by_key) and not missing and not failed), {
         "manifest_path": str(mpath), "regime_tag": plan.regime_tag, "total_tasks": len(plan.unique_specs_by_key),
-        "cache_hits": hits, "missing_tasks": missing, "failed_tasks": failed,
+        "cache_hits": hits, "missing_tasks": missing, "failed_tasks": failed, "stale_tasks": stale,
     }
 
 
@@ -1600,7 +1646,7 @@ def _resolve_env_values(env_file: str | Path | None) -> dict[str, str]:
 def _build_cpu_compile_env(env_vals: Mapping[str, str], tl_cache_dir: Path, source_root: Path | None = None) -> tuple[dict[str, str], Callable[[Path], list[str]]]:
     py = env_vals.get("TILEFOUNDRY_NPU_PYTHON") or os.environ.get("TILEFOUNDRY_NPU_PYTHON") or sys.executable
     cann_setup = (env_vals.get("TILEFOUNDRY_NPU_CANN_SETUP") or os.environ.get("TILEFOUNDRY_NPU_CANN_SETUP") or "").strip()
-    tl_src = (env_vals.get("TILEFOUNDRY_NPU_TILELANG_SOURCE") or os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE") or "").strip()
+    tl_src = _resolve_tilelang_source_dir(env_vals=env_vals, source_root=source_root) or ""
     root = source_root or Path(__file__).resolve().parents[5]
     pp = [*( [tl_src] if tl_src else [] ), str(root), str(root / "src"), str(root / "targets" / "ascend"), *( [os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [] )]
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(pp), "TILELANG_DISABLE_CACHE": "0", "TILELANG_KERNEL_CACHE_USE_LIB_STAMP": "1", "TILELANG_CACHE_DIR": str(tl_cache_dir), "TORCH_DEVICE_BACKEND_AUTOLOAD": "0", "ASCEND_RT_VISIBLE_DEVICES": ""}
@@ -1789,6 +1835,7 @@ def run_l1_compile_check(
     plan = build_post_selector_regime_plan(
         module_source, regime_tag or "default", cases_by_id,
         ModuleSelectorPlanExtractor(builder_name=builder_name, config_selector_name=config_selector_name or "", default_builder_kwargs=builder_kwargs, default_pass_configs=norm_pc, default_compile_flags=norm_cf),
+        env_file=env_file, source_root=root,
     )
     if not plan.unique_specs_by_key:
         with tempfile.TemporaryDirectory(prefix="tf_l1_fallback_") as tmp_dir:
