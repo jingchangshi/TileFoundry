@@ -925,3 +925,90 @@ def test_stage_b_gate_forwards_unit_kind_to_compile_task_key() -> None:
     )
     assert tb_spec.task_key == cpp_key
     assert tb_spec.task_key != dsl_key
+
+
+@pytest.mark.parametrize(
+    ("raw_prof", "expected_metrics", "absent_keys"),
+    [
+        (
+            {
+                "aic_mac_ratio": "42.5",
+                "aiv_vec_ratio": "0.65",
+                "aiv_mte2": 80.0,
+                "aic_mte2": 0.4,
+                "dur_ns": "25000",
+            },
+            {
+                "aic_mac_ratio": 0.425,
+                "aic_mad": 0.425,
+                "aiv_vec_ratio": 0.65,
+                "aiv_vec": 0.65,
+                "aiv_mte2": 0.8,
+                "aic_mte2": 0.4,
+                "mte2_wait_ratio": 0.8,
+                "dur_us": 25.0,
+            },
+            (),
+        ),
+        (
+            {
+                "aic_mac_ratio": "N/A",
+                "aiv_vec_ratio": "nan",
+                "aiv_mte2": float("inf"),
+                "aic_mte2": True,
+                "l2_hit_rate": None,
+                "dur_us": "invalid",
+            },
+            {},
+            (
+                "aic_mac_ratio",
+                "aic_mad",
+                "aiv_vec_ratio",
+                "aiv_vec",
+                "aiv_mte2",
+                "aic_mte2",
+                "mte2_wait_ratio",
+                "l2_hit_rate",
+                "dur_us",
+            ),
+        ),
+    ],
+    ids=["accept_percent_and_unit_ratio", "reject_malformed_and_missing_cells"],
+)
+def test_surrogate_batch_harness_msprof_detail_metrics_reject_and_accept(
+    raw_prof: dict[str, object],
+    expected_metrics: dict[str, float],
+    absent_keys: tuple[str, ...],
+) -> None:
+    """Parse percent and unit ratios cleanly without UnboundLocalError and skip malformed cells."""
+    repo_root = Path(__file__).resolve().parents[4]
+    harness_path = repo_root / "tests" / "ascend" / "agent" / "surrogate_batch_harness.py"
+    spec = importlib.util.spec_from_file_location("surrogate_batch_harness_msp_mod", harness_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+
+    class _StubMsprofBench:
+        def __call__(
+            self,
+            fn_call: object,
+            *,
+            _n_warmup: int,
+            _n_repeat: int,
+            backend: str,
+            device: object,
+        ) -> object:
+            assert callable(fn_call)
+            assert backend == "msprof_detail"
+            assert _n_warmup >= 1 and _n_repeat >= 1
+            assert device == "cpu"
+            return raw_prof
+
+    parsed = mod.measure_msprof(lambda: None, bench_fn=_StubMsprofBench(), device="cpu")
+    assert "error" not in parsed
+    for key, expected_val in expected_metrics.items():
+        assert parsed[key] == pytest.approx(expected_val)
+    for key in absent_keys:
+        assert key not in parsed
+    assert mod.measure_msprof(None) == {"error": "msprof_detail_failed: no_callable"}

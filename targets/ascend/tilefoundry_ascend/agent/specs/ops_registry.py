@@ -980,7 +980,9 @@ def _infer_regime_runtime_backend(
         return module_backend
     tb_funcs = {
         fn for fn, fn_node in funcs.items()
-        if fn != entrypoint and (any(s in (seg := ast.get_source_segment(module_text, fn_node) or "") for s in trackb_symbols) or "_get_track_b_lib" in seg)
+        if fn != entrypoint
+        and (seg := ast.get_source_segment(module_text, fn_node) or "")
+        and (any(s in seg for s in trackb_symbols) or "_get_track_b_lib" in seg)
     }
     changed = True
     while changed:

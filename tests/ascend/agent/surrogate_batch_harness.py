@@ -25,9 +25,7 @@ import torch
 
 from tilefoundry_ascend.agent import npu as ag_npu
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
-    MicroProbeSpec,
-    verify_micro_probe_hardware,
-)
+    MicroProbeSpec, verify_micro_probe_hardware)
 from tilefoundry_ascend.agent.npu.ag_transport import _sha256_file
 from tilefoundry_ascend.agent.specs import anchor_specs as aspecs
 from tilefoundry_ascend.ascend.json_record import atomic_write_text
@@ -38,14 +36,12 @@ _FAST_SHA256 = re.compile(r"[0-9a-f]{64}")
 _MSP_KEYS = (
     *((k, (k,)) for k in ("aic_scalar", "aic_mte1", "aic_mte3", "aic_fixpipe", "aiv_scalar",
                           "aiv_mte3", "aic_mte2", "aiv_mte2", "sync_stall_ratio",
-                          "mte2_wait_ratio")),
-    ("aic_mac_ratio", ("aic_mad", "aic_mac_ratio")),
+                          "mte2_wait_ratio")), ("aic_mac_ratio", ("aic_mad", "aic_mac_ratio")),
     ("aiv_vec_ratio", ("aiv_vec", "aiv_vec_ratio")),
     *((f"{k}_ratio", (f"{k}_ratio", k)) for k in ("aiv0_vec", "aiv1_vec")),
     ("l2_hit_rate", ("l2_hit_rate", "l2_cache_hit_rate")),
     ("bank_conflict_ratio", ("bank_conflict_ratio", "ub_bank_conflict_ratio",
-                             "resource_conflict_ratio")),
-)
+                             "resource_conflict_ratio")))
 
 
 def _ensure_npu(*, require: bool = False) -> None:
@@ -81,10 +77,8 @@ def _setup_env(cann_repo: Path | None, shim_dir: Path | None, tl_cache_dir: str)
         resolved = Path(tl_cache_dir).resolve()
         resolved.mkdir(parents=True, exist_ok=True)
         os.environ.update({
-            "TILELANG_CACHE_DIR": str(resolved),
-            "TILELANG_KERNEL_CACHE_USE_LIB_STAMP": "1",
-            "TILELANG_DISABLE_CACHE": "0",
-        })
+            "TILELANG_CACHE_DIR": str(resolved), "TILELANG_KERNEL_CACHE_USE_LIB_STAMP": "1",
+            "TILELANG_DISABLE_CACHE": "0"})
         importlib.import_module("tilelang.env").env.enable_cache()
         kc = importlib.import_module("tilelang.cache.kernel_cache").KernelCache
         kc._get_cache_namespace.cache_clear()
@@ -144,57 +138,63 @@ def _measure_null_launch_us(warmup: int = 5, repeat: int = 20) -> float | None:
         return None
 
 
-def _measure_msprof(
-    fn_call: Callable[[], object] | None, *, warmup: int = 1, repeat: int = 3
+class MsprofBenchPort(Protocol):
+    def __call__(self, fn_call: Callable[[], object], *, _n_warmup: int, _n_repeat: int,
+                 backend: str, device: object) -> object: ...
+
+
+def extract_msprof_metrics(prof: object) -> dict[str, object]:
+    def _num(*names: str) -> float | None:
+        for n in names:
+            raw = prof.get(n) if isinstance(prof, Mapping) else getattr(prof, n, None)
+            if isinstance(raw, (int, float, str)) and not isinstance(raw, bool):
+                with contextlib.suppress(ValueError):
+                    if math.isfinite(v := float(raw.strip() if isinstance(raw, str) else raw)):
+                        return v
+        return None
+
+    m: dict[str, object] = {ok: max(0.0, min(1.0, v / 100.0 if v > 1.05 else v))
+                           for ok, names in _MSP_KEYS if (v := _num(*names)) is not None}
+    m.update({d: m[s] for d, s in (("aic_mad", "aic_mac_ratio"), ("aiv_vec", "aiv_vec_ratio"))
+              if s in m})
+    if "mte2_wait_ratio" not in m and ("aiv_mte2" in m or "aic_mte2" in m):
+        m["mte2_wait_ratio"] = max(float(m[k]) for k in ("aiv_mte2", "aic_mte2") if k in m)
+    m.update({k: int(v) for k in ("aic_total_cycles", "aiv_total_cycles", "hbm_read_bytes",
+                                  "hbm_write_bytes", "actual_gm_bytes")
+              if (v := _num(k)) is not None})
+    if "actual_gm_bytes" not in m and ("hbm_read_bytes" in m or "hbm_write_bytes" in m):
+        m["actual_gm_bytes"] = int(m.get("hbm_read_bytes", 0)) + int(m.get("hbm_write_bytes", 0))
+    if (dur := _num("dur_us", "measured_latency_us")) is not None:
+        m["dur_us"] = dur
+    elif (ns := _num("dur_ns")) is not None:
+        m["dur_us"] = ns / 1000.0
+    return m
+
+
+def measure_msprof(
+    fn_call: Callable[[], object] | None, *, warmup: int = 1, repeat: int = 3,
+    bench_fn: MsprofBenchPort | None = None, device: object = None,
 ) -> dict[str, object]:
     if fn_call is None:
         return {"error": "msprof_detail_failed: no_callable"}
-
-    def _num(*names: str) -> int | float | None:
-        for name in names:
-            raw = prof.get(name) if isinstance(prof, Mapping) else getattr(prof, name, None)
-            if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw):
-                return raw
-        return None
-
     try:
-        prof = importlib.import_module("tilelang.profiler").do_bench(
+        runner = bench_fn or importlib.import_module("tilelang.profiler").do_bench
+        prof = runner(
             fn_call, _n_warmup=max(1, int(warmup)), _n_repeat=max(1, int(repeat)),
-            backend="msprof_detail", device=torch.device("npu:0"),
-        )
-        m: dict[str, object] = {
-            ok: max(0.0, min(1.0, (v := float(raw)) / 100.0 if v > 1.05 else v))
-            for ok, names in _MSP_KEYS if (raw := _num(*names)) is not None
-        }
-        m.update({d: m[s] for d, s in (("aic_mad", "aic_mac_ratio"), ("aiv_vec", "aiv_vec_ratio"))
-                  if s in m})
-        if "mte2_wait_ratio" not in m and ("aiv_mte2" in m or "aic_mte2" in m):
-            m["mte2_wait_ratio"] = max(float(m[k]) for k in ("aiv_mte2", "aic_mte2") if k in m)
-        m.update({k: int(raw) for k in ("aic_total_cycles", "aiv_total_cycles", "hbm_read_bytes",
-                                        "hbm_write_bytes", "actual_gm_bytes")
-                  if (raw := _num(k)) is not None})
-        if "actual_gm_bytes" not in m and ("hbm_read_bytes" in m or "hbm_write_bytes" in m):
-            m["actual_gm_bytes"] = int(m.get("hbm_read_bytes", 0)) + int(
-                m.get("hbm_write_bytes", 0))
-        if (dur := _num("dur_us", "measured_latency_us")) is not None:
-            m["dur_us"] = float(dur)
-        elif (ns := _num("dur_ns")) is not None:
-            m["dur_us"] = float(ns) / 1000.0
-        return m
+            backend="msprof_detail", device=(torch.device("npu:0") if device is None else device))
+        return extract_msprof_metrics(prof)
     except Exception as exc:
         return {"error": f"msprof_detail_failed: {type(exc).__name__}: {exc}"[:300]}
 
 
-def _oracle_bundle(
-    cache: object, harness: object, case: object
-) -> tuple[object, object, Callable[[], object]]:
+def _oracle_bundle(cache: object, harness: object, case: object) -> tuple[
+    object, object, Callable[[], object]
+]:
     b = cache.get(case, "oracle", lambda: {
-        "inputs": (ts := harness.prepare(case)), "oracle": harness.reference_output(case, ts),
-    })
+        "inputs": (ts := harness.prepare(case)), "oracle": harness.reference_output(case, ts)})
     t, o = b["inputs"], b["oracle"]
     return t, o, lambda: cache.get(
-        case, "native", lambda: harness.reference_output(case, t, native=True)
-    )
+        case, "native", lambda: harness.reference_output(case, t, native=True))
 
 
 def _load_harness(
@@ -451,8 +451,8 @@ def _evaluate_operator_batch(
                     if msprof_out is not None and int(spec.case_num) in msp_cases:
                         for _i, cid, fn in passed:
                             msprof_out.setdefault(cid, {})[str(int(spec.case_num))] = (
-                                _measure_msprof(lambda f=fn, p=base_params: f(**p),
-                                                warmup=mw, repeat=mr))
+                                measure_msprof(lambda f=fn, p=base_params: f(**p),
+                                               warmup=mw, repeat=mr))
                 try:
                     _with_npu_params(cmod, harness, case, tensors, _time_pass)
                 except Exception as exc:
@@ -492,7 +492,7 @@ def _collect_msprof_targets(
                     metrics = _with_npu_params(
                         cmod, harness, by_num[cn], t,
                         lambda p, f=loaded[(cid, mp)][0], w=int(r.get("warmup", 1)),
-                        rep=int(r.get("repeat", 3)): _measure_msprof(
+                        rep=int(r.get("repeat", 3)): measure_msprof(
                             lambda f=f, p=p: f(**p), warmup=w, repeat=rep))
                 except Exception as exc:
                     metrics = {"error": f"msprof_target_failed: {type(exc).__name__}: {exc}"[:300]}
