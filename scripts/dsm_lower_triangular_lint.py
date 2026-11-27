@@ -121,10 +121,11 @@ def _module_name_from_path(root: Path, file_path: Path) -> str:
 
 
 def _resolve_target(name: str, known_modules: set[str]) -> str:
-    pkg_init = f"{name}.__init__"
-    if pkg_init in known_modules:
-        return pkg_init
-    return name
+    return f"{name}.__init__" if f"{name}.__init__" in known_modules else name
+
+
+def _is_internal_module(name: str) -> bool:
+    return name == "tilefoundry_ascend" or name.startswith("tilefoundry_ascend.")
 
 
 def _resolve_import_from_base(
@@ -132,13 +133,12 @@ def _resolve_import_from_base(
 ) -> str | None:
     if node.level == 0:
         base = node.module or ""
-        if base == "tilefoundry_ascend" or base.startswith("tilefoundry_ascend."):
-            return base
-        return None
-    if src_module.endswith(".__init__"):
-        pkg = src_module[: -len(".__init__")]
-    else:
-        pkg = src_module.rsplit(".", 1)[0]
+        return base if _is_internal_module(base) else None
+    pkg = (
+        src_module[: -len(".__init__")]
+        if src_module.endswith(".__init__")
+        else src_module.rsplit(".", 1)[0]
+    )
     pkg_parts = pkg.split(".")
     up = node.level - 1
     if up > len(pkg_parts):
@@ -147,22 +147,10 @@ def _resolve_import_from_base(
     if node.module:
         anchor.extend(node.module.split("."))
     base = ".".join(anchor)
-    if base == "tilefoundry_ascend" or base.startswith("tilefoundry_ascend."):
-        return base
-    return None
+    return base if _is_internal_module(base) else None
 
 
-_BASE_SCAN_TOKENS = (
-    "modules",
-    "_invoke_with_optional_kwargs",
-    "_sync_coordinators",
-    "_PROPAGATED_HOOKS",
-    "_owner_override",
-    "_resolve_hook",
-    "_bind_facade_globals",
-    "_FACADE_NS",
-    "_hook",
-)
+_BASE_SCAN_TOKENS = ("modules", *BANNED_REFLECTION_NAMES)
 
 
 def _iter_import_nodes(tree: ast.Module) -> list[ast.Import | ast.ImportFrom]:
@@ -206,9 +194,8 @@ def _extract_internal_imports(
     for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
-                name = alias.name
-                if name == "tilefoundry_ascend" or name.startswith("tilefoundry_ascend."):
-                    add(node.lineno, _resolve_target(name, known_modules))
+                if _is_internal_module(alias.name):
+                    add(node.lineno, _resolve_target(alias.name, known_modules))
         elif isinstance(node, ast.ImportFrom):
             base = _resolve_import_from_base(src_module, node)
             if base is None:
@@ -240,10 +227,12 @@ def _is_sys_modules_expr(node: ast.AST, sys_aliases: set[str], mod_aliases: set[
 
 
 def _is_safe_external_probe_key(node: ast.AST) -> bool:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        val = node.value
-        return "tilefoundry_ascend" not in val and not val.startswith(".")
-    return False
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "tilefoundry_ascend" not in node.value
+        and not node.value.startswith(".")
+    )
 
 
 def _scan_full_ast(
@@ -347,14 +336,9 @@ def _scan_full_ast(
                     record("reflection", node.lineno, "banned reflection symbol `inspect.signature`")
             elif isinstance(node, ast.ImportFrom):
                 for alias in node.names:
-                    if alias.name in BANNED_REFLECTION_NAMES:
-                        record(
-                            "reflection", node.lineno, f"banned reflection symbol `{alias.name}`"
-                        )
-                    if alias.asname and alias.asname in BANNED_REFLECTION_NAMES:
-                        record(
-                            "reflection", node.lineno, f"banned reflection symbol `{alias.asname}`"
-                        )
+                    for sym in (alias.name, alias.asname):
+                        if sym and sym in BANNED_REFLECTION_NAMES:
+                            record("reflection", node.lineno, f"banned reflection symbol `{sym}`")
                 if (
                     in_campaign
                     and node.module == "inspect"
@@ -518,11 +502,9 @@ def run_lint(
         for comp in _tarjan_sccs(sorted(known_modules), adj):
             if len(comp) > 1:
                 head = comp[0]
-                line = 1
-                for nxt in comp[1:]:
-                    if (head, nxt) in edge_lines:
-                        line = edge_lines[(head, nxt)]
-                        break
+                line = next(
+                    (edge_lines[(head, nxt)] for nxt in comp[1:] if (head, nxt) in edge_lines), 1
+                )
                 violations.append(
                     Violation(
                         module_to_rel[head],
@@ -600,15 +582,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report = run_lint(args.root, categories)
     if args.json:
-        payload = {
-            "root": report.root,
-            "files_scanned": report.files_scanned,
-            "elapsed_ms": report.elapsed_ms,
-            "total_violations": report.total_violations,
-            "counts_by_category": report.counts_by_category,
-            "violations": [asdict(item) for item in report.violations],
-        }
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(asdict(report), indent=2))
     else:
         for item in report.violations:
             print(f"{item.path}:{item.line}: [{item.category}] {item.message}")
