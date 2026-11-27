@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Literal, Protocol
 
 
 @dataclass(frozen=True)
@@ -14,9 +14,11 @@ class CompileTaskSpec:
 
     task_key: str
     builder_name: str
-    static_kwargs: tuple[tuple[str, Any], ...]
-    pass_configs: tuple[tuple[str, Any], ...]
+    static_kwargs: tuple[tuple[str, object], ...]
+    pass_configs: tuple[tuple[str, object], ...]
     compile_flags: tuple[str, ...]
+    unit_kind: Literal["tilelang_dsl", "cce_cpp20"] = "tilelang_dsl"
+    unit_source: str = ""
 
     @property
     def disables_vf_stack_ubuf(self) -> bool:
@@ -55,7 +57,7 @@ class CasePlanExtractor(Protocol):
         self,
         module_source: str,
         case_id: str,
-        case_spec: dict[str, Any],
+        case_spec: dict[str, object],
     ) -> tuple[CompileTaskSpec, ...]: ...
 
 
@@ -79,6 +81,69 @@ class CampaignStateSnapshot:
     frozen_regimes: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class RoundContextReceipt:
+    """Immutable L1 receipt summarizing per-round synthesis context preparation."""
+
+    round_idx: int
+    regime_tag: str
+    func_name: str
+    parent_lane: str
+    parent_sha256: str
+    track: str
+    creative_effort: str = "high"
+    stagnation_rounds: int = 0
+    worker_count: int = 0
+    escalated: bool = False
+    paradigm_shift_active: bool = False
+    p2_escalated: bool = False
+    active_parent_id: str = ""
+    parent_lat_us: float = 0.0
+    parent_obj_score: float = 0.0
+    parent_dominant_bound: str = ""
+
+
+@dataclass(frozen=True)
+class StageGateRoundReceipt:
+    """Immutable L1 receipt summarizing one round's L0/L1/L2 gate funnel outcome."""
+
+    round_idx: int
+    regime_tag: str
+    raw_candidate_count: int
+    l0_l1_passed_ids: tuple[str, ...]
+    l0_l1_failed: tuple[tuple[str, str, str], ...]
+    l2_passed_ids: tuple[str, ...]
+    l2_run_ids: tuple[tuple[str, str], ...] = ()
+    l2_infra_fault_plane: str = ""
+    l2_infra_fault_code: str = ""
+    round_active_kernel: str = ""
+    infeasible_boundaries_added: int = 0
+    prescreen_pruned_ids: tuple[str, ...] = ()
+    llm_gen_sec: float = 0.0
+    l0_l1_sec: float = 0.0
+    syntax_repair_sec: float = 0.0
+    l2_prewarm_sec: float = 0.0
+    l2_npu_sec: float = 0.0
+
+
+@dataclass(frozen=True)
+class RecoveryReceipt:
+    """Immutable L1 receipt summarizing pending L3 promotion or L4 recovery resolution."""
+
+    stage: Literal["l3_promotion", "l4_cannbench"]
+    resolved: bool
+    passed: bool
+    promotion_blocked: bool = False
+    candidate_sha256: str = ""
+    execution_id: str = ""
+    run_id: str = ""
+    receipt_path: str = ""
+    device_id: str = ""
+    failure_kind: str = ""
+    error_message: str = ""
+    execution_terminal: bool = True
+
+
 class StageGatePort(Protocol):
     """Typed port replacing monkeypatched globals and owner overrides."""
 
@@ -94,13 +159,13 @@ class RoundGatePort(Protocol):
 
     async def execute_round_gates(
         self,
-        batch: Any,
-        working_anchors: Sequence[Any] = (),
+        batch: object,
+        working_anchors: Sequence[object] = (),
         *,
         snapshot: CampaignStateSnapshot | None = None,
         parent_sha: str = "",
-        parent_workload: Any = None,
-    ) -> Any: ...
+        parent_workload: object = None,
+    ) -> object: ...
 
     async def cancel_pending_speculative(self) -> None: ...
 
@@ -110,14 +175,14 @@ class RoundContextPort(Protocol):
 
     def build_round_bundle(
         self,
-        state: Any,
+        state: object,
         *,
         round_idx: int,
-        regime_spec: Any = None,
-        working_anchors: Sequence[Any] | None = None,
+        regime_spec: object = None,
+        working_anchors: Sequence[object] | None = None,
         exclude_regime: str | None = None,
         creative_effort: str = "high",
-    ) -> Any: ...
+    ) -> object: ...
 
 
 class CalibrationPort(Protocol):
@@ -126,41 +191,41 @@ class CalibrationPort(Protocol):
     def build_snapshot(
         self,
         incumbent_source: str,
-        active_anchors: Sequence[Any],
-        regime_specs: Sequence[Any],
-    ) -> Any: ...
+        active_anchors: Sequence[object],
+        regime_specs: Sequence[object],
+    ) -> object: ...
 
     def collect_msprof_by_case(
         self,
         source: str,
-        result: Any,
-        active_anchors: Sequence[Any],
-        target_regimes: Sequence[Any],
+        result: object,
+        active_anchors: Sequence[object],
+        target_regimes: Sequence[object],
     ) -> dict[tuple[str, int], dict[str, float]]: ...
 
 
 class RecoveryPort(Protocol):
     """Typed port for L3/L4 execution, card rotation, and pending recovery."""
 
-    def resolve_pending_promotion(self, pending: Any, **kwargs: Any) -> Any: ...
+    def resolve_pending_promotion(self, pending: object, **kwargs: object) -> object: ...
 
     def resolve_pending_l4(
-        self, pending: Any, *, incumbent_source: str = ""
-    ) -> Any: ...
+        self, pending: object, *, incumbent_source: str = ""
+    ) -> object: ...
 
     def run_final_l4_tracked(
         self, *, incumbent_source: str, prior_stop_reason: str
-    ) -> Any: ...
+    ) -> object: ...
 
 
 class TelemetryLedgerPort(Protocol):
     """Typed port for ExperienceLake, KB, funnel JSONL, and checkpoint persistence."""
 
-    def record_surrogate_observations(self, **kwargs: Any) -> None: ...
+    def record_surrogate_observations(self, **kwargs: object) -> None: ...
 
-    def emit_round_funnel_events(self, **kwargs: Any) -> Any: ...
+    def emit_round_funnel_events(self, **kwargs: object) -> object: ...
 
-    def save_checkpoint(self, **kwargs: Any) -> None: ...
+    def save_checkpoint(self, **kwargs: object) -> None: ...
 
 
 class NpuExecutionPort(Protocol):
@@ -168,29 +233,29 @@ class NpuExecutionPort(Protocol):
 
     def run_l2_batch(
         self,
-        candidates: Sequence[tuple[str, Any]],
-        anchors: Sequence[Any],
-    ) -> Any: ...
+        candidates: Sequence[tuple[str, object]],
+        anchors: Sequence[object],
+    ) -> object: ...
 
     def run_l3_contract(
         self,
-        module_path: Any,
+        module_path: object,
         *,
         device_id: str = "",
         resume_execution_id: str = "",
         resume_run_id: str = "",
         on_execution_started: Callable[..., None] | None = None,
-    ) -> Any: ...
+    ) -> object: ...
 
     def run_l4_cannbench(
         self,
-        module_path: Any,
+        module_path: object,
         *,
         device_id: str = "",
         resume_execution_id: str = "",
         resume_run_id: str = "",
         on_execution_started: Callable[..., None] | None = None,
-    ) -> Any: ...
+    ) -> object: ...
 
 
 class HardwareProbePort(Protocol):
@@ -201,7 +266,7 @@ class HardwareProbePort(Protocol):
         env: dict[str, str] | None = None,
     ) -> dict[str, str] | list[str]: ...
 
-    def run_msprof_detail(self, *args: Any, **kwargs: Any) -> Any: ...
+    def run_msprof_detail(self, *args: object, **kwargs: object) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -483,11 +548,14 @@ __all__ = [
     "HardwareProbePort",
     "NpuExecutionPort",
     "RecoveryPort",
+    "RecoveryReceipt",
     "RegimeCompilePlan",
     "RoundContextPort",
+    "RoundContextReceipt",
     "RoundGatePort",
     "StageBCompileReceipt",
     "StageGatePort",
+    "StageGateRoundReceipt",
     "TelemetryLedgerPort",
     "WorkerStepRecord",
 ]
