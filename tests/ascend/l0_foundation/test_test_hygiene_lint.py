@@ -138,7 +138,7 @@ def test_cli_json_error_and_speed(
 
     assert hygiene_lint.main(["--root", str(tmp_path / "missing")]) == 2
 
-    live_dir = _REPO_ROOT / "tests" / "ascend" / "cost_model"
+    live_dir = _REPO_ROOT / "tests" / "ascend" / "l0_foundation"
     proc = subprocess.run(
         [
             sys.executable,
