@@ -3690,6 +3690,7 @@ __global__ __mix__(1, 2) void mla_kv_reuse_c1c1c2(
           asc_sync_intra_arrive(PIPE_FIX, 19);
         }
       }
+      pipe_barrier(PIPE_ALL);
       asc_sync_notify(PIPE_M, PIPE_MTE2, (event_t)2);
       asc_sync_intra_wait(PIPE_FIX, 6);
       asc_sync_intra_wait(PIPE_FIX, 22);
