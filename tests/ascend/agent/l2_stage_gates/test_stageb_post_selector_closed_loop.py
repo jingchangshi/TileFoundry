@@ -771,3 +771,118 @@ def test_load_plan_module_resolves_tilelang_source_without_pythonpath(tmp_path: 
         check=False,
     )
     assert proc_sib.returncode == 0, proc_sib.stderr or proc_sib.stdout
+
+
+def test_stage_b_compile_gate_routes_render_trackb_tu_to_ascendc_compile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """StageBCompileGate routes _render_trackb_tu specs to AscendC compile, never tilelang."""
+    from tilefoundry_ascend.agent.orchestrator import stage_b_gate
+    from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
+
+    hybrid_src = _sample_hybrid_mla_module(trackb_val="2.5f")
+    ext = ModuleSelectorPlanExtractor(target="dav-3510")
+    cases = {"c0": {"B": 1, "S_kv": 1024, "tl_dtype": "bfloat16", "use_trackb": True}}
+    plan = build_post_selector_regime_plan(hybrid_src, "mla_trackb", cases, ext)
+    assert len(plan.unique_specs_by_key) == 1
+    spec = next(iter(plan.unique_specs_by_key.values()))
+    assert spec.builder_name == "_render_trackb_tu"
+
+    ascendc_calls: list[tuple[str, tuple[str, ...], str]] = []
+
+    def _fake_ascendc_compile(
+        cpp_source: str,
+        *,
+        compile_flags: Any = None,
+        artifact_store: ArtifactStore | None = None,
+        artifact_id: str = "",
+        **_kw: Any,
+    ) -> stage_b_gate.StageBResult:
+        flags_t = tuple(str(f) for f in (compile_flags or ()))
+        ascendc_calls.append((cpp_source, flags_t, str(artifact_id)))
+        out_dir = artifact_store.root if artifact_store is not None else tmp_path
+        out_dir.mkdir(parents=True, exist_ok=True)
+        obj_path = out_dir / "trackb_kernel.o"
+        obj_path.write_bytes(b"\x7fELF-trackb-obj")
+        return stage_b_gate.StageBResult(
+            passed=True,
+            compiler_summary=BishengResourceSummary(stack_bytes=0),
+            generated_cce=cpp_source,
+            artifact_id=artifact_id or spec.task_key,
+            binary_paths=(str(obj_path),),
+        )
+
+    def _forbid_tilelang_driver(*_a: Any, **_kw: Any) -> str:
+        raise AssertionError("Track-B spec must not route through build_stage_b_driver_source")
+
+    monkeypatch.setattr(stage_b_gate, "run_stage_b_ascendc_compile", _fake_ascendc_compile)
+    monkeypatch.setattr(stage_b_gate, "build_stage_b_driver_source", _forbid_tilelang_driver)
+
+    store = ArtifactStore(tmp_path / "tl_cache")
+    receipt1 = StageBCompileGate(plan, store, max_workers=1).run(hybrid_src)
+    assert receipt1.passed is True
+    assert receipt1.fault_code == ""
+    assert len(ascendc_calls) == 1
+    assert "mla_kv_reuse_c1c1c2" in ascendc_calls[0][0]
+    assert "2.5f" in ascendc_calls[0][0]
+
+    manifest_path = Path(receipt1.manifest_path)
+    ok_valid, details = validate_prewarm_manifest_v1(manifest_path, plan)
+    assert ok_valid is True
+    assert details["cache_hits"] == 1
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["tasks"][spec.task_key]["builder_name"] == "_render_trackb_tu"
+    assert manifest["tasks"][spec.task_key]["passed"] is True
+    rec = store.get_verified_artifact(spec.task_key)
+    assert rec is not None and rec.backend_kind == "ascendc_trackb"
+
+    ascendc_calls.clear()
+    receipt2 = StageBCompileGate(plan, store, max_workers=1).run(hybrid_src)
+    assert receipt2.passed is True
+    assert ascendc_calls == []
+
+    unres_spec = CompileTaskSpec(
+        task_key="manual_trackb_unreserved",
+        builder_name="_render_trackb_tu",
+        static_kwargs=(),
+        pass_configs=(),
+        compile_flags=("--cce-disable-vf-stack-reserved-ubuf",),
+    )
+    unres_plan = build_post_selector_regime_plan(
+        hybrid_src,
+        "mla_trackb_ovf",
+        {"c0": {}},
+        type(
+            "_FixedExt",
+            (),
+            {"extract_case_tasks": lambda _s, _m, _cid, _cs: (unres_spec,)},
+        )(),
+    )
+
+    def _fake_ascendc_overflow(
+        cpp_source: str,
+        *,
+        artifact_store: ArtifactStore | None = None,
+        artifact_id: str = "",
+        **_kw: Any,
+    ) -> stage_b_gate.StageBResult:
+        out_dir = artifact_store.root if artifact_store is not None else tmp_path
+        out_dir.mkdir(parents=True, exist_ok=True)
+        obj_path = out_dir / "trackb_ovf.o"
+        obj_path.write_bytes(b"\x7fELF-trackb-ovf")
+        return stage_b_gate.StageBResult(
+            passed=True,
+            compiler_summary=BishengResourceSummary(stack_bytes=128),
+            generated_cce=cpp_source,
+            artifact_id=artifact_id,
+            binary_paths=(str(obj_path),),
+        )
+
+    monkeypatch.setattr(stage_b_gate, "run_stage_b_ascendc_compile", _fake_ascendc_overflow)
+    ovf_receipt = StageBCompileGate(unres_plan, ArtifactStore(tmp_path / "ovf_cache")).run(
+        hybrid_src
+    )
+    assert ovf_receipt.passed is False
+    assert ovf_receipt.fault_code == "VF_STACK_OVERFLOW"
+    assert ovf_receipt.max_stack_bytes == 128

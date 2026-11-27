@@ -461,6 +461,7 @@ class _LoadedPlanModule:
     backend_kind: str
     closure_cache: dict[tuple[str, ...], str]
     spec_cache: dict[tuple[Any, ...], CompileTaskSpec]
+    trackb_tu_by_key: dict[str, str]
 
 
 _PLAN_MODULE_CACHE: dict[str, _LoadedPlanModule] = {}
@@ -506,19 +507,19 @@ def _ensure_tilelang_on_sys_path(
 
 
 def _load_plan_module(
-    module_source: str, *, env_file: str | Path | None = None, source_root: str | Path | None = None,
+    module_source: str, *, env_vals: Mapping[str, str] | None = None, env_file: str | Path | None = None, source_root: str | Path | None = None,
 ) -> _LoadedPlanModule:
     global _LAST_PLAN_ENTRY
-    last = _LAST_PLAN_ENTRY
-    if last is not None and (last[0] is module_source or last[0] == module_source):
-        return last[1]
-    mod_sha = hashlib.sha256(module_source.encode("utf-8")).hexdigest()
     with _PLAN_MODULE_LOCK:
+        last = _LAST_PLAN_ENTRY
+        if last is not None and (last[0] is module_source or last[0] == module_source):
+            return last[1]
+        mod_sha = hashlib.sha256(module_source.encode("utf-8")).hexdigest()
         if (cached := _PLAN_MODULE_CACHE.get(mod_sha)) is not None:
             _LAST_PLAN_ENTRY = (module_source, cached)
             return cached
 
-    _ensure_tilelang_on_sys_path(env_file=env_file, source_root=source_root)
+    _ensure_tilelang_on_sys_path(env_vals=env_vals, env_file=env_file, source_root=source_root)
     mod_filename = f"<tf_plan_{mod_sha[:12]}>"
     linecache.cache[mod_filename] = (len(module_source), None, module_source.splitlines(keepends=True), mod_filename)
     mod = types.ModuleType(f"_tf_plan_{mod_sha[:12]}")
@@ -593,12 +594,12 @@ def _load_plan_module(
             "npu": types.SimpleNamespace(current_stream=lambda *_a, **_k: types.SimpleNamespace(npu_stream=0)),
         }))
 
-    loaded = _LoadedPlanModule(module_source, mod_sha, mod, records, tb_records, ep, selectors, builders, backend, {}, {})
+    loaded = _LoadedPlanModule(module_source, mod_sha, mod, records, tb_records, ep, selectors, builders, backend, {}, {}, {})
     with _PLAN_MODULE_LOCK:
         if len(_PLAN_MODULE_CACHE) >= 64:
             _PLAN_MODULE_CACHE.clear()
         _PLAN_MODULE_CACHE[mod_sha] = loaded
-    _LAST_PLAN_ENTRY = (module_source, loaded)
+        _LAST_PLAN_ENTRY = (module_source, loaded)
     return loaded
 
 
@@ -737,7 +738,9 @@ class ModuleSelectorPlanExtractor:
                 clean_src = extract_reachable_closure_source(loaded.module_source, active_symbols=sym_key) if sym_key else loaded.module_source
                 loaded.closure_cache[sym_key] = clean_src
         spec = CompileTaskSpec(compute_compile_task_key(clean_src, self.target, builder_name, static_kwargs, pc_t, cf_t), builder_name, static_kwargs, pc_t, cf_t)
-        if clean_unit_override is None:
+        if clean_unit_override is not None:
+            loaded.trackb_tu_by_key[spec.task_key] = clean_unit_override
+        else:
             loaded.spec_cache[ckey] = spec
         return spec
 
@@ -1697,6 +1700,62 @@ def _run_driver_spec(
     return True, s_bytes, comb, tuple(_collect_built_bins(work_dir, w_cache, resolved_tl_cache, pre_bins, emit_path)), ""
 
 
+def _is_trackb_spec(spec: CompileTaskSpec) -> bool:
+    low = str(spec.builder_name or "").strip().lower()
+    return low in ("_render_trackb_tu", "_trackb_tu") or "trackb" in low
+
+
+def _resolve_trackb_spec_cpp_source(
+    spec: CompileTaskSpec, module_source: str, *, env_vals: Mapping[str, str] | None = None, source_root: Path | None = None
+) -> tuple[bool, str]:
+    if not _is_trackb_spec(spec):
+        return False, ""
+    is_explicit = spec.builder_name in ("_render_trackb_tu", "_trackb_tu")
+    if module_source.strip():
+        loaded = _load_plan_module(module_source, env_vals=env_vals, source_root=source_root)
+        if (cached_tu := loaded.trackb_tu_by_key.get(spec.task_key)) is not None:
+            return True, cached_tu
+        fn = getattr(loaded.mod, spec.builder_name, None)
+        if fn is None and spec.builder_name == "_trackb_tu":
+            fn = getattr(loaded.mod, "_render_trackb_tu", None)
+        raw_fn = getattr(fn, "__wrapped__", fn) if callable(fn) else None
+        if callable(raw_fn):
+            res = raw_fn(**_filter_kwargs_for_callable(raw_fn, dict(spec.static_kwargs)))
+            if isinstance(res, str):
+                return True, _normalize_trackb_unit_source(res)
+            if not is_explicit:
+                return False, ""
+        if is_explicit and (tb := extract_trackb_cpp_source(module_source, discover_module_trackb_symbols(module_source))):
+            return True, _normalize_trackb_unit_source(tb[1])
+    return is_explicit, ""
+
+
+def _run_trackb_spec(
+    spec: CompileTaskSpec, cpp_source: str, work_dir: Path, *,
+    env_vals: Mapping[str, str], source_root: Path | None = None, timeout_sec: int = 120, regime_tag: str = "",
+) -> tuple[bool, int, str, tuple[Path, ...], str]:
+    cann_setup = (env_vals.get("TILEFOUNDRY_NPU_CANN_SETUP") or "").strip()
+    cann_root = str(p.parent) if cann_setup and (p := Path(cann_setup).expanduser().resolve()).is_file() else None
+    tl_dir = _resolve_tilelang_source_dir(env_vals=env_vals, source_root=source_root)
+    extra_incs = [str(Path(tl_dir) / "src")] if tl_dir and (Path(tl_dir) / "src" / "tl_templates" / "ascend").is_dir() else None
+    eff_flags = resolve_trackb_compile_flags(cpp_source, spec.compile_flags) if cpp_source.strip() else spec.compile_flags
+    res = run_stage_b_ascendc_compile(
+        cpp_source, compile_flags=eff_flags, cann_root=cann_root, extra_include_dirs=extra_incs, timeout_sec=timeout_sec,
+        artifact_store=ArtifactStore(work_dir / "ascendc_store"), artifact_id=spec.task_key, regime_tag=regime_tag, spec_key=spec.task_key,
+    )
+    sb = int(res.compiler_summary.stack_bytes) if res.compiler_summary is not None else 0
+    bins = tuple(Path(p) for p in res.binary_paths if is_verified_binary_file(Path(p)))
+    diag = res.error_message or res.full_diagnostic or ""
+    if not res.passed:
+        fc = res.fault_code or _classify_stage_b_overflow_fault_code(diag, res.compiler_summary, "STAGE_B_ASCENDC_COMPILE_FAILED")
+        return False, sb, diag, (), fc
+    if has_unreserved_vf_stack_overflow(spec, sb, diag):
+        return False, sb, f"stage_b_ascendc_vf_stack_overflow: stack_bytes={sb}", bins, "VF_STACK_OVERFLOW"
+    if not bins:
+        return False, sb, "stage_b_ascendc_missing_object: no verified binary artifact produced", (), "STAGE_B_ASCENDC_MISSING_OBJECT"
+    return True, sb, diag, bins, ""
+
+
 class StageBCompileGate:
     """Compile cache-missed CompileTaskSpecs on CPU and emit prewarm_manifest_v1.json."""
 
@@ -1741,6 +1800,8 @@ class StageBCompileGate:
         with contextlib.ExitStack() as stack:
             if missed:
                 tmp_root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="tf_stageb_gate_")))
+                if module_source.strip() and any(_is_trackb_spec(s) for s in missed):
+                    _load_plan_module(module_source, env_vals=self._env_vals, source_root=self._source_root)
 
                 def _run_one(idx: int, spec: CompileTaskSpec) -> tuple[bool, int, str, tuple[Path, ...], str]:
                     (w_dir := tmp_root / f"spec_{idx}").mkdir(parents=True, exist_ok=True)
@@ -1751,6 +1812,17 @@ class StageBCompileGate:
                             return False, int(sb), diag, bins, "VF_STACK_OVERFLOW"
                         fc = "" if ok else _classify_stage_b_overflow_fault_code(diag, BishengResourceSummary(stack_bytes=int(sb)), "STAGE_B_COMPILE_FAILED")
                         return bool(ok), int(sb), str(diag), bins, fc
+                    try:
+                        is_tb, cpp_src = _resolve_trackb_spec_cpp_source(
+                            spec, module_source, env_vals=self._env_vals, source_root=self._source_root
+                        )
+                    except Exception as exc:
+                        return False, 0, f"stage_b_ascendc_render_failed: {type(exc).__name__}: {exc}", (), "STAGE_B_ASCENDC_RENDER_FAILED"
+                    if is_tb:
+                        return _run_trackb_spec(
+                            spec, cpp_src, w_dir, env_vals=self._env_vals, source_root=self._source_root,
+                            timeout_sec=self._timeout_sec, regime_tag=active_plan.regime_tag,
+                        )
                     return _run_driver_spec(spec, module_source, w_dir, resolved_tl_cache=tl_cache, env_vals=self._env_vals, source_root=self._source_root, timeout_sec=self._timeout_sec)
 
                 with ThreadPoolExecutor(max_workers=self._max_workers or min(16, os.cpu_count() or 8, max(1, len(missed)))) as pool:
@@ -1772,7 +1844,7 @@ class StageBCompileGate:
                             ok, fc = False, "VF_STACK_OVERFLOW"
                         rbins = bins
                         if ok and tkey in compiled_res and bins:
-                            bk = "ascendc_trackb" if spec.builder_name in ("_render_trackb_tu", "_trackb_tu") else "tilelang"
+                            bk = "ascendc_trackb" if _is_trackb_spec(spec) else "tilelang"
                             rec = self.artifact_store.record_verified_artifact(tkey, binary_paths=bins, backend_kind=bk, flags=" ".join(spec.compile_flags), metadata={"stack_bytes": int(sb), "regime_tag": active_plan.regime_tag}, copy_binaries=True)
                             rbins = tuple(Path(p) for p in rec.binary_paths)
                         if not ok:
