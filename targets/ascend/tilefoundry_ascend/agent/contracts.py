@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -71,6 +71,12 @@ class CampaignStateSnapshot:
     active_regime_tag: str
     guardrail_case_ids: tuple[str, ...]
     stagnation_by_regime: dict[str, int]
+    compile_wall_streak_by_regime: tuple[tuple[str, int], ...] = ()
+    last_round_promoted: bool = True
+    last_round_promoted_by_regime: tuple[tuple[str, bool], ...] = ()
+    last_local_rel_gain_by_regime: tuple[tuple[str, float], ...] = ()
+    incumbent_anchor_us_by_case: tuple[tuple[int, float], ...] = ()
+    frozen_regimes: tuple[str, ...] = ()
 
 
 class StageGatePort(Protocol):
@@ -81,6 +87,110 @@ class StageGatePort(Protocol):
         snapshot: CampaignStateSnapshot,
         candidate_sources: tuple[tuple[str, str], ...],
     ) -> tuple[tuple[str, float], ...]: ...
+
+
+class RoundGatePort(Protocol):
+    """Typed port for round LLM generation, L0/L1 filtering, and L2 evaluation."""
+
+    async def execute_round_gates(
+        self,
+        batch: Any,
+        working_anchors: Sequence[Any] = (),
+        *,
+        snapshot: CampaignStateSnapshot | None = None,
+        parent_sha: str = "",
+        parent_workload: Any = None,
+    ) -> Any: ...
+
+    async def cancel_pending_speculative(self) -> None: ...
+
+
+class RoundContextPort(Protocol):
+    """Typed port for building immutable per-round synthesis bundles."""
+
+    def build_round_bundle(
+        self,
+        state: Any,
+        *,
+        round_idx: int,
+        regime_spec: Any = None,
+        working_anchors: Sequence[Any] | None = None,
+        exclude_regime: str | None = None,
+        creative_effort: str = "high",
+    ) -> Any: ...
+
+
+class CalibrationPort(Protocol):
+    """Typed port for baseline evaluation, dispatch floor calibration, and profiling."""
+
+    def build_snapshot(
+        self,
+        incumbent_source: str,
+        active_anchors: Sequence[Any],
+        regime_specs: Sequence[Any],
+    ) -> Any: ...
+
+    def collect_msprof_by_case(
+        self,
+        source: str,
+        result: Any,
+        active_anchors: Sequence[Any],
+        target_regimes: Sequence[Any],
+    ) -> dict[tuple[str, int], dict[str, float]]: ...
+
+
+class RecoveryPort(Protocol):
+    """Typed port for L3/L4 execution, card rotation, and pending recovery."""
+
+    def resolve_pending_promotion(self, pending: Any, **kwargs: Any) -> Any: ...
+
+    def resolve_pending_l4(
+        self, pending: Any, *, incumbent_source: str = ""
+    ) -> Any: ...
+
+    def run_final_l4_tracked(
+        self, *, incumbent_source: str, prior_stop_reason: str
+    ) -> Any: ...
+
+
+class TelemetryLedgerPort(Protocol):
+    """Typed port for ExperienceLake, KB, funnel JSONL, and checkpoint persistence."""
+
+    def record_surrogate_observations(self, **kwargs: Any) -> None: ...
+
+    def emit_round_funnel_events(self, **kwargs: Any) -> Any: ...
+
+    def save_checkpoint(self, **kwargs: Any) -> None: ...
+
+
+class NpuExecutionPort(Protocol):
+    """Typed port decoupling L4 NPU execution from L5 campaign orchestration."""
+
+    def run_l2_batch(
+        self,
+        candidates: Sequence[tuple[str, Any]],
+        anchors: Sequence[Any],
+    ) -> Any: ...
+
+    def run_l3_contract(
+        self,
+        module_path: Any,
+        *,
+        device_id: str = "",
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        on_execution_started: Callable[..., None] | None = None,
+    ) -> Any: ...
+
+    def run_l4_cannbench(
+        self,
+        module_path: Any,
+        *,
+        device_id: str = "",
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        on_execution_started: Callable[..., None] | None = None,
+    ) -> Any: ...
 
 
 class HardwareProbePort(Protocol):
@@ -363,6 +473,7 @@ class CampaignRoundRecord:
 
 
 __all__ = [
+    "CalibrationPort",
     "CampaignRoundRecord",
     "CampaignStateSnapshot",
     "CasePlanExtractor",
@@ -370,8 +481,13 @@ __all__ = [
     "EvolutionRoundRecord",
     "EvolutionTrajectory",
     "HardwareProbePort",
+    "NpuExecutionPort",
+    "RecoveryPort",
     "RegimeCompilePlan",
+    "RoundContextPort",
+    "RoundGatePort",
     "StageBCompileReceipt",
     "StageGatePort",
+    "TelemetryLedgerPort",
     "WorkerStepRecord",
 ]

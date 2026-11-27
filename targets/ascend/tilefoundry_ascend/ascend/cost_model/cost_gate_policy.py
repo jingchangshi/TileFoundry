@@ -37,13 +37,19 @@ def is_paradigm_shift_exempt(
     is_creative: bool = False,
 ) -> bool:
     """Return True when a candidate crosses topology/workspace paradigms or is creative."""
-    if is_creative:
+    if is_creative or cand_workspace_stages != parent_workspace_stages:
         return True
-    if cand_workspace_stages != parent_workspace_stages:
-        return True
-    if cand_axes is not None and parent_axes is not None and cand_axes != parent_axes:
-        return True
-    return False
+    return cand_axes is not None and parent_axes is not None and cand_axes != parent_axes
+
+
+def _gate(mode: CostModelMode, engaged: bool, reason: str) -> CostGateDecision:
+    return CostGateDecision(
+        mode=mode,
+        engaged=engaged,
+        reason=reason,
+        allow_prompt_guidance=engaged,
+        allow_candidate_pruning=False,
+    )
 
 
 def evaluate_cost_gate_policy(
@@ -54,80 +60,30 @@ def evaluate_cost_gate_policy(
     out_of_sample_spearman_rho: float | None = None,
 ) -> CostGateDecision:
     """Evaluate whether advisory cost-model guidance should engage for the current round."""
-    resolved_mode = (
+    resolved = (
         CostModelMode.OFF
         if not enable_prescreen_flag
         else CostModelMode(str(mode).strip().lower())
     )
-    if resolved_mode == CostModelMode.OFF:
-        return CostGateDecision(
-            mode=resolved_mode,
-            engaged=False,
-            reason="disabled_by_config",
-            allow_prompt_guidance=False,
-            allow_candidate_pruning=False,
-        )
-    if resolved_mode == CostModelMode.SHADOW:
-        return CostGateDecision(
-            mode=resolved_mode,
-            engaged=False,
-            reason="shadow_observation_only",
-            allow_prompt_guidance=False,
-            allow_candidate_pruning=False,
-        )
+    if resolved == CostModelMode.OFF:
+        return _gate(resolved, False, "disabled_by_config")
+    if resolved == CostModelMode.SHADOW:
+        return _gate(resolved, False, "shadow_observation_only")
 
     samples = int(bucket_clean_samples)
     if samples < 8:
-        return CostGateDecision(
-            mode=resolved_mode,
-            engaged=False,
-            reason="insufficient_bucket_samples",
-            allow_prompt_guidance=False,
-            allow_candidate_pruning=False,
-        )
-    if out_of_sample_spearman_rho is None or not math.isfinite(
-        float(out_of_sample_spearman_rho)
-    ):
-        return CostGateDecision(
-            mode=resolved_mode,
-            engaged=False,
-            reason="missing_spearman_rho",
-            allow_prompt_guidance=False,
-            allow_candidate_pruning=False,
-        )
+        return _gate(resolved, False, "insufficient_bucket_samples")
+    if out_of_sample_spearman_rho is None or not math.isfinite(float(out_of_sample_spearman_rho)):
+        return _gate(resolved, False, "missing_spearman_rho")
     rho = float(out_of_sample_spearman_rho)
     if rho >= 1.0:
-        return CostGateDecision(
-            mode=resolved_mode,
-            engaged=True,
-            reason="advisory_t_stat_validated",
-            allow_prompt_guidance=True,
-            allow_candidate_pruning=False,
-        )
+        return _gate(resolved, True, "advisory_t_stat_validated")
     if rho <= 0.0:
-        return CostGateDecision(
-            mode=resolved_mode,
-            engaged=False,
-            reason="spearman_t_stat_below_threshold",
-            allow_prompt_guidance=False,
-            allow_candidate_pruning=False,
-        )
+        return _gate(resolved, False, "spearman_t_stat_below_threshold")
     t_stat = rho * math.sqrt(float(samples - 2) / (1.0 - rho * rho))
     if t_stat > 2.0:
-        return CostGateDecision(
-            mode=resolved_mode,
-            engaged=True,
-            reason="advisory_t_stat_validated",
-            allow_prompt_guidance=True,
-            allow_candidate_pruning=False,
-        )
-    return CostGateDecision(
-        mode=resolved_mode,
-        engaged=False,
-        reason="spearman_t_stat_below_threshold",
-        allow_prompt_guidance=False,
-        allow_candidate_pruning=False,
-    )
+        return _gate(resolved, True, "advisory_t_stat_validated")
+    return _gate(resolved, False, "spearman_t_stat_below_threshold")
 
 
 __all__ = [

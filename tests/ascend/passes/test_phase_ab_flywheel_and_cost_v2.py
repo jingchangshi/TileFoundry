@@ -877,7 +877,7 @@ def test_record_l4_observations_hydrates_non_anchor_metadata_from_cannbench(
         per_case_elapsed_us={1: 40.0, 2: 100.0, 3: 30.0},
         run_id="l4_non_anchor",
     )
-    runner._record_l4_observations(source=mod_src, l4_result=l4_res, active_anchors=anchors)
+    runner._telemetry_writer.record_l4_observations(source=mod_src, l4_result=l4_res, active_anchors=anchors)
 
     _cands, obs = ExperienceLake(lake_dir).load_records()
     by_case = {int(o.case_num): o for o in obs if o.eval_tier == "l4_official"}
@@ -940,7 +940,9 @@ def test_evaluate_causal_rule_outcome_rejects_zero_gain_and_global_regression() 
         measured_sync_stall_ratio=0.1,
         unexplained_gap_ratio=0.1,
     )
-    ok_zero, gain_zero = PerfTargetCampaignRunner._evaluate_causal_rule_outcome(
+    from tilefoundry_ascend.agent.campaign.telemetry_ledger_writer import TelemetryLedgerWriter
+
+    ok_zero, gain_zero = TelemetryLedgerWriter.evaluate_causal_rule_outcome(
         rule=rule,
         res_all_passed=True,
         rolled_back=False,
@@ -966,7 +968,7 @@ def test_evaluate_causal_rule_outcome_rejects_zero_gain_and_global_regression() 
         measured_sync_stall_ratio=0.1,
         unexplained_gap_ratio=0.1,
     )
-    ok_noise, gain_noise = PerfTargetCampaignRunner._evaluate_causal_rule_outcome(
+    ok_noise, gain_noise = TelemetryLedgerWriter.evaluate_causal_rule_outcome(
         rule=rule,
         res_all_passed=True,
         rolled_back=False,
@@ -992,7 +994,7 @@ def test_evaluate_causal_rule_outcome_rejects_zero_gain_and_global_regression() 
         measured_sync_stall_ratio=0.1,
         unexplained_gap_ratio=0.1,
     )
-    ok_glob_reg, gain_glob_reg = PerfTargetCampaignRunner._evaluate_causal_rule_outcome(
+    ok_glob_reg, gain_glob_reg = TelemetryLedgerWriter.evaluate_causal_rule_outcome(
         rule=rule,
         res_all_passed=True,
         rolled_back=False,
@@ -1011,7 +1013,7 @@ def test_evaluate_causal_rule_outcome_rejects_zero_gain_and_global_regression() 
     )
     assert (ok_glob_reg, gain_glob_reg) == (False, 0.0)
 
-    ok_good, gain_good = PerfTargetCampaignRunner._evaluate_causal_rule_outcome(
+    ok_good, gain_good = TelemetryLedgerWriter.evaluate_causal_rule_outcome(
         rule=rule,
         res_all_passed=True,
         rolled_back=False,

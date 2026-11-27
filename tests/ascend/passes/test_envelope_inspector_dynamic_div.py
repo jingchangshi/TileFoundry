@@ -209,7 +209,8 @@ def test_ordered_tensor_shapes_extraction_and_l0_callsite_wiring(
 ) -> None:
     """Wire extracted ordered_tensor_shapes through precheck, campaign runner, and marathon."""
     from tilefoundry_ascend.agent.campaign import campaign_runner as cr_mod  # noqa: PLC0415
-    from tilefoundry_ascend.agent.campaign import marathon as marathon_mod  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign import helpers as helpers_mod  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign import stage_gate_coordinator as sgc_mod  # noqa: PLC0415
     from tilefoundry_ascend.agent.specs.anchor_specs import (  # noqa: PLC0415
         AnchorCaseSpec,
         PerfTargetSpec,
@@ -273,15 +274,16 @@ def test_ordered_tensor_shapes_extraction_and_l0_callsite_wiring(
         seen_marathon_shapes.append(kwargs.get("ordered_tensor_shapes"))
         return StageAResult(passed=True, prim_func=None, ledger=precheck_res.ledger)
 
+    monkeypatch.setattr(helpers_mod, "run_stage_a_static", _fake_cr_stage_a)
+    monkeypatch.setattr(sgc_mod, "run_stage_a_static", _fake_cr_stage_a)
     monkeypatch.setattr(cr_mod, "run_stage_a_static", _fake_cr_stage_a)
-    monkeypatch.setattr(marathon_mod, "run_stage_a_static", _fake_marathon_stage_a)
     monkeypatch.setattr(
-        marathon_mod,
-        "_stage0_entrypoint_contract_error",
+        cr_mod,
+        "_stage0_contract_err",
         lambda *_a, **_kw: "",
     )
     monkeypatch.setattr(
-        marathon_mod,
+        cr_mod,
         "run_l1_compile_check",
         lambda *_a, **_kw: StageBResult(passed=True),
     )
@@ -331,19 +333,21 @@ def test_ordered_tensor_shapes_extraction_and_l0_callsite_wiring(
         + "\ndef _build_combine(**_kw):\n    fn = make_kernel()\n    return fn\n"
         + "\ndef main(*_args, **_kwargs):\n    return make_kernel()\n"
     )
-    monkeypatch.setattr(runner, "_resolve_operator_semantics_for_gates", lambda: None)
-    cr_res = runner._default_l0_checker(cr_cand_src, regime)
+    monkeypatch.setattr(
+        runner._stage_gate_coordinator, "_resolve_operator_semantics_for_gates", lambda: None
+    )
+    cr_res = runner._stage_gate_coordinator._default_l0_checker(cr_cand_src, regime)
     assert cr_res.passed is True
     assert seen_cr_shapes == [((256, 32), (256, 32)), ((256, 32), (256, 32))]
 
-    ok, err, _ = marathon_mod._run_stage0_track_a_gates(
-        mod_src,
-        regime,
+    monkeypatch.setattr(cr_mod, "run_stage_a_static", _fake_marathon_stage_a)
+    validator = cr_mod.build_stage0_static_validator(
+        (regime,),
         entrypoint="main",
         worktree=tmp_path,
         env_file=None,
-        enforce_hardware_engines=False,
     )
+    ok, err = validator(mod_src, "tilelang_dsl")
     assert ok is True, err
     assert err == ""
     assert seen_marathon_shapes == [((256, 32), (256, 32))]

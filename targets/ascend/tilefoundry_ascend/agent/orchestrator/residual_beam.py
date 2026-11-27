@@ -6,22 +6,14 @@ import ast
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
-from tilefoundry_ascend.agent.kb.schema import SymptomFamily, compute_symptom_simplex
 from tilefoundry_ascend.agent.specs.latency_algebra import (
     StaticDynamicResidual,
-    _read_bool,
-    _read_float,
-    _read_int,
     compute_static_dynamic_residual,
 )
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
-from tilefoundry_ascend.ascend.passes.observation_space import (
-    CompilerSummaryLike,
-    ObservationVector5D,
-    RooflineSummaryLike,
-    compute_transfer_inflation_ratio,
-)
+from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios, TopologyAxes
 
@@ -40,27 +32,37 @@ _NOVELTY_TOKENS = (
     "T.set_atomic",
 )
 
+_HW_TOKENS = (
+    "SetL2CacheHint",
+    "CACHE_MODE_DISABLE",
+    "LocalMemBar",
+    "DATA_BLOCK_COPY",
+    "FixpipeParamsArch3510",
+    "__simd_vf__",
+    "__simt_vf__",
+    "__launch_bounds__",
+)
+
+_SYNC_NOTIFY_EVENT_RE = re.compile(
+    r"asc_sync_notify\s*\([^,]+,[^,]+,\s*((?:[^()]+|\([^()]*\))+)\)"
+)
+_CPP_CUBE_MMAD_RE = re.compile(
+    r"\b(?:asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\s*(?:<[^;{}()]*>)?\s*\("
+)
+
 
 def compiler_summary_from_residual(
     residual: StaticDynamicResidual,
 ) -> BishengResourceSummary | None:
-    """Recover the genuine L1 compiler summary captured in a residual's observation.
-
-    Returns ``None`` when the residual was built without a real bisheng summary so that
-    callers rebuilding a residual from cached L2 telemetry never fabricate zero penalties.
-    """
+    """Recover the genuine L1 compiler summary captured in a residual's observation."""
     observation = residual.observation
     if observation is None or not observation.has_l1_compiler_summary:
         return None
     extra_signals: dict[str, float] = {}
     if residual.scalar_compute_loop_fallback > 0.0:
-        extra_signals["scalar_compute_loop_fallback"] = float(
-            residual.scalar_compute_loop_fallback
-        )
+        extra_signals["scalar_compute_loop_fallback"] = float(residual.scalar_compute_loop_fallback)
     if residual.dcache_bypass_narrow_store > 0.0:
-        extra_signals["dcache_bypass_narrow_store"] = float(
-            residual.dcache_bypass_narrow_store
-        )
+        extra_signals["dcache_bypass_narrow_store"] = float(residual.dcache_bypass_narrow_store)
     return BishengResourceSummary(
         vec_regs=observation.onchip_sram_reg.l1_vec_regs,
         scalar_regs=observation.onchip_sram_reg.l1_scalar_regs,
@@ -121,17 +123,6 @@ def _is_int_gt_one(node: ast.AST) -> bool:
     )
 
 
-def _extract_target_names(stmt: ast.AST) -> list[str]:
-    names: list[str] = []
-    if isinstance(stmt, ast.Assign):
-        for target in stmt.targets:
-            if isinstance(target, ast.Name):
-                names.append(target.id)
-    elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-        names.append(stmt.target.id)
-    return names
-
-
 def _has_static_pingpong_buffers(tree: ast.AST, dsl_source: str) -> bool:
     if "enable_offset=True" in dsl_source:
         return False
@@ -141,83 +132,108 @@ def _has_static_pingpong_buffers(tree: ast.AST, dsl_source: str) -> bool:
         if not isinstance(stmt, (ast.Assign, ast.AnnAssign)) or stmt.value is None:
             continue
         call = stmt.value
-        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
-            continue
-        if call.func.attr not in ("alloc_shared", "alloc_ub", "alloc_fragment"):
-            continue
-        if not call.args:
+        if (
+            not isinstance(call, ast.Call)
+            or not isinstance(call.func, ast.Attribute)
+            or call.func.attr not in ("alloc_shared", "alloc_ub", "alloc_fragment")
+            or not call.args
+        ):
             continue
         shape_node = call.args[0]
         shape_key = ast.dump(shape_node)
-        target_names = _extract_target_names(stmt)
-        shape_counts[shape_key] = shape_counts.get(shape_key, 0) + max(1, len(target_names))
-        if isinstance(shape_node, (ast.Tuple, ast.List)) and len(shape_node.elts) >= 2:
-            lead = shape_node.elts[0]
-            if isinstance(lead, ast.Constant) and lead.value == 2:
-                two_slot_vars.update(target_names)
+        names = (
+            [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+            if isinstance(stmt, ast.Assign)
+            else ([stmt.target.id] if isinstance(stmt.target, ast.Name) else [])
+        )
+        shape_counts[shape_key] = shape_counts.get(shape_key, 0) + max(1, len(names))
+        if (
+            isinstance(shape_node, (ast.Tuple, ast.List))
+            and len(shape_node.elts) >= 2
+            and isinstance(shape_node.elts[0], ast.Constant)
+            and shape_node.elts[0].value == 2
+        ):
+            two_slot_vars.update(names)
     if any(count >= 2 for count in shape_counts.values()):
         return True
     if not two_slot_vars:
         return False
     seen_slots: dict[str, set[int]] = {}
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Subscript) or not isinstance(node.value, ast.Name):
+        if (
+            not isinstance(node, ast.Subscript)
+            or not isinstance(node.value, ast.Name)
+            or node.value.id not in two_slot_vars
+        ):
             continue
-        var_name = node.value.id
-        if var_name not in two_slot_vars:
-            continue
-        lead_slice = node.slice.elts[0] if isinstance(node.slice, ast.Tuple) and node.slice.elts else node.slice
-        if isinstance(lead_slice, ast.Constant) and isinstance(lead_slice.value, int) and lead_slice.value in (0, 1):
-            seen_slots.setdefault(var_name, set()).add(lead_slice.value)
+        lead_slice = (
+            node.slice.elts[0]
+            if isinstance(node.slice, ast.Tuple) and node.slice.elts
+            else node.slice
+        )
+        if (
+            isinstance(lead_slice, ast.Constant)
+            and isinstance(lead_slice.value, int)
+            and lead_slice.value in (0, 1)
+        ):
+            seen_slots.setdefault(node.value.id, set()).add(lead_slice.value)
     return any(len(slots) >= 2 for slots in seen_slots.values())
 
 
 def _has_loop_fission_multi_pass(tree: ast.AST) -> bool:
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.With, ast.AsyncWith, ast.For, ast.AsyncFor)):
-            sibling_fors = sum(1 for stmt in node.body if isinstance(stmt, ast.For))
-            if sibling_fors >= 2:
-                return True
-    return False
+    containers = (ast.FunctionDef, ast.AsyncFunctionDef, ast.With, ast.AsyncWith, ast.For, ast.AsyncFor)
+    return any(
+        isinstance(node, containers) and sum(1 for stmt in node.body if isinstance(stmt, ast.For)) >= 2
+        for node in ast.walk(tree)
+    )
 
 
 def _has_pipe_all_barrier(tree: ast.AST, dsl_source: str) -> bool:
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr in ("ascend_pipe_barrier", "pipe_barrier"):
-                for arg in node.args:
-                    if isinstance(arg, ast.Constant) and arg.value == "PIPE_ALL":
-                        return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("ascend_pipe_barrier", "pipe_barrier")
+            and any(isinstance(arg, ast.Constant) and arg.value == "PIPE_ALL" for arg in node.args)
+        ):
+            return True
     return "ascend_pipe_barrier" in dsl_source and "PIPE_ALL" in dsl_source
-
-
-def _node_has_add_mult_fma(loop_node: ast.For) -> bool:
-    has_exp = False
-    has_fma_expr = False
-    for inner in ast.walk(loop_node):
-        if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
-            if inner.func.attr in ("exp", "exp2"):
-                has_exp = True
-            elif inner.func.attr in ("fma", "vfma"):
-                has_fma_expr = True
-        elif isinstance(inner, ast.AugAssign) and isinstance(inner.op, ast.Add):
-            if any(isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mult) for sub in ast.walk(inner.value)):
-                has_fma_expr = True
-        elif isinstance(inner, ast.Assign) and isinstance(inner.value, ast.BinOp) and isinstance(inner.value.op, ast.Add):
-            if any(isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mult) for sub in ast.walk(inner.value)):
-                has_fma_expr = True
-    return has_fma_expr and not has_exp
 
 
 def _has_vfma_unshifted(tree: ast.AST, dsl_source: str) -> bool:
     if "vfma" in dsl_source.lower():
         return True
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr in ("fma", "vfma"):
-                return True
-        if isinstance(node, ast.For) and _node_has_add_mult_fma(node):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("fma", "vfma")
+        ):
             return True
+        if isinstance(node, ast.For):
+            has_exp = False
+            has_fma_expr = False
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+                    if inner.func.attr in ("exp", "exp2"):
+                        has_exp = True
+                    elif inner.func.attr in ("fma", "vfma"):
+                        has_fma_expr = True
+                elif (
+                    (isinstance(inner, ast.AugAssign) and isinstance(inner.op, ast.Add))
+                    or (
+                        isinstance(inner, ast.Assign)
+                        and isinstance(inner.value, ast.BinOp)
+                        and isinstance(inner.value.op, ast.Add)
+                    )
+                ):
+                    if any(
+                        isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mult)
+                        for sub in ast.walk(inner.value)
+                    ):
+                        has_fma_expr = True
+            if has_fma_expr and not has_exp:
+                return True
     return False
 
 
@@ -237,30 +253,23 @@ def _has_split_kv_multi(tree: ast.AST, dsl_source: str) -> bool:
     return False
 
 
-_SYNC_NOTIFY_EVENT_RE = re.compile(
-    r"asc_sync_notify\s*\([^,]+,[^,]+,\s*((?:[^()]+|\([^()]*\))+)\)"
-)
-_CPP_CUBE_MMAD_RE = re.compile(
-    r"\b(?:asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\s*(?:<[^;{}()]*>)?\s*\("
-)
-
-
 def extract_cpp_trackb_signature_tags(cpp_source: str) -> set[str]:
     """Extract structural mechanism tags from tl_templates/ascend C++20 kernel bodies."""
     tags: set[str] = set()
     if _CPP_CUBE_MMAD_RE.search(cpp_source):
         tags.add("cpp:cube_mmad")
-    if "asc_copy_gm2l1_nd2nz(" in cpp_source:
-        tags.add("cpp:gm2l1_nd2nz")
-    if "asc_copy_l0c2ub(" in cpp_source:
-        tags.add("cpp:l0c2ub_ring")
+    for needle, tag in (
+        ("asc_copy_gm2l1_nd2nz(", "cpp:gm2l1_nd2nz"),
+        ("asc_copy_l0c2ub(", "cpp:l0c2ub_ring"),
+        ("simd_inst::vsts_pack_b32", "cpp:vsts_pack_b32"),
+    ):
+        if needle in cpp_source:
+            tags.add(tag)
     if "asc_lock(" in cpp_source and "asc_unlock(" in cpp_source:
         tags.add("cpp:slot_lock_pipeline")
     events = {ev.strip() for ev in _SYNC_NOTIFY_EVENT_RE.findall(cpp_source) if ev.strip()}
     if len(events) >= 2 or any("%" in ev or "& 1" in ev or "&1" in ev for ev in events):
         tags.add("cpp:pingpong_event_parity")
-    if "simd_inst::vsts_pack_b32" in cpp_source:
-        tags.add("cpp:vsts_pack_b32")
     if "+ 16" in cpp_source or "+ 32" in cpp_source:
         tags.add("cpp:ub_bank_pad")
     return tags
@@ -277,101 +286,73 @@ def extract_structural_signature(
     tags: list[str] = []
     if track and track != "unconstrained":
         tags.append(f"track:{track}")
-    for token in _NOVELTY_TOKENS:
-        if token in dsl_source:
-            tags.append(token)
-    for hw_token in (
-        "SetL2CacheHint",
-        "CACHE_MODE_DISABLE",
-        "LocalMemBar",
-        "DATA_BLOCK_COPY",
-        "FixpipeParamsArch3510",
-        "__simd_vf__",
-        "__simt_vf__",
-        "__launch_bounds__",
-    ):
-        if hw_token in dsl_source:
-            tags.append(hw_token)
-    eff_spill = 0
-    eff_vf_breaks = 0
-    eff_alias_ser = 0
-    eff_ipc_collapse = 0.0
-    eff_dcci = 0
-    eff_local_membar = False
-    eff_vloop_miss = False
+    tags.extend(tok for tok in (*_NOVELTY_TOKENS, *_HW_TOKENS) if tok in dsl_source)
+
+    comp = getattr(stage_b, "compiler_summary", None) if stage_b is not None else None
+    sources = [s for s in (residual, comp) if s is not None]
+    eff_spill = max((int(getattr(s, "spill_bytes", 0) or 0) for s in sources), default=0)
+    if stage_b is not None:
+        eff_spill = max(eff_spill, int(getattr(stage_b, "spill_bytes", 0) or 0))
+    eff_vf_breaks = max((int(getattr(s, "vf_fusion_breaks", 0) or 0) for s in sources), default=0)
+    eff_alias_ser = max(
+        (int(getattr(s, "alias_serialized_buffers", 0) or 0) for s in sources), default=0
+    )
+    eff_ipc_collapse = max(
+        (float(getattr(s, "dual_issue_ipc_collapse", 0.0) or 0.0) for s in sources), default=0.0
+    )
+    eff_dcci = max((int(getattr(s, "dcache_dcci_flushes", 0) or 0) for s in sources), default=0)
+    eff_local_membar = any(bool(getattr(s, "has_local_membar_in_vf_call", False)) for s in sources)
+    eff_vloop_miss = (
+        (residual is not None and residual.vloopv2_hit is False)
+        or (stage_b is not None and getattr(stage_b, "vloopv2_hit", True) is False)
+        or (
+            comp is not None
+            and int(getattr(comp, "software_loops", 0) or 0) > 0
+            and int(getattr(comp, "vloopv2_loops", 0) or 0) == 0
+        )
+    )
     if residual is not None:
-        eff_spill = max(eff_spill, int(residual.spill_bytes))
-        eff_vf_breaks = max(eff_vf_breaks, int(residual.vf_fusion_breaks))
-        eff_alias_ser = max(eff_alias_ser, int(residual.alias_serialized_buffers))
-        eff_ipc_collapse = max(eff_ipc_collapse, float(residual.dual_issue_ipc_collapse))
-        eff_dcci = max(eff_dcci, int(residual.dcache_dcci_flushes))
-        eff_local_membar = eff_local_membar or bool(residual.has_local_membar_in_vf_call)
-        if residual.vloopv2_hit is False:
-            eff_vloop_miss = True
         if residual.bank_conflict_ratio > 0.05:
             tags.append("hw:bank_conflict")
         if residual.l2_hit_rate < 0.70:
             tags.append("hw:low_l2_hit")
-    if stage_b is not None:
-        eff_spill = max(eff_spill, int(getattr(stage_b, "spill_bytes", 0) or 0))
-        if getattr(stage_b, "vloopv2_hit", True) is False:
-            eff_vloop_miss = True
-        comp = getattr(stage_b, "compiler_summary", None)
-        if comp is not None:
-            eff_spill = max(eff_spill, int(getattr(comp, "spill_bytes", 0) or 0))
-            eff_vf_breaks = max(eff_vf_breaks, int(getattr(comp, "vf_fusion_breaks", 0) or 0))
-            eff_alias_ser = max(eff_alias_ser, int(getattr(comp, "alias_serialized_buffers", 0) or 0))
-            eff_ipc_collapse = max(eff_ipc_collapse, float(getattr(comp, "dual_issue_ipc_collapse", 0.0) or 0.0))
-            eff_dcci = max(eff_dcci, int(getattr(comp, "dcache_dcci_flushes", 0) or 0))
-            eff_local_membar = eff_local_membar or bool(getattr(comp, "has_local_membar_in_vf_call", False))
-            if int(getattr(comp, "software_loops", 0) or 0) > 0 and int(getattr(comp, "vloopv2_loops", 0) or 0) == 0:
-                eff_vloop_miss = True
-    if eff_vloop_miss:
-        tags.append("hw:vloopv2_miss")
-    if eff_spill > 0:
-        tags.append("hw:register_spill")
-    if eff_vf_breaks > 0:
-        tags.append("hw:vf_fusion_break")
-    if eff_alias_ser > 0:
-        tags.append("hw:alias_serialized")
-    if eff_ipc_collapse > 0.0:
-        tags.append("hw:ipc_collapse")
-    if eff_dcci > 0:
-        tags.append("hw:dcache_dcci")
-    if eff_local_membar:
-        tags.append("hw:local_membar_vf")
+    for cond, hw_tag in (
+        (eff_vloop_miss, "hw:vloopv2_miss"),
+        (eff_spill > 0, "hw:register_spill"),
+        (eff_vf_breaks > 0, "hw:vf_fusion_break"),
+        (eff_alias_ser > 0, "hw:alias_serialized"),
+        (eff_ipc_collapse > 0.0, "hw:ipc_collapse"),
+        (eff_dcci > 0, "hw:dcache_dcci"),
+        (eff_local_membar, "hw:local_membar_vf"),
+    ):
+        if cond:
+            tags.append(hw_tag)
+
     tree = ast.parse(dsl_source)
     for node in tree.body:
-        val_node = None
-        if isinstance(node, ast.Assign):
-            val_node = node.value
-        elif isinstance(node, ast.AnnAssign):
-            val_node = node.value
+        val_node = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
         if isinstance(val_node, ast.Constant) and isinstance(val_node.value, str):
             cpp_text = val_node.value
-            if (
-                "tl_templates/ascend/" in cpp_text
-                or "__aicore__" in cpp_text
-                or "__global__" in cpp_text
-                or "__simd_vf__" in cpp_text
+            if any(
+                tok in cpp_text
+                for tok in ("tl_templates/ascend/", "__aicore__", "__global__", "__simd_vf__")
             ):
                 tags.extend(extract_cpp_trackb_signature_tags(cpp_text))
 
-    if _has_static_pingpong_buffers(tree, dsl_source):
-        tags.append("static_pingpong_2buf")
-    if _has_loop_fission_multi_pass(tree):
-        tags.append("loop_fission_multi_pass")
-    if _has_pipe_all_barrier(tree, dsl_source):
-        tags.append("pipe_all_barrier")
-    if _has_vfma_unshifted(tree, dsl_source):
-        tags.append("vfma_unshifted")
-    if _has_split_kv_multi(tree, dsl_source):
-        tags.append("split_kv_multi")
+    for pred, ast_tag in (
+        (_has_static_pingpong_buffers(tree, dsl_source), "static_pingpong_2buf"),
+        (_has_loop_fission_multi_pass(tree), "loop_fission_multi_pass"),
+        (_has_pipe_all_barrier(tree, dsl_source), "pipe_all_barrier"),
+        (_has_vfma_unshifted(tree, dsl_source), "vfma_unshifted"),
+        (_has_split_kv_multi(tree, dsl_source), "split_kv_multi"),
+    ):
+        if pred:
+            tags.append(ast_tag)
     return tuple(sorted(set(tags)))
 
 
 @dataclass(frozen=True)
-class BeamCandidate:
+class BeamCandidate(JsonRecordMixin):
     """Single evaluated kernel candidate tracked by the two-lane beam search."""
 
     candidate_id: str
@@ -398,140 +379,52 @@ class BeamCandidate:
         if not self.track:
             object.__setattr__(self, "track", "unconstrained")
         if self.features is not None:
-            if isinstance(self.features, Mapping):
-                object.__setattr__(
-                    self,
-                    "features",
-                    {str(k): v for k, v in self.features.items()},
+            if not isinstance(self.features, Mapping):
+                raise TypeError(
+                    f"BeamCandidate.features must be Mapping or None, "
+                    f"got {type(self.features).__name__}"
                 )
+            object.__setattr__(self, "features", {str(k): v for k, v in self.features.items()})
+        for field_name, cls in (("topology_axes", TopologyAxes), ("case_ratios", CasePhysicsRatios)):
+            val = getattr(self, field_name)
+            if val is None or isinstance(val, cls):
+                continue
+            if isinstance(val, Mapping):
+                object.__setattr__(self, field_name, cls.from_dict(val))
             else:
                 raise TypeError(
-                    f"BeamCandidate.features must be Mapping or None, got {type(self.features).__name__}"
-                )
-        if self.topology_axes is not None:
-            if isinstance(self.topology_axes, Mapping):
-                object.__setattr__(
-                    self, "topology_axes", TopologyAxes.from_dict(self.topology_axes)
-                )
-            elif not isinstance(self.topology_axes, TopologyAxes):
-                raise TypeError(
-                    "BeamCandidate.topology_axes must be TopologyAxes or None, "
-                    f"got {type(self.topology_axes).__name__}"
-                )
-        if self.case_ratios is not None:
-            if isinstance(self.case_ratios, Mapping):
-                object.__setattr__(
-                    self, "case_ratios", CasePhysicsRatios.from_dict(self.case_ratios)
-                )
-            elif not isinstance(self.case_ratios, CasePhysicsRatios):
-                raise TypeError(
-                    "BeamCandidate.case_ratios must be CasePhysicsRatios or None, "
-                    f"got {type(self.case_ratios).__name__}"
+                    f"BeamCandidate.{field_name} must be {cls.__name__} or None, "
+                    f"got {type(val).__name__}"
                 )
 
-    def to_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable dictionary representation."""
-        return {
-            "candidate_id": self.candidate_id,
-            "round_idx": self.round_idx,
-            "worker_kind": self.worker_kind,
-            "rule_id": self.rule_id,
-            "dsl_source": self.dsl_source,
-            "track": self.track,
-            "ledger": self.ledger.to_dict(),
-            "residual": self.residual.to_dict(),
-            "latency_us": self.latency_us,
-            "accuracy_passed": self.accuracy_passed,
-            "structural_signature": list(self.structural_signature),
-            "hypothesis": self.hypothesis,
-            "parent_id": self.parent_id,
-            "features": dict(self.features) if self.features is not None else None,
-            "topology_axes": (
-                self.topology_axes.to_dict() if self.topology_axes is not None else None
-            ),
-            "case_ratios": (
-                self.case_ratios.to_dict() if self.case_ratios is not None else None
-            ),
-            "objective_score": self.objective_score,
-            "case_latencies_us": {
-                int(case_id): float(lat) for case_id, lat in self.case_latencies_us.items()
-            },
-            "policy": dict(self.policy),
+        out = super().to_dict()
+        out["case_latencies_us"] = {
+            int(k): float(v) for k, v in self.case_latencies_us.items()
         }
+        return out
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> BeamCandidate:
+    def from_dict(cls, payload: Mapping[str, Any]) -> BeamCandidate:
         """Reconstruct a BeamCandidate from a serialized dictionary."""
-        raw_ledger = payload["ledger"]
-        ledger = (
-            raw_ledger
-            if isinstance(raw_ledger, ObjectivePhysicalLedger)
-            else ObjectivePhysicalLedger.from_dict(raw_ledger)
-        )
-        raw_residual = payload["residual"]
-        residual = (
-            raw_residual
-            if isinstance(raw_residual, StaticDynamicResidual)
-            else StaticDynamicResidual.from_dict(raw_residual)
-        )
-        raw_features = payload.get("features")
-        if isinstance(raw_features, Mapping):
-            features: dict[str, object] | None = {str(k): v for k, v in raw_features.items()}
-        else:
-            features = None
-        raw_axes = payload.get("topology_axes")
-        if isinstance(raw_axes, TopologyAxes):
-            topology_axes: TopologyAxes | None = raw_axes
-        elif isinstance(raw_axes, Mapping):
-            topology_axes = TopologyAxes.from_dict(raw_axes)
-        else:
-            topology_axes = None
-        raw_ratios = payload.get("case_ratios")
-        if isinstance(raw_ratios, CasePhysicsRatios):
-            case_ratios: CasePhysicsRatios | None = raw_ratios
-        elif isinstance(raw_ratios, Mapping):
-            case_ratios = CasePhysicsRatios.from_dict(raw_ratios)
-        else:
-            case_ratios = None
-        raw_rule = payload.get("rule_id")
-        raw_parent = payload.get("parent_id")
-        raw_sig = payload.get("structural_signature") or ()
-        raw_obj = payload.get("objective_score")
-        raw_case_latencies = payload.get("case_latencies_us")
-        case_latencies_us: dict[int, float] = {}
-        if isinstance(raw_case_latencies, Mapping):
-            for k, v in raw_case_latencies.items():
+        cleaned = dict(payload)
+        raw_lats = cleaned.get("case_latencies_us")
+        clean_lats: dict[int, float] = {}
+        if isinstance(raw_lats, Mapping):
+            for k, v in raw_lats.items():
                 if isinstance(k, bool) or isinstance(v, bool):
                     continue
                 try:
-                    case_latencies_us[int(k)] = float(v)
+                    clean_lats[int(k)] = float(v)
                 except (TypeError, ValueError):
                     continue
-        raw_policy = payload.get("policy")
-        policy = (
-            {str(k): v for k, v in raw_policy.items()} if isinstance(raw_policy, Mapping) else {}
-        )
-        return cls(
-            candidate_id=str(payload["candidate_id"]),
-            round_idx=int(payload["round_idx"]),
-            worker_kind=str(payload["worker_kind"]),
-            rule_id=str(raw_rule) if raw_rule is not None else None,
-            dsl_source=str(payload["dsl_source"]),
-            track=str(payload.get("track") or "unconstrained"),
-            ledger=ledger,
-            residual=residual,
-            latency_us=float(payload["latency_us"]),
-            accuracy_passed=bool(payload["accuracy_passed"]),
-            structural_signature=tuple(str(item) for item in raw_sig),
-            hypothesis=str(payload.get("hypothesis", "")),
-            parent_id=str(raw_parent) if raw_parent is not None else None,
-            features=features,
-            topology_axes=topology_axes,
-            case_ratios=case_ratios,
-            objective_score=float(raw_obj) if raw_obj is not None else None,
-            case_latencies_us=case_latencies_us,
-            policy=policy,
-        )
+        cleaned["case_latencies_us"] = clean_lats
+        if not isinstance(cleaned.get("features"), Mapping):
+            cleaned["features"] = None
+        if not isinstance(cleaned.get("policy"), Mapping):
+            cleaned["policy"] = {}
+        return super().from_dict(cleaned)
 
 
 @dataclass
@@ -561,9 +454,7 @@ class TwoLaneBeamSearch:
         if not valid:
             return list(self.exploit_beam), list(self.stepping_stone_beam)
 
-        exploit_pool = {c.candidate_id: c for c in self.exploit_beam}
-        for cand in valid:
-            exploit_pool[cand.candidate_id] = cand
+        exploit_pool = {c.candidate_id: c for c in (*self.exploit_beam, *valid)}
         use_objective = any(c.objective_score is not None for c in exploit_pool.values())
         sorted_exploit = sorted(
             exploit_pool.values(),
@@ -583,13 +474,10 @@ class TwoLaneBeamSearch:
         for c in self.exploit_beam:
             self.exploited_signatures.add(c.structural_signature)
 
-        stone_pool = [
-            c
-            for c in (*self.stepping_stone_beam, *valid)
-            if c.candidate_id not in exploit_ids
-        ]
         deduped_stones: dict[tuple[str, ...], BeamCandidate] = {}
-        for cand in stone_pool:
+        for cand in (*self.stepping_stone_beam, *valid):
+            if cand.candidate_id in exploit_ids:
+                continue
             sig = cand.structural_signature or (cand.candidate_id,)
             prev = deduped_stones.get(sig)
             if prev is None or cand.latency_us < prev.latency_us:
@@ -609,9 +497,7 @@ class TwoLaneBeamSearch:
 
     def parent_pool(self) -> list[BeamCandidate]:
         """Return combined unique parent candidates across both beams."""
-        merged: dict[str, BeamCandidate] = {}
-        for c in (*self.exploit_beam, *self.stepping_stone_beam):
-            merged[c.candidate_id] = c
+        merged = {c.candidate_id: c for c in (*self.exploit_beam, *self.stepping_stone_beam)}
         return list(merged.values())
 
     def to_dict(self) -> dict[str, object]:

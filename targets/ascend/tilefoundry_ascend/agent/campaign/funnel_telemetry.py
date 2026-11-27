@@ -6,63 +6,50 @@ import json
 import math
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from tilefoundry_ascend.agent.specs.fault_types import (
-    FaultPlane,
-    L3Resolution,
-    TypedFault,
-)
+from tilefoundry_ascend.agent.specs.fault_types import FaultPlane, L3Resolution, TypedFault
+from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
 
 MAX_CLEAN_CALIBRATION_BURST_CV: float = 0.08
 SPEARMAN_QUARANTINE_FLOOR: float = 0.20
 ANOMALY_LOG_ERROR_THRESHOLD: float = 1.20
+_SHA_CODES = frozenset(
+    {
+        "NOOP_IDENTICAL", "PATCH_ANCHOR_MISS", "TRACKB_SLICE_SPLICE_ERR",
+        "SIGNATURE_CONTRACT_MISMATCH", "VF_STACK_OVERFLOW", "UB_SRAM_OVERFLOW", "L1_SRAM_OVERFLOW",
+    }
+)
+_KNOB_CODES = frozenset({"VF_STACK_OVERFLOW", "UB_SRAM_OVERFLOW", "L1_SRAM_OVERFLOW"})
 
 
-def _coerce_int(raw: object, default: int = 0) -> int:
+def _num(raw: object, cast: type[int] | type[float], default: int | float) -> int | float:
     if isinstance(raw, bool):
         return default
     if isinstance(raw, (int, float)):
-        return int(raw)
+        return cast(raw)
     if isinstance(raw, str):
         try:
-            return int(raw.strip())
-        except ValueError:
-            return default
-    return default
-
-
-def _coerce_float(raw: object, default: float = 0.0) -> float:
-    if isinstance(raw, bool):
-        return default
-    if isinstance(raw, (int, float)):
-        return float(raw)
-    if isinstance(raw, str):
-        try:
-            return float(raw.strip())
+            return cast(raw.strip())
         except ValueError:
             return default
     return default
 
 
 def is_clean_calibration_sample(
-    burst_batch_cv: float,
-    *,
-    max_cv: float = MAX_CLEAN_CALIBRATION_BURST_CV,
+    burst_batch_cv: float, *, max_cv: float = MAX_CLEAN_CALIBRATION_BURST_CV
 ) -> bool:
     """Return True when ring-burst jitter is quiet enough for Tier-2 weight updates."""
     return math.isfinite(burst_batch_cv) and float(burst_batch_cv) <= float(max_cv)
 
 
 def compute_spearman_rho(
-    predicted_us: Mapping[str, float],
-    measured_us: Mapping[str, float],
+    predicted_us: Mapping[str, float], measured_us: Mapping[str, float]
 ) -> float | None:
     """Compute Spearman rank correlation across shared candidate IDs (requires n >= 3)."""
     shared = [
-        cid
-        for cid in predicted_us
+        cid for cid in predicted_us
         if cid in measured_us and predicted_us[cid] > 0.0 and measured_us[cid] > 0.0
     ]
     n = len(shared)
@@ -77,27 +64,22 @@ def compute_spearman_rho(
             end = idx
             while end + 1 < len(indexed) and indexed[end + 1][1] == indexed[idx][1]:
                 end += 1
-            avg_rank = 0.5 * (idx + end) + 1.0
+            avg = 0.5 * (idx + end) + 1.0
             for pos in range(idx, end + 1):
-                out[indexed[pos][0]] = avg_rank
+                out[indexed[pos][0]] = avg
             idx = end + 1
         return out
 
     rx = _ranks([float(predicted_us[cid]) for cid in shared])
     ry = _ranks([float(measured_us[cid]) for cid in shared])
-    mx = sum(rx) / n
-    my = sum(ry) / n
+    mx, my = sum(rx) / n, sum(ry) / n
     cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry, strict=True))
-    vx = sum((a - mx) ** 2 for a in rx)
-    vy = sum((b - my) ** 2 for b in ry)
-    denom = math.sqrt(vx * vy)
-    if denom <= 1e-12:
-        return 0.0
-    return max(-1.0, min(1.0, cov / denom))
+    denom = math.sqrt(sum((a - mx) ** 2 for a in rx) * sum((b - my) ** 2 for b in ry))
+    return 0.0 if denom <= 1e-12 else max(-1.0, min(1.0, cov / denom))
 
 
 @dataclass(frozen=True)
-class RoundFunnelEvent:
+class RoundFunnelEvent(JsonRecordMixin):
     """Single candidate lifecycle record persisted to round_funnel_events.jsonl."""
 
     run_id: str
@@ -139,108 +121,47 @@ class RoundFunnelEvent:
         """Return an updated event populated from a structured TypedFault."""
         if fault is None:
             return replace(
-                self,
-                fault_plane=FaultPlane.NONE.value,
-                error_code_norm="OK",
-                failed_tier="",
-                noop_identical=False,
+                self, fault_plane=FaultPlane.NONE.value, error_code_norm="OK",
+                failed_tier="", noop_identical=False,
             )
         return replace(
-            self,
-            fault_plane=fault.plane.value,
-            error_code_norm=fault.code or self.error_code_norm,
+            self, fault_plane=fault.plane.value, error_code_norm=fault.code or self.error_code_norm,
             failed_tier=fault.failed_tier or self.failed_tier,
-            noop_identical=bool(
-                self.noop_identical or fault.plane == FaultPlane.NOOP_IDENTICAL
-            ),
+            noop_identical=bool(self.noop_identical or fault.plane == FaultPlane.NOOP_IDENTICAL),
         )
 
     @classmethod
     def from_typed_fault(
-        cls,
-        *,
-        run_id: str,
-        operator: str,
-        round_idx: int,
-        regime_tag: str,
-        topology_axes: dict[str, str],
-        candidate_id: str,
-        cand_sha: str,
-        worker_kind: str,
-        fault: TypedFault | None,
-        rule_id: str | None = None,
-        l3_resolution: str = L3Resolution.NOT_RUN.value,
-        is_real_npu: bool = False,
+        cls, *, run_id: str, operator: str, round_idx: int, regime_tag: str,
+        topology_axes: dict[str, str], candidate_id: str, cand_sha: str, worker_kind: str,
+        fault: TypedFault | None, rule_id: str | None = None,
+        l3_resolution: str = L3Resolution.NOT_RUN.value, is_real_npu: bool = False,
         wall_sec: float = 0.0,
     ) -> RoundFunnelEvent:
         """Construct a RoundFunnelEvent directly from a TypedFault payload."""
-        if fault is None:
-            return cls(
-                run_id=run_id,
-                operator=operator,
-                round_idx=round_idx,
-                regime_tag=regime_tag,
-                topology_axes=topology_axes,
-                candidate_id=candidate_id,
-                cand_sha=cand_sha,
-                worker_kind=worker_kind,
-                rule_id=rule_id,
-                passed_l0_l1=True,
-                failed_tier="",
-                error_code_norm="OK",
-                fault_plane=FaultPlane.NONE.value,
-                l3_resolution=l3_resolution,
-                is_real_npu=is_real_npu,
-                wall_sec=wall_sec,
-            )
+        passed = fault is None or fault.plane == FaultPlane.NONE
         return cls(
-            run_id=run_id,
-            operator=operator,
-            round_idx=round_idx,
-            regime_tag=regime_tag,
-            topology_axes=topology_axes,
-            candidate_id=candidate_id,
-            cand_sha=cand_sha,
-            worker_kind=worker_kind,
-            rule_id=rule_id,
-            passed_l0_l1=(fault.plane == FaultPlane.NONE),
-            failed_tier=fault.failed_tier,
-            error_code_norm=fault.code or (
-                "OK" if fault.plane == FaultPlane.NONE else fault.plane.value
-            ),
-            noop_identical=(fault.plane == FaultPlane.NOOP_IDENTICAL),
-            fault_plane=fault.plane.value,
-            l3_resolution=l3_resolution,
-            is_real_npu=is_real_npu,
-            wall_sec=wall_sec,
+            run_id=run_id, operator=operator, round_idx=round_idx, regime_tag=regime_tag,
+            topology_axes=topology_axes, candidate_id=candidate_id, cand_sha=cand_sha,
+            worker_kind=worker_kind, rule_id=rule_id, passed_l0_l1=passed,
+            failed_tier="" if fault is None else fault.failed_tier,
+            error_code_norm="OK" if fault is None else (fault.code or ("OK" if passed else fault.plane.value)),
+            noop_identical=bool(fault is not None and fault.plane == FaultPlane.NOOP_IDENTICAL),
+            fault_plane=FaultPlane.NONE.value if fault is None else fault.plane.value,
+            l3_resolution=l3_resolution, is_real_npu=is_real_npu, wall_sec=wall_sec,
         )
-
-    def to_dict(self) -> dict[str, object]:
-        """Serialize funnel event to a JSON-compatible dictionary."""
-        return asdict(self)
 
 
 def assert_unmodeled_fault_share_bounded(
-    events: Sequence[RoundFunnelEvent],
-    *,
-    max_share: float = 0.10,
+    events: Sequence[RoundFunnelEvent], *, max_share: float = 0.10
 ) -> float:
-    """Assert unmodeled faults stay strictly below max_share of faulted events."""
-    fault_events = [
-        evt for evt in events if str(evt.fault_plane) != FaultPlane.NONE.value
-    ]
-    if not fault_events:
+    """Assert unmodeled faults stay strictly below *max_share* of faulted events."""
+    faults = [e for e in events if str(e.fault_plane) != FaultPlane.NONE.value]
+    if not faults:
         return 0.0
-    unmodeled_count = sum(
-        1
-        for evt in fault_events
-        if str(evt.fault_plane) == FaultPlane.UNMODELED_FAULT.value
-    )
-    share = unmodeled_count / len(fault_events)
+    share = sum(1 for e in faults if str(e.fault_plane) == FaultPlane.UNMODELED_FAULT.value) / len(faults)
     if share >= float(max_share):
-        raise AssertionError(
-            f"unmodeled fault share {share:.3f} >= {float(max_share):.3f}"
-        )
+        raise AssertionError(f"unmodeled fault share {share:.3f} >= {float(max_share):.3f}")
     return share
 
 
@@ -254,7 +175,7 @@ def append_round_funnel_event(telemetry_dir: Path, event: RoundFunnelEvent) -> P
 
 
 @dataclass
-class DeterministicSearchBoundaryLedger:
+class DeterministicSearchBoundaryLedger(JsonRecordMixin):
     """Persist verified infeasible envelopes, noop digests, and CostModel quarantines."""
 
     rejected_cand_shas: dict[str, str] = field(default_factory=dict)
@@ -275,23 +196,10 @@ class DeterministicSearchBoundaryLedger:
     ) -> bool:
         """Record a deterministic physical or noop compile boundary; return True if new."""
         added = False
-        if cand_sha and error_code_norm in {
-            "NOOP_IDENTICAL",
-            "PATCH_ANCHOR_MISS",
-            "TRACKB_SLICE_SPLICE_ERR",
-            "SIGNATURE_CONTRACT_MISMATCH",
-            "VF_STACK_OVERFLOW",
-            "UB_SRAM_OVERFLOW",
-            "L1_SRAM_OVERFLOW",
-        }:
-            if cand_sha not in self.rejected_cand_shas:
-                self.rejected_cand_shas[cand_sha] = error_code_norm
-                added = True
-        if knob_signature and error_code_norm in {
-            "VF_STACK_OVERFLOW",
-            "UB_SRAM_OVERFLOW",
-            "L1_SRAM_OVERFLOW",
-        }:
+        if cand_sha and error_code_norm in _SHA_CODES and cand_sha not in self.rejected_cand_shas:
+            self.rejected_cand_shas[cand_sha] = error_code_norm
+            added = True
+        if knob_signature and error_code_norm in _KNOB_CODES:
             bucket = self.infeasible_knobs_by_regime.setdefault(regime_tag, {})
             if knob_signature not in bucket:
                 bucket[knob_signature] = error_code_norm
@@ -311,11 +219,7 @@ class DeterministicSearchBoundaryLedger:
         return added
 
     def precheck_known_infeasible(
-        self,
-        *,
-        regime_tag: str,
-        cand_sha: str,
-        knob_signature: str = "",
+        self, *, regime_tag: str, cand_sha: str, knob_signature: str = ""
     ) -> str | None:
         """Return deterministic rejection reason if candidate hits a known wall."""
         if cand_sha and cand_sha in self.rejected_cand_shas:
@@ -330,15 +234,12 @@ class DeterministicSearchBoundaryLedger:
         lines: list[str] = []
         ub_ceil = self.min_overflow_ub_bytes.get(regime_tag)
         if ub_ceil is not None:
-            lines.append(
-                f"- Verified UB SRAM overflow ceiling: ub_bytes >= {ub_ceil} failed Stage-B."
-            )
+            lines.append(f"- Verified UB SRAM overflow ceiling: ub_bytes >= {ub_ceil} failed Stage-B.")
         for item in self.min_overflow_stack_knobs.get(regime_tag) or ():
             lines.append(f"- Verified VF stack overflow point: {item}.")
         knob_map = self.infeasible_knobs_by_regime.get(regime_tag) or {}
         if knob_map:
-            recent = list(knob_map.items())[-5:]
-            formatted = ", ".join(f"{k}->{v}" for k, v in recent)
+            formatted = ", ".join(f"{k}->{v}" for k, v in list(knob_map.items())[-5:])
             lines.append(f"- Infeasible knob tuples (do not repeat): {formatted}")
         if not lines:
             return ""
@@ -357,79 +258,41 @@ class DeterministicSearchBoundaryLedger:
         hist = self.spearman_history.get(bucket_key) or []
         return len(hist) >= 2 and all(val < SPEARMAN_QUARANTINE_FLOOR for val in hist[-2:])
 
-    def to_dict(self) -> dict[str, object]:
-        """Serialize ledger state to a JSON-compatible dictionary."""
-        return {
-            "rejected_cand_shas": dict(self.rejected_cand_shas),
-            "infeasible_knobs_by_regime": {
-                k: dict(v) for k, v in self.infeasible_knobs_by_regime.items()
-            },
-            "min_overflow_ub_bytes": dict(self.min_overflow_ub_bytes),
-            "min_overflow_stack_knobs": {
-                k: list(v) for k, v in self.min_overflow_stack_knobs.items()
-            },
-            "spearman_history": {k: list(v) for k, v in self.spearman_history.items()},
-        }
-
     @classmethod
     def from_dict(cls, payload: Mapping[str, object] | None) -> DeterministicSearchBoundaryLedger:
         """Reconstruct ledger state from a serialized dictionary."""
         if not isinstance(payload, Mapping):
             return cls()
-        raw_shas = payload.get("rejected_cand_shas")
-        raw_knobs = payload.get("infeasible_knobs_by_regime")
-        raw_ub = payload.get("min_overflow_ub_bytes")
-        raw_stack = payload.get("min_overflow_stack_knobs")
-        raw_spearman = payload.get("spearman_history")
+        shas, knobs = payload.get("rejected_cand_shas"), payload.get("infeasible_knobs_by_regime")
+        ub, stk, sp = (
+            payload.get("min_overflow_ub_bytes"),
+            payload.get("min_overflow_stack_knobs"),
+            payload.get("spearman_history"),
+        )
         return cls(
-            rejected_cand_shas=(
-                {str(k): str(v) for k, v in raw_shas.items()}
-                if isinstance(raw_shas, Mapping)
-                else {}
-            ),
+            rejected_cand_shas={str(k): str(v) for k, v in shas.items()} if isinstance(shas, Mapping) else {},
             infeasible_knobs_by_regime=(
-                {
-                    str(r): {str(k): str(v) for k, v in m.items()}
-                    for r, m in raw_knobs.items()
-                    if isinstance(m, Mapping)
-                }
-                if isinstance(raw_knobs, Mapping)
+                {str(r): {str(k): str(v) for k, v in m.items()} for r, m in knobs.items() if isinstance(m, Mapping)}
+                if isinstance(knobs, Mapping)
                 else {}
             ),
-            min_overflow_ub_bytes=(
-                {str(k): _coerce_int(v) for k, v in raw_ub.items()}
-                if isinstance(raw_ub, Mapping)
-                else {}
-            ),
+            min_overflow_ub_bytes={str(k): int(_num(v, int, 0)) for k, v in ub.items()} if isinstance(ub, Mapping) else {},
             min_overflow_stack_knobs=(
-                {
-                    str(k): [str(x) for x in v]
-                    for k, v in raw_stack.items()
-                    if isinstance(v, Sequence) and not isinstance(v, (str, bytes))
-                }
-                if isinstance(raw_stack, Mapping)
+                {str(k): [str(x) for x in v] for k, v in stk.items() if isinstance(v, Sequence) and not isinstance(v, (str, bytes))}
+                if isinstance(stk, Mapping)
                 else {}
             ),
             spearman_history=(
-                {
-                    str(k): [_coerce_float(x) for x in v]
-                    for k, v in raw_spearman.items()
-                    if isinstance(v, Sequence) and not isinstance(v, (str, bytes))
-                }
-                if isinstance(raw_spearman, Mapping)
+                {str(k): [float(_num(x, float, 0.0)) for x in v] for k, v in sp.items() if isinstance(v, Sequence) and not isinstance(v, (str, bytes))}
+                if isinstance(sp, Mapping)
                 else {}
             ),
         )
 
 
 __all__ = [
-    "ANOMALY_LOG_ERROR_THRESHOLD",
-    "DeterministicSearchBoundaryLedger",
-    "MAX_CLEAN_CALIBRATION_BURST_CV",
-    "RoundFunnelEvent",
-    "SPEARMAN_QUARANTINE_FLOOR",
-    "append_round_funnel_event",
-    "assert_unmodeled_fault_share_bounded",
-    "compute_spearman_rho",
-    "is_clean_calibration_sample",
+    "ANOMALY_LOG_ERROR_THRESHOLD", "DeterministicSearchBoundaryLedger",
+    "MAX_CLEAN_CALIBRATION_BURST_CV", "RoundFunnelEvent", "SPEARMAN_QUARANTINE_FLOOR",
+    "append_round_funnel_event", "assert_unmodeled_fault_share_bounded",
+    "compute_spearman_rho", "is_clean_calibration_sample",
 ]

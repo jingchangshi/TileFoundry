@@ -4,59 +4,45 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, fields
 from typing import Any
 
+from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
+
 _KNOWN_ASCEND_DTYPE_BYTES: dict[str, float] = {
-    "f16": 2.0,
-    "fp16": 2.0,
-    "float16": 2.0,
-    "bf16": 2.0,
-    "bfloat16": 2.0,
-    "f32": 4.0,
-    "fp32": 4.0,
-    "float32": 4.0,
-    "hf32": 4.0,
-    "f64": 8.0,
-    "fp64": 8.0,
-    "float64": 8.0,
-    "fp8e4m3": 1.0,
-    "fp8_e4m3": 1.0,
-    "float8_e4m3": 1.0,
-    "float8_e4m3fn": 1.0,
-    "e4m3": 1.0,
-    "fp8e5m2": 1.0,
-    "fp8_e5m2": 1.0,
-    "float8_e5m2": 1.0,
-    "e5m2": 1.0,
-    "hif8": 1.0,
-    "i8": 1.0,
-    "int8": 1.0,
-    "u8": 1.0,
-    "uint8": 1.0,
-    "i16": 2.0,
-    "int16": 2.0,
-    "u16": 2.0,
-    "uint16": 2.0,
-    "i32": 4.0,
-    "int32": 4.0,
-    "u32": 4.0,
-    "uint32": 4.0,
-    "i64": 8.0,
-    "int64": 8.0,
-    "u64": 8.0,
-    "uint64": 8.0,
-    "f4e2m1": 0.5,
-    "f4e1m2": 0.5,
-    "fp4": 0.5,
-    "i4": 0.5,
-    "int4": 0.5,
-    "u4": 0.5,
-    "uint4": 0.5,
-    "bool": 1.0,
-    "int1": 1.0,
+    "f16": 2.0, "fp16": 2.0, "float16": 2.0, "bf16": 2.0, "bfloat16": 2.0,
+    "f32": 4.0, "fp32": 4.0, "float32": 4.0, "hf32": 4.0, "f64": 8.0, "fp64": 8.0, "float64": 8.0,
+    "fp8e4m3": 1.0, "fp8_e4m3": 1.0, "float8_e4m3": 1.0, "float8_e4m3fn": 1.0, "e4m3": 1.0,
+    "fp8e5m2": 1.0, "fp8_e5m2": 1.0, "float8_e5m2": 1.0, "e5m2": 1.0, "hif8": 1.0,
+    "i8": 1.0, "int8": 1.0, "u8": 1.0, "uint8": 1.0, "i16": 2.0, "int16": 2.0, "u16": 2.0, "uint16": 2.0,
+    "i32": 4.0, "int32": 4.0, "u32": 4.0, "uint32": 4.0, "i64": 8.0, "int64": 8.0, "u64": 8.0, "uint64": 8.0,
+    "f4e2m1": 0.5, "f4e1m2": 0.5, "fp4": 0.5, "i4": 0.5, "int4": 0.5, "u4": 0.5, "uint4": 0.5,
+    "bool": 1.0, "int1": 1.0,
 }
+_TL_SCOPE_MAP: dict[str, str] = {
+    "global": "GM", "global.ddr": "GM", "shared.l1": "L1", "l1": "L1", "shared.l0a": "L0A", "l0a": "L0A",
+    "shared.l0b": "L0B", "l0b": "L0B", "shared.l0c": "L0C", "l0c": "L0C", "shared.ss": "SSBUF",
+    "ssbuf": "SSBUF", "shared": "UB", "shared.dyn": "UB", "ub": "UB",
+}
+_COPY_EDGE_KEYS: dict[tuple[str, str], str] = {
+    ("GM", "L1"): "gm_to_l1_bytes", ("GM", "UB"): "gm_to_ub_bytes",
+    ("L1", "L0A"): "l1_to_l0a_bytes", ("L1", "L0B"): "l1_to_l0b_bytes",
+    ("L0C", "UB"): "l0c_to_ub_bytes", ("L0C", "L1"): "l0c_to_l1_bytes",
+    ("L0C", "GM"): "l0c_to_gm_bytes", ("UB", "L1"): "ub_to_l1_bytes", ("UB", "GM"): "ub_to_gm_bytes",
+}
+_BYTE_FIELDS = frozenset(_COPY_EDGE_KEYS.values()) | {"ub_load_bytes", "ub_store_bytes"}
+_MIN1_FIELDS = frozenset({"pipeline_depth", "inner_loop_trips", "subkernel_count"})
+_CCE_XFER_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("gm_to_l1_bytes", r"\b(?:copy_gm_to_cbuf|asc_copy_gm2l1\w*)\b"),
+    ("gm_to_ub_bytes", r"\b(?:copy_gm_to_ubuf|asc_copy_gm2ub\w*)\b"),
+    ("l1_to_l0a_bytes", r"\bcopy_cbuf_to_ca\b"), ("l1_to_l0b_bytes", r"\bcopy_cbuf_to_cb\b"),
+    ("l0c_to_ub_bytes", r"\b(?:copy_matrix_cc_to_ubuf|asc_copy_l0c2ub\w*)\b"),
+    ("l0c_to_l1_bytes", r"\bcopy_matrix_cc_to_cbuf\b"),
+    ("l0c_to_gm_bytes", r"\b(?:copy_matrix_cc_to_gm|Fixpipe|asc_copy_l0c2gm\w*)\b"),
+    ("ub_to_l1_bytes", r"\b(?:copy_ubuf_to_cbuf|asc_copy_ub2l1\w*)\b"),
+    ("ub_to_gm_bytes", r"\b(?:copy_ubuf_to_gm|asc_copy_ub2gm\w*)\b"),
+)
 
 
 def _dtype_bytes_strict(dtype_name: object) -> float:
@@ -64,34 +50,30 @@ def _dtype_bytes_strict(dtype_name: object) -> float:
     if raw in _KNOWN_ASCEND_DTYPE_BYTES:
         return _KNOWN_ASCEND_DTYPE_BYTES[raw]
     m = re.fullmatch(r"([a-z0-9_]+)x(\d+)", raw)
-    if m:
-        base, lanes = m.group(1), int(m.group(2))
-        if base in _KNOWN_ASCEND_DTYPE_BYTES and lanes > 0:
-            return _KNOWN_ASCEND_DTYPE_BYTES[base] * lanes
+    if m and m.group(1) in _KNOWN_ASCEND_DTYPE_BYTES and int(m.group(2)) > 0:
+        return _KNOWN_ASCEND_DTYPE_BYTES[m.group(1)] * int(m.group(2))
     raise ValueError(f"Unknown Ascend dtype {dtype_name!r}; refusing 16-bit silent fallback")
 
 
-def _dtype_bits_strict(dtype_name: object) -> int:
+def _dtype_bits(dtype_name: object, dt_cls: Any = None) -> int:
+    if dt_cls is not None:
+        try:
+            return int(dt_cls(str(dtype_name)).bits)
+        except Exception:
+            pass
     return max(1, int(round(_dtype_bytes_strict(dtype_name) * 8.0)))
 
 
-def _safe_int(val: object, default: int = 0) -> int:
+def _safe_num(val: object, default: float | int, is_float: bool = False) -> Any:
     try:
-        return int(val)
-    except Exception:
-        return default
-
-
-def _safe_float(val: object, default: float = 0.0) -> float:
-    try:
-        v = float(val)
-        return v if math.isfinite(v) else default
+        v = float(val) if is_float else int(val)  # type: ignore[arg-type]
+        return (v if math.isfinite(v) else default) if is_float else v
     except Exception:
         return default
 
 
 @dataclass(frozen=True)
-class MicroarchProfile:
+class MicroarchProfile(JsonRecordMixin):
     """Compiler-invariant hardware operation, DMA edge, and bank geometry telemetry."""
 
     fp_alu_ops: int = 0
@@ -103,7 +85,6 @@ class MicroarchProfile:
     scalar_ops: int = 0
     ub_load_bytes: int = 0
     ub_store_bytes: int = 0
-
     gm_to_l1_bytes: int = 0
     gm_to_ub_bytes: int = 0
     l1_to_l0a_bytes: int = 0
@@ -113,7 +94,6 @@ class MicroarchProfile:
     l0c_to_gm_bytes: int = 0
     ub_to_l1_bytes: int = 0
     ub_to_gm_bytes: int = 0
-
     cube_mmad_count: int = 0
     cube_macs_total: int = 0
     cv_sync_barriers: int = 0
@@ -121,50 +101,22 @@ class MicroarchProfile:
     pipeline_depth: int = 1
     inner_loop_trips: int = 1
     subkernel_count: int = 1
-
     ub_bank_conflict_factor: float = 1.0
     l1_bank_conflict_factor: float = 1.0
     simt_shm_conflict_factor: float = 1.0
-
     source_kind: str = "empty"
 
     @property
     def is_empty(self) -> bool:
-        return self.source_kind == "empty" and (
-            self.total_transfer_bytes == 0
-            and self.total_vector_ops == 0
-            and self.cube_mmad_count == 0
-            and self.cube_macs_total == 0
-        )
+        return self.source_kind == "empty" and self.total_transfer_bytes == 0 and self.total_vector_ops == 0 and self.cube_mmad_count == 0 and self.cube_macs_total == 0
 
     @property
     def total_vector_ops(self) -> int:
-        return (
-            self.fp_alu_ops
-            + self.int_alu_ops
-            + self.sfu_f16_ops
-            + self.sfu_f32_ops
-            + self.reduce_ops
-            + self.slot0_only_ops
-        )
+        return self.fp_alu_ops + self.int_alu_ops + self.sfu_f16_ops + self.sfu_f32_ops + self.reduce_ops + self.slot0_only_ops
 
     @property
     def total_transfer_bytes(self) -> int:
-        return (
-            self.gm_to_l1_bytes
-            + self.gm_to_ub_bytes
-            + self.l1_to_l0a_bytes
-            + self.l1_to_l0b_bytes
-            + self.l0c_to_ub_bytes
-            + self.l0c_to_l1_bytes
-            + self.l0c_to_gm_bytes
-            + self.ub_to_l1_bytes
-            + self.ub_to_gm_bytes
-        )
-
-    def to_dict(self) -> dict[str, object]:
-        """Serialize profile to a JSON-safe dictionary."""
-        return asdict(self)
+        return sum(getattr(self, name) for name in _COPY_EDGE_KEYS.values())
 
     @classmethod
     def coerce(cls, raw: MicroarchProfile | Mapping[str, object] | None) -> MicroarchProfile:
@@ -175,19 +127,19 @@ class MicroarchProfile:
             return raw
         if not isinstance(raw, Mapping):
             raise TypeError(f"Expected MicroarchProfile or Mapping, got {type(raw).__name__}")
-        valid = set(cls.__dataclass_fields__.keys())
         kw: dict[str, Any] = {}
-        for k in valid:
-            if k not in raw or raw[k] is None:
+        for f in fields(cls):
+            val = raw.get(f.name)
+            if val is None:
                 continue
-            if k == "source_kind":
-                kw[k] = str(raw[k])
-            elif k.endswith("_factor"):
-                kw[k] = max(1.0, _safe_float(raw[k], 1.0))
-            elif k in ("pipeline_depth", "inner_loop_trips", "subkernel_count"):
-                kw[k] = max(1, _safe_int(raw[k], 1))
+            if f.name == "source_kind":
+                kw[f.name] = str(val)
+            elif f.name.endswith("_factor"):
+                kw[f.name] = max(1.0, _safe_num(val, 1.0, True))
+            elif f.name in _MIN1_FIELDS:
+                kw[f.name] = max(1, _safe_num(val, 1))
             else:
-                kw[k] = max(0, _safe_int(raw[k], 0))
+                kw[f.name] = max(0, _safe_num(val, 0))
         return cls(**kw)
 
 
@@ -208,113 +160,51 @@ def _eval_tirx_expr_int(expr: object, var_bindings: Mapping[str, int] | None) ->
     return None
 
 
+def _eval_extents(extents: Sequence[object], var_bindings: Mapping[str, int] | None) -> list[int] | None:
+    dims: list[int] = []
+    for ext in extents:
+        iv = _eval_tirx_expr_int(ext, var_bindings)
+        if iv is None or iv <= 0:
+            return None
+        dims.append(iv)
+    return dims
+
+
 def _map_tl_scope_name(raw_scope: object) -> str | None:
-    s = str(raw_scope or "").strip().lower()
-    if s in ("global", "global.ddr"):
-        return "GM"
-    if s in ("shared.l1", "l1"):
-        return "L1"
-    if s in ("shared.l0a", "l0a"):
-        return "L0A"
-    if s in ("shared.l0b", "l0b"):
-        return "L0B"
-    if s in ("shared.l0c", "l0c"):
-        return "L0C"
-    if s in ("shared.ss", "ssbuf"):
-        return "SSBUF"
-    if s in ("shared", "shared.dyn", "ub"):
-        return "UB"
-    return None
+    return _TL_SCOPE_MAP.get(str(raw_scope or "").strip().lower())
 
 
-def _extract_region_info(
-    arg: object,
-    *,
-    tirx: Any,
-    DataTypeCls: Any,
-    var_bindings: Mapping[str, int] | None,
-) -> tuple[str | None, int, int, str]:
-    """Return (scope, total_bytes, elems, dtype_str) from a BufferLoad / region / access_ptr."""
-    if isinstance(arg, tirx.Call):
-        op_name = str(getattr(arg.op, "name", arg.op)).lower()
-        args = list(arg.args)
-        if "region" in op_name and args:
-            bl = args[0]
-            buf = getattr(bl, "buffer", None)
-            extents = args[2:]
-            if buf is not None:
-                scope = _map_tl_scope_name(buf.scope())
-                dtype_str = str(getattr(buf, "dtype", ""))
-                try:
-                    elem_bits = int(DataTypeCls(dtype_str).bits)
-                except Exception:
-                    elem_bits = _dtype_bits_strict(dtype_str)
-                elems = 1
-                known = True
-                for ext in extents:
-                    iv = _eval_tirx_expr_int(ext, var_bindings)
-                    if iv is None or iv <= 0:
-                        known = False
-                        break
-                    elems *= iv
-                if not known or not extents:
-                    elems = 1
-                    for ext in getattr(buf, "shape", ()) or ():
-                        iv = _eval_tirx_expr_int(ext, var_bindings)
-                        if iv is None or iv <= 0:
-                            elems = 0
-                            break
-                        elems *= iv
-                total_b = (elems * elem_bits + 7) // 8 if elems > 0 else 0
-                return scope, total_b, max(0, elems), dtype_str
-        if "access_ptr" in op_name and args:
-            bl = args[0]
-            buf = getattr(bl, "buffer", None)
-            if buf is not None:
-                scope = _map_tl_scope_name(buf.scope())
-                dtype_str = str(getattr(buf, "dtype", ""))
-                try:
-                    elem_bits = int(DataTypeCls(dtype_str).bits)
-                except Exception:
-                    elem_bits = _dtype_bits_strict(dtype_str)
-                iv = _eval_tirx_expr_int(args[3], var_bindings) if len(args) > 3 else None
-                if iv is None or iv <= 0:
-                    elems = 1
-                    for ext in getattr(buf, "shape", ()) or ():
-                        d = _eval_tirx_expr_int(ext, var_bindings)
-                        if d is None or d <= 0:
-                            elems = 0
-                            break
-                        elems *= d
-                else:
-                    elems = iv
-                total_b = (elems * elem_bits + 7) // 8 if elems > 0 else 0
-                return scope, total_b, max(0, elems), dtype_str
+def _extract_region_info(arg: object, *, tirx: Any, DataTypeCls: Any, var_bindings: Mapping[str, int] | None) -> tuple[str | None, int, int, str]:
+    extents: Sequence[object] = ()
+    explicit: int | None = None
     buf = getattr(arg, "buffer", None)
-    if buf is not None:
-        scope = _map_tl_scope_name(buf.scope())
-        dtype_str = str(getattr(buf, "dtype", ""))
-        try:
-            elem_bits = int(DataTypeCls(dtype_str).bits)
-        except Exception:
-            elem_bits = _dtype_bits_strict(dtype_str)
-        elems = 1
-        for ext in getattr(buf, "shape", ()) or ():
-            d = _eval_tirx_expr_int(ext, var_bindings)
-            if d is None or d <= 0:
-                elems = 0
-                break
-            elems *= d
-        total_b = (elems * elem_bits + 7) // 8 if elems > 0 else 0
-        return scope, total_b, max(0, elems), dtype_str
-    return None, 0, 0, ""
+    if isinstance(arg, tirx.Call):
+        op_name, args = str(getattr(arg.op, "name", arg.op)).lower(), list(arg.args)
+        if ("region" in op_name or "access_ptr" in op_name) and args:
+            buf = getattr(args[0], "buffer", None)
+            extents = args[2:] if "region" in op_name else ()
+            explicit = _eval_tirx_expr_int(args[3], var_bindings) if ("access_ptr" in op_name and len(args) > 3) else None
+    if buf is None:
+        return None, 0, 0, ""
+    scope = _map_tl_scope_name(buf.scope()) if hasattr(buf, "scope") else None
+    dtype_str = str(getattr(buf, "dtype", ""))
+    elem_bits = _dtype_bits(dtype_str, DataTypeCls)
+    dims = ([explicit] if (explicit and explicit > 0) else None) or (_eval_extents(extents, var_bindings) if extents else None) or _eval_extents(getattr(buf, "shape", ()) or (), var_bindings)
+    elems = math.prod(dims) if dims else 0
+    return scope, ((elems * elem_bits + 7) // 8 if elems > 0 else 0), max(0, elems), dtype_str
 
 
-def extract_microarch_profile_from_tirx(
-    prim_func: object,
-    *,
-    var_bindings: Mapping[str, int] | None = None,
-) -> MicroarchProfile:
+def _classify_dtype_family(dtype_str: str) -> str:
+    low = str(dtype_str or "").strip().lower()
+    if not low or low in ("void", "handle"):
+        return "f32"
+    _dtype_bytes_strict(low)
+    if any(t in low for t in ("float16", "bfloat16")) or low.startswith(("f16", "bf16", "fp16")):
+        return "f16"
+    return "int" if ("int" in low or low == "bool" or low.startswith(("i", "u"))) else "f32"
+
+
+def extract_microarch_profile_from_tirx(prim_func: object, *, var_bindings: Mapping[str, int] | None = None) -> MicroarchProfile:
     """Extract Ascend 950 MicroarchProfile from a TileLang PrimFunc or IRModule."""
     if prim_func is None:
         return MicroarchProfile()
@@ -325,57 +215,20 @@ def extract_microarch_profile_from_tirx(
     except ImportError:
         return MicroarchProfile()
 
-    funcs: list[Any] = []
-    if isinstance(prim_func, tvm.IRModule):
-        funcs = [fn for fn in prim_func.functions.values() if isinstance(fn, tirx.PrimFunc)]
-    elif isinstance(prim_func, tirx.PrimFunc):
-        funcs = [prim_func]
+    funcs = [f for f in prim_func.functions.values() if isinstance(f, tirx.PrimFunc)] if isinstance(prim_func, tvm.IRModule) else ([prim_func] if isinstance(prim_func, tirx.PrimFunc) else [])
     if not funcs:
         return MicroarchProfile()
 
-    c = {
-        "fp_alu_ops": 0,
-        "int_alu_ops": 0,
-        "sfu_f16_ops": 0,
-        "sfu_f32_ops": 0,
-        "reduce_ops": 0,
-        "slot0_only_ops": 0,
-        "scalar_ops": 0,
-        "ub_load_bytes": 0,
-        "ub_store_bytes": 0,
-        "gm_to_l1_bytes": 0,
-        "gm_to_ub_bytes": 0,
-        "l1_to_l0a_bytes": 0,
-        "l1_to_l0b_bytes": 0,
-        "l0c_to_ub_bytes": 0,
-        "l0c_to_l1_bytes": 0,
-        "l0c_to_gm_bytes": 0,
-        "ub_to_l1_bytes": 0,
-        "ub_to_gm_bytes": 0,
-        "cube_mmad_count": 0,
-        "cube_macs_total": 0,
-        "cv_sync_barriers": 0,
-        "pipe_all_barriers": 0,
-        "pipeline_depth": 1,
-        "inner_loop_trips": 1,
-        "subkernel_count": len(funcs),
-    }
-    ub_total_bytes = 0
-    ub_conflict_bytes = 0
-    l1_buffers: list[int] = []
+    c: dict[str, int] = dict.fromkeys(
+        ("fp_alu_ops", "int_alu_ops", "sfu_f16_ops", "sfu_f32_ops", "reduce_ops", "slot0_only_ops",
+         "scalar_ops", "ub_load_bytes", "ub_store_bytes", "cube_mmad_count", "cube_macs_total",
+         "cv_sync_barriers", "pipe_all_barriers", *_COPY_EDGE_KEYS.values()),
+        0,
+    )
+    c.update({"pipeline_depth": 1, "inner_loop_trips": 1, "subkernel_count": len(funcs)})
+    ub_total_bytes, ub_conflict_bytes, l1_buffers = 0, 0, []
 
-    def _classify_dtype_family(dtype_str: str) -> str:
-        low = str(dtype_str or "").strip().lower()
-        if not low or low in ("void", "handle"):
-            return "f32"
-        _dtype_bytes_strict(low)
-        if "float16" in low or "bfloat16" in low or low.startswith(("f16", "bf16", "fp16")):
-            return "f16"
-        if "int" in low or "uint" in low or low == "bool" or low.startswith(("i", "u")):
-            return "int"
-        return "f32"
-
-    def _is_scalar_dtype(dtype_str: str) -> bool:
+    def _is_scalar(dtype_str: str) -> bool:
         low = str(dtype_str or "").strip().lower()
         if not low or low in ("void", "handle"):
             return True
@@ -384,27 +237,21 @@ def extract_microarch_profile_from_tirx(
         except Exception:
             return "x" not in low
 
+    def _ub_bytes(dtype_obj: object) -> int:
+        try:
+            dt = TLDataType(str(dtype_obj))
+            return max(1, (int(dt.bits) * int(dt.lanes) + 7) // 8)
+        except Exception:
+            return max(1, int(math.ceil(_dtype_bytes_strict(dtype_obj))))
+
     def _record_buf(buf: object) -> None:
         nonlocal ub_total_bytes, ub_conflict_bytes
         scope = _map_tl_scope_name(buf.scope()) if hasattr(buf, "scope") else None
-        if scope is None:
-            return
-        shape = getattr(buf, "shape", ()) or ()
-        dims: list[int] = []
-        for ext in shape:
-            iv = _eval_tirx_expr_int(ext, var_bindings)
-            if iv is None or iv <= 0:
-                dims = []
-                break
-            dims.append(iv)
+        dims = _eval_extents(getattr(buf, "shape", ()) or (), var_bindings) if scope else None
         if not dims:
             return
-        try:
-            bits = int(TLDataType(str(buf.dtype)).bits)
-        except Exception:
-            bits = _dtype_bits_strict(getattr(buf, "dtype", ""))
-        total_b = (math.prod(dims) * bits + 7) // 8
-        inner_b = (dims[-1] * bits + 7) // 8
+        bits = _dtype_bits(getattr(buf, "dtype", ""), TLDataType)
+        total_b, inner_b = (math.prod(dims) * bits + 7) // 8, (dims[-1] * bits + 7) // 8
         if scope == "UB" and len(dims) >= 2 and math.prod(dims[:-1]) > 1:
             ub_total_bytes += total_b
             if inner_b >= 512 and inner_b % 512 == 0:
@@ -418,54 +265,29 @@ def extract_microarch_profile_from_tirx(
         dt_str = str(getattr(expr, "dtype", ""))
         if isinstance(expr, tirx.Call):
             op_name = str(getattr(expr.op, "name", expr.op)).lower()
-            args = list(expr.args)
-            arg_dtypes = [_scan_expr(a, repeat=repeat, in_simtvf=in_simtvf) for a in args]
+            arg_dtypes = [_scan_expr(a, repeat=repeat, in_simtvf=in_simtvf) for a in expr.args]
             eff_dt = next((d for d in arg_dtypes if d), dt_str)
             fam = _classify_dtype_family(eff_dt)
-            if any(tok in op_name for tok in ("vintlv", "vdintlv", "interleave")):
+            if any(t in op_name for t in ("vintlv", "vdintlv", "interleave")):
                 c["slot0_only_ops"] += repeat
-            elif any(tok in op_name for tok in ("exp", "log", "sqrt", "rsqrt", "div", "tanh", "erf", "sigmoid")):
-                if fam == "f16":
-                    c["sfu_f16_ops"] += repeat
-                else:
-                    c["sfu_f32_ops"] += repeat
+            elif any(t in op_name for t in ("exp", "log", "sqrt", "rsqrt", "div", "tanh", "erf", "sigmoid")):
+                c["sfu_f16_ops" if fam == "f16" else "sfu_f32_ops"] += repeat
             elif "reduce" in op_name:
                 c["reduce_ops"] += repeat
-            elif "simd" in op_name or "vec" in op_name or "cast" in op_name or "fma" in op_name:
-                if fam == "int":
-                    if _is_scalar_dtype(eff_dt):
-                        c["scalar_ops"] += repeat
-                    else:
-                        c["int_alu_ops"] += repeat
-                else:
-                    c["fp_alu_ops"] += repeat
+            elif any(t in op_name for t in ("simd", "vec", "cast", "fma")):
+                c[("scalar_ops" if _is_scalar(eff_dt) else "int_alu_ops") if fam == "int" else "fp_alu_ops"] += repeat
             return eff_dt
         if isinstance(expr, tirx.BufferLoad):
             for idx_expr in getattr(expr, "indices", ()) or ():
                 _scan_expr(idx_expr, repeat=repeat, in_simtvf=in_simtvf)
-            scope = _map_tl_scope_name(expr.buffer.scope())
-            if scope == "UB":
-                try:
-                    dt = TLDataType(str(expr.dtype))
-                    b = max(1, (int(dt.bits) * int(dt.lanes) + 7) // 8)
-                except Exception:
-                    b = max(1, int(math.ceil(_dtype_bytes_strict(getattr(expr, "dtype", "")))))
-                c["ub_load_bytes"] += repeat * b
-            return str(getattr(expr, "dtype", ""))
+            if _map_tl_scope_name(expr.buffer.scope()) == "UB":
+                c["ub_load_bytes"] += repeat * _ub_bytes(getattr(expr, "dtype", ""))
+            return dt_str
         if isinstance(expr, (tirx.Add, tirx.Sub, tirx.Mul, tirx.Div, tirx.FloorDiv, tirx.Mod, tirx.Min, tirx.Max)):
-            ld = _scan_expr(expr.a, repeat=repeat, in_simtvf=in_simtvf)
-            rd = _scan_expr(expr.b, repeat=repeat, in_simtvf=in_simtvf)
-            eff_dt = ld or rd or dt_str
-            fam = _classify_dtype_family(eff_dt)
-            if fam == "int":
-                if (
-                    isinstance(expr, (tirx.FloorDiv, tirx.Mod, tirx.Min, tirx.Max))
-                    or _is_scalar_dtype(eff_dt)
-                    or in_simtvf
-                ):
-                    c["scalar_ops"] += repeat
-                else:
-                    c["int_alu_ops"] += repeat
+            eff_dt = _scan_expr(expr.a, repeat=repeat, in_simtvf=in_simtvf) or _scan_expr(expr.b, repeat=repeat, in_simtvf=in_simtvf) or dt_str
+            if _classify_dtype_family(eff_dt) == "int":
+                scalar = isinstance(expr, (tirx.FloorDiv, tirx.Mod, tirx.Min, tirx.Max)) or _is_scalar(eff_dt) or in_simtvf
+                c["scalar_ops" if scalar else "int_alu_ops"] += repeat
             else:
                 c["fp_alu_ops"] += repeat
             return eff_dt
@@ -477,171 +299,87 @@ def extract_microarch_profile_from_tirx(
         if isinstance(stmt, tirx.SeqStmt):
             for ch in stmt.seq:
                 _walk(ch, repeat=repeat, in_simtvf=in_simtvf)
-            return
-        if isinstance(stmt, tirx.For):
+        elif isinstance(stmt, tirx.For):
             ann = getattr(stmt, "annotations", None) or {}
-            raw_stages = ann.get("num_stages", ann.get("software_pipeline_stage"))
-            if raw_stages is not None:
-                c["pipeline_depth"] = max(c["pipeline_depth"], max(1, _safe_int(raw_stages, 1)))
-            tb = getattr(stmt, "thread_binding", None)
-            if tb is not None:
+            raw_st = ann.get("num_stages", ann.get("software_pipeline_stage"))
+            if raw_st is not None:
+                c["pipeline_depth"] = max(c["pipeline_depth"], max(1, _safe_num(raw_st, 1)))
+            if getattr(stmt, "thread_binding", None) is not None:
                 _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf)
                 return
             trip = _eval_tirx_expr_int(stmt.extent, var_bindings)
-            kind_raw = getattr(stmt, "kind", 0)
-            kind_val = int(getattr(kind_raw, "value", kind_raw)) if isinstance(getattr(kind_raw, "value", kind_raw), int) else -1
-            is_parallel_for = kind_val == 1 or "parallel" in str(kind_raw).lower()
-            if in_simtvf and is_parallel_for and trip is not None and trip > 0:
-                eff_trip = max(1, math.ceil(trip / 64))
-            else:
-                eff_trip = trip if (trip is not None and trip > 0) else 1
-            if eff_trip > 1:
-                c["inner_loop_trips"] = max(c["inner_loop_trips"], eff_trip)
-            _walk(stmt.body, repeat=repeat * eff_trip, in_simtvf=in_simtvf)
-            return
-        if isinstance(stmt, tirx.While):
-            _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf)
-            return
-        if isinstance(stmt, tirx.IfThenElse):
+            kraw = getattr(stmt, "kind", 0)
+            is_par = getattr(kraw, "value", kraw) == 1 or "parallel" in str(kraw).lower()
+            eff = max(1, math.ceil(trip / 64)) if (in_simtvf and is_par and trip and trip > 0) else (trip if (trip and trip > 0) else 1)
+            c["inner_loop_trips"] = max(c["inner_loop_trips"], eff)
+            _walk(stmt.body, repeat=repeat * eff, in_simtvf=in_simtvf)
+        elif isinstance(stmt, tirx.IfThenElse):
             _walk(stmt.then_case, repeat=repeat, in_simtvf=in_simtvf)
-            if stmt.else_case is not None:
-                _walk(stmt.else_case, repeat=repeat, in_simtvf=in_simtvf)
-            return
-        if isinstance(stmt, tirx.AttrStmt):
-            attr_key = str(getattr(stmt, "attr_key", "")).lower()
-            node_low = str(getattr(stmt, "node", "")).lower()
-            ann_val = _safe_int(getattr(stmt, "value", None), 0)
-            if "stage" in attr_key and ann_val > 1:
-                c["pipeline_depth"] = max(c["pipeline_depth"], ann_val)
-            next_simtvf = in_simtvf or ("simt" in attr_key) or ("simt" in node_low) or (attr_key == "pragma_parallel")
-            _walk(stmt.body, repeat=repeat, in_simtvf=next_simtvf)
-            return
-        if isinstance(stmt, (tirx.SBlockRealize,)):
+            _walk(stmt.else_case, repeat=repeat, in_simtvf=in_simtvf)
+        elif isinstance(stmt, tirx.AttrStmt):
+            ak = str(getattr(stmt, "attr_key", "")).lower()
+            av = _safe_num(getattr(stmt, "value", None), 0)
+            if "stage" in ak and av > 1:
+                c["pipeline_depth"] = max(c["pipeline_depth"], av)
+            _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf or ("simt" in ak) or ("simt" in str(getattr(stmt, "node", "")).lower()) or (ak == "pragma_parallel"))
+        elif isinstance(stmt, tirx.SBlockRealize):
             _walk(stmt.block, repeat=repeat, in_simtvf=in_simtvf)
-            return
-        if isinstance(stmt, tirx.SBlock):
+        elif isinstance(stmt, tirx.SBlock):
             for buf in getattr(stmt, "alloc_buffers", ()) or ():
                 _record_buf(buf)
-            blk_name = str(getattr(stmt, "name_hint", "")).lower()
-            blk_ann = getattr(stmt, "annotations", None) or {}
-            next_simtvf = in_simtvf or ("simt" in blk_name) or ("tl.vf_source_index" in blk_ann)
-            _walk(stmt.body, repeat=repeat, in_simtvf=next_simtvf)
-            return
-        if isinstance(stmt, (tirx.AllocBuffer, tirx.DeclBuffer)):
+            ann = getattr(stmt, "annotations", None) or {}
+            _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf or ("simt" in str(getattr(stmt, "name_hint", "")).lower()) or ("tl.vf_source_index" in ann))
+        elif isinstance(stmt, (tirx.While, tirx.AllocBuffer, tirx.DeclBuffer, tirx.Bind)):
             if hasattr(stmt, "buffer"):
                 _record_buf(stmt.buffer)
+            if isinstance(stmt, tirx.Bind):
+                _scan_expr(stmt.value, repeat=repeat, in_simtvf=in_simtvf)
             if hasattr(stmt, "body"):
                 _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf)
-            return
-        if isinstance(stmt, tirx.Bind):
-            _scan_expr(stmt.value, repeat=repeat, in_simtvf=in_simtvf)
-            if hasattr(stmt, "body"):
-                _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf)
-            return
-        if isinstance(stmt, tirx.BufferStore):
+        elif isinstance(stmt, tirx.BufferStore):
             for idx_expr in getattr(stmt, "indices", ()) or ():
                 _scan_expr(idx_expr, repeat=repeat, in_simtvf=in_simtvf)
-            scope = _map_tl_scope_name(stmt.buffer.scope())
-            if scope == "UB":
-                try:
-                    dt = TLDataType(str(stmt.value.dtype))
-                    b = max(1, (int(dt.bits) * int(dt.lanes) + 7) // 8)
-                except Exception:
-                    b = max(1, int(math.ceil(_dtype_bytes_strict(getattr(stmt.value, "dtype", "")))))
-                c["ub_store_bytes"] += repeat * b
+            if _map_tl_scope_name(stmt.buffer.scope()) == "UB":
+                c["ub_store_bytes"] += repeat * _ub_bytes(getattr(stmt.value, "dtype", ""))
             _scan_expr(stmt.value, repeat=repeat, in_simtvf=in_simtvf)
-            return
-        if isinstance(stmt, tirx.Evaluate) and isinstance(stmt.value, tirx.Call):
-            op_name = str(getattr(stmt.value.op, "name", stmt.value.op)).lower()
-            args = list(stmt.value.args)
+        elif isinstance(stmt, tirx.Evaluate) and isinstance(stmt.value, tirx.Call):
+            op_name, args = str(getattr(stmt.value.op, "name", stmt.value.op)).lower(), list(stmt.value.args)
             if "copy" in op_name and len(args) >= 2:
-                src_s, src_b, _, _ = _extract_region_info(
-                    args[0], tirx=tirx, DataTypeCls=TLDataType, var_bindings=var_bindings
-                )
-                dst_s, dst_b, _, _ = _extract_region_info(
-                    args[1], tirx=tirx, DataTypeCls=TLDataType, var_bindings=var_bindings
-                )
+                src_s, src_b, _, _ = _extract_region_info(args[0], tirx=tirx, DataTypeCls=TLDataType, var_bindings=var_bindings)
+                dst_s, dst_b, _, _ = _extract_region_info(args[1], tirx=tirx, DataTypeCls=TLDataType, var_bindings=var_bindings)
                 xfer = max(src_b, dst_b)
-                edge_key = {
-                    ("GM", "L1"): "gm_to_l1_bytes",
-                    ("GM", "UB"): "gm_to_ub_bytes",
-                    ("L1", "L0A"): "l1_to_l0a_bytes",
-                    ("L1", "L0B"): "l1_to_l0b_bytes",
-                    ("L0C", "UB"): "l0c_to_ub_bytes",
-                    ("L0C", "L1"): "l0c_to_l1_bytes",
-                    ("L0C", "GM"): "l0c_to_gm_bytes",
-                    ("UB", "L1"): "ub_to_l1_bytes",
-                    ("UB", "GM"): "ub_to_gm_bytes",
-                }.get((src_s, dst_s))
-                if edge_key is not None and xfer > 0:
-                    c[edge_key] += repeat * xfer
+                edge = _COPY_EDGE_KEYS.get((src_s or "", dst_s or ""))
+                if edge and xfer > 0:
+                    c[edge] += repeat * xfer
                 if src_s == "UB":
                     c["ub_load_bytes"] += repeat * xfer
                 if dst_s == "UB":
                     c["ub_store_bytes"] += repeat * xfer
-                return
-            if ("gemm" in op_name or "mmad" in op_name) and len(args) >= 2:
+            elif ("gemm" in op_name or "mmad" in op_name) and len(args) >= 2:
                 c["cube_mmad_count"] += repeat
-                _s0, _b0, elems_a, _dt0 = _extract_region_info(
-                    args[0], tirx=tirx, DataTypeCls=TLDataType, var_bindings=var_bindings
-                )
-                _s1, _b1, elems_b, _dt1 = _extract_region_info(
-                    args[1], tirx=tirx, DataTypeCls=TLDataType, var_bindings=var_bindings
-                )
-                _s2, _b2, elems_c, _dt2 = (
-                    _extract_region_info(
-                        args[2], tirx=tirx, DataTypeCls=TLDataType, var_bindings=var_bindings
-                    )
-                    if len(args) >= 3
-                    else (None, 0, 0, "")
-                )
-                m_val, n_val, k_val = 0, 0, 0
-                buf_a = getattr(getattr(args[0], "args", [None])[0] if isinstance(args[0], tirx.Call) else args[0], "buffer", None)
-                buf_b = getattr(getattr(args[1], "args", [None])[0] if isinstance(args[1], tirx.Call) else args[1], "buffer", None)
-                if buf_a is not None and buf_b is not None:
-                    sa = [_eval_tirx_expr_int(d, var_bindings) for d in (getattr(buf_a, "shape", ()) or ())]
-                    sb = [_eval_tirx_expr_int(d, var_bindings) for d in (getattr(buf_b, "shape", ()) or ())]
-                    if len(sa) >= 2 and len(sb) >= 2 and sa[-2] and sa[-1] and sb[-2] and sb[-1]:
-                        m_val = sa[-2]
-                        k_val = sa[-1]
-                        n_val = sb[-1] if sb[-2] == k_val else sb[-2]
-                macs = (m_val * n_val * k_val) if (m_val > 0 and n_val > 0 and k_val > 0) else max(elems_a, elems_b, elems_c, 0) * 64
+                elems = [_extract_region_info(args[i], tirx=tirx, DataTypeCls=TLDataType, var_bindings=var_bindings)[2] for i in range(min(3, len(args)))]
+                ba = getattr(args[0].args[0] if isinstance(args[0], tirx.Call) and args[0].args else args[0], "buffer", None)
+                bb = getattr(args[1].args[0] if isinstance(args[1], tirx.Call) and args[1].args else args[1], "buffer", None)
+                sa = _eval_extents((getattr(ba, "shape", ()) or ())[-2:], var_bindings) if ba else None
+                sb = _eval_extents((getattr(bb, "shape", ()) or ())[-2:], var_bindings) if bb else None
+                macs = (sa[0] * sa[1] * (sb[1] if sb[0] == sa[1] else sb[0])) if (sa and sb and len(sa) == 2 and len(sb) == 2) else max(elems, default=0) * 64
                 c["cube_macs_total"] += repeat * macs
-                return
-            if "cross_flag" in op_name or "cross_core" in op_name:
+            elif "cross_flag" in op_name or "cross_core" in op_name:
                 c["cv_sync_barriers"] += repeat
-                return
-            if "pipe_barrier" in op_name or "pipe_all" in op_name:
+            elif "pipe_barrier" in op_name or "pipe_all" in op_name:
                 c["pipe_all_barriers"] += repeat
-                return
-            _scan_expr(stmt.value, repeat=repeat, in_simtvf=in_simtvf)
+            else:
+                _scan_expr(stmt.value, repeat=repeat, in_simtvf=in_simtvf)
 
     for fn in funcs:
         for buf in (getattr(fn, "buffer_map", {}) or {}).values():
             _record_buf(buf)
         _walk(fn.body, repeat=1)
 
-    ub_factor = (
-        1.0 + 0.5 * (ub_conflict_bytes / float(ub_total_bytes))
-        if ub_total_bytes > 0 and ub_conflict_bytes > 0
-        else 1.0
-    )
-    l1_sum = sum(l1_buffers)
-    l1_half = 256 * 1024
+    ub_factor = (1.0 + 0.5 * (ub_conflict_bytes / float(ub_total_bytes))) if (ub_total_bytes > 0 and ub_conflict_bytes > 0) else 1.0
+    l1_sum, l1_half = sum(l1_buffers), 256 * 1024
     l1_factor = 1.25 if l1_sum > l1_half else (1.12 if len(l1_buffers) >= 2 and l1_sum > l1_half // 2 else 1.0)
-
-    return MicroarchProfile(
-        **c,
-        ub_bank_conflict_factor=round(ub_factor, 4),
-        l1_bank_conflict_factor=round(l1_factor, 4),
-        simt_shm_conflict_factor=1.0,
-        source_kind="tirx",
-    )
-
-
-def _strip_cpp_comments(text: str) -> str:
-    no_block = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    return re.sub(r"//[^\n]*", "", no_block)
+    return MicroarchProfile(**c, ub_bank_conflict_factor=round(ub_factor, 4), l1_bank_conflict_factor=round(l1_factor, 4), source_kind="tirx")
 
 
 def extract_microarch_profile_from_cce(source_text: str) -> MicroarchProfile:
@@ -649,153 +387,40 @@ def extract_microarch_profile_from_cce(source_text: str) -> MicroarchProfile:
     raw = str(source_text or "")
     if not raw.strip():
         return MicroarchProfile()
-    clean = _strip_cpp_comments(raw)
-
-    subkernels = len(re.findall(r"\b__(?:aicore|simd_vf|simt_vf)__\b(?!\s*\()", clean))
-    cube_mmad = len(
-        re.findall(
-            r"\b(?:Mmad|mmad|mad|cube::gemm|gemm_v\d|asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\b\s*[(<]",
-            clean,
-        )
-    )
-    cv_sync = len(
-        re.findall(
-            r"\b(?:CrossCore(?:Set|Wait)Flag|asc_sync_(?:notify|wait|block_arrive|block_wait))\b",
-            clean,
-        )
-    )
-    pipe_all = len(
-        re.findall(r"\b(?:pipe_barrier|asc_sync_pipe)\s*\(\s*PIPE_ALL\s*\)", clean)
-    )
-    reduce_cnt = len(
-        re.findall(
-            r"\b(?:Reduce(?:Max|Min|Sum)|vcmax|vcmin|vcadd|reduce_(?:sum|max)|asc_reduce_\w+)\b",
-            clean,
-            flags=re.IGNORECASE,
-        )
-    )
-    slot0_cnt = len(re.findall(r"\b(?:vintlv|vdintlv|Interleave|DeInterleave)\b", clean, flags=re.IGNORECASE))
-
-    sfu_matches = re.findall(
-        r"([^\n;]{0,80}\b(?:vexp|vln|vsqrt|vrsqrt|vdiv|Exp|Ln|Sqrt|Rsqrt|Div|Tanh|Sigmoid)\b[^\n;]{0,80})",
-        clean,
-        flags=re.IGNORECASE,
-    )
-    sfu_f16 = 0
-    sfu_f32 = 0
-    for snippet in sfu_matches:
-        low = snippet.lower()
-        if any(tok in low for tok in ("half", "bfloat16", "fp16", "bf16", "__fp16")):
-            sfu_f16 += 1
-        else:
-            sfu_f32 += 1
-
-    fp_alu = len(re.findall(r"\b(?:vadd|vmul|vsub|vmad|vfma|vfadd|vfmul|Add|Mul|Sub|Muls|Adds)\b", clean))
-    int_alu = len(re.findall(r"\b(?:viadd|vimul|vand|vor|vshl|vshr)\b", clean))
-
-    unit_xfer = 32768
-    gm_l1 = len(re.findall(r"\b(?:copy_gm_to_cbuf|asc_copy_gm2l1\w*)\b", clean)) * unit_xfer
-    gm_ub = len(re.findall(r"\b(?:copy_gm_to_ubuf|asc_copy_gm2ub\w*)\b", clean)) * unit_xfer
-    l1_l0a = len(re.findall(r"\bcopy_cbuf_to_ca\b", clean)) * unit_xfer
-    l1_l0b = len(re.findall(r"\bcopy_cbuf_to_cb\b", clean)) * unit_xfer
-    l0c_ub = len(re.findall(r"\b(?:copy_matrix_cc_to_ubuf|asc_copy_l0c2ub\w*)\b", clean)) * unit_xfer
-    l0c_l1 = len(re.findall(r"\bcopy_matrix_cc_to_cbuf\b", clean)) * unit_xfer
-    l0c_gm = len(re.findall(r"\b(?:copy_matrix_cc_to_gm|Fixpipe|asc_copy_l0c2gm\w*)\b", clean)) * unit_xfer
-    ub_l1 = len(re.findall(r"\b(?:copy_ubuf_to_cbuf|asc_copy_ub2l1\w*)\b", clean)) * unit_xfer
-    ub_gm = len(re.findall(r"\b(?:copy_ubuf_to_gm|asc_copy_ub2gm\w*)\b", clean)) * unit_xfer
-
-    simt_factor = 1.0
-    if re.search(r"__simt_vf__|__shared__", clean):
-        shm_strs = re.findall(r"__shared__[^;]*\[(\d+)\]\s*\[(\d+)\]", clean)
-        for _rows, cols in shm_strs:
-            if int(cols) in (16, 32, 64, 128):
-                simt_factor = max(simt_factor, 1.5)
-
+    clean = re.sub(r"//[^\n]*", "", re.sub(r"/\*.*?\*/", " ", raw, flags=re.DOTALL))
+    sfu = re.findall(r"([^\n;]{0,80}\b(?:vexp|vln|vsqrt|vrsqrt|vdiv|Exp|Ln|Sqrt|Rsqrt|Div|Tanh|Sigmoid)\b[^\n;]{0,80})", clean, flags=re.IGNORECASE)
+    sfu_f16 = sum(1 for s in sfu if any(t in s.lower() for t in ("half", "bfloat16", "fp16", "bf16", "__fp16")))
+    xfers = {name: len(re.findall(pat, clean)) * 32768 for name, pat in _CCE_XFER_PATTERNS}
+    simt_factor = 1.5 if (re.search(r"__simt_vf__|__shared__", clean) and any(int(c) in (16, 32, 64, 128) for _, c in re.findall(r"__shared__[^;]*\[(\d+)\]\s*\[(\d+)\]", clean))) else 1.0
     return MicroarchProfile(
-        fp_alu_ops=fp_alu,
-        int_alu_ops=int_alu,
-        sfu_f16_ops=sfu_f16,
-        sfu_f32_ops=sfu_f32,
-        reduce_ops=reduce_cnt,
-        slot0_only_ops=slot0_cnt,
-        ub_load_bytes=ub_l1 + ub_gm,
-        ub_store_bytes=gm_ub + l0c_ub,
-        gm_to_l1_bytes=gm_l1,
-        gm_to_ub_bytes=gm_ub,
-        l1_to_l0a_bytes=l1_l0a,
-        l1_to_l0b_bytes=l1_l0b,
-        l0c_to_ub_bytes=l0c_ub,
-        l0c_to_l1_bytes=l0c_l1,
-        l0c_to_gm_bytes=l0c_gm,
-        ub_to_l1_bytes=ub_l1,
-        ub_to_gm_bytes=ub_gm,
-        cube_mmad_count=cube_mmad,
-        cube_macs_total=0,
-        cv_sync_barriers=cv_sync,
-        pipe_all_barriers=pipe_all,
-        pipeline_depth=1,
-        inner_loop_trips=1,
-        subkernel_count=max(1, subkernels),
-        ub_bank_conflict_factor=1.0,
-        l1_bank_conflict_factor=1.0,
-        simt_shm_conflict_factor=simt_factor,
-        source_kind="cce",
+        fp_alu_ops=len(re.findall(r"\b(?:vadd|vmul|vsub|vmad|vfma|vfadd|vfmul|Add|Mul|Sub|Muls|Adds)\b", clean)),
+        int_alu_ops=len(re.findall(r"\b(?:viadd|vimul|vand|vor|vshl|vshr)\b", clean)),
+        sfu_f16_ops=sfu_f16, sfu_f32_ops=len(sfu) - sfu_f16,
+        reduce_ops=len(re.findall(r"\b(?:Reduce(?:Max|Min|Sum)|vcmax|vcmin|vcadd|reduce_(?:sum|max)|asc_reduce_\w+)\b", clean, flags=re.IGNORECASE)),
+        slot0_only_ops=len(re.findall(r"\b(?:vintlv|vdintlv|Interleave|DeInterleave)\b", clean, flags=re.IGNORECASE)),
+        ub_load_bytes=xfers["ub_to_l1_bytes"] + xfers["ub_to_gm_bytes"],
+        ub_store_bytes=xfers["gm_to_ub_bytes"] + xfers["l0c_to_ub_bytes"],
+        cube_mmad_count=len(re.findall(r"\b(?:Mmad|mmad|mad|cube::gemm|gemm_v\d|asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\b\s*[(<]", clean)),
+        cv_sync_barriers=len(re.findall(r"\b(?:CrossCore(?:Set|Wait)Flag|asc_sync_(?:notify|wait|block_arrive|block_wait))\b", clean)),
+        pipe_all_barriers=len(re.findall(r"\b(?:pipe_barrier|asc_sync_pipe)\s*\(\s*PIPE_ALL\s*\)", clean)),
+        subkernel_count=max(1, len(re.findall(r"\b__(?:aicore|simd_vf|simt_vf)__\b(?!\s*\()", clean))),
+        simt_shm_conflict_factor=simt_factor, source_kind="cce", **xfers,
     )
 
 
-def merge_microarch_profiles(
-    stage_a: MicroarchProfile | Mapping[str, object] | None,
-    stage_b: MicroarchProfile | Mapping[str, object] | None,
-) -> MicroarchProfile:
+def merge_microarch_profiles(stage_a: MicroarchProfile | Mapping[str, object] | None, stage_b: MicroarchProfile | Mapping[str, object] | None) -> MicroarchProfile:
     """Merge Stage-A TIR profile (exact byte volumes) with Stage-B CCE/AscendC profile."""
-    pa = MicroarchProfile.coerce(stage_a)
-    pb = MicroarchProfile.coerce(stage_b)
-    if pa.is_empty and pb.is_empty:
-        return MicroarchProfile()
+    pa, pb = MicroarchProfile.coerce(stage_a), MicroarchProfile.coerce(stage_b)
     if pa.is_empty:
         return pb
     if pb.is_empty:
         return pa
-
-    def _prefer_tir_bytes(a_val: int, b_val: int) -> int:
-        return a_val if a_val > 0 else b_val
-
-    return MicroarchProfile(
-        fp_alu_ops=max(pa.fp_alu_ops, pb.fp_alu_ops),
-        int_alu_ops=max(pa.int_alu_ops, pb.int_alu_ops),
-        sfu_f16_ops=max(pa.sfu_f16_ops, pb.sfu_f16_ops),
-        sfu_f32_ops=max(pa.sfu_f32_ops, pb.sfu_f32_ops),
-        reduce_ops=max(pa.reduce_ops, pb.reduce_ops),
-        slot0_only_ops=max(pa.slot0_only_ops, pb.slot0_only_ops),
-        scalar_ops=max(pa.scalar_ops, pb.scalar_ops),
-        ub_load_bytes=_prefer_tir_bytes(pa.ub_load_bytes, pb.ub_load_bytes),
-        ub_store_bytes=_prefer_tir_bytes(pa.ub_store_bytes, pb.ub_store_bytes),
-        gm_to_l1_bytes=_prefer_tir_bytes(pa.gm_to_l1_bytes, pb.gm_to_l1_bytes),
-        gm_to_ub_bytes=_prefer_tir_bytes(pa.gm_to_ub_bytes, pb.gm_to_ub_bytes),
-        l1_to_l0a_bytes=_prefer_tir_bytes(pa.l1_to_l0a_bytes, pb.l1_to_l0a_bytes),
-        l1_to_l0b_bytes=_prefer_tir_bytes(pa.l1_to_l0b_bytes, pb.l1_to_l0b_bytes),
-        l0c_to_ub_bytes=_prefer_tir_bytes(pa.l0c_to_ub_bytes, pb.l0c_to_ub_bytes),
-        l0c_to_l1_bytes=_prefer_tir_bytes(pa.l0c_to_l1_bytes, pb.l0c_to_l1_bytes),
-        l0c_to_gm_bytes=_prefer_tir_bytes(pa.l0c_to_gm_bytes, pb.l0c_to_gm_bytes),
-        ub_to_l1_bytes=_prefer_tir_bytes(pa.ub_to_l1_bytes, pb.ub_to_l1_bytes),
-        ub_to_gm_bytes=_prefer_tir_bytes(pa.ub_to_gm_bytes, pb.ub_to_gm_bytes),
-        cube_mmad_count=max(pa.cube_mmad_count, pb.cube_mmad_count),
-        cube_macs_total=max(pa.cube_macs_total, pb.cube_macs_total),
-        cv_sync_barriers=max(pa.cv_sync_barriers, pb.cv_sync_barriers),
-        pipe_all_barriers=max(pa.pipe_all_barriers, pb.pipe_all_barriers),
-        pipeline_depth=max(pa.pipeline_depth, pb.pipeline_depth),
-        inner_loop_trips=max(pa.inner_loop_trips, pb.inner_loop_trips),
-        subkernel_count=max(pa.subkernel_count, pb.subkernel_count),
-        ub_bank_conflict_factor=max(pa.ub_bank_conflict_factor, pb.ub_bank_conflict_factor),
-        l1_bank_conflict_factor=max(pa.l1_bank_conflict_factor, pb.l1_bank_conflict_factor),
-        simt_shm_conflict_factor=max(pa.simt_shm_conflict_factor, pb.simt_shm_conflict_factor),
-        source_kind="merged",
-    )
+    merged: dict[str, Any] = {"source_kind": "merged"}
+    for f in fields(MicroarchProfile):
+        if f.name != "source_kind":
+            av, bv = getattr(pa, f.name), getattr(pb, f.name)
+            merged[f.name] = (av if av > 0 else bv) if f.name in _BYTE_FIELDS else max(av, bv)
+    return MicroarchProfile(**merged)
 
 
-__all__ = [
-    "MicroarchProfile",
-    "extract_microarch_profile_from_cce",
-    "extract_microarch_profile_from_tirx",
-    "merge_microarch_profiles",
-]
+__all__ = ["MicroarchProfile", "extract_microarch_profile_from_cce", "extract_microarch_profile_from_tirx", "merge_microarch_profiles"]

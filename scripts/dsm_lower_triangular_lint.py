@@ -91,6 +91,7 @@ _L5_EXACT = frozenset(
         "agent.campaign.promotion_coordinator",
         "agent.campaign.flywheel_coordinator",
         "agent.campaign.funnel_telemetry",
+        "agent.campaign.helpers",
         "agent.campaign.marathon",
         "agent.campaign.cli",
         "agent.campaign.__init__",

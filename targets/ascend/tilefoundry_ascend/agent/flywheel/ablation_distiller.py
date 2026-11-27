@@ -6,7 +6,6 @@ import ast
 import copy
 import difflib
 import hashlib
-import json
 import math
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -33,6 +32,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     run_stage_a_static,
 )
 from tilefoundry_ascend.agent.specs.ops_registry import CannbenchOpsRegistry
+from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
 from tilefoundry_ascend.ascend.passes.observation_space import (
     AxisResidual5D,
     ComputeIssueAxis,
@@ -42,77 +42,37 @@ from tilefoundry_ascend.ascend.passes.observation_space import (
     OnChipSramRegAxis,
     PipelineSyncAxis,
 )
-from tilefoundry_ascend.ascend.passes.physical_ledger import (
-    ObjectivePhysicalLedger,
-    ScopeWaterline,
-)
-from tilefoundry_ascend.ascend.sil.schema import (
-    VALID_FREEDOM_FACETS,
-    CasePhysicsRatios,
-    TopologyAxes,
-)
+from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger, ScopeWaterline
+from tilefoundry_ascend.ascend.sil.schema import VALID_FREEDOM_FACETS, CasePhysicsRatios, TopologyAxes
 
 _GENERIC_PATH_PATTERN = re.compile(r"(?:^|[\s'\"=(])/(?:[A-Za-z0-9._-]+/){2,}")
+_SUPPORTED_PROBE_KINDS = (
+    "core_parallelism", "coalesced_copy", "pipeline_versions", "ssbuf_handoff",
+    "barrier_prune", "dual_copy_1c2v", "pad_alignment",
+    "static_pingpong_unroll", "loop_fission_sfu",
+)
 
 
 def _build_allowed_schema_signal_vocabulary() -> frozenset[str]:
     """Build closed predicate identifier vocabulary from schema dataclasses and builtins."""
     vocab: set[str] = {
-        "True",
-        "False",
-        "None",
-        "abs",
-        "min",
-        "max",
-        "prev",
-        "PIPE_M",
-        "PIPE_FIX",
-        "PIPE_V",
-        "PIPE_MTE2",
-        "PIPE_MTE3",
-        "AIC",
-        "AIV0",
-        "AIV1",
-        "UB",
-        "L1",
-        "L0A",
-        "L0B",
-        "L0C",
-        "SSBUF",
-        "any_overflow_bytes",
-        "degraded_buffer_count",
-        "implicit_bloat_bytes",
-        "max_overflow_bytes",
-        "ub_utilization_ratio",
-        "ub_occupancy_ratio",
-        "cube_to_vector_ratio",
-        "cube_cycles",
-        "vec_cycles",
-        "has_dynamic_control",
-        "has_opaque_regions",
-        "has_simtvf",
-        "dominant_axis",
-        "has_l1_compiler_summary",
-        "degraded_count",
+        "True", "False", "None", "abs", "min", "max", "prev",
+        "PIPE_M", "PIPE_FIX", "PIPE_V", "PIPE_MTE2", "PIPE_MTE3",
+        "AIC", "AIV0", "AIV1", "UB", "L1", "L0A", "L0B", "L0C", "SSBUF",
+        "any_overflow_bytes", "degraded_buffer_count", "implicit_bloat_bytes",
+        "max_overflow_bytes", "ub_utilization_ratio", "ub_occupancy_ratio",
+        "cube_to_vector_ratio", "cube_cycles", "vec_cycles",
+        "has_dynamic_control", "has_opaque_regions", "has_simtvf",
+        "dominant_axis", "has_l1_compiler_summary", "degraded_count",
     }
-    schema_classes = (
-        ObservationVector5D,
-        ComputeIssueAxis,
-        OffChipMemoryDmaAxis,
-        OnChipSramRegAxis,
-        PipelineSyncAxis,
-        GridIrregularityAxis,
-        AxisResidual5D,
-        ObjectivePhysicalLedger,
-        ScopeWaterline,
-        CasePhysicsRatios,
-        TopologyAxes,
-    )
-    for cls in schema_classes:
-        for f in fields(cls):
-            vocab.add(f.name)
-    for mapping in (_RESIDUAL_DEFAULTS, _TELEMETRY_CONTEXT_DEFAULTS):
-        vocab.update(mapping.keys())
+    for cls in (
+        ObservationVector5D, ComputeIssueAxis, OffChipMemoryDmaAxis,
+        OnChipSramRegAxis, PipelineSyncAxis, GridIrregularityAxis,
+        AxisResidual5D, ObjectivePhysicalLedger, ScopeWaterline, CasePhysicsRatios, TopologyAxes,
+    ):
+        vocab.update(f.name for f in fields(cls))
+    vocab.update(_RESIDUAL_DEFAULTS.keys())
+    vocab.update(_TELEMETRY_CONTEXT_DEFAULTS.keys())
     return frozenset(vocab)
 
 
@@ -130,19 +90,17 @@ def _validate_schema_closed_identifiers(expr: str) -> list[str]:
     unknown: list[str] = []
     seen: set[str] = set()
     for node in ast.walk(tree):
+        ident: str | None = None
         if isinstance(node, ast.Name) and node.id not in ALLOWED_SCHEMA_SIGNAL_VOCABULARY:
-            if node.id not in seen:
-                seen.add(node.id)
-                unknown.append(node.id)
+            ident = node.id
         elif (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "prev"
-            and node.attr not in ALLOWED_SCHEMA_SIGNAL_VOCABULARY
-            and node.attr not in seen
+            isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+            and node.value.id == "prev" and node.attr not in ALLOWED_SCHEMA_SIGNAL_VOCABULARY
         ):
-            seen.add(node.attr)
-            unknown.append(node.attr)
+            ident = node.attr
+        if ident is not None and ident not in seen:
+            seen.add(ident)
+            unknown.append(ident)
     return unknown
 
 
@@ -156,22 +114,16 @@ def _operator_name_variants(operator_name: str) -> set[str]:
     parts = [p for p in re.split(r"[^a-z0-9]+", low) if p]
     if parts:
         snake = "_".join(parts)
-        variants.add(snake)
-        variants.add("-".join(parts))
-        variants.add("".join(parts))
-        variants.add(f"{snake}_model")
+        variants.update({snake, "-".join(parts), "".join(parts), f"{snake}_model"})
         if len(parts) >= 2:
             variants.add(f"{parts[0][:4]}_{parts[1][:3]}")
             if len(parts[0]) >= 3 and len(parts[1]) >= 3:
                 variants.add(f"{parts[0][:3]}_{parts[1][:3]}")
         if len(parts) >= 3:
             variants.add("".join(p[0] for p in parts))
-    camel_split = [p.lower() for p in re.findall(r"[A-Z]?[a-z0-9]+|[A-Z]+(?=[A-Z]|$)", raw)]
-    if len(camel_split) >= 2:
-        snake_c = "_".join(camel_split)
-        variants.add(snake_c)
-        variants.add("-".join(camel_split))
-        variants.add("".join(camel_split))
+    camel = [p.lower() for p in re.findall(r"[A-Z]?[a-z0-9]+|[A-Z]+(?=[A-Z]|$)", raw)]
+    if len(camel) >= 2:
+        variants.update({"_".join(camel), "-".join(camel), "".join(camel)})
     return {v for v in variants if len(v) >= 2}
 
 
@@ -179,71 +131,55 @@ def _build_disallowed_provenance_tokens(operator_name: str = "") -> frozenset[st
     """Dynamically collect operator variants and registered operator IDs without hardcoding."""
     tokens = _operator_name_variants(operator_name)
     try:
-        for op_id in CannbenchOpsRegistry.default().list_operators():
-            cleaned = str(op_id).strip().lower()
-            if cleaned:
-                tokens.add(cleaned)
+        tokens.update(
+            str(op).strip().lower()
+            for op in CannbenchOpsRegistry.default().list_operators()
+            if str(op).strip()
+        )
     except (FileNotFoundError, OSError):
         pass
     return frozenset(tokens)
 
 
 def resolve_paired_sigma_us(
-    reference_us: float,
-    *,
-    sigma_paired_us: float | None = None,
-    paired_rel_mad: float | None = None,
+    reference_us: float, *, sigma_paired_us: float | None = None, paired_rel_mad: float | None = None
 ) -> float:
     """Resolve paired measurement uncertainty (us) from sigma_paired_us or paired_rel_mad."""
     if sigma_paired_us is not None:
         val = float(sigma_paired_us)
         return max(0.0, val) if math.isfinite(val) else 0.0
     if paired_rel_mad is not None:
-        mad = float(paired_rel_mad)
-        ref = float(reference_us)
+        mad, ref = float(paired_rel_mad), float(reference_us)
         if math.isfinite(mad) and mad > 0.0 and math.isfinite(ref) and ref > 0.0:
             return 1.4826 * mad * ref
     return 0.0
 
 
 def is_paired_gain_significant(
-    delta_us: float,
-    *,
-    sigma_paired_us: float | None = None,
-    paired_rel_mad: float | None = None,
-    reference_us: float = 0.0,
-    sigma_multiplier: float = 2.0,
+    delta_us: float, *, sigma_paired_us: float | None = None,
+    paired_rel_mad: float | None = None, reference_us: float = 0.0, sigma_multiplier: float = 2.0,
 ) -> bool:
     """Return True when paired latency reduction exceeds sigma_multiplier * sigma_paired_us."""
     delta = float(delta_us)
     if not math.isfinite(delta) or delta <= 0.0:
         return False
     eff_sigma = resolve_paired_sigma_us(
-        reference_us,
-        sigma_paired_us=sigma_paired_us,
-        paired_rel_mad=paired_rel_mad,
+        reference_us, sigma_paired_us=sigma_paired_us, paired_rel_mad=paired_rel_mad
     )
     return delta > float(sigma_multiplier) * eff_sigma
 
 
 def should_trigger_flywheel_checkpoint(
-    baseline_latency_us: float,
-    winner_latency_us: float,
-    *,
-    sigma_paired_us: float | None = None,
-    paired_rel_mad: float | None = None,
+    baseline_latency_us: float, winner_latency_us: float, *,
+    sigma_paired_us: float | None = None, paired_rel_mad: float | None = None,
 ) -> bool:
     """Return True when winner latency beats baseline by more than 3 * sigma_paired_us."""
-    base_lat = float(baseline_latency_us)
-    win_lat = float(winner_latency_us)
+    base_lat, win_lat = float(baseline_latency_us), float(winner_latency_us)
     if not (math.isfinite(base_lat) and math.isfinite(win_lat)) or base_lat <= 0.0 or win_lat <= 0.0:
         return False
     return is_paired_gain_significant(
-        base_lat - win_lat,
-        sigma_paired_us=sigma_paired_us,
-        paired_rel_mad=paired_rel_mad,
-        reference_us=base_lat,
-        sigma_multiplier=3.0,
+        base_lat - win_lat, sigma_paired_us=sigma_paired_us, paired_rel_mad=paired_rel_mad,
+        reference_us=base_lat, sigma_multiplier=3.0,
     )
 
 
@@ -261,11 +197,8 @@ class AstEditChunk:
     def to_dict(self) -> dict[str, object]:
         """Serialize atomic AST delta to JSON-compatible dictionary."""
         return {
-            "chunk_id": self.chunk_id,
-            "edit_kind": self.edit_kind,
-            "target_path": self.target_path,
-            "before_src": self.before_src,
-            "after_src": self.after_src,
+            "chunk_id": self.chunk_id, "edit_kind": self.edit_kind, "target_path": self.target_path,
+            "before_src": self.before_src, "after_src": self.after_src,
             "dsl_sha256": hashlib.sha256(self.ablated_dsl.encode("utf-8")).hexdigest()[:16],
         }
 
@@ -286,13 +219,11 @@ class AblationMeasurement:
     def to_dict(self) -> dict[str, object]:
         """Serialize ablation measurement to JSON-compatible dictionary."""
         return {
-            "chunk": self.chunk.to_dict(),
-            "funnel_passed": self.funnel_passed,
+            "chunk": self.chunk.to_dict(), "funnel_passed": self.funnel_passed,
             "baseline_latency_us": round(self.baseline_latency_us, 6),
             "variant_latency_us": round(self.variant_latency_us, 6),
             "relative_gain": round(self.relative_gain, 6),
-            "positive_gain": self.positive_gain,
-            "diagnostic": self.diagnostic,
+            "positive_gain": self.positive_gain, "diagnostic": self.diagnostic,
         }
 
 
@@ -313,27 +244,11 @@ class MicroProbeSpec:
     def to_dict(self) -> dict[str, object]:
         """Serialize micro-probe specification without raw machine paths."""
         return {
-            "probe_id": self.probe_id,
-            "probe_kind": self.probe_kind,
-            "factory_name": self.factory_name,
-            "line_count_baseline": self.line_count_baseline,
+            "probe_id": self.probe_id, "probe_kind": self.probe_kind,
+            "factory_name": self.factory_name, "line_count_baseline": self.line_count_baseline,
             "line_count_optimized": self.line_count_optimized,
-            "tensor_shape": list(self.tensor_shape),
-            "tensor_dtype": self.tensor_dtype,
+            "tensor_shape": list(self.tensor_shape), "tensor_dtype": self.tensor_dtype,
         }
-
-
-_SUPPORTED_PROBE_KINDS = (
-    "core_parallelism",
-    "coalesced_copy",
-    "pipeline_versions",
-    "ssbuf_handoff",
-    "barrier_prune",
-    "dual_copy_1c2v",
-    "pad_alignment",
-    "static_pingpong_unroll",
-    "loop_fission_sfu",
-)
 
 
 @dataclass(frozen=True)
@@ -353,16 +268,14 @@ class DistilledRuleOutcome:
         return {
             "chunk_id": self.chunk_id,
             "probe": self.probe.to_dict() if self.probe is not None else None,
-            "hardware_verified": self.hardware_verified,
-            "probe_metrics": dict(self.probe_metrics),
+            "hardware_verified": self.hardware_verified, "probe_metrics": dict(self.probe_metrics),
             "rule_id": self.rule.rule_id if self.rule else None,
-            "admitted": self.admitted,
-            "rejection_reason": self.rejection_reason,
+            "admitted": self.admitted, "rejection_reason": self.rejection_reason,
         }
 
 
 @dataclass
-class FlywheelDistillationReport:
+class FlywheelDistillationReport(JsonRecordMixin):
     """Complete audit report across AST decomposition, ablation, probing, and KB admission."""
 
     baseline_latency_us: float
@@ -385,24 +298,6 @@ class FlywheelDistillationReport:
             "admitted_rule_ids": list(self.admitted_rule_ids),
         }
 
-    def to_json(self) -> str:
-        """Render formatted JSON representation of the distillation report."""
-        return json.dumps(self.to_dict(), indent=2)
-
-
-def _locate_prim_func(tree: ast.Module) -> tuple[ast.FunctionDef | None, ast.FunctionDef | None]:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "main":
-            for parent in ast.walk(tree):
-                if isinstance(parent, ast.FunctionDef) and parent is not node:
-                    if node in parent.body:
-                        return parent, node
-            return None, node
-    for stmt in tree.body:
-        if isinstance(stmt, ast.FunctionDef):
-            return None, stmt
-    return None, None
-
 
 def _node_key(node: ast.AST) -> str:
     return ast.unparse(node)
@@ -412,12 +307,10 @@ def _node_tag(node: ast.AST) -> str:
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return f"def:{node.name}"
     if isinstance(node, ast.With):
-        if node.items:
-            ctx = node.items[0].context_expr
-            if isinstance(ctx, ast.Call):
-                return f"with:{_node_key(ctx.func)}"
-            return f"with:{_node_key(ctx)}"
-        return "with"
+        if not node.items:
+            return "with"
+        ctx = node.items[0].context_expr
+        return f"with:{_node_key(ctx.func if isinstance(ctx, ast.Call) else ctx)}"
     if isinstance(node, ast.For):
         return f"for:{_node_key(node.target)}"
     if isinstance(node, ast.Assign) and node.targets:
@@ -431,57 +324,35 @@ def _classify_edit(before_src: str, after_src: str) -> str:
     combined = f"{before_src} {after_src}"
     if "alloc_ss" in combined or "SSBUF" in combined:
         return "ssbuf_handoff"
-    if "T.dual_copy" in combined or (
-        "T.MixedKernel" in after_src and "T.Kernel" in before_src
-    ):
+    if "T.dual_copy" in combined or ("T.MixedKernel" in after_src and "T.Kernel" in before_src):
         return "dual_copy_1c2v"
-    if (
-        ("T.Pipelined" in before_src and "T.Pipelined" not in after_src)
-        or ("enable_offset" in before_src and "enable_offset" not in after_src)
+    if ("T.Pipelined" in before_src and "T.Pipelined" not in after_src) or (
+        "enable_offset" in before_src and "enable_offset" not in after_src
     ):
         return "static_pingpong_unroll"
-    if (
-        "gm_to_ub_pad" in combined
-        or "pad_value" in combined
-        or ("alloc_shared" in before_src and "alloc_shared" in after_src and before_src != after_src)
+    if "gm_to_ub_pad" in combined or "pad_value" in combined or (
+        "alloc_shared" in before_src and "alloc_shared" in after_src and before_src != after_src
     ):
         return "pad_alignment"
     if "ascend_pipe_barrier" in combined or "unit_flag_ctrl" in combined:
         return "barrier_prune"
     if "num_stages" in combined or "annotate_buffer_versions" in combined:
         return "pipeline_versions"
-    if (
-        ("vcadd" in combined or "vexp" in combined or "vsqrt" in combined)
-        and (
-            after_src.count("for ") > before_src.count("for ")
-            or ("vcadd" in before_src and "vcadd" not in after_src)
-            or (
-                before_src.count("for ") >= 1
-                and after_src.count("for ") >= 1
-                and len(after_src.strip().splitlines()) < len(before_src.strip().splitlines())
-            )
-        )
+    if ("vcadd" in combined or "vexp" in combined or "vsqrt" in combined) and (
+        after_src.count("for ") > before_src.count("for ")
+        or ("vcadd" in before_src and "vcadd" not in after_src)
+        or (before_src.count("for ") >= 1 and after_src.count("for ") >= 1
+            and len(after_src.strip().splitlines()) < len(before_src.strip().splitlines()))
     ):
         return "loop_fission_sfu"
-    if (
-        "T.Kernel" in combined
-        or "T.MixedKernel" in combined
-        or "num_cores" in combined
-        or "num_blocks" in combined
-    ):
+    if any(t in combined for t in ("T.Kernel", "T.MixedKernel", "num_cores", "num_blocks")):
         return "core_parallelism"
-    if "T.copy" in combined:
-        return "coalesced_copy"
-    return "stmt_rewrite"
+    return "coalesced_copy" if "T.copy" in combined else "stmt_rewrite"
 
 
 def _extract_probe_params(chunk: AstEditChunk) -> dict[str, object]:
     """Extract and clamp concrete tile, core, stage, and dtype parameters from AST."""
-    cores = 28
-    stages = 2
-    tile_elems = 2048
-    dtype = "float32"
-
+    cores, stages, tile_elems, dtype = 28, 2, 2048, "float32"
     for candidate_src in (chunk.after_src, chunk.ablated_dsl):
         if not candidate_src.strip():
             continue
@@ -490,56 +361,48 @@ def _extract_probe_params(chunk: AstEditChunk) -> dict[str, object]:
         except SyntaxError:
             continue
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                attr = node.func.attr
-                if attr in ("Kernel", "MixedKernel") and node.args:
-                    arg0 = node.args[0]
-                    if isinstance(arg0, ast.Constant) and isinstance(arg0.value, int):
-                        cores = max(2, min(56, int(arg0.value)))
-                elif attr == "Pipelined":
-                    for kw in node.keywords:
-                        if kw.arg == "num_stages" and isinstance(kw.value, ast.Constant):
-                            if isinstance(kw.value.value, int):
-                                stages = max(2, min(3, int(kw.value.value)))
-                elif attr in ("alloc_shared", "alloc_l1") and node.args:
-                    shape_arg = node.args[0]
-                    if isinstance(shape_arg, (ast.Tuple, ast.List)):
-                        ints = [
-                            int(elt.value)
-                            for elt in shape_arg.elts
-                            if isinstance(elt, ast.Constant) and isinstance(elt.value, int)
-                        ]
-                        if len(ints) == len(shape_arg.elts) and ints:
-                            prod = 1
-                            for dim_val in ints:
-                                prod *= max(1, dim_val)
-                            aligned = ((prod + 127) // 128) * 128
-                            tile_elems = max(512, min(4096, aligned))
-                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
-                        dt_val = str(node.args[1].value)
-                        if dt_val in ("float32", "float16", "bfloat16"):
-                            dtype = dt_val
-    return {
-        "cores": cores,
-        "stages": stages,
-        "tile_elems": tile_elems,
-        "dtype": dtype,
-    }
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            attr = node.func.attr
+            if attr in ("Kernel", "MixedKernel") and node.args:
+                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, int):
+                    cores = max(2, min(56, int(node.args[0].value)))
+            elif attr == "Pipelined":
+                for kw in node.keywords:
+                    if kw.arg == "num_stages" and isinstance(kw.value, ast.Constant):
+                        if isinstance(kw.value.value, int):
+                            stages = max(2, min(3, int(kw.value.value)))
+            elif attr in ("alloc_shared", "alloc_l1") and node.args:
+                shape_arg = node.args[0]
+                if isinstance(shape_arg, (ast.Tuple, ast.List)):
+                    ints = [int(e.value) for e in shape_arg.elts
+                            if isinstance(e, ast.Constant) and isinstance(e.value, int)]
+                    if len(ints) == len(shape_arg.elts) and ints:
+                        prod = math.prod(max(1, d) for d in ints)
+                        tile_elems = max(512, min(4096, ((prod + 127) // 128) * 128))
+                if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                    if str(node.args[1].value) in ("float32", "float16", "bfloat16"):
+                        dtype = str(node.args[1].value)
+    return {"cores": cores, "stages": stages, "tile_elems": tile_elems, "dtype": dtype}
 
 
-def _set_stmt_by_path(tree: ast.Module, path: tuple[int, ...], new_stmt: ast.stmt | None) -> bool:
+def _resolve_stmt_list(tree: ast.Module, path: tuple[int, ...]) -> list[ast.stmt] | None:
     cur_list: list[ast.stmt] = tree.body
     for idx in path[:-1]:
         node = cur_list[idx]
         if not hasattr(node, "body") or not isinstance(node.body, list):
-            return False
+            return None
         cur_list = node.body
+    return cur_list
+
+
+def _set_stmt_by_path(tree: ast.Module, path: tuple[int, ...], new_stmt: ast.stmt | None) -> bool:
+    cur_list = _resolve_stmt_list(tree, path)
+    if cur_list is None:
+        return False
     leaf = path[-1]
     if new_stmt is None:
-        if 0 <= leaf < len(cur_list):
-            cur_list.pop(leaf)
-            return True
-        return False
+        return (cur_list.pop(leaf) is not None) if 0 <= leaf < len(cur_list) else False
     if 0 <= leaf < len(cur_list):
         cur_list[leaf] = copy.deepcopy(new_stmt)
         return True
@@ -550,30 +413,19 @@ def _set_stmt_by_path(tree: ast.Module, path: tuple[int, ...], new_stmt: ast.stm
 
 
 def _insert_stmt_by_path(tree: ast.Module, path: tuple[int, ...], new_stmt: ast.stmt) -> bool:
-    cur_list: list[ast.stmt] = tree.body
-    for idx in path[:-1]:
-        node = cur_list[idx]
-        if not hasattr(node, "body") or not isinstance(node.body, list):
-            return False
-        cur_list = node.body
-    leaf = max(0, min(path[-1], len(cur_list)))
-    cur_list.insert(leaf, copy.deepcopy(new_stmt))
+    cur_list = _resolve_stmt_list(tree, path)
+    if cur_list is None:
+        return False
+    cur_list.insert(max(0, min(path[-1], len(cur_list))), copy.deepcopy(new_stmt))
     return True
 
 
 def _replace_call_arg(
-    tree: ast.Module,
-    stmt_path: tuple[int, ...],
-    *,
-    is_with_header: bool,
-    new_expr: ast.expr,
+    tree: ast.Module, stmt_path: tuple[int, ...], *, is_with_header: bool, new_expr: ast.expr
 ) -> bool:
-    cur_list: list[ast.stmt] = tree.body
-    for idx in stmt_path[:-1]:
-        node = cur_list[idx]
-        if not hasattr(node, "body") or not isinstance(node.body, list):
-            return False
-        cur_list = node.body
+    cur_list = _resolve_stmt_list(tree, stmt_path)
+    if cur_list is None:
+        return False
     stmt = cur_list[stmt_path[-1]]
     if is_with_header and isinstance(stmt, ast.With) and stmt.items:
         stmt.items[0].context_expr = copy.deepcopy(new_expr)
@@ -589,30 +441,24 @@ def _collect_top_defs(tree: ast.Module) -> list[tuple[str, ast.stmt]]:
     for stmt in tree.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             defs.append((stmt.name, stmt))
-        elif isinstance(stmt, ast.Assign):
-            if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
-                defs.append((stmt.targets[0].id, stmt))
+        elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            defs.append((stmt.targets[0].id, stmt))
         elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
             defs.append((stmt.target.id, stmt))
     return defs
 
 
 def _attach_missing_winner_defs(
-    patched_tree: ast.Module,
-    new_defs: Mapping[str, ast.stmt] | None,
-    def_order: Sequence[str],
+    patched_tree: ast.Module, new_defs: Mapping[str, ast.stmt] | None, def_order: Sequence[str]
 ) -> ast.Module:
     if not new_defs:
         return patched_tree
-    existing = {name for name, _stmt in _collect_top_defs(patched_tree)}
+    existing = {name for name, _ in _collect_top_defs(patched_tree)}
     needed: set[str] = set()
     changed = True
     while changed:
         changed = False
-        roots: list[ast.AST] = [patched_tree]
-        for n in needed:
-            roots.append(new_defs[n])
-        for root in roots:
+        for root in [patched_tree, *(new_defs[n] for n in needed)]:
             for sub in ast.walk(root):
                 if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
                     if sub.id in new_defs and sub.id not in existing and sub.id not in needed:
@@ -620,34 +466,23 @@ def _attach_missing_winner_defs(
                         changed = True
     if not needed:
         return patched_tree
-    order_rank = {name: idx for idx, name in enumerate(def_order)}
-    to_insert = [
-        copy.deepcopy(new_defs[name])
-        for name in sorted(needed, key=lambda n: order_rank.get(n, 0))
-    ]
+    rank = {name: idx for idx, name in enumerate(def_order)}
+    to_insert = [copy.deepcopy(new_defs[n]) for n in sorted(needed, key=lambda n: rank.get(n, 0))]
     insert_at = 0
     for idx, stmt in enumerate(patched_tree.body):
         if isinstance(stmt, (ast.Import, ast.ImportFrom)) or (
-            isinstance(stmt, ast.Expr)
-            and isinstance(stmt.value, ast.Constant)
+            isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
             and isinstance(stmt.value.value, str)
         ):
             insert_at = idx + 1
         elif idx == insert_at:
             break
-    patched_tree.body = [
-        *patched_tree.body[:insert_at],
-        *to_insert,
-        *patched_tree.body[insert_at:],
-    ]
+    patched_tree.body = [*patched_tree.body[:insert_at], *to_insert, *patched_tree.body[insert_at:]]
     return patched_tree
 
 
 def _render_patched(
-    base_tree: ast.Module,
-    *,
-    new_defs: Mapping[str, ast.stmt] | None = None,
-    def_order: Sequence[str] = (),
+    base_tree: ast.Module, *, new_defs: Mapping[str, ast.stmt] | None = None, def_order: Sequence[str] = ()
 ) -> str:
     base_tree = _attach_missing_winner_defs(base_tree, new_defs, def_order)
     ast.fix_missing_locations(base_tree)
@@ -656,273 +491,136 @@ def _render_patched(
     return code
 
 
-def _extract_stmt_list_deltas(
-    base_tree: ast.Module,
-    base_list: list[ast.stmt],
-    win_list: list[ast.stmt],
-    parent_path: tuple[int, ...],
-    path_label: str,
-    chunks: list[AstEditChunk],
-    seen_dsls: set[str],
-    *,
-    new_defs: Mapping[str, ast.stmt] | None = None,
-    def_order: Sequence[str] = (),
+def _emit_chunk(
+    chunks: list[AstEditChunk], seen_dsls: set[str], *, prefix: str,
+    edit_kind: str, target_path: str, before_src: str, after_src: str, dsl: str,
 ) -> None:
-    base_tags = [_node_tag(s) for s in base_list]
-    win_tags = [_node_tag(s) for s in win_list]
-    base_blk_txt = "\n".join(_node_key(s) for s in base_list)
-    block_has_sfu = any(tok in base_blk_txt for tok in ("vcadd", "vexp", "vsqrt"))
-    block_fission_loops = block_has_sfu and (
-        sum(isinstance(s, ast.For) for s in win_list)
-        > sum(isinstance(s, ast.For) for s in base_list)
-    )
-    matcher = difflib.SequenceMatcher(a=base_tags, b=win_tags, autojunk=False)
+    if dsl in seen_dsls:
+        return
+    seen_dsls.add(dsl)
+    chunks.append(AstEditChunk(
+        chunk_id=f"{prefix}{len(chunks)}", edit_kind=edit_kind, target_path=target_path,
+        before_src=before_src, after_src=after_src, ablated_dsl=dsl,
+    ))
 
+
+def _extract_stmt_deltas(
+    patch_base: ast.Module, base_list: list[ast.stmt], win_list: list[ast.stmt],
+    parent_path: tuple[int, ...], path_label: str, chunks: list[AstEditChunk],
+    seen_dsls: set[str], *, reverse: bool, new_defs: Mapping[str, ast.stmt] | None = None,
+    def_order: Sequence[str] = (), skip_assign_symbols: frozenset[str] = frozenset(),
+) -> None:
+    prefix = "loo_" if reverse else "edit_"
+    base_blk_txt = "\n".join(_node_key(s) for s in base_list)
+    block_fission = (
+        not reverse and any(tok in base_blk_txt for tok in ("vcadd", "vexp", "vsqrt"))
+        and sum(isinstance(s, ast.For) for s in win_list) > sum(isinstance(s, ast.For) for s in base_list)
+    )
+
+    def _try_emit(fn: Callable[[ast.Module], bool], kind: str, tpath: str, before: str, after: str) -> None:
+        patched = copy.deepcopy(patch_base)
+        if fn(patched):
+            dsl = _render_patched(patched, new_defs=None if reverse else new_defs, def_order=() if reverse else def_order)
+            _emit_chunk(chunks, seen_dsls, prefix=prefix, edit_kind=kind, target_path=tpath,
+                        before_src=before, after_src=after, dsl=dsl)
+
+    def _handle_compound(b_s: ast.stmt, w_s: ast.stmt, cur_p: tuple[int, ...], hdr_l: str, body_l: str) -> None:
+        if isinstance(b_s, ast.With) and isinstance(w_s, ast.With):
+            bh = _node_key(b_s.items[0].context_expr) if b_s.items else ""
+            wh = _node_key(w_s.items[0].context_expr) if w_s.items else ""
+            es = b_s if reverse else w_s
+            if bh != wh and es.items:
+                _try_emit(lambda t: _replace_call_arg(t, cur_p, is_with_header=True, new_expr=es.items[0].context_expr),
+                          _classify_edit(bh, wh), hdr_l, bh, wh)
+        elif isinstance(b_s, ast.For) and isinstance(w_s, ast.For):
+            bi, wi = _node_key(b_s.iter), _node_key(w_s.iter)
+            if bi != wi:
+                _try_emit(lambda t: _replace_call_arg(t, cur_p, is_with_header=False, new_expr=b_s.iter if reverse else w_s.iter),
+                          _classify_edit(bi, wi), hdr_l, bi, wi)
+        _extract_stmt_deltas(patch_base, b_s.body, w_s.body, cur_p, body_l, chunks, seen_dsls,
+                             reverse=reverse, new_defs=new_defs, def_order=def_order)
+
+    matcher = difflib.SequenceMatcher(a=[_node_tag(s) for s in base_list], b=[_node_tag(s) for s in win_list], autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             for k in range(i2 - i1):
-                b_stmt = base_list[i1 + k]
-                w_stmt = win_list[j1 + k]
-                b_txt = _node_key(b_stmt)
-                w_txt = _node_key(w_stmt)
-                if b_txt == w_txt:
+                bs, ws = base_list[i1 + k], win_list[j1 + k]
+                bt, wt = _node_key(bs), _node_key(ws)
+                if bt == wt:
                     continue
-                cur_path = parent_path + (i1 + k,)
-                if isinstance(b_stmt, ast.With) and isinstance(w_stmt, ast.With):
-                    b_hdr = _node_key(b_stmt.items[0].context_expr) if b_stmt.items else ""
-                    w_hdr = _node_key(w_stmt.items[0].context_expr) if w_stmt.items else ""
-                    if b_hdr != w_hdr and w_stmt.items:
-                        patched = copy.deepcopy(base_tree)
-                        if _replace_call_arg(patched, cur_path, is_with_header=True, new_expr=w_stmt.items[0].context_expr):
-                            dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
-                            if dsl not in seen_dsls:
-                                seen_dsls.add(dsl)
-                                chunks.append(
-                                    AstEditChunk(
-                                        chunk_id=f"edit_{len(chunks)}",
-                                        edit_kind=_classify_edit(b_hdr, w_hdr),
-                                        target_path=f"{path_label}/with_{i1 + k}",
-                                        before_src=b_hdr,
-                                        after_src=w_hdr,
-                                        ablated_dsl=dsl,
-                                    )
-                                )
-                    _extract_stmt_list_deltas(
-                        base_tree,
-                        b_stmt.body,
-                        w_stmt.body,
-                        cur_path,
-                        f"{path_label}/with_{i1 + k}",
-                        chunks,
-                        seen_dsls,
-                        new_defs=new_defs,
-                        def_order=def_order,
-                    )
-                    continue
-
-                if isinstance(b_stmt, ast.For) and isinstance(w_stmt, ast.For):
-                    b_iter = _node_key(b_stmt.iter)
-                    w_iter = _node_key(w_stmt.iter)
-                    if b_iter != w_iter:
-                        patched = copy.deepcopy(base_tree)
-                        if _replace_call_arg(patched, cur_path, is_with_header=False, new_expr=w_stmt.iter):
-                            dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
-                            if dsl not in seen_dsls:
-                                seen_dsls.add(dsl)
-                                chunks.append(
-                                    AstEditChunk(
-                                        chunk_id=f"edit_{len(chunks)}",
-                                        edit_kind=_classify_edit(b_iter, w_iter),
-                                        target_path=f"{path_label}/for_{i1 + k}",
-                                        before_src=b_iter,
-                                        after_src=w_iter,
-                                        ablated_dsl=dsl,
-                                    )
-                                )
-                    _extract_stmt_list_deltas(
-                        base_tree,
-                        b_stmt.body,
-                        w_stmt.body,
-                        cur_path,
-                        f"{path_label}/for_{i1 + k}",
-                        chunks,
-                        seen_dsls,
-                        new_defs=new_defs,
-                        def_order=def_order,
-                    )
-                    continue
-
-                if isinstance(b_stmt, ast.FunctionDef) and isinstance(w_stmt, ast.FunctionDef):
-                    _extract_stmt_list_deltas(
-                        base_tree,
-                        b_stmt.body,
-                        w_stmt.body,
-                        cur_path,
-                        f"{path_label}/{b_stmt.name}",
-                        chunks,
-                        seen_dsls,
-                        new_defs=new_defs,
-                        def_order=def_order,
-                    )
-                    continue
-
-                patched = copy.deepcopy(base_tree)
-                if _set_stmt_by_path(patched, cur_path, w_stmt):
-                    dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
-                    if dsl not in seen_dsls:
-                        seen_dsls.add(dsl)
-                        chunks.append(
-                            AstEditChunk(
-                                chunk_id=f"edit_{len(chunks)}",
-                                edit_kind=_classify_edit(b_txt, w_txt),
-                                target_path=f"{path_label}/stmt_{i1 + k}",
-                                before_src=b_txt,
-                                after_src=w_txt,
-                                ablated_dsl=dsl,
-                            )
-                        )
+                if reverse and skip_assign_symbols and not parent_path:
+                    wtag = _node_tag(ws)
+                    if (wtag.startswith("assign:") and wtag.removeprefix("assign:") in skip_assign_symbols) or (
+                        isinstance(ws, ast.AnnAssign) and isinstance(ws.target, ast.Name) and ws.target.id in skip_assign_symbols
+                    ):
+                        continue
+                idx = (j1 + k) if reverse else (i1 + k)
+                cp = parent_path + (idx,)
+                if isinstance(bs, (ast.With, ast.For)) and isinstance(ws, type(bs)):
+                    sub = "with" if isinstance(bs, ast.With) else "for"
+                    _handle_compound(bs, ws, cp, f"{path_label}/{sub}_{idx}", f"{path_label}/{sub}_{idx}")
+                elif isinstance(bs, ast.FunctionDef) and isinstance(ws, ast.FunctionDef):
+                    fn_name = ws.name if reverse else bs.name
+                    _extract_stmt_deltas(patch_base, bs.body, ws.body, cp, f"{path_label}/{fn_name}",
+                                         chunks, seen_dsls, reverse=reverse, new_defs=new_defs, def_order=def_order)
+                else:
+                    _try_emit(lambda t: _set_stmt_by_path(t, cp, bs if reverse else ws),
+                              _classify_edit(bt, wt), f"{path_label}/stmt_{idx}", bt, wt)
         elif tag == "replace":
             common = min(i2 - i1, j2 - j1)
             for k in range(common):
-                b_stmt = base_list[i1 + k]
-                w_stmt = win_list[j1 + k]
-                b_txt = _node_key(b_stmt)
-                w_txt = _node_key(w_stmt)
-                if isinstance(b_stmt, (ast.With, ast.For)) and isinstance(w_stmt, type(b_stmt)):
-                    if isinstance(b_stmt, ast.With) and isinstance(w_stmt, ast.With) and b_stmt.items and w_stmt.items:
-                        b_hdr = _node_key(b_stmt.items[0].context_expr)
-                        w_hdr = _node_key(w_stmt.items[0].context_expr)
-                        if b_hdr != w_hdr:
-                            hdr_patch = copy.deepcopy(base_tree)
-                            if _replace_call_arg(
-                                hdr_patch,
-                                parent_path + (i1 + k,),
-                                is_with_header=True,
-                                new_expr=w_stmt.items[0].context_expr,
-                            ):
-                                dsl = _render_patched(hdr_patch, new_defs=new_defs, def_order=def_order)
-                                if dsl not in seen_dsls:
-                                    seen_dsls.add(dsl)
-                                    chunks.append(
-                                        AstEditChunk(
-                                            chunk_id=f"edit_{len(chunks)}",
-                                            edit_kind=_classify_edit(b_hdr, w_hdr),
-                                            target_path=f"{path_label}/with_hdr_{i1 + k}",
-                                            before_src=b_hdr,
-                                            after_src=w_hdr,
-                                            ablated_dsl=dsl,
-                                        )
-                                    )
-                    _extract_stmt_list_deltas(
-                        base_tree,
-                        b_stmt.body,
-                        w_stmt.body,
-                        parent_path + (i1 + k,),
-                        f"{path_label}/block_{i1 + k}",
-                        chunks,
-                        seen_dsls,
-                        new_defs=new_defs,
-                        def_order=def_order,
-                    )
-                    continue
-                cur_path = parent_path + (i1 + k,)
-                patched = copy.deepcopy(base_tree)
-                if _set_stmt_by_path(patched, cur_path, w_stmt):
-                    dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
-                    if dsl not in seen_dsls:
-                        seen_dsls.add(dsl)
-                        chunks.append(
-                            AstEditChunk(
-                                chunk_id=f"edit_{len(chunks)}",
-                                edit_kind=_classify_edit(b_txt, w_txt),
-                                target_path=f"{path_label}/replace_{i1 + k}",
-                                before_src=b_txt,
-                                after_src=w_txt,
-                                ablated_dsl=dsl,
-                            )
-                        )
+                bs, ws = base_list[i1 + k], win_list[j1 + k]
+                idx = (j1 + k) if reverse else (i1 + k)
+                cp = parent_path + (idx,)
+                if isinstance(bs, (ast.With, ast.For)) and isinstance(ws, type(bs)):
+                    _handle_compound(bs, ws, cp, f"{path_label}/with_hdr_{idx}", f"{path_label}/block_{idx}")
+                else:
+                    bt, wt = _node_key(bs), _node_key(ws)
+                    _try_emit(lambda t: _set_stmt_by_path(t, cp, bs if reverse else ws),
+                              _classify_edit(bt, wt), f"{path_label}/replace_{idx}", bt, wt)
             for j in range(j1 + common, j2):
-                w_stmt = win_list[j]
-                w_txt = _node_key(w_stmt)
-                ins_idx = min(i2 + (j - (j1 + common)), len(base_list))
-                cur_path = parent_path + (ins_idx,)
-                patched = copy.deepcopy(base_tree)
-                if _insert_stmt_by_path(patched, cur_path, w_stmt):
-                    dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
-                    if dsl not in seen_dsls:
-                        seen_dsls.add(dsl)
-                        kind = (
-                            "loop_fission_sfu"
-                            if (block_fission_loops and isinstance(w_stmt, ast.For))
-                            else _classify_edit("", w_txt)
-                        )
-                        chunks.append(
-                            AstEditChunk(
-                                chunk_id=f"edit_{len(chunks)}",
-                                edit_kind=kind,
-                                target_path=f"{path_label}/replace_ins_{j}",
-                                before_src="",
-                                after_src=w_txt,
-                                ablated_dsl=dsl,
-                            )
-                        )
+                ws = win_list[j]
+                wt = _node_key(ws)
+                if reverse:
+                    _try_emit(lambda t: _set_stmt_by_path(t, parent_path + (j,), None),
+                              _classify_edit("", wt), f"{path_label}/remove_extra_{j}", "", wt)
+                else:
+                    ins = min(i2 + (j - (j1 + common)), len(base_list))
+                    kind = "loop_fission_sfu" if (block_fission and isinstance(ws, ast.For)) else _classify_edit("", wt)
+                    _try_emit(lambda t: _insert_stmt_by_path(t, parent_path + (ins,), ws),
+                              kind, f"{path_label}/replace_ins_{j}", "", wt)
         elif tag == "delete":
             for idx in range(i1, i2):
-                b_stmt = base_list[idx]
-                b_txt = _node_key(b_stmt)
-                cur_path = parent_path + (idx,)
-                patched = copy.deepcopy(base_tree)
-                if _set_stmt_by_path(patched, cur_path, None):
-                    dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
-                    if dsl not in seen_dsls:
-                        seen_dsls.add(dsl)
-                        chunks.append(
-                            AstEditChunk(
-                                chunk_id=f"edit_{len(chunks)}",
-                                edit_kind=_classify_edit(b_txt, ""),
-                                target_path=f"{path_label}/delete_{idx}",
-                                before_src=b_txt,
-                                after_src="",
-                                ablated_dsl=dsl,
-                            )
-                        )
+                bs = base_list[idx]
+                bt = _node_key(bs)
+                _try_emit(
+                    (lambda t: _insert_stmt_by_path(t, parent_path + (min(j1, len(win_list)),), bs))
+                    if reverse else (lambda t: _set_stmt_by_path(t, parent_path + (idx,), None)),
+                    _classify_edit(bt, ""), f"{path_label}/{'reinsert' if reverse else 'delete'}_{idx}", bt, "",
+                )
         elif tag == "insert":
             for j in range(j1, j2):
-                w_stmt = win_list[j]
-                w_txt = _node_key(w_stmt)
-                cur_path = parent_path + (min(i1, len(base_list)),)
-                patched = copy.deepcopy(base_tree)
-                if _insert_stmt_by_path(patched, cur_path, w_stmt):
-                    dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
-                    if dsl not in seen_dsls:
-                        seen_dsls.add(dsl)
-                        kind = (
-                            "loop_fission_sfu"
-                            if (block_fission_loops and isinstance(w_stmt, ast.For))
-                            else _classify_edit("", w_txt)
-                        )
-                        chunks.append(
-                            AstEditChunk(
-                                chunk_id=f"edit_{len(chunks)}",
-                                edit_kind=kind,
-                                target_path=f"{path_label}/insert_{i1}_{j}",
-                                before_src="",
-                                after_src=w_txt,
-                                ablated_dsl=dsl,
-                            )
-                        )
+                ws = win_list[j]
+                wt = _node_key(ws)
+                if reverse:
+                    _try_emit(lambda t: _set_stmt_by_path(t, parent_path + (j,), None),
+                              _classify_edit("", wt), f"{path_label}/remove_ins_{j}", "", wt)
+                else:
+                    kind = "loop_fission_sfu" if (block_fission and isinstance(ws, ast.For)) else _classify_edit("", wt)
+                    _try_emit(lambda t: _insert_stmt_by_path(t, parent_path + (min(i1, len(base_list)),), ws),
+                              kind, f"{path_label}/insert_{i1}_{j}", "", wt)
 
 
 def _classify_config_key_edit(key_name: str, before_src: str, after_src: str) -> str:
     kl = key_name.lower()
-    if any(tok in kl for tok in ("stage", "buffer", "preload")):
-        return "pipeline_versions"
-    if any(tok in kl for tok in ("core", "block", "split", "threads")):
-        return "core_parallelism"
-    if any(tok in kl for tok in ("pad", "align", "datablock", "stride")):
-        return "pad_alignment"
-    if "barrier" in kl or "sync" in kl or "unit_flag" in kl:
-        return "barrier_prune"
+    for tokens, kind in (
+        (("stage", "buffer", "preload"), "pipeline_versions"),
+        (("core", "block", "split", "threads"), "core_parallelism"),
+        (("pad", "align", "datablock", "stride"), "pad_alignment"),
+        (("barrier", "sync", "unit_flag"), "barrier_prune"),
+    ):
+        if any(tok in kl for tok in tokens):
+            return kind
     classified = _classify_edit(before_src, after_src)
     return classified if classified != "stmt_rewrite" else "config_knob"
 
@@ -932,31 +630,23 @@ def _find_dict_literals_by_context(tree: ast.Module) -> dict[str, ast.Dict]:
     found: dict[str, ast.Dict] = {}
     counts: dict[str, int] = {}
 
-    def _record(prefix: str, node: ast.Dict) -> None:
-        occ = counts.get(prefix, 0)
-        counts[prefix] = occ + 1
-        key = prefix if occ == 0 else f"{prefix}#{occ}"
-        found[key] = node
-
     def _stmt_key(fn_prefix: str, idx: int, stmt: ast.stmt) -> str:
         if isinstance(stmt, ast.Return):
             return f"{fn_prefix}:return"
-        if (
-            isinstance(stmt, ast.Assign)
-            and len(stmt.targets) == 1
-            and isinstance(stmt.targets[0], ast.Name)
-        ):
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
             return f"{fn_prefix}:assign:{stmt.targets[0].id}"
         return f"{fn_prefix}:{idx}"
 
     def _visit(node: ast.AST, prefix: str) -> None:
         if isinstance(node, ast.FunctionDef):
-            fn_prefix = f"{prefix}/{node.name}" if prefix else node.name
+            fn_p = f"{prefix}/{node.name}" if prefix else node.name
             for idx, stmt in enumerate(node.body):
-                _visit(stmt, _stmt_key(fn_prefix, idx, stmt))
+                _visit(stmt, _stmt_key(fn_p, idx, stmt))
             return
         if isinstance(node, ast.Dict):
-            _record(prefix, node)
+            occ = counts.get(prefix, 0)
+            counts[prefix] = occ + 1
+            found[prefix if occ == 0 else f"{prefix}#{occ}"] = node
         for child in ast.iter_child_nodes(node):
             _visit(child, prefix)
 
@@ -971,586 +661,147 @@ def _find_dict_literals_by_context(tree: ast.Module) -> dict[str, ast.Dict]:
 
 
 def _dict_key_map(dnode: ast.Dict) -> dict[str, tuple[int, ast.expr]]:
-    out: dict[str, tuple[int, ast.expr]] = {}
-    for idx, (k, v) in enumerate(zip(dnode.keys, dnode.values)):
-        if isinstance(k, ast.Constant) and isinstance(k.value, str):
-            out[k.value] = (idx, v)
-    return out
+    return {
+        k.value: (idx, v)
+        for idx, (k, v) in enumerate(zip(dnode.keys, dnode.values))
+        if isinstance(k, ast.Constant) and isinstance(k.value, str)
+    }
 
 
-def _extract_config_dict_loo_chunks(
-    base_tree: ast.Module,
-    win_tree: ast.Module,
-    chunks: list[AstEditChunk],
-    seen_dsls: set[str],
+def _extract_config_dict_chunks(
+    base_tree: ast.Module, win_tree: ast.Module, chunks: list[AstEditChunk], seen_dsls: set[str], *, reverse: bool
 ) -> None:
-    """Create Leave-One-Out chunks reverting one dict config entry in winner_dsl at a time."""
-    base_dicts = _find_dict_literals_by_context(base_tree)
-    win_dicts = _find_dict_literals_by_context(win_tree)
+    """Create forward or Leave-One-Out chunks over matching dict config literals."""
+    prefix, patch_root = ("loo_" if reverse else "edit_"), (win_tree if reverse else base_tree)
+    base_dicts, win_dicts = _find_dict_literals_by_context(base_tree), _find_dict_literals_by_context(win_tree)
     for ctx_key, w_dict in win_dicts.items():
-        b_dict = base_dicts.get(ctx_key)
-        if b_dict is None:
+        if (b_dict := base_dicts.get(ctx_key)) is None:
             continue
-        b_map = _dict_key_map(b_dict)
-        w_map = _dict_key_map(w_dict)
+        b_map, w_map = _dict_key_map(b_dict), _dict_key_map(w_dict)
         for k, (w_idx, w_val) in w_map.items():
-            w_val_src = _node_key(w_val)
-            if k in b_map:
-                _b_idx, b_val = b_map[k]
-                b_val_src = _node_key(b_val)
-                if b_val_src == w_val_src:
-                    continue
-                patched = copy.deepcopy(win_tree)
-                p_dict = _find_dict_literals_by_context(patched).get(ctx_key)
-                if p_dict is None or w_idx >= len(p_dict.values):
-                    continue
-                p_dict.values[w_idx] = copy.deepcopy(b_val)
-                dsl = _render_patched(patched)
-                if dsl not in seen_dsls:
-                    seen_dsls.add(dsl)
-                    chunks.append(
-                        AstEditChunk(
-                            chunk_id=f"loo_{len(chunks)}",
-                            edit_kind=_classify_config_key_edit(k, b_val_src, w_val_src),
-                            target_path=f"{ctx_key}/dict:{k}",
-                            before_src=f"{k}: {b_val_src}",
-                            after_src=f"{k}: {w_val_src}",
-                            ablated_dsl=dsl,
-                        )
-                    )
-            else:
-                patched = copy.deepcopy(win_tree)
-                p_dict = _find_dict_literals_by_context(patched).get(ctx_key)
-                if p_dict is None or w_idx >= len(p_dict.values):
-                    continue
-                del p_dict.keys[w_idx]
-                del p_dict.values[w_idx]
-                dsl = _render_patched(patched)
-                if dsl not in seen_dsls:
-                    seen_dsls.add(dsl)
-                    chunks.append(
-                        AstEditChunk(
-                            chunk_id=f"loo_{len(chunks)}",
-                            edit_kind=_classify_config_key_edit(k, "", w_val_src),
-                            target_path=f"{ctx_key}/dict_del:{k}",
-                            before_src="",
-                            after_src=f"{k}: {w_val_src}",
-                            ablated_dsl=dsl,
-                        )
-                    )
-
-
-def _extract_config_dict_forward_chunks(
-    base_tree: ast.Module,
-    win_tree: ast.Module,
-    chunks: list[AstEditChunk],
-    seen_dsls: set[str],
-) -> None:
-    """Create forward single-key AST chunks updating one dict config entry in baseline_dsl."""
-    base_dicts = _find_dict_literals_by_context(base_tree)
-    win_dicts = _find_dict_literals_by_context(win_tree)
-    for ctx_key, w_dict in win_dicts.items():
-        b_dict = base_dicts.get(ctx_key)
-        if b_dict is None:
-            continue
-        b_map = _dict_key_map(b_dict)
-        w_map = _dict_key_map(w_dict)
-        for k, (_w_idx, w_val) in w_map.items():
-            w_val_src = _node_key(w_val)
-            patched = copy.deepcopy(base_tree)
-            p_dict = _find_dict_literals_by_context(patched).get(ctx_key)
-            if p_dict is None:
+            w_src = _node_key(w_val)
+            patched = copy.deepcopy(patch_root)
+            if (p_dict := _find_dict_literals_by_context(patched).get(ctx_key)) is None:
                 continue
             if k in b_map:
                 b_idx, b_val = b_map[k]
-                b_val_src = _node_key(b_val)
-                if b_val_src == w_val_src or b_idx >= len(p_dict.values):
+                b_src = _node_key(b_val)
+                t_idx = w_idx if reverse else b_idx
+                if b_src == w_src or t_idx >= len(p_dict.values):
                     continue
-                p_dict.values[b_idx] = copy.deepcopy(w_val)
-                dsl = _render_patched(patched)
-                if dsl not in seen_dsls:
-                    seen_dsls.add(dsl)
-                    chunks.append(
-                        AstEditChunk(
-                            chunk_id=f"edit_{len(chunks)}",
-                            edit_kind=_classify_config_key_edit(k, b_val_src, w_val_src),
-                            target_path=f"{ctx_key}/dict:{k}",
-                            before_src=f"{k}: {b_val_src}",
-                            after_src=f"{k}: {w_val_src}",
-                            ablated_dsl=dsl,
-                        )
-                    )
+                p_dict.values[t_idx] = copy.deepcopy(b_val if reverse else w_val)
+                _emit_chunk(chunks, seen_dsls, prefix=prefix, edit_kind=_classify_config_key_edit(k, b_src, w_src),
+                            target_path=f"{ctx_key}/dict:{k}", before_src=f"{k}: {b_src}",
+                            after_src=f"{k}: {w_src}", dsl=_render_patched(patched))
             else:
-                p_dict.keys.append(ast.Constant(value=k))
-                p_dict.values.append(copy.deepcopy(w_val))
-                dsl = _render_patched(patched)
-                if dsl not in seen_dsls:
-                    seen_dsls.add(dsl)
-                    chunks.append(
-                        AstEditChunk(
-                            chunk_id=f"edit_{len(chunks)}",
-                            edit_kind=_classify_config_key_edit(k, "", w_val_src),
-                            target_path=f"{ctx_key}/dict_add:{k}",
-                            before_src="",
-                            after_src=f"{k}: {w_val_src}",
-                            ablated_dsl=dsl,
-                        )
-                    )
+                if reverse:
+                    if w_idx >= len(p_dict.values):
+                        continue
+                    del p_dict.keys[w_idx], p_dict.values[w_idx]
+                    tpath = f"{ctx_key}/dict_del:{k}"
+                else:
+                    p_dict.keys.append(ast.Constant(value=k))
+                    p_dict.values.append(copy.deepcopy(w_val))
+                    tpath = f"{ctx_key}/dict_add:{k}"
+                _emit_chunk(chunks, seen_dsls, prefix=prefix, edit_kind=_classify_config_key_edit(k, "", w_src),
+                            target_path=tpath, before_src="", after_src=f"{k}: {w_src}", dsl=_render_patched(patched))
 
 
 def _is_trackb_render_fn(name: str) -> bool:
-    return name == "_render_trackb_tu" or (
-        name.startswith("_render_") and name.endswith("_trackb_launcher")
-    )
+    return name == "_render_trackb_tu" or (name.startswith("_render_") and name.endswith("_trackb_launcher"))
 
 
 def _extract_func_default_loo_chunks(
-    base_tree: ast.Module,
-    win_tree: ast.Module,
-    chunks: list[AstEditChunk],
-    seen_dsls: set[str],
+    base_tree: ast.Module, win_tree: ast.Module, chunks: list[AstEditChunk], seen_dsls: set[str]
 ) -> None:
     """Revert changed default parameters one at a time on selector and Track-B renderers."""
-    base_funcs = {
-        n.name: n for n in base_tree.body if isinstance(n, ast.FunctionDef)
-    }
+    def _collect(fn: ast.FunctionDef) -> list[tuple[str, bool, int, ast.expr]]:
+        pos = [*fn.args.posonlyargs, *fn.args.args]
+        off = len(pos) - len(fn.args.defaults)
+        out = [(pos[off + i].arg, False, i, d) for i, d in enumerate(fn.args.defaults) if off + i >= 0]
+        out.extend((a.arg, True, ki, kd) for ki, (a, kd) in enumerate(zip(fn.args.kwonlyargs, fn.args.kw_defaults)) if kd is not None)
+        return out
+
+    base_funcs = {n.name: n for n in base_tree.body if isinstance(n, ast.FunctionDef)}
     for w_idx, w_node in enumerate(win_tree.body):
         if not isinstance(w_node, ast.FunctionDef):
             continue
         fname = w_node.name
-        if not (
-            _is_trackb_render_fn(fname)
-            or (fname.startswith("_select_") and fname.endswith("_config"))
-        ):
+        if not (_is_trackb_render_fn(fname) or (fname.startswith("_select_") and fname.endswith("_config"))):
             continue
-        b_node = base_funcs.get(fname)
-        if b_node is None:
+        if (b_node := base_funcs.get(fname)) is None:
             continue
-
-        def _pos_defaults(fn: ast.FunctionDef) -> dict[str, tuple[int, ast.expr]]:
-            pos = [*fn.args.posonlyargs, *fn.args.args]
-            offset = len(pos) - len(fn.args.defaults)
-            return {
-                pos[offset + i].arg: (i, d)
-                for i, d in enumerate(fn.args.defaults)
-                if offset + i >= 0
-            }
-
-        b_pos = _pos_defaults(b_node)
-        w_pos = _pos_defaults(w_node)
-        for arg_name, (d_idx, w_def) in w_pos.items():
-            if arg_name not in b_pos:
+        prefix = "trackb_tu_" if _is_trackb_render_fn(fname) else "loo_"
+        b_defs = {(name, is_kw): expr for name, is_kw, _, expr in _collect(b_node)}
+        for arg_name, is_kw, d_idx, w_def in _collect(w_node):
+            if (b_def := b_defs.get((arg_name, is_kw))) is None:
                 continue
-            b_def = b_pos[arg_name][1]
             b_src, w_src = _node_key(b_def), _node_key(w_def)
             if b_src == w_src:
                 continue
             patched = copy.deepcopy(win_tree)
             p_fn = patched.body[w_idx]
-            if isinstance(p_fn, ast.FunctionDef) and d_idx < len(p_fn.args.defaults):
-                p_fn.args.defaults[d_idx] = copy.deepcopy(b_def)
-                dsl = _render_patched(patched)
-                if dsl not in seen_dsls:
-                    seen_dsls.add(dsl)
-                    prefix = "trackb_tu_" if _is_trackb_render_fn(fname) else "loo_"
-                    chunks.append(
-                        AstEditChunk(
-                            chunk_id=f"{prefix}{len(chunks)}",
-                            edit_kind=_classify_config_key_edit(arg_name, b_src, w_src),
-                            target_path=f"{fname}/default:{arg_name}",
-                            before_src=f"{arg_name}={b_src}",
-                            after_src=f"{arg_name}={w_src}",
-                            ablated_dsl=dsl,
-                        )
-                    )
-
-        b_kw = {
-            arg.arg: kw_def
-            for arg, kw_def in zip(b_node.args.kwonlyargs, b_node.args.kw_defaults)
-            if kw_def is not None
-        }
-        for k_idx, (arg, w_def) in enumerate(
-            zip(w_node.args.kwonlyargs, w_node.args.kw_defaults)
-        ):
-            if w_def is None or arg.arg not in b_kw:
-                continue
-            b_def = b_kw[arg.arg]
-            b_src, w_src = _node_key(b_def), _node_key(w_def)
-            if b_src == w_src:
-                continue
-            patched = copy.deepcopy(win_tree)
-            p_fn = patched.body[w_idx]
-            if isinstance(p_fn, ast.FunctionDef) and k_idx < len(p_fn.args.kw_defaults):
-                p_fn.args.kw_defaults[k_idx] = copy.deepcopy(b_def)
-                dsl = _render_patched(patched)
-                if dsl not in seen_dsls:
-                    seen_dsls.add(dsl)
-                    prefix = "trackb_tu_" if _is_trackb_render_fn(fname) else "loo_"
-                    chunks.append(
-                        AstEditChunk(
-                            chunk_id=f"{prefix}{len(chunks)}",
-                            edit_kind=_classify_config_key_edit(arg.arg, b_src, w_src),
-                            target_path=f"{fname}/kw_default:{arg.arg}",
-                            before_src=f"{arg.arg}={b_src}",
-                            after_src=f"{arg.arg}={w_src}",
-                            ablated_dsl=dsl,
-                        )
-                    )
+            if isinstance(p_fn, ast.FunctionDef):
+                t_defs = p_fn.args.kw_defaults if is_kw else p_fn.args.defaults
+                if d_idx < len(t_defs):
+                    t_defs[d_idx] = copy.deepcopy(b_def)
+                    tag = "kw_default" if is_kw else "default"
+                    _emit_chunk(chunks, seen_dsls, prefix=prefix, edit_kind=_classify_config_key_edit(arg_name, b_src, w_src),
+                                target_path=f"{fname}/{tag}:{arg_name}", before_src=f"{arg_name}={b_src}",
+                                after_src=f"{arg_name}={w_src}", dsl=_render_patched(patched))
 
 
 def _extract_trackb_render_template_loo_chunks(
-    baseline_dsl: str,
-    winner_dsl: str,
-    base_tree: ast.Module,
-    win_tree: ast.Module,
-    chunks: list[AstEditChunk],
-    seen_dsls: set[str],
+    baseline_dsl: str, winner_dsl: str, base_tree: ast.Module, win_tree: ast.Module,
+    chunks: list[AstEditChunk], seen_dsls: set[str],
 ) -> None:
     """Decompose multi-line C++ template parameter blocks inside Track-B renderer functions."""
-    base_funcs = {
-        n.name: n for n in base_tree.body if isinstance(n, ast.FunctionDef)
-    }
+    base_funcs = {n.name: n for n in base_tree.body if isinstance(n, ast.FunctionDef)}
     for top_idx, w_fn in enumerate(win_tree.body):
         if not isinstance(w_fn, ast.FunctionDef) or not _is_trackb_render_fn(w_fn.name):
             continue
-        b_fn = base_funcs.get(w_fn.name)
-        if b_fn is None:
+        if (b_fn := base_funcs.get(w_fn.name)) is None:
             continue
-        b_tags = [_node_tag(s) for s in b_fn.body]
-        w_tags = [_node_tag(s) for s in w_fn.body]
-        matcher = difflib.SequenceMatcher(a=b_tags, b=w_tags, autojunk=False)
+        matcher = difflib.SequenceMatcher(a=[_node_tag(s) for s in b_fn.body], b=[_node_tag(s) for s in w_fn.body], autojunk=False)
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag not in ("equal", "replace"):
                 continue
-            span = min(i2 - i1, j2 - j1)
-            for k in range(span):
-                b_stmt = b_fn.body[i1 + k]
-                w_stmt = w_fn.body[j1 + k]
-                if _node_key(b_stmt) == _node_key(w_stmt):
+            for k in range(min(i2 - i1, j2 - j1)):
+                bs, ws = b_fn.body[i1 + k], w_fn.body[j1 + k]
+                if _node_key(bs) == _node_key(ws):
                     continue
-                b_seg = ast.get_source_segment(baseline_dsl, b_stmt) or ""
-                w_seg = ast.get_source_segment(winner_dsl, w_stmt) or ""
-                if not b_seg.strip() or not w_seg.strip():
+                b_seg = ast.get_source_segment(baseline_dsl, bs) or ""
+                w_seg = ast.get_source_segment(winner_dsl, ws) or ""
+                b_lines, w_lines = b_seg.splitlines(keepends=True), w_seg.splitlines(keepends=True)
+                if not b_seg.strip() or not w_seg.strip() or (len(b_lines) <= 1 and len(w_lines) <= 1):
                     continue
-                b_lines = b_seg.splitlines(keepends=True)
-                w_lines = w_seg.splitlines(keepends=True)
-                if len(b_lines) <= 1 and len(w_lines) <= 1:
+                ops = [op for op in difflib.SequenceMatcher(a=b_lines, b=w_lines, autojunk=False).get_opcodes() if op[0] != "equal"]
+                if len(ops) < 2:
                     continue
-                line_matcher = difflib.SequenceMatcher(
-                    a=b_lines, b=w_lines, autojunk=False
-                )
-                diff_ops = [
-                    op for op in line_matcher.get_opcodes() if op[0] != "equal"
-                ]
-                if len(diff_ops) < 2:
-                    continue
-                for op_idx, (_op, bi1, bi2, wj1, wj2) in enumerate(diff_ops):
+                for _op, bi1, bi2, wj1, wj2 in ops:
                     mid = list(b_lines[bi1:bi2])
                     if mid and wj2 < len(w_lines) and not mid[-1].endswith("\n"):
-                        mid[-1] = mid[-1] + "\n"
-                    ablated_stmt_raw = "".join([*w_lines[:wj1], *mid, *w_lines[wj2:]])
+                        mid[-1] += "\n"
                     try:
-                        parsed_stmt = ast.parse(ablated_stmt_raw)
+                        parsed = ast.parse("".join([*w_lines[:wj1], *mid, *w_lines[wj2:]]))
                     except SyntaxError:
                         continue
-                    if len(parsed_stmt.body) != 1:
-                        continue
-                    patched = copy.deepcopy(win_tree)
-                    if _set_stmt_by_path(
-                        patched, (top_idx, j1 + k), parsed_stmt.body[0]
-                    ):
-                        dsl = _render_patched(patched)
-                        if dsl not in seen_dsls:
-                            seen_dsls.add(dsl)
-                            before_part = "".join(b_lines[bi1:bi2]).strip()
-                            after_part = "".join(w_lines[wj1:wj2]).strip()
-                            kind = _classify_cpp_hunk_kind(before_part, after_part)
-                            if kind == "cpp_hunk_edit" and (
-                                "<<<" in f"{before_part}{after_part}"
-                            ):
-                                kind = "core_parallelism"
-                            chunks.append(
-                                AstEditChunk(
-                                    chunk_id=f"trackb_tu_{len(chunks)}_{op_idx}",
-                                    edit_kind=kind,
-                                    target_path=f"{w_fn.name}/template_L{wj1 + 1}",
-                                    before_src=before_part,
-                                    after_src=after_part,
-                                    ablated_dsl=dsl,
-                                )
-                            )
-
-
-def _extract_leave_one_out_stmt_deltas(
-    win_tree: ast.Module,
-    base_list: list[ast.stmt],
-    win_list: list[ast.stmt],
-    parent_path: tuple[int, ...],
-    path_label: str,
-    chunks: list[AstEditChunk],
-    seen_dsls: set[str],
-    *,
-    skip_assign_symbols: frozenset[str] = frozenset(),
-) -> None:
-    """Extract Leave-One-Out AST chunks on winner_dsl reverting one change at a time."""
-    base_tags = [_node_tag(s) for s in base_list]
-    win_tags = [_node_tag(s) for s in win_list]
-    matcher = difflib.SequenceMatcher(a=base_tags, b=win_tags, autojunk=False)
-
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            for k in range(i2 - i1):
-                b_stmt = base_list[i1 + k]
-                w_stmt = win_list[j1 + k]
-                if _node_key(b_stmt) == _node_key(w_stmt):
-                    continue
-                if skip_assign_symbols and not parent_path:
-                    w_tag = _node_tag(w_stmt)
-                    if w_tag.startswith("assign:") and (
-                        w_tag.removeprefix("assign:") in skip_assign_symbols
-                    ):
-                        continue
-                    if (
-                        isinstance(w_stmt, ast.AnnAssign)
-                        and isinstance(w_stmt.target, ast.Name)
-                        and w_stmt.target.id in skip_assign_symbols
-                    ):
-                        continue
-                cur_path = parent_path + (j1 + k,)
-                if isinstance(b_stmt, ast.With) and isinstance(w_stmt, ast.With):
-                    b_hdr = _node_key(b_stmt.items[0].context_expr) if b_stmt.items else ""
-                    w_hdr = _node_key(w_stmt.items[0].context_expr) if w_stmt.items else ""
-                    if b_hdr != w_hdr and b_stmt.items:
-                        patched = copy.deepcopy(win_tree)
-                        if _replace_call_arg(
-                            patched,
-                            cur_path,
-                            is_with_header=True,
-                            new_expr=b_stmt.items[0].context_expr,
-                        ):
-                            dsl = _render_patched(patched)
-                            if dsl not in seen_dsls:
-                                seen_dsls.add(dsl)
-                                chunks.append(
-                                    AstEditChunk(
-                                        chunk_id=f"loo_{len(chunks)}",
-                                        edit_kind=_classify_edit(b_hdr, w_hdr),
-                                        target_path=f"{path_label}/with_{j1 + k}",
-                                        before_src=b_hdr,
-                                        after_src=w_hdr,
-                                        ablated_dsl=dsl,
-                                    )
-                                )
-                    _extract_leave_one_out_stmt_deltas(
-                        win_tree,
-                        b_stmt.body,
-                        w_stmt.body,
-                        cur_path,
-                        f"{path_label}/with_{j1 + k}",
-                        chunks,
-                        seen_dsls,
-                    )
-                    continue
-
-                if isinstance(b_stmt, ast.For) and isinstance(w_stmt, ast.For):
-                    b_iter = _node_key(b_stmt.iter)
-                    w_iter = _node_key(w_stmt.iter)
-                    if b_iter != w_iter:
-                        patched = copy.deepcopy(win_tree)
-                        if _replace_call_arg(
-                            patched,
-                            cur_path,
-                            is_with_header=False,
-                            new_expr=b_stmt.iter,
-                        ):
-                            dsl = _render_patched(patched)
-                            if dsl not in seen_dsls:
-                                seen_dsls.add(dsl)
-                                chunks.append(
-                                    AstEditChunk(
-                                        chunk_id=f"loo_{len(chunks)}",
-                                        edit_kind=_classify_edit(b_iter, w_iter),
-                                        target_path=f"{path_label}/for_{j1 + k}",
-                                        before_src=b_iter,
-                                        after_src=w_iter,
-                                        ablated_dsl=dsl,
-                                    )
-                                )
-                    _extract_leave_one_out_stmt_deltas(
-                        win_tree,
-                        b_stmt.body,
-                        w_stmt.body,
-                        cur_path,
-                        f"{path_label}/for_{j1 + k}",
-                        chunks,
-                        seen_dsls,
-                    )
-                    continue
-
-                if isinstance(b_stmt, ast.FunctionDef) and isinstance(w_stmt, ast.FunctionDef):
-                    _extract_leave_one_out_stmt_deltas(
-                        win_tree,
-                        b_stmt.body,
-                        w_stmt.body,
-                        cur_path,
-                        f"{path_label}/{w_stmt.name}",
-                        chunks,
-                        seen_dsls,
-                    )
-                    continue
-
-                patched = copy.deepcopy(win_tree)
-                if _set_stmt_by_path(patched, cur_path, b_stmt):
-                    dsl = _render_patched(patched)
-                    if dsl not in seen_dsls:
-                        seen_dsls.add(dsl)
-                        b_txt, w_txt = _node_key(b_stmt), _node_key(w_stmt)
-                        chunks.append(
-                            AstEditChunk(
-                                chunk_id=f"loo_{len(chunks)}",
-                                edit_kind=_classify_edit(b_txt, w_txt),
-                                target_path=f"{path_label}/stmt_{j1 + k}",
-                                before_src=b_txt,
-                                after_src=w_txt,
-                                ablated_dsl=dsl,
-                            )
-                        )
-
-        elif tag == "replace":
-            common = min(i2 - i1, j2 - j1)
-            for k in range(common):
-                b_stmt = base_list[i1 + k]
-                w_stmt = win_list[j1 + k]
-                cur_path = parent_path + (j1 + k,)
-                if isinstance(b_stmt, (ast.With, ast.For)) and isinstance(w_stmt, type(b_stmt)):
-                    if isinstance(b_stmt, ast.With) and isinstance(w_stmt, ast.With) and b_stmt.items and w_stmt.items:
-                        b_hdr = _node_key(b_stmt.items[0].context_expr)
-                        w_hdr = _node_key(w_stmt.items[0].context_expr)
-                        if b_hdr != w_hdr:
-                            hdr_patch = copy.deepcopy(win_tree)
-                            if _replace_call_arg(
-                                hdr_patch,
-                                cur_path,
-                                is_with_header=True,
-                                new_expr=b_stmt.items[0].context_expr,
-                            ):
-                                dsl = _render_patched(hdr_patch)
-                                if dsl not in seen_dsls:
-                                    seen_dsls.add(dsl)
-                                    chunks.append(
-                                        AstEditChunk(
-                                            chunk_id=f"loo_{len(chunks)}",
-                                            edit_kind=_classify_edit(b_hdr, w_hdr),
-                                            target_path=f"{path_label}/with_hdr_{j1 + k}",
-                                            before_src=b_hdr,
-                                            after_src=w_hdr,
-                                            ablated_dsl=dsl,
-                                        )
-                                    )
-                    _extract_leave_one_out_stmt_deltas(
-                        win_tree,
-                        b_stmt.body,
-                        w_stmt.body,
-                        cur_path,
-                        f"{path_label}/block_{j1 + k}",
-                        chunks,
-                        seen_dsls,
-                    )
-                    continue
-                patched = copy.deepcopy(win_tree)
-                if _set_stmt_by_path(patched, cur_path, b_stmt):
-                    dsl = _render_patched(patched)
-                    if dsl not in seen_dsls:
-                        seen_dsls.add(dsl)
-                        b_txt, w_txt = _node_key(b_stmt), _node_key(w_stmt)
-                        chunks.append(
-                            AstEditChunk(
-                                chunk_id=f"loo_{len(chunks)}",
-                                edit_kind=_classify_edit(b_txt, w_txt),
-                                target_path=f"{path_label}/replace_{j1 + k}",
-                                before_src=b_txt,
-                                after_src=w_txt,
-                                ablated_dsl=dsl,
-                            )
-                        )
-            for j in range(j1 + common, j2):
-                w_stmt = win_list[j]
-                w_txt = _node_key(w_stmt)
-                cur_path = parent_path + (j,)
-                patched = copy.deepcopy(win_tree)
-                if _set_stmt_by_path(patched, cur_path, None):
-                    dsl = _render_patched(patched)
-                    if dsl not in seen_dsls:
-                        seen_dsls.add(dsl)
-                        chunks.append(
-                            AstEditChunk(
-                                chunk_id=f"loo_{len(chunks)}",
-                                edit_kind=_classify_edit("", w_txt),
-                                target_path=f"{path_label}/remove_extra_{j}",
-                                before_src="",
-                                after_src=w_txt,
-                                ablated_dsl=dsl,
-                            )
-                        )
-
-        elif tag == "insert":
-            for j in range(j1, j2):
-                w_stmt = win_list[j]
-                w_txt = _node_key(w_stmt)
-                cur_path = parent_path + (j,)
-                patched = copy.deepcopy(win_tree)
-                if _set_stmt_by_path(patched, cur_path, None):
-                    dsl = _render_patched(patched)
-                    if dsl not in seen_dsls:
-                        seen_dsls.add(dsl)
-                        chunks.append(
-                            AstEditChunk(
-                                chunk_id=f"loo_{len(chunks)}",
-                                edit_kind=_classify_edit("", w_txt),
-                                target_path=f"{path_label}/remove_ins_{j}",
-                                before_src="",
-                                after_src=w_txt,
-                                ablated_dsl=dsl,
-                            )
-                        )
-
-        elif tag == "delete":
-            for idx in range(i1, i2):
-                b_stmt = base_list[idx]
-                b_txt = _node_key(b_stmt)
-                cur_path = parent_path + (min(j1, len(win_list)),)
-                patched = copy.deepcopy(win_tree)
-                if _insert_stmt_by_path(patched, cur_path, b_stmt):
-                    dsl = _render_patched(patched)
-                    if dsl not in seen_dsls:
-                        seen_dsls.add(dsl)
-                        chunks.append(
-                            AstEditChunk(
-                                chunk_id=f"loo_{len(chunks)}",
-                                edit_kind=_classify_edit(b_txt, ""),
-                                target_path=f"{path_label}/reinsert_{idx}",
-                                before_src=b_txt,
-                                after_src="",
-                                ablated_dsl=dsl,
-                            )
-                        )
+                    if len(parsed.body) == 1 and _set_stmt_by_path(patched := copy.deepcopy(win_tree), (top_idx, j1 + k), parsed.body[0]):
+                        bp, ap = "".join(b_lines[bi1:bi2]).strip(), "".join(w_lines[wj1:wj2]).strip()
+                        kind = _classify_cpp_hunk_kind(bp, ap)
+                        if kind == "cpp_hunk_edit" and "<<<" in f"{bp}{ap}":
+                            kind = "core_parallelism"
+                        _emit_chunk(chunks, seen_dsls, prefix="trackb_tu_", edit_kind=kind,
+                                    target_path=f"{w_fn.name}/template_L{wj1 + 1}", before_src=bp,
+                                    after_src=ap, dsl=_render_patched(patched))
 
 
 def _find_str_constant_node(tree: ast.Module, symbol_name: str) -> ast.Constant | None:
     for node in tree.body:
         val: ast.AST | None = None
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == symbol_name
-        ):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == symbol_name:
             val = node.value
-        elif (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == symbol_name
-        ):
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == symbol_name:
             val = node.value
         if isinstance(val, ast.Constant) and isinstance(val.value, str):
             return val
@@ -1570,28 +821,18 @@ def _format_cpp_string_literal(cpp_src: str) -> str:
     return repr(cpp_src)
 
 
-def _replace_str_constant_in_module(
-    module_src: str,
-    symbol_name: str,
-    new_cpp_src: str,
-) -> str:
+def _replace_str_constant_in_module(module_src: str, symbol_name: str, new_cpp_src: str) -> str:
     tree = ast.parse(module_src)
     node = _find_str_constant_node(tree, symbol_name)
-    if (
-        node is not None
-        and node.end_lineno is not None
-        and node.end_col_offset is not None
-    ):
+    if node is not None and node.end_lineno is not None and node.end_col_offset is not None:
         lines = module_src.splitlines(keepends=True)
-        start_line = lines[node.lineno - 1].encode("utf-8")
-        end_line = lines[node.end_lineno - 1].encode("utf-8")
-        prefix = "".join(lines[: node.lineno - 1]) + start_line[: node.col_offset].decode("utf-8")
-        suffix = end_line[node.end_col_offset :].decode("utf-8") + "".join(lines[node.end_lineno :])
-        candidate = f"{prefix}{_format_cpp_string_literal(new_cpp_src)}{suffix}"
+        sb, eb = lines[node.lineno - 1].encode("utf-8"), lines[node.end_lineno - 1].encode("utf-8")
+        prefix = "".join(lines[: node.lineno - 1]) + sb[: node.col_offset].decode("utf-8")
+        suffix = eb[node.end_col_offset :].decode("utf-8") + "".join(lines[node.end_lineno :])
+        cand = f"{prefix}{_format_cpp_string_literal(new_cpp_src)}{suffix}"
         try:
-            parsed = ast.parse(candidate)
-            if _extract_str_constant(parsed, symbol_name) == new_cpp_src:
-                return candidate
+            if _extract_str_constant(ast.parse(cand), symbol_name) == new_cpp_src:
+                return cand
         except SyntaxError:
             pass
     if node is not None:
@@ -1602,29 +843,17 @@ def _replace_str_constant_in_module(
 
 def _classify_cpp_hunk_kind(before_seg: str, after_seg: str) -> str:
     combined = f"{before_seg} {after_seg}"
-    if "& 1" in combined or "% 2" in combined or "(event_t)1" in combined:
-        return "static_pingpong_unroll"
-    if (
-        "asc_sync_notify" in combined
-        or "asc_lock" in combined
-        or "asc_unlock" in combined
-        or "pipe_barrier" in combined
-        or "CrossCore" in combined
+    for tokens, kind in (
+        (("& 1", "% 2", "(event_t)1"), "static_pingpong_unroll"),
+        (("asc_sync_notify", "asc_lock", "asc_unlock", "pipe_barrier", "CrossCore"), "barrier_prune"),
+        (("+ 16", "+ 32", "STRIDE", "PAD"), "pad_alignment"),
+        (("asc_copy_gm2ub", "asc_copy_ub2gm", "asc_copy_gm2l1", "asc_copy_l0c2ub"), "coalesced_copy"),
+        (("block_idx", "num_cores", "get_block_num"), "core_parallelism"),
     ):
-        return "barrier_prune"
-    if "+ 16" in combined or "+ 32" in combined or "STRIDE" in combined or "PAD" in combined:
-        return "pad_alignment"
-    if (
-        "asc_copy_gm2ub" in combined
-        or "asc_copy_ub2gm" in combined
-        or "asc_copy_gm2l1" in combined
-        or "asc_copy_l0c2ub" in combined
-    ):
-        return "coalesced_copy"
+        if any(t in combined for t in tokens):
+            return kind
     if "get_subblockid" in combined or "1c2v" in combined.lower():
         return "dual_copy_1c2v"
-    if "block_idx" in combined or "num_cores" in combined or "get_block_num" in combined:
-        return "core_parallelism"
     if "simd_inst::" in combined and after_seg.count("for ") > before_seg.count("for "):
         return "loop_fission_sfu"
     return "cpp_hunk_edit"
@@ -1632,183 +861,130 @@ def _classify_cpp_hunk_kind(before_seg: str, after_seg: str) -> str:
 
 def _discover_trackb_cpp_symbols(tree: ast.Module) -> list[str]:
     symbols: list[str] = []
+    markers = ("tl_templates/ascend/", "__aicore__", "__global__", "__simd_vf__")
     for node in tree.body:
-        name: str | None = None
-        val: ast.AST | None = None
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-        ):
+        name, val = None, None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             name, val = node.targets[0].id, node.value
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             name, val = node.target.id, node.value
-        if not name or not isinstance(val, ast.Constant) or not isinstance(val.value, str):
-            continue
-        cpp_text = val.value
-        if (
-            name.endswith("_TRACKB_SRC")
-            or "tl_templates/ascend/" in cpp_text
-            or "__aicore__" in cpp_text
-            or "__global__" in cpp_text
-            or "__simd_vf__" in cpp_text
-        ):
-            symbols.append(name)
+        if name and isinstance(val, ast.Constant) and isinstance(val.value, str):
+            if name.endswith("_TRACKB_SRC") or any(m in val.value for m in markers):
+                symbols.append(name)
     return symbols
 
 
 def decompose_cpp_string_leave_one_out(
-    baseline_module_src: str,
-    winner_module_src: str,
-    cpp_symbol_name: str,
+    baseline_module_src: str, winner_module_src: str, cpp_symbol_name: str
 ) -> list[AstEditChunk]:
     """Generate Leave-One-Out counterfactual modules by reverting one C++ diff hunk at a time."""
-    base_tree = ast.parse(baseline_module_src)
-    win_tree = ast.parse(winner_module_src)
-    base_cpp = _extract_str_constant(base_tree, cpp_symbol_name)
-    win_cpp = _extract_str_constant(win_tree, cpp_symbol_name)
+    base_cpp = _extract_str_constant(ast.parse(baseline_module_src), cpp_symbol_name)
+    win_cpp = _extract_str_constant(ast.parse(winner_module_src), cpp_symbol_name)
     if not base_cpp or not win_cpp or base_cpp == win_cpp:
         return []
-
-    base_lines = base_cpp.splitlines(keepends=True)
-    win_lines = win_cpp.splitlines(keepends=True)
-    matcher = difflib.SequenceMatcher(a=base_lines, b=win_lines, autojunk=False)
-    diff_ops = [
-        (tag, i1, i2, j1, j2)
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
-        if tag != "equal"
-    ]
-    if len(diff_ops) <= 1:
+    base_lines, win_lines = base_cpp.splitlines(keepends=True), win_cpp.splitlines(keepends=True)
+    ops = [op for op in difflib.SequenceMatcher(a=base_lines, b=win_lines, autojunk=False).get_opcodes() if op[0] != "equal"]
+    if len(ops) <= 1:
         return []
-
     chunks: list[AstEditChunk] = []
-    for idx, (_tag, i1, i2, j1, j2) in enumerate(diff_ops):
-        mid_lines = list(base_lines[i1:i2])
-        if mid_lines and j2 < len(win_lines) and not mid_lines[-1].endswith("\n"):
-            mid_lines[-1] = mid_lines[-1] + "\n"
-        ablated_cpp = "".join([*win_lines[:j1], *mid_lines, *win_lines[j2:]])
+    for idx, (_tag, i1, i2, j1, j2) in enumerate(ops):
+        mid = list(base_lines[i1:i2])
+        if mid and j2 < len(win_lines) and not mid[-1].endswith("\n"):
+            mid[-1] += "\n"
+        ablated_cpp = "".join([*win_lines[:j1], *mid, *win_lines[j2:]])
         if ablated_cpp.count("{") != ablated_cpp.count("}"):
             continue
-        before_seg = "".join(base_lines[i1:i2]).strip()
-        after_seg = "".join(win_lines[j1:j2]).strip()
-        ablated_mod_src = _replace_str_constant_in_module(
-            winner_module_src, cpp_symbol_name, ablated_cpp
-        )
-        chunks.append(
-            AstEditChunk(
-                chunk_id=f"cpp_loo_{cpp_symbol_name}_{idx}",
-                edit_kind=_classify_cpp_hunk_kind(before_seg, after_seg),
-                target_path=f"{cpp_symbol_name}:L{j1 + 1}-L{max(j1 + 1, j2)}",
-                before_src=before_seg,
-                after_src=after_seg,
-                ablated_dsl=ablated_mod_src,
-            )
-        )
+        bs, as_ = "".join(base_lines[i1:i2]).strip(), "".join(win_lines[j1:j2]).strip()
+        chunks.append(AstEditChunk(
+            chunk_id=f"cpp_loo_{cpp_symbol_name}_{idx}", edit_kind=_classify_cpp_hunk_kind(bs, as_),
+            target_path=f"{cpp_symbol_name}:L{j1 + 1}-L{max(j1 + 1, j2)}", before_src=bs, after_src=as_,
+            ablated_dsl=_replace_str_constant_in_module(winner_module_src, cpp_symbol_name, ablated_cpp),
+        ))
     return chunks
 
 
-def decompose_leave_one_out_ablations(
-    baseline_dsl: str,
-    winner_dsl: str,
-) -> tuple[AstEditChunk, ...]:
+def decompose_leave_one_out_ablations(baseline_dsl: str, winner_dsl: str) -> tuple[AstEditChunk, ...]:
     """Decompose winner_dsl into Leave-One-Out AST, config-dict, and Track-B C++ ablations."""
-    base_tree = ast.parse(baseline_dsl)
-    win_tree = ast.parse(winner_dsl)
+    base_tree, win_tree = ast.parse(baseline_dsl), ast.parse(winner_dsl)
     chunks: list[AstEditChunk] = []
     seen_dsls: set[str] = {ast.unparse(win_tree)}
-
     base_cpp_syms = set(_discover_trackb_cpp_symbols(base_tree))
     decomposed_cpp_syms: set[str] = set()
     for sym_name in _discover_trackb_cpp_symbols(win_tree):
         if sym_name not in base_cpp_syms:
             continue
-        cpp_chunks = decompose_cpp_string_leave_one_out(baseline_dsl, winner_dsl, sym_name)
-        if not cpp_chunks:
-            continue
-        decomposed_cpp_syms.add(sym_name)
-        for ch in cpp_chunks:
-            norm = ast.unparse(ast.parse(ch.ablated_dsl))
-            if norm not in seen_dsls:
-                seen_dsls.add(norm)
-                chunks.append(ch)
-
-    _extract_config_dict_loo_chunks(base_tree, win_tree, chunks, seen_dsls)
+        if (cpp_chunks := decompose_cpp_string_leave_one_out(baseline_dsl, winner_dsl, sym_name)):
+            decomposed_cpp_syms.add(sym_name)
+            for ch in cpp_chunks:
+                norm = ast.unparse(ast.parse(ch.ablated_dsl))
+                if norm not in seen_dsls:
+                    seen_dsls.add(norm)
+                    chunks.append(ch)
+    _extract_config_dict_chunks(base_tree, win_tree, chunks, seen_dsls, reverse=True)
     _extract_func_default_loo_chunks(base_tree, win_tree, chunks, seen_dsls)
-    _extract_trackb_render_template_loo_chunks(
-        baseline_dsl, winner_dsl, base_tree, win_tree, chunks, seen_dsls
-    )
-    _extract_leave_one_out_stmt_deltas(
-        win_tree,
-        base_tree.body,
-        win_tree.body,
-        (),
-        "module",
-        chunks,
-        seen_dsls,
-        skip_assign_symbols=frozenset(decomposed_cpp_syms),
-    )
+    _extract_trackb_render_template_loo_chunks(baseline_dsl, winner_dsl, base_tree, win_tree, chunks, seen_dsls)
+    _extract_stmt_deltas(win_tree, base_tree.body, win_tree.body, (), "module", chunks, seen_dsls,
+                         reverse=True, skip_assign_symbols=frozenset(decomposed_cpp_syms))
     return tuple(chunks)
 
 
 def decompose_ast_ablations(baseline_dsl: str, winner_dsl: str) -> tuple[AstEditChunk, ...]:
     """Decompose AST difference between baseline and winner DSL into single-variable edits."""
-    base_tree = ast.parse(baseline_dsl)
-    win_tree = ast.parse(winner_dsl)
+    base_tree, win_tree = ast.parse(baseline_dsl), ast.parse(winner_dsl)
     chunks: list[AstEditChunk] = []
     seen_dsls: set[str] = {ast.unparse(base_tree)}
-
     base_defs = dict(_collect_top_defs(base_tree))
     win_defs_list = _collect_top_defs(win_tree)
     new_defs = {name: stmt for name, stmt in win_defs_list if name not in base_defs}
-    def_order = [name for name, _stmt in win_defs_list if name in new_defs]
-
-    _extract_config_dict_forward_chunks(base_tree, win_tree, chunks, seen_dsls)
-    _extract_stmt_list_deltas(
-        base_tree,
-        base_tree.body,
-        win_tree.body,
-        (),
-        "module",
-        chunks,
-        seen_dsls,
-        new_defs=new_defs,
-        def_order=def_order,
-    )
-    has_verifiable_chunk = any(c.edit_kind in _SUPPORTED_PROBE_KINDS for c in chunks)
+    def_order = [name for name, _ in win_defs_list if name in new_defs]
+    _extract_config_dict_chunks(base_tree, win_tree, chunks, seen_dsls, reverse=False)
+    _extract_stmt_deltas(base_tree, base_tree.body, win_tree.body, (), "module", chunks, seen_dsls,
+                         reverse=False, new_defs=new_defs, def_order=def_order)
     win_rendered = ast.unparse(win_tree)
-    if (
-        (not chunks or (len(base_tree.body) > 2 and not has_verifiable_chunk))
-        and win_rendered != ast.unparse(base_tree)
-        and win_rendered not in seen_dsls
-    ):
-        win_defs_map = dict(win_defs_list)
-        diff_names = [
-            name
-            for name, w_stmt in win_defs_list
-            if name not in base_defs or _node_key(base_defs[name]) != _node_key(w_stmt)
-        ]
-        before_diff = "\n".join(
-            _node_key(base_defs[n]) for n in diff_names if n in base_defs
-        ) or ast.unparse(base_tree)
-        after_diff = "\n".join(
-            _node_key(win_defs_map[n]) for n in diff_names if n in win_defs_map
-        ) or win_rendered
-        chunks.append(
-            AstEditChunk(
-                chunk_id=f"edit_{len(chunks)}",
-                edit_kind=_classify_edit(before_diff, after_diff),
-                target_path="module/regime_composite" if chunks else "module/whole",
-                before_src=before_diff,
-                after_src=after_diff,
-                ablated_dsl=win_rendered,
-            )
-        )
+    has_verifiable = any(c.edit_kind in _SUPPORTED_PROBE_KINDS for c in chunks)
+    if (not chunks or (len(base_tree.body) > 2 and not has_verifiable)) and win_rendered != ast.unparse(base_tree) and win_rendered not in seen_dsls:
+        win_map = dict(win_defs_list)
+        diff = [n for n, ws in win_defs_list if n not in base_defs or _node_key(base_defs[n]) != _node_key(ws)]
+        b_diff = "\n".join(_node_key(base_defs[n]) for n in diff if n in base_defs) or ast.unparse(base_tree)
+        a_diff = "\n".join(_node_key(win_map[n]) for n in diff if n in win_map) or win_rendered
+        _emit_chunk(chunks, seen_dsls, prefix="edit_", edit_kind=_classify_edit(b_diff, a_diff),
+                    target_path="module/regime_composite" if chunks else "module/whole",
+                    before_src=b_diff, after_src=a_diff, dsl=win_rendered)
     return tuple(chunks)
 
 
+def _wrap_probe(vars_lines: Sequence[str], params_lines: Sequence[str], kernel_hdr: str, body_lines: Sequence[str]) -> str:
+    vblk = "\n".join(f"    {ln}" for ln in vars_lines)
+    pblk = "\n".join(f"        {ln}" for ln in params_lines)
+    bblk = "\n".join(f"            {ln}" for ln in body_lines)
+    return (
+        "import tilelang.ascend.language as T\n\ndef make_flywheel_probe():\n"
+        f"{vblk}\n\n    @T.prim_func\n    def main(\n{pblk}\n    ):\n"
+        f"        with {kernel_hdr}:\n{bblk}\n    return main\n"
+    )
+
+
+def _simd_vadd(a_idx: str, b_idx: str, c_idx: str, *, loop: str, count: str, pad: str = "") -> list[str]:
+    return [
+        f"{pad}with T.SimdVF():", f"{pad}    mask = T.simd.pset(32)", f"{pad}    for {loop} in {count}:",
+        f"{pad}        va = T.simd.vld({a_idx})", f"{pad}        vb = T.simd.vld({b_idx})",
+        f"{pad}        T.simd.vsts({c_idx}, T.simd.vadd(va, vb, mask), mask)",
+    ]
+
+
+def _vec_params(shape: str, dtype: str = "float32") -> list[str]:
+    return [f'{n}: T.Tensor({shape}, "{dtype}"),' for n in ("A", "B", "C")]
+
+
+def _alloc_abc(shape: str, dtype: str = "float32", *, stages: int | None = None) -> list[str]:
+    out = [f'{n}_ub = T.alloc_shared({shape}, "{dtype}")' for n in ("a", "b", "c")]
+    if stages is not None:
+        out.append(f"T.annotate_buffer_versions({{a_ub: {stages}, b_ub: {stages}, c_ub: {stages}}})")
+    return out
+
+
 def _probe_templates_for_kind(
-    probe_kind: str,
-    params: Mapping[str, object] | None = None,
+    probe_kind: str, params: Mapping[str, object] | None = None
 ) -> tuple[str, str, tuple[int, ...], str] | None:
     cfg = dict(params or {})
     cores = max(2, min(56, int(cfg.get("cores", 28))))
@@ -1817,705 +993,205 @@ def _probe_templates_for_kind(
     tile = max(512, min(4096, ((int(cfg.get("tile_elems", 2048)) + 127) // 128) * 128))
     dtype = str(cfg.get("dtype", "float32"))
 
+    def _pipelined_vec(n_stages: int, *, with_barriers: bool) -> str:
+        bar = ['    T.ascend_pipe_barrier("PIPE_ALL")'] if with_barriers else []
+        vadd = _simd_vadd("a_ub[i * 64]", "b_ub[i * 64]", "c_ub[i * 64]", loop="i", count="range(tile // 64)", pad="    ")
+        return _wrap_probe(
+            [f"tile = {tile}", "steps = 16", f"cores = {mix_cores}", "total = cores * steps * tile"],
+            _vec_params("(total,)"), "T.Kernel(cores) as bx",
+            [*_alloc_abc("(tile,)"), f"for s in T.Pipelined(steps, num_stages={n_stages}):",
+             "    off = (s * cores + bx) * tile", "    T.copy(A[off : off + tile], a_ub)",
+             "    T.copy(B[off : off + tile], b_ub)", *bar, *vadd, *bar, "    T.copy(c_ub, C[off : off + tile])", *bar],
+        )
+
     if probe_kind == "core_parallelism":
-        base = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    tile = {tile}
-    steps = {cores}
-    total = tile * steps
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((total,), "float32"),
-        B: T.Tensor((total,), "float32"),
-        C: T.Tensor((total,), "float32"),
-    ):
-        with T.Kernel(1) as bx:
-            a_ub = T.alloc_shared((tile,), "float32")
-            b_ub = T.alloc_shared((tile,), "float32")
-            c_ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({{a_ub: 1, b_ub: 1, c_ub: 1}})
-            for s in T.Pipelined(steps, num_stages=1):
-                off = s * tile + bx * 0
-                T.copy(A[off : off + tile], a_ub)
-                T.copy(B[off : off + tile], b_ub)
-                with T.SimdVF():
-                    mask = T.simd.pset(32)
-                    for i in range(tile // 64):
-                        va = T.simd.vld(a_ub[i * 64])
-                        vb = T.simd.vld(b_ub[i * 64])
-                        T.simd.vsts(c_ub[i * 64], T.simd.vadd(va, vb, mask), mask)
-                T.copy(c_ub, C[off : off + tile])
-                T.ascend_pipe_barrier("PIPE_ALL")
-    return main
-"""
-        opt = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    tile = {tile}
-    cores = {cores}
-    total = tile * cores
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((total,), "float32"),
-        B: T.Tensor((total,), "float32"),
-        C: T.Tensor((total,), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a_ub = T.alloc_shared((tile,), "float32")
-            b_ub = T.alloc_shared((tile,), "float32")
-            c_ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({{a_ub: 1, b_ub: 1, c_ub: 1}})
-            off = bx * tile
-            T.copy(A[off : off + tile], a_ub)
-            T.copy(B[off : off + tile], b_ub)
-            with T.SimdVF():
-                mask = T.simd.pset(32)
-                for i in range(tile // 64):
-                    va = T.simd.vld(a_ub[i * 64])
-                    vb = T.simd.vld(b_ub[i * 64])
-                    T.simd.vsts(c_ub[i * 64], T.simd.vadd(va, vb, mask), mask)
-            T.copy(c_ub, C[off : off + tile])
-    return main
-"""
+        vadd_in = _simd_vadd("a_ub[i * 64]", "b_ub[i * 64]", "c_ub[i * 64]", loop="i", count="range(tile // 64)", pad="    ")
+        base = _wrap_probe(
+            [f"tile = {tile}", f"steps = {cores}", "total = tile * steps"], _vec_params("(total,)"), "T.Kernel(1) as bx",
+            [*_alloc_abc("(tile,)", stages=1), "for s in T.Pipelined(steps, num_stages=1):",
+             "    off = s * tile + bx * 0", "    T.copy(A[off : off + tile], a_ub)", "    T.copy(B[off : off + tile], b_ub)",
+             *vadd_in, "    T.copy(c_ub, C[off : off + tile])", '    T.ascend_pipe_barrier("PIPE_ALL")'],
+        )
+        opt = _wrap_probe(
+            [f"tile = {tile}", f"cores = {cores}", "total = tile * cores"], _vec_params("(total,)"), "T.Kernel(cores) as bx",
+            [*_alloc_abc("(tile,)", stages=1), "off = bx * tile", "T.copy(A[off : off + tile], a_ub)",
+             "T.copy(B[off : off + tile], b_ub)",
+             *_simd_vadd("a_ub[i * 64]", "b_ub[i * 64]", "c_ub[i * 64]", loop="i", count="range(tile // 64)"),
+             "T.copy(c_ub, C[off : off + tile])"],
+        )
         return base, opt, (tile * cores,), dtype
 
     if probe_kind == "coalesced_copy":
-        rows = 16
-        cols = 128
-        base = f"""import tilelang.ascend.language as T
+        v2d = ["with T.SimdVF():", "    mask = T.simd.pset(32)", "    for r in T.serial(rows):", "        for k in range(2):",
+               "            va = T.simd.vld(a_ub[r, k * 64])", "            vb = T.simd.vld(b_ub[r, k * 64])",
+               "            T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)"]
+        vv, vp, hdr = [f"cores = {mix_cores}", "rows = 16", "cols = 128"], _vec_params("(cores * rows, cols)"), "T.Kernel(cores) as bx"
+        base = _wrap_probe(vv, vp, hdr, [
+            *_alloc_abc("(rows, cols)"), "base_r = bx * rows", "for r in T.serial(rows):",
+            "    T.copy(A[base_r + r, 0:cols], a_ub[r, 0:cols])", "    T.copy(B[base_r + r, 0:cols], b_ub[r, 0:cols])",
+            *v2d, "for r in T.serial(rows):", "    T.copy(c_ub[r, 0:cols], C[base_r + r, 0:cols])"])
+        opt = _wrap_probe(vv, vp, hdr, [
+            *_alloc_abc("(rows, cols)"), "base_r = bx * rows", "T.copy(A[base_r : base_r + rows, 0:cols], a_ub)",
+            "T.copy(B[base_r : base_r + rows, 0:cols], b_ub)", *v2d, "T.copy(c_ub, C[base_r : base_r + rows, 0:cols])"])
+        return base, opt, (mix_cores * 16, 128), dtype
 
-def make_flywheel_probe():
-    cores = {mix_cores}
-    rows = {rows}
-    cols = {cols}
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((cores * rows, cols), "float32"),
-        B: T.Tensor((cores * rows, cols), "float32"),
-        C: T.Tensor((cores * rows, cols), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a_ub = T.alloc_shared((rows, cols), "float32")
-            b_ub = T.alloc_shared((rows, cols), "float32")
-            c_ub = T.alloc_shared((rows, cols), "float32")
-            base_r = bx * rows
-            for r in T.serial(rows):
-                T.copy(A[base_r + r, 0:cols], a_ub[r, 0:cols])
-                T.copy(B[base_r + r, 0:cols], b_ub[r, 0:cols])
-            with T.SimdVF():
-                mask = T.simd.pset(32)
-                for r in T.serial(rows):
-                    for k in range(2):
-                        va = T.simd.vld(a_ub[r, k * 64])
-                        vb = T.simd.vld(b_ub[r, k * 64])
-                        T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)
-            for r in T.serial(rows):
-                T.copy(c_ub[r, 0:cols], C[base_r + r, 0:cols])
-    return main
-"""
-        opt = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    cores = {mix_cores}
-    rows = {rows}
-    cols = {cols}
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((cores * rows, cols), "float32"),
-        B: T.Tensor((cores * rows, cols), "float32"),
-        C: T.Tensor((cores * rows, cols), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a_ub = T.alloc_shared((rows, cols), "float32")
-            b_ub = T.alloc_shared((rows, cols), "float32")
-            c_ub = T.alloc_shared((rows, cols), "float32")
-            base_r = bx * rows
-            T.copy(A[base_r : base_r + rows, 0:cols], a_ub)
-            T.copy(B[base_r : base_r + rows, 0:cols], b_ub)
-            with T.SimdVF():
-                mask = T.simd.pset(32)
-                for r in T.serial(rows):
-                    for k in range(2):
-                        va = T.simd.vld(a_ub[r, k * 64])
-                        vb = T.simd.vld(b_ub[r, k * 64])
-                        T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)
-            T.copy(c_ub, C[base_r : base_r + rows, 0:cols])
-    return main
-"""
-        return base, opt, (mix_cores * rows, cols), dtype
-
-    if probe_kind == "pipeline_versions":
-        steps = 16
-        base = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    tile = {tile}
-    steps = {steps}
-    cores = {mix_cores}
-    total = cores * steps * tile
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((total,), "float32"),
-        B: T.Tensor((total,), "float32"),
-        C: T.Tensor((total,), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a_ub = T.alloc_shared((tile,), "float32")
-            b_ub = T.alloc_shared((tile,), "float32")
-            c_ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({{a_ub: 1, b_ub: 1, c_ub: 1}})
-            for s in T.Pipelined(steps, num_stages=1):
-                off = (s * cores + bx) * tile
-                T.copy(A[off : off + tile], a_ub)
-                T.copy(B[off : off + tile], b_ub)
-                with T.SimdVF():
-                    mask = T.simd.pset(32)
-                    for i in range(tile // 64):
-                        va = T.simd.vld(a_ub[i * 64])
-                        vb = T.simd.vld(b_ub[i * 64])
-                        T.simd.vsts(c_ub[i * 64], T.simd.vadd(va, vb, mask), mask)
-                T.copy(c_ub, C[off : off + tile])
-                T.ascend_pipe_barrier("PIPE_ALL")
-    return main
-"""
-        opt = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    tile = {tile}
-    steps = {steps}
-    cores = {mix_cores}
-    total = cores * steps * tile
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((total,), "float32"),
-        B: T.Tensor((total,), "float32"),
-        C: T.Tensor((total,), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a_ub = T.alloc_shared((tile,), "float32")
-            b_ub = T.alloc_shared((tile,), "float32")
-            c_ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({{a_ub: {stages}, b_ub: {stages}, c_ub: {stages}}})
-            for s in T.Pipelined(steps, num_stages={stages}):
-                off = (s * cores + bx) * tile
-                T.copy(A[off : off + tile], a_ub)
-                T.copy(B[off : off + tile], b_ub)
-                with T.SimdVF():
-                    mask = T.simd.pset(32)
-                    for i in range(tile // 64):
-                        va = T.simd.vld(a_ub[i * 64])
-                        vb = T.simd.vld(b_ub[i * 64])
-                        T.simd.vsts(c_ub[i * 64], T.simd.vadd(va, vb, mask), mask)
-                T.copy(c_ub, C[off : off + tile])
-    return main
-"""
-        return base, opt, (mix_cores * steps * tile,), dtype
+    if probe_kind in ("pipeline_versions", "barrier_prune"):
+        b_stg = 1 if probe_kind == "pipeline_versions" else stages
+        return _pipelined_vec(b_stg, with_barriers=True), _pipelined_vec(stages, with_barriers=False), (mix_cores * 16 * tile,), dtype
 
     if probe_kind == "ssbuf_handoff":
-        rounds = 64
-        base = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    rounds = {rounds}
-    tile = 16
-
-    @T.prim_func
-    def main(
-        seed: T.Tensor((tile, tile), "float16"),
-        scratch: T.Tensor((rounds, 2), "uint32"),
-        out: T.Tensor((rounds, 1), "uint64"),
-    ):
-        with T.MixedKernel(1) as (_, sid):
-            cube = T.alloc_l1((tile, tile), "float16")
-            tmp_ub = T.alloc_shared((1,), "uint32")
-            T.copy(seed, cube)
-            for i in T.Pipelined(
-                rounds,
-                num_stages=1,
-            ):
-                with T.Stage(0):
-                    val = T.Cast("uint32", (i + 1) * (100 + sid))
-                    tmp_ub[0] = val
-                    T.copy(tmp_ub, scratch[i, sid : sid + 1])
-                with T.Stage(0):
-                    lo = T.Cast("uint64", scratch[i, 0])
-                    hi = T.Cast("uint64", scratch[i, 1]) << 32
-                    out[i, 0] = lo | hi
-                    T.ascend_pipe_barrier("PIPE_ALL")
-    return main
-"""
-        opt = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    rounds = {rounds}
-    tile = 16
-
-    @T.prim_func
-    def main(
-        seed: T.Tensor((tile, tile), "float16"),
-        out: T.Tensor((rounds, 1), "uint64"),
-    ):
-        with T.MixedKernel(1) as (_, sid):
-            words = T.alloc_ss((2,), "uint32")
-            packed = T.view(words, shape=(1,), dtype="uint64")
-            T.annotate_buffer_versions({{words: (3, "auto")}})
-            cube = T.alloc_l1((tile, tile), "float16")
-            T.copy(seed, cube)
-            for i in T.Pipelined(
-                rounds,
-                num_stages=3,
-                annotations={{"enable_offset": True}},
-            ):
-                with T.Stage(0):
-                    words[sid] = T.Cast(
-                        "uint32",
-                        (i + 1) * (100 + sid),
-                    )
-                with T.Stage(2):
-                    out[i, 0] = packed[0]
-    return main
-"""
-        return base, opt, (rounds, 1), "uint64"
-
-    if probe_kind == "barrier_prune":
-        steps = 16
-        base = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    tile = {tile}
-    steps = {steps}
-    cores = {mix_cores}
-    total = cores * steps * tile
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((total,), "float32"),
-        B: T.Tensor((total,), "float32"),
-        C: T.Tensor((total,), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a_ub = T.alloc_shared((tile,), "float32")
-            b_ub = T.alloc_shared((tile,), "float32")
-            c_ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({{a_ub: {stages}, b_ub: {stages}, c_ub: {stages}}})
-            for s in T.Pipelined(steps, num_stages={stages}):
-                off = (s * cores + bx) * tile
-                T.copy(A[off : off + tile], a_ub)
-                T.copy(B[off : off + tile], b_ub)
-                T.ascend_pipe_barrier("PIPE_ALL")
-                with T.SimdVF():
-                    mask = T.simd.pset(32)
-                    for i in range(tile // 64):
-                        va = T.simd.vld(a_ub[i * 64])
-                        vb = T.simd.vld(b_ub[i * 64])
-                        T.simd.vsts(c_ub[i * 64], T.simd.vadd(va, vb, mask), mask)
-                T.ascend_pipe_barrier("PIPE_ALL")
-                T.copy(c_ub, C[off : off + tile])
-                T.ascend_pipe_barrier("PIPE_ALL")
-    return main
-"""
-        opt = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    tile = {tile}
-    steps = {steps}
-    cores = {mix_cores}
-    total = cores * steps * tile
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((total,), "float32"),
-        B: T.Tensor((total,), "float32"),
-        C: T.Tensor((total,), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a_ub = T.alloc_shared((tile,), "float32")
-            b_ub = T.alloc_shared((tile,), "float32")
-            c_ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({{a_ub: {stages}, b_ub: {stages}, c_ub: {stages}}})
-            for s in T.Pipelined(steps, num_stages={stages}):
-                off = (s * cores + bx) * tile
-                T.copy(A[off : off + tile], a_ub)
-                T.copy(B[off : off + tile], b_ub)
-                with T.SimdVF():
-                    mask = T.simd.pset(32)
-                    for i in range(tile // 64):
-                        va = T.simd.vld(a_ub[i * 64])
-                        vb = T.simd.vld(b_ub[i * 64])
-                        T.simd.vsts(c_ub[i * 64], T.simd.vadd(va, vb, mask), mask)
-                T.copy(c_ub, C[off : off + tile])
-    return main
-"""
-        return base, opt, (mix_cores * steps * tile,), dtype
+        base = _wrap_probe(
+            ["rounds = 64", "tile = 16"],
+            ['seed: T.Tensor((tile, tile), "float16"),', 'scratch: T.Tensor((rounds, 2), "uint32"),', 'out: T.Tensor((rounds, 1), "uint64"),'],
+            "T.MixedKernel(1) as (_, sid)",
+            ['cube = T.alloc_l1((tile, tile), "float16")', 'tmp_ub = T.alloc_shared((1,), "uint32")',
+             "T.copy(seed, cube)", "for i in T.Pipelined(rounds, num_stages=1):", "    with T.Stage(0):",
+             '        val = T.Cast("uint32", (i + 1) * (100 + sid))', "        tmp_ub[0] = val",
+             "        T.copy(tmp_ub, scratch[i, sid : sid + 1])", "    with T.Stage(0):",
+             '        lo = T.Cast("uint64", scratch[i, 0])', '        hi = T.Cast("uint64", scratch[i, 1]) << 32',
+             '        out[i, 0] = lo | hi', '        T.ascend_pipe_barrier("PIPE_ALL")'],
+        )
+        opt = _wrap_probe(
+            ["rounds = 64", "tile = 16"], ['seed: T.Tensor((tile, tile), "float16"),', 'out: T.Tensor((rounds, 1), "uint64"),'],
+            "T.MixedKernel(1) as (_, sid)",
+            ['words = T.alloc_ss((2,), "uint32")', 'packed = T.view(words, shape=(1,), dtype="uint64")',
+             'T.annotate_buffer_versions({words: (3, "auto")})', 'cube = T.alloc_l1((tile, tile), "float16")',
+             "T.copy(seed, cube)", "for i in T.Pipelined(", "    rounds,", "    num_stages=3,",
+             '    annotations={"enable_offset": True},', "):", "    with T.Stage(0):",
+             "        words[sid] = T.Cast(", '            "uint32",', "            (i + 1) * (100 + sid),",
+             "        )", "    with T.Stage(2):", "        out[i, 0] = packed[0]"],
+        )
+        return base, opt, (64, 1), "uint64"
 
     if probe_kind == "dual_copy_1c2v":
-        rows = 16
-        half_rows = 8
-        cols = 128
-        base = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    cores = {mix_cores}
-    rows = {rows}
-    cols = {cols}
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((cores * rows, cols), "float32"),
-        B: T.Tensor((cores * rows, cols), "float32"),
-        C: T.Tensor((cores * rows, cols), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a_ub = T.alloc_shared((rows, cols), "float32")
-            b_ub = T.alloc_shared((rows, cols), "float32")
-            c_ub = T.alloc_shared((rows, cols), "float32")
-            base_r = bx * rows
-            T.copy(A[base_r : base_r + rows, 0:cols], a_ub)
-            T.copy(B[base_r : base_r + rows, 0:cols], b_ub)
-            with T.SimdVF():
-                mask = T.simd.pset(32)
-                for r in T.serial(rows):
-                    for k in range(cols // 64):
-                        va = T.simd.vld(a_ub[r, k * 64])
-                        vb = T.simd.vld(b_ub[r, k * 64])
-                        T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)
-            T.copy(c_ub, C[base_r : base_r + rows, 0:cols])
-    return main
-"""
-        opt = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    cores = {mix_cores}
-    rows = {rows}
-    half_rows = {half_rows}
-    cols = {cols}
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((cores * rows, cols), "float32"),
-        B: T.Tensor((cores * rows, cols), "float32"),
-        C: T.Tensor((cores * rows, cols), "float32"),
-    ):
-        with T.MixedKernel(cores) as (bx, sid):
-            a_ub = T.alloc_shared((half_rows, cols), "float32")
-            b_ub = T.alloc_shared((half_rows, cols), "float32")
-            c_ub = T.alloc_shared((half_rows, cols), "float32")
-            row_off = bx * rows + sid * half_rows
-            T.copy(A[row_off : row_off + half_rows, 0:cols], a_ub)
-            T.copy(B[row_off : row_off + half_rows, 0:cols], b_ub)
-            with T.SimdVF():
-                mask = T.simd.pset(32)
-                for r in T.serial(half_rows):
-                    for k in range(cols // 64):
-                        va = T.simd.vld(a_ub[r, k * 64])
-                        vb = T.simd.vld(b_ub[r, k * 64])
-                        T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)
-            T.copy(c_ub, C[row_off : row_off + half_rows, 0:cols])
-    return main
-"""
-        return base, opt, (mix_cores * rows, cols), dtype
+        def _dvf(rv: str) -> list[str]:
+            return ["with T.SimdVF():", "    mask = T.simd.pset(32)", f"    for r in T.serial({rv}):",
+                    "        for k in range(cols // 64):", "            va = T.simd.vld(a_ub[r, k * 64])",
+                    "            vb = T.simd.vld(b_ub[r, k * 64])", "            T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)"]
+        vp = _vec_params("(cores * rows, cols)")
+        base = _wrap_probe([f"cores = {mix_cores}", "rows = 16", "cols = 128"], vp, "T.Kernel(cores) as bx", [
+            *_alloc_abc("(rows, cols)"), "base_r = bx * rows", "T.copy(A[base_r : base_r + rows, 0:cols], a_ub)",
+            "T.copy(B[base_r : base_r + rows, 0:cols], b_ub)", *_dvf("rows"), "T.copy(c_ub, C[base_r : base_r + rows, 0:cols])"])
+        opt = _wrap_probe([f"cores = {mix_cores}", "rows = 16", "half_rows = 8", "cols = 128"], vp, "T.MixedKernel(cores) as (bx, sid)", [
+            *_alloc_abc("(half_rows, cols)"), "row_off = bx * rows + sid * half_rows",
+            "T.copy(A[row_off : row_off + half_rows, 0:cols], a_ub)", "T.copy(B[row_off : row_off + half_rows, 0:cols], b_ub)",
+            *_dvf("half_rows"), "T.copy(c_ub, C[row_off : row_off + half_rows, 0:cols])"])
+        return base, opt, (mix_cores * 16, 128), dtype
 
     if probe_kind == "pad_alignment":
-        rows = 8
-        steps = 4
-        base = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    cores = {mix_cores}
-    rows = {rows}
-    cols = 70
-    steps = {steps}
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((cores * steps * rows, cols), "float32"),
-        B: T.Tensor((cores * steps * rows, cols), "float32"),
-        C: T.Tensor((cores * steps * rows, cols), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a_ub = T.alloc_shared((rows, cols), "float32")
-            b_ub = T.alloc_shared((rows, cols), "float32")
-            c_ub = T.alloc_shared((rows, cols), "float32")
-            for s in T.serial(steps):
-                r0 = (bx * steps + s) * rows
-                T.copy(A[r0 : r0 + rows, 0:cols], a_ub)
-                T.copy(B[r0 : r0 + rows, 0:cols], b_ub)
-                with T.SimdVF():
-                    mask = T.simd.pset(32)
-                    for r in T.serial(rows):
-                        va = T.simd.vld(a_ub[r, 0])
-                        vb = T.simd.vld(b_ub[r, 0])
-                        T.simd.vsts(c_ub[r, 0], T.simd.vadd(va, vb, mask), mask)
-                T.copy(c_ub, C[r0 : r0 + rows, 0:cols])
-    return main
-"""
-        opt = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    cores = {mix_cores}
-    rows = {rows}
-    cols = 128
-    steps = {steps}
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((cores * steps * rows, cols), "float32"),
-        B: T.Tensor((cores * steps * rows, cols), "float32"),
-        C: T.Tensor((cores * steps * rows, cols), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a_ub = T.alloc_shared((rows, cols), "float32")
-            b_ub = T.alloc_shared((rows, cols), "float32")
-            c_ub = T.alloc_shared((rows, cols), "float32")
-            for s in T.Pipelined(steps, num_stages={stages}):
-                r0 = (bx * steps + s) * rows
-                T.copy(A[r0 : r0 + rows, 0:cols], a_ub)
-                T.copy(B[r0 : r0 + rows, 0:cols], b_ub)
-                with T.SimdVF():
-                    mask = T.simd.pset(32)
-                    for r in T.serial(rows):
-                        for k in range(2):
-                            va = T.simd.vld(a_ub[r, k * 64])
-                            vb = T.simd.vld(b_ub[r, k * 64])
-                            T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)
-                T.copy(c_ub, C[r0 : r0 + rows, 0:cols])
-    return main
-"""
-        return base, opt, (mix_cores * steps * rows, 128), dtype
+        vp = _vec_params("(cores * steps * rows, cols)")
+        base = _wrap_probe([f"cores = {mix_cores}", "rows = 8", "cols = 70", "steps = 4"], vp, "T.Kernel(cores) as bx", [
+            *_alloc_abc("(rows, cols)"), "for s in T.serial(steps):", "    r0 = (bx * steps + s) * rows",
+            "    T.copy(A[r0 : r0 + rows, 0:cols], a_ub)", "    T.copy(B[r0 : r0 + rows, 0:cols], b_ub)",
+            *_simd_vadd("a_ub[r, 0]", "b_ub[r, 0]", "c_ub[r, 0]", loop="r", count="T.serial(rows)", pad="    "),
+            "    T.copy(c_ub, C[r0 : r0 + rows, 0:cols])"])
+        opt = _wrap_probe([f"cores = {mix_cores}", "rows = 8", "cols = 128", "steps = 4"], vp, "T.Kernel(cores) as bx", [
+            *_alloc_abc("(rows, cols)"), f"for s in T.Pipelined(steps, num_stages={stages}):", "    r0 = (bx * steps + s) * rows",
+            "    T.copy(A[r0 : r0 + rows, 0:cols], a_ub)", "    T.copy(B[r0 : r0 + rows, 0:cols], b_ub)",
+            "    with T.SimdVF():", "        mask = T.simd.pset(32)", "        for r in T.serial(rows):", "            for k in range(2):",
+            "                va = T.simd.vld(a_ub[r, k * 64])", "                vb = T.simd.vld(b_ub[r, k * 64])",
+            "                T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)",
+            "    T.copy(c_ub, C[r0 : r0 + rows, 0:cols])"])
+        return base, opt, (mix_cores * 32, 128), dtype
 
     if probe_kind == "static_pingpong_unroll":
-        steps = 16
-        base = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    tile = {tile}
-    steps = {steps}
-    cores = {mix_cores}
-    total = cores * steps * tile
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((total,), "float32"),
-        B: T.Tensor((total,), "float32"),
-        C: T.Tensor((total,), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a_ub = T.alloc_shared((tile,), "float32")
-            b_ub = T.alloc_shared((tile,), "float32")
-            c_ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({{a_ub: 2, b_ub: 2, c_ub: 2}})
-            for s in T.Pipelined(steps, num_stages=2, annotations={{"enable_offset": True}}):
-                off = (s * cores + bx) * tile
-                T.copy(A[off : off + tile], a_ub)
-                T.copy(B[off : off + tile], b_ub)
-                with T.SimdVF():
-                    mask = T.simd.pset(32)
-                    for i in range(tile // 64):
-                        va = T.simd.vld(a_ub[i * 64])
-                        vb = T.simd.vld(b_ub[i * 64])
-                        T.simd.vsts(c_ub[i * 64], T.simd.vadd(va, vb, mask), mask)
-                T.copy(c_ub, C[off : off + tile])
-    return main
-"""
-        opt = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    tile = {tile}
-    pairs = {steps // 2}
-    cores = {mix_cores}
-    total = cores * pairs * 2 * tile
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((total,), "float32"),
-        B: T.Tensor((total,), "float32"),
-        C: T.Tensor((total,), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            a0 = T.alloc_shared((tile,), "float32")
-            a1 = T.alloc_shared((tile,), "float32")
-            b0 = T.alloc_shared((tile,), "float32")
-            b1 = T.alloc_shared((tile,), "float32")
-            c0 = T.alloc_shared((tile,), "float32")
-            c1 = T.alloc_shared((tile,), "float32")
-            for s in T.serial(pairs):
-                off0 = (s * 2 * cores + bx) * tile
-                off1 = ((s * 2 + 1) * cores + bx) * tile
-                T.copy(A[off0 : off0 + tile], a0)
-                T.copy(B[off0 : off0 + tile], b0)
-                T.copy(A[off1 : off1 + tile], a1)
-                T.copy(B[off1 : off1 + tile], b1)
-                with T.SimdVF():
-                    mask = T.simd.pset(32)
-                    for i in range(tile // 64):
-                        T.simd.vsts(c0[i * 64], T.simd.vadd(T.simd.vld(a0[i * 64]), T.simd.vld(b0[i * 64]), mask), mask)
-                        T.simd.vsts(c1[i * 64], T.simd.vadd(T.simd.vld(a1[i * 64]), T.simd.vld(b1[i * 64]), mask), mask)
-                T.copy(c0, C[off0 : off0 + tile])
-                T.copy(c1, C[off1 : off1 + tile])
-    return main
-"""
-        return base, opt, (mix_cores * steps * tile,), "float32"
+        base = _wrap_probe(
+            [f"tile = {tile}", "steps = 16", f"cores = {mix_cores}", "total = cores * steps * tile"],
+            _vec_params("(total,)"), "T.Kernel(cores) as bx",
+            [*_alloc_abc("(tile,)", stages=2), 'for s in T.Pipelined(steps, num_stages=2, annotations={"enable_offset": True}):',
+             "    off = (s * cores + bx) * tile", "    T.copy(A[off : off + tile], a_ub)", "    T.copy(B[off : off + tile], b_ub)",
+             *_simd_vadd("a_ub[i * 64]", "b_ub[i * 64]", "c_ub[i * 64]", loop="i", count="range(tile // 64)", pad="    "),
+             "    T.copy(c_ub, C[off : off + tile])"])
+        opt = _wrap_probe(
+            [f"tile = {tile}", "pairs = 8", f"cores = {mix_cores}", "total = cores * pairs * 2 * tile"],
+            _vec_params("(total,)"), "T.Kernel(cores) as bx",
+            [*[f'{n}{k} = T.alloc_shared((tile,), "float32")' for n in ("a", "b", "c") for k in (0, 1)],
+             "for s in T.serial(pairs):", "    off0 = (s * 2 * cores + bx) * tile", "    off1 = ((s * 2 + 1) * cores + bx) * tile",
+             "    T.copy(A[off0 : off0 + tile], a0)", "    T.copy(B[off0 : off0 + tile], b0)",
+             "    T.copy(A[off1 : off1 + tile], a1)", "    T.copy(B[off1 : off1 + tile], b1)",
+             "    with T.SimdVF():", "        mask = T.simd.pset(32)", "        for i in range(tile // 64):",
+             "            T.simd.vsts(c0[i * 64], T.simd.vadd(T.simd.vld(a0[i * 64]), T.simd.vld(b0[i * 64]), mask), mask)",
+             "            T.simd.vsts(c1[i * 64], T.simd.vadd(T.simd.vld(a1[i * 64]), T.simd.vld(b1[i * 64]), mask), mask)",
+             "    T.copy(c0, C[off0 : off0 + tile])", "    T.copy(c1, C[off1 : off1 + tile])"])
+        return base, opt, (mix_cores * 16 * tile,), "float32"
 
     if probe_kind == "loop_fission_sfu":
-        base = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    cores = {mix_cores}
-    rows = 4
-    cols = 64
-
-    @T.prim_func
-    def main(
-        Q: T.Tensor((cores * rows, cols), "float32"),
-        Out: T.Tensor((cores, cols), "float32"),
-        WOut: T.Tensor((cores * rows, 1), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            q_ub = T.alloc_shared((1, cols), "float32")
-            acc_ub = T.alloc_shared((rows, cols), "float32")
-            w_ub = T.alloc_shared((rows, 1), "float32")
-            for s in T.serial(rows):
-                T.copy(Q[bx * rows + s : bx * rows + s + 1, :], q_ub)
-                with T.SimdVF():
-                    m32 = T.simd.pset(32, "PAT_ALL")
-                    qv = T.simd.vld(q_ub[0, 0])
-                    sv = T.simd.vdupv(T.simd.vcadd(qv, mask=m32), mask=m32, pos="POS_LOWEST")
-                    ev = T.simd.vexp(sv, mask=m32)
-                    T.simd.vsts(w_ub[s, 0], ev, mask=m32, dist="ONEPT_B32")
-                    av = T.simd.vld(acc_ub[s, 0])
-                    T.simd.vsts(acc_ub[s, 0], T.simd.vadd(av, qv, mask=m32), mask=m32)
-            T.copy(acc_ub[0:1, :], Out[bx : bx + 1, :])
-            T.copy(w_ub, WOut[bx * rows : bx * rows + rows, :])
-    return main
-"""
-        opt = f"""import tilelang.ascend.language as T
-
-def make_flywheel_probe():
-    cores = {mix_cores}
-    rows = 4
-    cols = 64
-
-    @T.prim_func
-    def main(
-        Q: T.Tensor((cores * rows, cols), "float32"),
-        Out: T.Tensor((cores, cols), "float32"),
-        WOut: T.Tensor((cores * rows, 1), "float32"),
-    ):
-        with T.Kernel(cores) as bx:
-            q_ub = T.alloc_shared((1, cols), "float32")
-            acc_ub = T.alloc_shared((rows, cols), "float32")
-            exb = T.alloc_shared((rows, 1), "float32")
-            for s in T.serial(rows):
-                T.copy(Q[bx * rows + s : bx * rows + s + 1, :], q_ub)
-                with T.SimdVF():
-                    m32 = T.simd.pset(32, "PAT_ALL")
-                    qv = T.simd.vld(q_ub[0, 0])
-                    sv = T.simd.vdupv(T.simd.vcadd(qv, mask=m32), mask=m32, pos="POS_LOWEST")
-                    ev = T.simd.vexp(sv, mask=m32)
-                    T.simd.vsts(exb[s, 0], ev, mask=m32, dist="ONEPT_B32")
-            for s2 in T.serial(rows):
-                T.copy(Q[bx * rows + s2 : bx * rows + s2 + 1, :], q_ub)
-                with T.SimdVF():
-                    m32 = T.simd.pset(32, "PAT_ALL")
-                    qv = T.simd.vld(q_ub[0, 0])
-                    av = T.simd.vld(acc_ub[s2, 0])
-                    T.simd.vsts(acc_ub[s2, 0], T.simd.vadd(av, qv, mask=m32), mask=m32)
-            T.copy(acc_ub[0:1, :], Out[bx : bx + 1, :])
-            T.copy(exb, WOut[bx * rows : bx * rows + rows, :])
-    return main
-"""
+        sfu_pars = ['Q: T.Tensor((cores * rows, cols), "float32"),', 'Out: T.Tensor((cores, cols), "float32"),',
+                    'WOut: T.Tensor((cores * rows, 1), "float32"),']
+        sfu_vars = [f"cores = {mix_cores}", "rows = 4", "cols = 64"]
+        sfu_hdr = ['    with T.SimdVF():', '        m32 = T.simd.pset(32, "PAT_ALL")', "        qv = T.simd.vld(q_ub[0, 0])"]
+        exp_blk = ['        sv = T.simd.vdupv(T.simd.vcadd(qv, mask=m32), mask=m32, pos="POS_LOWEST")', "        ev = T.simd.vexp(sv, mask=m32)"]
+        base = _wrap_probe(sfu_vars, sfu_pars, "T.Kernel(cores) as bx", [
+            'q_ub = T.alloc_shared((1, cols), "float32")', 'acc_ub = T.alloc_shared((rows, cols), "float32")',
+            'w_ub = T.alloc_shared((rows, 1), "float32")', "for s in T.serial(rows):",
+            "    T.copy(Q[bx * rows + s : bx * rows + s + 1, :], q_ub)", *sfu_hdr, *exp_blk,
+            '        T.simd.vsts(w_ub[s, 0], ev, mask=m32, dist="ONEPT_B32")', "        av = T.simd.vld(acc_ub[s, 0])",
+            "        T.simd.vsts(acc_ub[s, 0], T.simd.vadd(av, qv, mask=m32), mask=m32)",
+            "T.copy(acc_ub[0:1, :], Out[bx : bx + 1, :])", "T.copy(w_ub, WOut[bx * rows : bx * rows + rows, :])"])
+        opt = _wrap_probe(sfu_vars, sfu_pars, "T.Kernel(cores) as bx", [
+            'q_ub = T.alloc_shared((1, cols), "float32")', 'acc_ub = T.alloc_shared((rows, cols), "float32")',
+            'exb = T.alloc_shared((rows, 1), "float32")', "for s in T.serial(rows):",
+            "    T.copy(Q[bx * rows + s : bx * rows + s + 1, :], q_ub)", *sfu_hdr, *exp_blk,
+            '        T.simd.vsts(exb[s, 0], ev, mask=m32, dist="ONEPT_B32")',
+            "for s2 in T.serial(rows):", "    T.copy(Q[bx * rows + s2 : bx * rows + s2 + 1, :], q_ub)", *sfu_hdr,
+            "        av = T.simd.vld(acc_ub[s2, 0])", "        T.simd.vsts(acc_ub[s2, 0], T.simd.vadd(av, qv, mask=m32), mask=m32)",
+            "T.copy(acc_ub[0:1, :], Out[bx : bx + 1, :])", "T.copy(exb, WOut[bx * rows : bx * rows + rows, :])"])
         return base, opt, (mix_cores * 4, 64), "float32"
 
     return None
 
 
-def synthesize_micro_probe(
-    chunk: AstEditChunk,
-    *,
-    probe_id: str | None = None,
-) -> MicroProbeSpec | None:
+def synthesize_micro_probe(chunk: AstEditChunk, *, probe_id: str | None = None) -> MicroProbeSpec | None:
     """Synthesize a standalone 30-50 line micro-probe, or None for unmapped edits."""
     if chunk.edit_kind not in _SUPPORTED_PROBE_KINDS:
         return None
-    params = _extract_probe_params(chunk)
-    rendered = _probe_templates_for_kind(chunk.edit_kind, params)
-    if rendered is None:
+    if (rendered := _probe_templates_for_kind(chunk.edit_kind, _extract_probe_params(chunk))) is None:
         return None
     base_src, opt_src, shape, dtype = rendered
-    pid = probe_id or f"probe_{chunk.edit_kind}_{chunk.chunk_id}"
     return MicroProbeSpec(
-        probe_id=pid,
-        probe_kind=chunk.edit_kind,
-        factory_name="make_flywheel_probe",
-        baseline_probe_source=base_src,
-        optimized_probe_source=opt_src,
+        probe_id=probe_id or f"probe_{chunk.edit_kind}_{chunk.chunk_id}", probe_kind=chunk.edit_kind,
+        factory_name="make_flywheel_probe", baseline_probe_source=base_src, optimized_probe_source=opt_src,
         line_count_baseline=len(base_src.strip().splitlines()),
         line_count_optimized=len(opt_src.strip().splitlines()),
-        tensor_shape=shape,
-        tensor_dtype=dtype,
+        tensor_shape=shape, tensor_dtype=dtype,
     )
 
 
+def _check_aiv_mte2_non_regression(base_m: float, opt_m: float, b_us: float, o_us: float, speedup: float) -> bool:
+    if base_m <= 0.0 or speedup >= 1.50:
+        return True
+    return not (opt_m > max(base_m * 1.15, base_m + 0.05) and opt_m * o_us > max(base_m * b_us * 1.15, base_m * b_us + 0.05 * b_us))
+
+
 def verify_micro_probe_hardware(
-    spec: MicroProbeSpec,
-    *,
-    probe_runner: Callable[[MicroProbeSpec], Mapping[str, float]] | None = None,
-    probe_port: HardwareProbePort | None = None,
-    sigma_paired_us: float | None = None,
+    spec: MicroProbeSpec, *, probe_runner: Callable[[MicroProbeSpec], Mapping[str, float]] | None = None,
+    probe_port: HardwareProbePort | None = None, sigma_paired_us: float | None = None,
     paired_rel_mad: float | None = None,
 ) -> tuple[bool, dict[str, float]]:
     """Verify micro-probe correctness, 3-sigma paired gain, and pipe wait ratios on NPU."""
     if probe_runner is not None:
         raw = dict(probe_runner(spec))
-        b_us = float(raw.get("baseline_dur_us", 0.0))
-        o_us = float(raw.get("optimized_dur_us", 0.0))
+        b_us, o_us = float(raw.get("baseline_dur_us", 0.0)), float(raw.get("optimized_dur_us", 0.0))
         speedup = float(raw.get("speedup", (b_us / o_us) if b_us > 0.0 and o_us > 0.0 else 0.0))
-        raw["speedup"] = speedup
-        raw_sigma = raw.get("sigma_paired_us")
-        raw_mad = raw.get("paired_rel_mad")
         eff_sigma = resolve_paired_sigma_us(
             b_us,
-            sigma_paired_us=float(raw_sigma) if raw_sigma is not None else sigma_paired_us,
-            paired_rel_mad=float(raw_mad) if raw_mad is not None else paired_rel_mad,
+            sigma_paired_us=float(raw["sigma_paired_us"]) if raw.get("sigma_paired_us") is not None else sigma_paired_us,
+            paired_rel_mad=float(raw["paired_rel_mad"]) if raw.get("paired_rel_mad") is not None else paired_rel_mad,
         )
         delta_us = b_us - o_us
-        raw["delta_us"] = delta_us
-        raw["sigma_paired_us"] = eff_sigma
-        sig_ok = (
-            b_us > 0.0
-            and o_us > 0.0
-            and is_paired_gain_significant(
-                delta_us,
-                sigma_paired_us=eff_sigma,
-                reference_us=b_us,
-                sigma_multiplier=3.0,
-            )
+        raw.update({"speedup": speedup, "delta_us": delta_us, "sigma_paired_us": eff_sigma})
+        sig_ok = b_us > 0.0 and o_us > 0.0 and is_paired_gain_significant(
+            delta_us, sigma_paired_us=eff_sigma, reference_us=b_us, sigma_multiplier=3.0
         )
         wait_ok = True
         if "baseline_mte2_wait_ratio" in raw and "optimized_mte2_wait_ratio" in raw:
-            base_w = float(raw["baseline_mte2_wait_ratio"])
-            opt_w = float(raw["optimized_mte2_wait_ratio"])
-            if opt_w > max(base_w * 1.05, base_w + 0.05):
-                wait_ok = False
+            bw, ow = float(raw["baseline_mte2_wait_ratio"]), float(raw["optimized_mte2_wait_ratio"])
+            wait_ok = ow <= max(bw * 1.05, bw + 0.05)
         if "baseline_aiv_mte2" in raw and "optimized_aiv_mte2" in raw:
-            base_m = float(raw["baseline_aiv_mte2"])
-            opt_m = float(raw["optimized_aiv_mte2"])
-            if base_m > 0.0 and speedup < 1.50:
-                base_abs = base_m * b_us
-                opt_abs = opt_m * o_us
-                if opt_m > max(base_m * 1.15, base_m + 0.05) and opt_abs > max(
-                    base_abs * 1.15, base_abs + 0.05 * b_us
-                ):
-                    wait_ok = False
-        passed = bool(raw.get("numerical_ok", True)) and sig_ok and wait_ok
-        return passed, raw
+            wait_ok = wait_ok and _check_aiv_mte2_non_regression(
+                float(raw["baseline_aiv_mte2"]), float(raw["optimized_aiv_mte2"]), b_us, o_us, speedup
+            )
+        return bool(raw.get("numerical_ok", True)) and sig_ok and wait_ok, raw
 
     import importlib.util  # noqa: PLC0415
     import tempfile  # noqa: PLC0415
@@ -2524,241 +1200,87 @@ def verify_micro_probe_hardware(
     import torch  # noqa: PLC0415
 
     if probe_port is None:
-        raise RuntimeError(
-            "HardwareProbePort is required for live micro-probe verification "
-            "when probe_runner is None."
-        )
+        raise RuntimeError("HardwareProbePort is required for live micro-probe verification when probe_runner is None.")
     probe_port.ensure_cann_include_cpath()
-
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         raise RuntimeError("Ascend NPU device is required for live micro-probe verification.")
 
     def _compile_and_time(src: str, tag: str, kind: str) -> tuple[float, dict[str, float]]:
         with tempfile.TemporaryDirectory(prefix=f"tf_probe_{tag}_") as tmp_dir:
-            mod_file = Path(tmp_dir) / "probe_mod.py"
-            mod_file.write_text(src, encoding="utf-8")
-            mod_spec = importlib.util.spec_from_file_location(f"_tf_probe_{tag}", str(mod_file))
-            assert mod_spec is not None and mod_spec.loader is not None
-            mod = importlib.util.module_from_spec(mod_spec)
-            mod_spec.loader.exec_module(mod)
-            prim_func = getattr(mod, spec.factory_name)()
-            kernel = tilelang.compile(prim_func, target="ascend", out_idx=-1)
-
+            mf = Path(tmp_dir) / "probe_mod.py"
+            mf.write_text(src, encoding="utf-8")
+            ms = importlib.util.spec_from_file_location(f"_tf_probe_{tag}", str(mf))
+            assert ms is not None and ms.loader is not None
+            mod = importlib.util.module_from_spec(ms)
+            ms.loader.exec_module(mod)
+            kernel = tilelang.compile(getattr(mod, spec.factory_name)(), target="ascend", out_idx=-1)
         torch.manual_seed(42)
         if kind == "ssbuf_handoff":
             rounds = spec.tensor_shape[0]
             seed = torch.zeros((16, 16), dtype=torch.float16).npu()
-            expected = torch.tensor(
-                [[(i + 1) * 100 + (((i + 1) * 101) << 32)] for i in range(rounds)],
-                dtype=torch.uint64,
-            )
-            if tag == "base":
-                scratch = torch.zeros((rounds, 2), dtype=torch.uint32).npu()
-                out = kernel(seed, scratch)
-                torch.npu.synchronize()
-                torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
-                prof = probe_port.run_msprof_detail(
-                    lambda: kernel(seed, scratch),
-                    n_warmup=3,
-                    n_repeat=6,
-                )
-            else:
-                out = kernel(seed)
-                torch.npu.synchronize()
-                torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
-                prof = probe_port.run_msprof_detail(
-                    lambda: kernel(seed),
-                    n_warmup=3,
-                    n_repeat=6,
-                )
+            expected = torch.tensor([[(i + 1) * 100 + (((i + 1) * 101) << 32)] for i in range(rounds)], dtype=torch.uint64)
+            args = (seed, torch.zeros((rounds, 2), dtype=torch.uint32).npu()) if tag == "base" else (seed,)
+            out = kernel(*args)
+            torch.npu.synchronize()
+            torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+            prof = probe_port.run_msprof_detail(lambda: kernel(*args), n_warmup=3, n_repeat=6)
         else:
-            run_shape = spec.tensor_shape
-            if kind == "pad_alignment" and tag == "base":
-                run_shape = (spec.tensor_shape[0], 70)
-            a = torch.randn(run_shape, dtype=torch.float32).npu()
-            b = torch.randn(run_shape, dtype=torch.float32).npu()
+            rshape = (spec.tensor_shape[0], 70) if (kind == "pad_alignment" and tag == "base") else spec.tensor_shape
+            a, b = torch.randn(rshape, dtype=torch.float32).npu(), torch.randn(rshape, dtype=torch.float32).npu()
             out = kernel(a, b)
             torch.npu.synchronize()
             torch.testing.assert_close(out.cpu(), a.cpu() + b.cpu(), atol=1e-4, rtol=1e-4)
-            prof = probe_port.run_msprof_detail(
-                lambda: kernel(a, b),
-                n_warmup=3,
-                n_repeat=6,
-            )
-        ratios = {
-            "aiv_mte2": float(getattr(prof, "aiv_mte2", 0.0)),
-            "aiv_vec": float(getattr(prof, "aiv_vec", 0.0)),
+            prof = probe_port.run_msprof_detail(lambda: kernel(a, b), n_warmup=3, n_repeat=6)
+        return float(prof.dur_us), {
+            "aiv_mte2": float(getattr(prof, "aiv_mte2", 0.0)), "aiv_vec": float(getattr(prof, "aiv_vec", 0.0)),
             "aic_fixpipe": float(getattr(prof, "aic_fixpipe", 0.0)),
         }
-        return float(prof.dur_us), ratios
 
-    b_us, b_ratios = _compile_and_time(spec.baseline_probe_source, "base", spec.probe_kind)
-    o_us, o_ratios = _compile_and_time(spec.optimized_probe_source, "opt", spec.probe_kind)
+    b_us, b_rat = _compile_and_time(spec.baseline_probe_source, "base", spec.probe_kind)
+    o_us, o_rat = _compile_and_time(spec.optimized_probe_source, "opt", spec.probe_kind)
     speedup = (b_us / o_us) if o_us > 0.0 else 0.0
-    wait_non_regression = True
-    if b_ratios["aiv_mte2"] > 0.0 and speedup < 1.50:
-        base_abs = b_ratios["aiv_mte2"] * b_us
-        opt_abs = o_ratios["aiv_mte2"] * o_us
-        if o_ratios["aiv_mte2"] > max(
-            b_ratios["aiv_mte2"] * 1.15, b_ratios["aiv_mte2"] + 0.05
-        ) and opt_abs > max(base_abs * 1.15, base_abs + 0.05 * b_us):
-            wait_non_regression = False
-    eff_sigma = resolve_paired_sigma_us(
-        b_us,
-        sigma_paired_us=sigma_paired_us,
-        paired_rel_mad=paired_rel_mad,
-    )
+    wait_ok = _check_aiv_mte2_non_regression(b_rat["aiv_mte2"], o_rat["aiv_mte2"], b_us, o_us, speedup)
+    eff_sigma = resolve_paired_sigma_us(b_us, sigma_paired_us=sigma_paired_us, paired_rel_mad=paired_rel_mad)
     delta_us = b_us - o_us
-    sig_ok = (
-        b_us > 0.0
-        and o_us > 0.0
-        and is_paired_gain_significant(
-            delta_us,
-            sigma_paired_us=eff_sigma,
-            reference_us=b_us,
-            sigma_multiplier=3.0,
-        )
+    sig_ok = b_us > 0.0 and o_us > 0.0 and is_paired_gain_significant(
+        delta_us, sigma_paired_us=eff_sigma, reference_us=b_us, sigma_multiplier=3.0
     )
     metrics = {
-        "baseline_dur_us": round(b_us, 6),
-        "optimized_dur_us": round(o_us, 6),
-        "delta_us": round(delta_us, 6),
-        "sigma_paired_us": round(eff_sigma, 6),
-        "speedup": round(speedup, 6),
-        "numerical_ok": 1.0,
-        "aiv_mte2": round(o_ratios["aiv_mte2"], 6),
-        "aiv_vec": round(o_ratios["aiv_vec"], 6),
-        "aic_fixpipe": round(o_ratios["aic_fixpipe"], 6),
-        "baseline_aiv_mte2": round(b_ratios["aiv_mte2"], 6),
-        "optimized_aiv_mte2": round(o_ratios["aiv_mte2"], 6),
+        "baseline_dur_us": round(b_us, 6), "optimized_dur_us": round(o_us, 6),
+        "delta_us": round(delta_us, 6), "sigma_paired_us": round(eff_sigma, 6),
+        "speedup": round(speedup, 6), "numerical_ok": 1.0,
+        "aiv_mte2": round(o_rat["aiv_mte2"], 6), "aiv_vec": round(o_rat["aiv_vec"], 6),
+        "aic_fixpipe": round(o_rat["aic_fixpipe"], 6),
+        "baseline_aiv_mte2": round(b_rat["aiv_mte2"], 6), "optimized_aiv_mte2": round(o_rat["aiv_mte2"], 6),
     }
-    return (sig_ok and wait_non_regression), metrics
+    return (sig_ok and wait_ok), metrics
 
 
-def _generalize_template_text(chunk: AstEditChunk) -> str:
-    if chunk.edit_kind == "core_parallelism":
-        return (
-            "Scale T.Kernel(block_count) grid dimensionality to saturate available hardware "
-            "blocks using contiguous per-block slicing and eliminate trailing PIPE_ALL barriers."
-        )
-    if chunk.edit_kind == "pipeline_versions":
-        return (
-            "Increase T.Pipelined num_stages to 2 and annotate on-chip buffer versions >= 2 "
-            "so DMA transfers overlap with compute stages while reserving compiler headroom."
-        )
-    if chunk.edit_kind == "coalesced_copy":
-        return (
-            "Coalesce strided inner row T.copy loops into contiguous 2D block DMA slices "
-            "to reduce MTE2 inflight queue pressure and improve burst efficiency."
-        )
-    if chunk.edit_kind == "ssbuf_handoff":
-        return (
-            "Replace global memory scalar barriers with 8B-aligned SSBUF T.alloc_ss slots "
-            "and explicit dirty-SRAM uint32 zero initialization before steady-state handoff."
-        )
-    if chunk.edit_kind == "dual_copy_1c2v":
-        return (
-            "Partition shared DMA workloads across independent dual-vector worker slices "
-            "with 1C2V swizzle scheduling to double concurrent MTE2 and vector throughput."
-        )
-    if chunk.edit_kind == "barrier_prune":
-        return (
-            "Eliminate redundant T.sync_all and T.set_flag barriers inside steady-state loops, "
-            "retaining only the minimal cross-pipe synchronization required by dependencies."
-        )
-    if chunk.edit_kind == "pad_alignment":
-        return (
-            "Pad inner buffer trailing dimensions to 32-byte and 512-byte bank-aligned strides "
-            "so DMA bursts avoid unaligned tail transactions and bank conflict stalls."
-        )
-    if chunk.edit_kind == "static_pingpong_unroll":
-        return (
-            "Replace dynamic-offset T.Pipelined loops with 2x-unrolled static ping-pong buffers "
-            "(buf_a, buf_b) and explicit prologue prefetch to eliminate pointer-alias serialization."
-        )
-    if chunk.edit_kind == "loop_fission_sfu":
-        return (
-            "Split coupled scalar reduction and SFU evaluation into Pass 1 before streaming wide "
-            "vector accumulation in Pass 2 so long SFU chains no longer serialize wide datapaths."
-        )
-    if chunk.edit_kind == "config_knob":
-        return (
-            "Tune schedule configuration dictionary parameters (tile shapes, buffer stages, "
-            "swizzle window, and bank padding) to maximize hardware pipeline occupancy without overflow."
-        )
-    if chunk.edit_kind == "cpp_hunk_edit":
-        return (
-            "Apply targeted tl_templates/ascend C++20 kernel optimizations across vector SIMD, "
-            "DMA alignment, and on-chip buffer staging while preserving exact synchronization parity."
-        )
-    return (
-        "Replace sequential or over-synchronized inner statements with non-blocking "
-        "pipelined vector and DMA execution while preserving static UB headroom."
-    )
-
-
-def _rule_predicates_for_kind(
-    chunk: AstEditChunk,
-    ledger: ObjectivePhysicalLedger | None,
-) -> tuple[str, str, str]:
-    if chunk.edit_kind == "core_parallelism":
-        return (
-            "is_legal and any_overflow_bytes == 0 and not has_indirect_gather",
-            "(wave_occupancy > 0.0 and wave_occupancy < 0.75) or PIPE_V > 0 or PIPE_MTE2 > 0",
-            "measured_latency_us < prev.measured_latency_us",
-        )
-    if chunk.edit_kind == "coalesced_copy":
-        return (
-            "is_legal and dominant_contig_bytes >= 64",
-            "mte2_inflight_per_aiv > 8 or PIPE_MTE2 > PIPE_M",
-            "mte2_inflight_per_aiv < prev.mte2_inflight_per_aiv and any_overflow_bytes == 0",
-        )
-    if chunk.edit_kind == "ssbuf_handoff":
-        return (
-            "is_legal and (has_dynamic_control or cube_to_vector_ratio >= 0.0)",
-            "unexplained_gap_ratio >= 0.15 or measured_sync_stall_ratio > 0.05",
-            "measured_sync_stall_ratio < prev.measured_sync_stall_ratio",
-        )
-    if chunk.edit_kind == "dual_copy_1c2v":
-        return (
-            "is_legal and (cube_to_vector_ratio > 0.0 or AIV0.PIPE_V > 0)",
-            "PIPE_MTE2 > 0 or PIPE_V > 0 or measured_mte2_wait_ratio > 0.1",
-            "any_overflow_bytes == 0 and measured_latency_us < prev.measured_latency_us",
-        )
-    if chunk.edit_kind == "barrier_prune":
-        return (
-            "is_legal and not has_dynamic_control",
-            "in_loop_pipe_all_barriers > 0 or measured_sync_stall_ratio > 0.05 or PIPE_V > 0",
-            "in_loop_pipe_all_barriers < prev.in_loop_pipe_all_barriers and any_overflow_bytes == 0",
-        )
-    if chunk.edit_kind == "pad_alignment":
-        return (
-            "is_legal and dominant_contig_bytes >= 16",
-            "unaligned_dma_padding_bytes > 0 or PIPE_MTE2 > 0 or PIPE_V > 0",
-            "unaligned_dma_padding_bytes < prev.unaligned_dma_padding_bytes "
-            "and any_overflow_bytes == 0",
-        )
-    if chunk.edit_kind == "static_pingpong_unroll":
-        return (
-            "is_legal and (uses_dynamic_offset_pipelining or pseudo_double_buffer_serialized)",
-            "pseudo_double_buffer_serialized or measured_mte2_wait_ratio >= 0.32",
-            "not uses_dynamic_offset_pipelining and any_overflow_bytes == 0",
-        )
-    if chunk.edit_kind == "loop_fission_sfu":
-        return (
-            "is_legal and PIPE_M == 0 and has_coupled_reduce_sfu_accum",
-            "has_coupled_reduce_sfu_accum or measured_aiv_vec_ratio >= 0.35",
-            "not has_coupled_reduce_sfu_accum and any_overflow_bytes == 0",
-        )
-    dom = ledger.dominant_pipe if ledger is not None else "AIV0.PIPE_V"
-    _ = dom
-    return (
-        "is_legal and any_overflow_bytes == 0",
-        "degraded_buffer_count > 0 and (PIPE_V > 0 or PIPE_MTE2 > 0)",
-        "degraded_buffer_count < prev.degraded_buffer_count and any_overflow_bytes == 0",
-    )
-
-
+_TEMPLATE_TEXT_BY_KIND: dict[str, str] = {
+    "core_parallelism": "Scale T.Kernel(block_count) grid dimensionality to saturate available hardware blocks using contiguous per-block slicing and eliminate trailing PIPE_ALL barriers.",
+    "pipeline_versions": "Increase T.Pipelined num_stages to 2 and annotate on-chip buffer versions >= 2 so DMA transfers overlap with compute stages while reserving compiler headroom.",
+    "coalesced_copy": "Coalesce strided inner row T.copy loops into contiguous 2D block DMA slices to reduce MTE2 inflight queue pressure and improve burst efficiency.",
+    "ssbuf_handoff": "Replace global memory scalar barriers with 8B-aligned SSBUF T.alloc_ss slots and explicit dirty-SRAM uint32 zero initialization before steady-state handoff.",
+    "dual_copy_1c2v": "Partition shared DMA workloads across independent dual-vector worker slices with 1C2V swizzle scheduling to double concurrent MTE2 and vector throughput.",
+    "barrier_prune": "Eliminate redundant T.sync_all and T.set_flag barriers inside steady-state loops, retaining only the minimal cross-pipe synchronization required by dependencies.",
+    "pad_alignment": "Pad inner buffer trailing dimensions to 32-byte and 512-byte bank-aligned strides so DMA bursts avoid unaligned tail transactions and bank conflict stalls.",
+    "static_pingpong_unroll": "Replace dynamic-offset T.Pipelined loops with 2x-unrolled static ping-pong buffers (buf_a, buf_b) and explicit prologue prefetch to eliminate pointer-alias serialization.",
+    "loop_fission_sfu": "Split coupled scalar reduction and SFU evaluation into Pass 1 before streaming wide vector accumulation in Pass 2 so long SFU chains no longer serialize wide datapaths.",
+    "config_knob": "Tune schedule configuration dictionary parameters (tile shapes, buffer stages, swizzle window, and bank padding) to maximize hardware pipeline occupancy without overflow.",
+    "cpp_hunk_edit": "Apply targeted tl_templates/ascend C++20 kernel optimizations across vector SIMD, DMA alignment, and on-chip buffer staging while preserving exact synchronization parity.",
+}
+_DEFAULT_TEMPLATE_TEXT = "Replace sequential or over-synchronized inner statements with non-blocking pipelined vector and DMA execution while preserving static UB headroom."
+_RULE_PREDICATES_BY_KIND: dict[str, tuple[str, str, str]] = {
+    "core_parallelism": ("is_legal and any_overflow_bytes == 0 and not has_indirect_gather", "(wave_occupancy > 0.0 and wave_occupancy < 0.75) or PIPE_V > 0 or PIPE_MTE2 > 0", "measured_latency_us < prev.measured_latency_us"),
+    "coalesced_copy": ("is_legal and dominant_contig_bytes >= 64", "mte2_inflight_per_aiv > 8 or PIPE_MTE2 > PIPE_M", "mte2_inflight_per_aiv < prev.mte2_inflight_per_aiv and any_overflow_bytes == 0"),
+    "ssbuf_handoff": ("is_legal and (has_dynamic_control or cube_to_vector_ratio >= 0.0)", "unexplained_gap_ratio >= 0.15 or measured_sync_stall_ratio > 0.05", "measured_sync_stall_ratio < prev.measured_sync_stall_ratio"),
+    "dual_copy_1c2v": ("is_legal and (cube_to_vector_ratio > 0.0 or AIV0.PIPE_V > 0)", "PIPE_MTE2 > 0 or PIPE_V > 0 or measured_mte2_wait_ratio > 0.1", "any_overflow_bytes == 0 and measured_latency_us < prev.measured_latency_us"),
+    "barrier_prune": ("is_legal and not has_dynamic_control", "in_loop_pipe_all_barriers > 0 or measured_sync_stall_ratio > 0.05 or PIPE_V > 0", "in_loop_pipe_all_barriers < prev.in_loop_pipe_all_barriers and any_overflow_bytes == 0"),
+    "pad_alignment": ("is_legal and dominant_contig_bytes >= 16", "unaligned_dma_padding_bytes > 0 or PIPE_MTE2 > 0 or PIPE_V > 0", "unaligned_dma_padding_bytes < prev.unaligned_dma_padding_bytes and any_overflow_bytes == 0"),
+    "static_pingpong_unroll": ("is_legal and (uses_dynamic_offset_pipelining or pseudo_double_buffer_serialized)", "pseudo_double_buffer_serialized or measured_mte2_wait_ratio >= 0.32", "not uses_dynamic_offset_pipelining and any_overflow_bytes == 0"),
+    "loop_fission_sfu": ("is_legal and PIPE_M == 0 and has_coupled_reduce_sfu_accum", "has_coupled_reduce_sfu_accum or measured_aiv_vec_ratio >= 0.35", "not has_coupled_reduce_sfu_accum and any_overflow_bytes == 0"),
+}
+_DEFAULT_RULE_PREDICATES = ("is_legal and any_overflow_bytes == 0", "degraded_buffer_count > 0 and (PIPE_V > 0 or PIPE_MTE2 > 0)", "degraded_buffer_count < prev.degraded_buffer_count and any_overflow_bytes == 0")
 _EDIT_KIND_TO_SYMPTOM_FAMILY: dict[str, SymptomFamily] = {
     "core_parallelism": SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL,
     "pipeline_versions": SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER,
@@ -2770,28 +1292,26 @@ _EDIT_KIND_TO_SYMPTOM_FAMILY: dict[str, SymptomFamily] = {
     "static_pingpong_unroll": SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER,
     "loop_fission_sfu": SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED,
 }
+_ANTI_PRECONDITION_BY_KIND: dict[str, str] = {
+    "core_parallelism": "any_overflow_bytes > 0 or spill_bytes > 0 or has_indirect_gather",
+    "barrier_prune": "any_overflow_bytes > 0 or has_dynamic_control",
+}
 
 
 def _infer_symptom_family(
-    chunk: AstEditChunk,
-    ledger: ObjectivePhysicalLedger | None,
-    active_symptom_family: str = "",
+    chunk: AstEditChunk, ledger: ObjectivePhysicalLedger | None, active_symptom_family: str = ""
 ) -> str:
-    cleaned = str(active_symptom_family or "").strip()
-    if cleaned:
+    if (cleaned := str(active_symptom_family or "").strip()):
         try:
             return SymptomFamily(cleaned).value
         except ValueError:
             pass
-    mapped = _EDIT_KIND_TO_SYMPTOM_FAMILY.get(chunk.edit_kind)
-    if mapped is not None:
+    if (mapped := _EDIT_KIND_TO_SYMPTOM_FAMILY.get(chunk.edit_kind)) is not None:
         return mapped.value
     if ledger is not None:
         if ledger.in_loop_pipe_all_barriers > 0:
             return SymptomFamily.SYNC_BARRIER_SERIALIZATION.value
-        if any(wl.degraded_single_buffers for wl in ledger.waterlines.values()) or (
-            ledger.uses_dynamic_offset_pipelining
-        ):
+        if any(wl.degraded_single_buffers for wl in ledger.waterlines.values()) or ledger.uses_dynamic_offset_pipelining:
             return SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER.value
         if ledger.dma_burst_efficiency_ratio < 0.7:
             return SymptomFamily.DMA_UNALIGNED_SHORT_BURST.value
@@ -2800,27 +1320,11 @@ def _infer_symptom_family(
     return SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT.value
 
 
-def _anti_precondition_for_kind(chunk: AstEditChunk) -> str:
-    if chunk.edit_kind == "core_parallelism":
-        return "any_overflow_bytes > 0 or spill_bytes > 0 or has_indirect_gather"
-    if chunk.edit_kind == "barrier_prune":
-        return "any_overflow_bytes > 0 or has_dynamic_control"
-    return "any_overflow_bytes > 0 or spill_bytes > 0"
-
-
 _CANONICAL_FREEDOM_FACETS: frozenset[str] = frozenset(VALID_FREEDOM_FACETS)
-_TRACKB_TOPOLOGY_TOKENS: frozenset[str] = frozenset(
-    {
-        "cce_cpp20",
-        "ascendc_trackb",
-        "hybrid_trackb",
-        "cce_trackb",
-        "ascendc_template",
-        "ascendc",
-        "hybrid",
-        "tl_templates_cpp20",
-    }
-)
+_TRACKB_TOPOLOGY_TOKENS: frozenset[str] = frozenset({
+    "cce_cpp20", "ascendc_trackb", "hybrid_trackb", "cce_trackb",
+    "ascendc_template", "ascendc", "hybrid", "tl_templates_cpp20",
+})
 
 
 def _extract_rule_facets(rule: AscendCausalRule) -> tuple[str, ...]:
@@ -2828,11 +1332,8 @@ def _extract_rule_facets(rule: AscendCausalRule) -> tuple[str, ...]:
     if raw_facets is not None:
         if isinstance(raw_facets, str):
             return tuple(f.strip() for f in raw_facets.split(",") if f.strip())
-        if isinstance(raw_facets, Iterable):
-            return tuple(str(f).strip() for f in raw_facets if str(f).strip())
-        return ()
-    family_name = str(getattr(rule, "symptom_family", "") or "").strip()
-    if family_name:
+        return tuple(str(f).strip() for f in raw_facets if str(f).strip()) if isinstance(raw_facets, Iterable) else ()
+    if (family_name := str(getattr(rule, "symptom_family", "") or "").strip()):
         try:
             return SYMPTOM_FAMILY_TO_FACETS.get(SymptomFamily(family_name), ())
         except ValueError:
@@ -2841,57 +1342,39 @@ def _extract_rule_facets(rule: AscendCausalRule) -> tuple[str, ...]:
 
 
 def _rule_covers_trackb(rule: AscendCausalRule) -> bool:
-    tokens: list[str] = []
-    for raw in getattr(rule, "compatible_backends", ()) or ():
-        tokens.append(str(raw).strip())
+    tokens = [str(raw).strip() for raw in getattr(rule, "compatible_backends", ()) or ()]
     app_topos = getattr(rule, "applicable_topologies", None)
     if isinstance(app_topos, str):
         tokens.extend(t.strip() for t in app_topos.split(",") if t.strip())
     elif isinstance(app_topos, Iterable):
         tokens.extend(str(t).strip() for t in app_topos if str(t).strip())
-    for tok in tokens:
-        low = tok.lower()
-        norm = normalize_runtime_backend(low) or low
-        if low in _TRACKB_TOPOLOGY_TOKENS or norm in _TRACKB_TOPOLOGY_TOKENS:
-            return True
-    return False
+    return any(
+        t.lower() in _TRACKB_TOPOLOGY_TOKENS or (normalize_runtime_backend(t.lower()) or t.lower()) in _TRACKB_TOPOLOGY_TOKENS
+        for t in tokens
+    )
 
 
 def _is_zero_literal(node: ast.AST) -> bool:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return not isinstance(node.value, bool) and float(node.value) == 0.0
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        return _is_zero_literal(node.operand)
-    return False
+    return isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)) and _is_zero_literal(node.operand)
 
 
 def _has_tautological_ge_zero(tree: ast.AST) -> bool:
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare):
-            continue
-        left = node.left
-        for op, right in zip(node.ops, node.comparators):
-            if isinstance(op, ast.GtE) and _is_zero_literal(right):
-                return True
-            if isinstance(op, ast.LtE) and _is_zero_literal(left):
-                return True
-            left = right
+        if isinstance(node, ast.Compare):
+            left = node.left
+            for op, right in zip(node.ops, node.comparators):
+                if (isinstance(op, ast.GtE) and _is_zero_literal(right)) or (isinstance(op, ast.LtE) and _is_zero_literal(left)):
+                    return True
+                left = right
     return False
 
 
-_IDEAL_UNIT_EFFICIENCY_NAMES = frozenset(
-    {
-        "effective_compute_eta",
-        "roofline_eta",
-        "dma_burst_efficiency_ratio",
-        "contig_atom_ratio",
-        "wave_occupancy",
-        "wave_occupancy_ratio",
-        "l2_hit_rate",
-        "cube_util_ratio",
-        "vec_util_ratio",
-    }
-)
+_IDEAL_UNIT_EFFICIENCY_NAMES = frozenset({
+    "effective_compute_eta", "roofline_eta", "dma_burst_efficiency_ratio", "contig_atom_ratio",
+    "wave_occupancy", "wave_occupancy_ratio", "l2_hit_rate", "cube_util_ratio", "vec_util_ratio",
+})
 _IDEAL_CONTIG_BYTE_NAMES = frozenset({"dominant_contig_bytes", "inner_contiguous_bytes"})
 _IDEAL_BOOL_TRUE_NAMES = frozenset({"is_legal", "vloopv2_hit", "is_atom_aligned"})
 
@@ -2902,14 +1385,12 @@ def _ideal_default_for_symbol(symbol: str) -> object:
         return True
     if leaf in _IDEAL_UNIT_EFFICIENCY_NAMES:
         return 1.0
-    if leaf in _IDEAL_CONTIG_BYTE_NAMES:
-        return 32768
-    return 0
+    return 32768 if leaf in _IDEAL_CONTIG_BYTE_NAMES else 0
 
 
 def _build_zero_ideal_env(tree: ast.AST) -> dict[str, object]:
     env: dict[str, object] = {"is_legal": True, "vloopv2_hit": True, "is_atom_aligned": True}
-    skip_names = frozenset({"True", "False", "None", "abs", "min", "max"})
+    skip = frozenset({"True", "False", "None", "abs", "min", "max"})
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
             parts: list[str] = []
@@ -2918,58 +1399,36 @@ def _build_zero_ideal_env(tree: ast.AST) -> dict[str, object]:
                 parts.append(cur.attr)
                 cur = cur.value
             if isinstance(cur, ast.Name):
-                parts.append(cur.id)
-                dotted = ".".join(reversed(parts))
-                if dotted not in env:
-                    env[dotted] = _ideal_default_for_symbol(dotted)
-        elif isinstance(node, ast.Name) and node.id not in skip_names:
-            if node.id not in env:
-                env[node.id] = _ideal_default_for_symbol(node.id)
+                dotted = ".".join(reversed([*parts, cur.id]))
+                env.setdefault(dotted, _ideal_default_for_symbol(dotted))
+        elif isinstance(node, ast.Name) and node.id not in skip:
+            env.setdefault(node.id, _ideal_default_for_symbol(node.id))
     return env
 
 
 def _node_references_prev(node: ast.AST) -> bool:
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
-            if sub.value.id == "prev":
-                return True
-    return False
+    return any(isinstance(s, ast.Attribute) and isinstance(s.value, ast.Name) and s.value.id == "prev" for s in ast.walk(node))
 
 
 def _validate_postcondition_strictness(tree: ast.AST) -> tuple[bool, str]:
-    has_strict_improvement = False
+    has_strict = False
     for node in ast.walk(tree):
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-            has_strict_improvement = True
+            has_strict = True
         elif isinstance(node, ast.Compare):
             left = node.left
             for op, right in zip(node.ops, node.comparators):
                 if isinstance(op, (ast.Lt, ast.Gt)):
-                    has_strict_improvement = True
-                elif isinstance(op, (ast.LtE, ast.GtE)):
-                    if _node_references_prev(left) or _node_references_prev(right):
-                        return (
-                            False,
-                            "expected_postcondition uses non-strict <= or >= against prev",
-                        )
+                    has_strict = True
+                elif isinstance(op, (ast.LtE, ast.GtE)) and (_node_references_prev(left) or _node_references_prev(right)):
+                    return False, "expected_postcondition uses non-strict <= or >= against prev"
                 left = right
-    if not has_strict_improvement:
-        return (
-            False,
-            "expected_postcondition lacks strict improvement comparison (<, >, or not)",
-        )
-    return True, ""
+    return (True, "") if has_strict else (False, "expected_postcondition lacks strict improvement comparison (<, >, or not)")
 
 
-def _validate_distilled_rule(
-    rule: AscendCausalRule,
-    *,
-    operator_name: str = "",
-) -> tuple[bool, str]:
+def _validate_distilled_rule(rule: AscendCausalRule, *, operator_name: str = "") -> tuple[bool, str]:
     """Enforce provenance, closed AST vocabulary, Track-B template, and convergence gates."""
-    raw_fields = list(rule.as_six_tuple())
-    if rule.cpp20_transform_template:
-        raw_fields.append(rule.cpp20_transform_template)
+    raw_fields = list(rule.as_six_tuple()) + ([rule.cpp20_transform_template] if rule.cpp20_transform_template else [])
     joined = " ".join(raw_fields).lower()
     active_op = operator_name or str(getattr(rule, "origin_operator", "") or "")
     for bad in _build_disallowed_provenance_tokens(active_op):
@@ -2978,9 +1437,8 @@ def _validate_distilled_rule(
     for bad in _operator_name_variants(active_op):
         if len(bad) >= 4 and bad in joined:
             return False, f"disallowed token {bad!r} in distilled rule text"
-    for field_text in raw_fields:
-        if _GENERIC_PATH_PATTERN.search(field_text):
-            return False, "filesystem path leaked into rule text"
+    if any(_GENERIC_PATH_PATTERN.search(ft) for ft in raw_fields):
+        return False, "filesystem path leaked into rule text"
     try:
         validate_rule_predicate(rule.regime_guard)
         pre_tree = validate_rule_predicate(rule.precondition)
@@ -2988,113 +1446,62 @@ def _validate_distilled_rule(
         post_tree = validate_rule_predicate(rule.expected_postcondition)
     except Exception as exc:
         return False, f"invalid predicate: {exc}"
-
-    facets = _extract_rule_facets(rule)
-    if not facets:
+    if not (facets := _extract_rule_facets(rule)):
         return False, "missing or empty recommended_facets"
-    invalid_facets = [f for f in facets if f not in _CANONICAL_FREEDOM_FACETS]
-    if invalid_facets:
-        return False, f"invalid recommended_facets {invalid_facets!r}"
-
+    if (bad_facets := [f for f in facets if f not in _CANONICAL_FREEDOM_FACETS]):
+        return False, f"invalid recommended_facets {bad_facets!r}"
     if _rule_covers_trackb(rule) and not str(rule.cpp20_transform_template or "").strip():
         return False, "Track-B applicable rule requires non-empty cpp20_transform_template"
-
     if _has_tautological_ge_zero(pre_tree):
         return False, "precondition contains tautological >= 0 comparison"
-    zero_env = _build_zero_ideal_env(pre_tree)
-    if safe_eval_predicate(rule.precondition, zero_env):
+    if safe_eval_predicate(rule.precondition, _build_zero_ideal_env(pre_tree)):
         return False, "precondition is tautological on all-zero ideal residual vector"
-
     post_ok, post_err = _validate_postcondition_strictness(post_tree)
     if not post_ok:
         return False, post_err
-
-    for field_name, expr in (
-        ("precondition", rule.precondition),
-        ("anti_precondition", rule.anti_precondition),
-        ("expected_postcondition", rule.expected_postcondition),
-    ):
-        unknown_ids = _validate_schema_closed_identifiers(expr)
-        if unknown_ids:
-            return False, f"unknown schema identifier(s) {unknown_ids!r} in {field_name}"
+    for fname, expr in (("precondition", rule.precondition), ("anti_precondition", rule.anti_precondition), ("expected_postcondition", rule.expected_postcondition)):
+        if (unknown_ids := _validate_schema_closed_identifiers(expr)):
+            return False, f"unknown schema identifier(s) {unknown_ids!r} in {fname}"
     return True, ""
 
 
-def _is_rule_text_clean(
-    rule: AscendCausalRule,
-    *,
-    operator_name: str = "",
-) -> tuple[bool, str]:
-    return _validate_distilled_rule(rule, operator_name=operator_name)
+_is_rule_text_clean = _validate_distilled_rule
 
 
 def distill_causal_rule(
-    chunk: AstEditChunk,
-    *,
-    rule_id: str,
-    ledger: ObjectivePhysicalLedger | None = None,
-    probe: MicroProbeSpec | None = None,
-    probe_metrics: Mapping[str, float] | None = None,
-    scope: str = "cross_op",
-    origin_operator: str = "",
-    active_symptom_family: str = "",
+    chunk: AstEditChunk, *, rule_id: str, ledger: ObjectivePhysicalLedger | None = None,
+    probe: MicroProbeSpec | None = None, probe_metrics: Mapping[str, float] | None = None,
+    scope: str = "cross_op", origin_operator: str = "", active_symptom_family: str = "",
 ) -> AscendCausalRule:
     """Synthesize a pure-English 6-tuple AscendCausalRule from a verified AST edit."""
-    regime_guard, precondition, expected_post = _rule_predicates_for_kind(chunk, ledger)
-    anti_precondition = _anti_precondition_for_kind(chunk)
-    symptom_family = _infer_symptom_family(chunk, ledger, active_symptom_family)
-    template = _generalize_template_text(chunk)
+    _ = probe
+    regime_guard, precondition, expected_post = _RULE_PREDICATES_BY_KIND.get(chunk.edit_kind, _DEFAULT_RULE_PREDICATES)
+    template = _TEMPLATE_TEXT_BY_KIND.get(chunk.edit_kind, _DEFAULT_TEMPLATE_TEXT)
     speedup = float((probe_metrics or {}).get("speedup", 1.0))
-    rationale = (
-        f"Counterfactual single-variable ablation verified on Ascend 950 micro-probe "
-        f"({chunk.edit_kind}, speedup={speedup:.3f}x)."
+    is_cpp = (
+        chunk.chunk_id.startswith(("cpp_loo_", "trackb_tu_")) or chunk.edit_kind == "cpp_hunk_edit"
+        or "_render_trackb_tu" in chunk.target_path or "_trackb_launcher" in chunk.target_path
     )
-    is_cpp_chunk = (
-        chunk.chunk_id.startswith("cpp_loo_")
-        or chunk.chunk_id.startswith("trackb_tu_")
-        or chunk.edit_kind == "cpp_hunk_edit"
-        or "_render_trackb_tu" in chunk.target_path
-        or "_trackb_launcher" in chunk.target_path
-    )
-    backends: tuple[str, ...] = (
-        ("ascendc_trackb", "hybrid_trackb") if is_cpp_chunk else ("tilelang_dsl",)
-    )
-    cpp_template = template if is_cpp_chunk else ""
     return AscendCausalRule(
-        rule_id=rule_id,
-        regime_guard=regime_guard,
-        precondition=precondition,
-        transform_template=template,
-        expected_postcondition=expected_post,
-        source_provenance="flywheel:ablation",
-        alpha_prior=2.5,
-        beta_prior=1.0,
-        rationale=rationale,
-        priority=85,
-        scope=scope,
-        origin_operator=origin_operator,
-        compatible_backends=backends,
-        cpp20_transform_template=cpp_template,
-        symptom_family=symptom_family,
-        anti_precondition=anti_precondition,
+        rule_id=rule_id, regime_guard=regime_guard, precondition=precondition,
+        transform_template=template, expected_postcondition=expected_post,
+        source_provenance="flywheel:ablation", alpha_prior=2.5, beta_prior=1.0,
+        rationale=f"Counterfactual single-variable ablation verified on Ascend 950 micro-probe ({chunk.edit_kind}, speedup={speedup:.3f}x).",
+        priority=85, scope=scope, origin_operator=origin_operator,
+        compatible_backends=("ascendc_trackb", "hybrid_trackb") if is_cpp else ("tilelang_dsl",),
+        cpp20_transform_template=template if is_cpp else "",
+        symptom_family=_infer_symptom_family(chunk, ledger, active_symptom_family),
+        anti_precondition=_ANTI_PRECONDITION_BY_KIND.get(chunk.edit_kind, "any_overflow_bytes > 0 or spill_bytes > 0"),
     )
 
 
 def _ledger_cost_score(ledger: ObjectivePhysicalLedger) -> float:
     dom = float(max(ledger.pipe_cycles.values(), default=100))
-    occ = float(ledger.wave_occupancy)
-    if occ <= 0.0:
-        occ = float(min(56, max(1, int(ledger.grid_blocks)))) / 56.0
-    occ = max(0.02, occ)
+    occ = max(0.02, float(ledger.wave_occupancy) or (float(min(56, max(1, int(ledger.grid_blocks)))) / 56.0))
     burst = max(0.15, float(ledger.dma_burst_efficiency_ratio))
-    degraded_count = sum(len(wl.degraded_single_buffers) for wl in ledger.waterlines.values())
-    penalty = 1.0
-    penalty += 0.25 * max(0, degraded_count)
-    penalty += 0.15 * max(0, int(ledger.in_loop_pipe_all_barriers))
-    if ledger.uses_dynamic_offset_pipelining:
-        penalty += 0.12
-    if ledger.has_coupled_reduce_sfu_accum:
-        penalty += 0.12
+    degraded = sum(len(wl.degraded_single_buffers) for wl in ledger.waterlines.values())
+    penalty = 1.0 + 0.25 * max(0, degraded) + 0.15 * max(0, int(ledger.in_loop_pipe_all_barriers))
+    penalty += (0.12 if ledger.uses_dynamic_offset_pipelining else 0.0) + (0.12 if ledger.has_coupled_reduce_sfu_accum else 0.0)
     return (dom / occ / burst) * penalty
 
 
@@ -3102,556 +1509,237 @@ class FlywheelDistiller:
     """Decomposes winning DSL edits, ablates negatives, probes NPU, and admits rules."""
 
     def __init__(
-        self,
-        *,
-        funnel: GateFunnel,
-        tracker: BayesianRuleTracker,
+        self, *, funnel: GateFunnel, tracker: BayesianRuleTracker,
         probe_runner: Callable[[MicroProbeSpec], Mapping[str, float]] | None = None,
-        probe_port: HardwareProbePort | None = None,
-        sigma_paired_us: float | None = None,
+        probe_port: HardwareProbePort | None = None, sigma_paired_us: float | None = None,
         paired_rel_mad: float | None = None,
     ) -> None:
-        self._funnel = funnel
-        self._tracker = tracker
-        self._probe_runner = probe_runner
-        self._probe_port = probe_port
-        self._sigma_paired_us = sigma_paired_us
-        self._paired_rel_mad = paired_rel_mad
+        self._funnel, self._tracker = funnel, tracker
+        self._probe_runner, self._probe_port = probe_runner, probe_port
+        self._sigma_paired_us, self._paired_rel_mad = sigma_paired_us, paired_rel_mad
+
+    def _allocate_rule_id(self, prefix: str, edit_kind: str) -> str:
+        rule_num, suffix = len(self._tracker.rules) + 1, edit_kind.upper()
+        cand = f"{prefix}_{rule_num:02d}_{suffix}"
+        while cand in self._tracker.rules:
+            rule_num += 1
+            cand = f"{prefix}_{rule_num:02d}_{suffix}"
+        return cand
+
+    def _admit_distilled_rule(
+        self, meas: AblationMeasurement, *, rule_id_prefix: str, probe: MicroProbeSpec | None,
+        metrics: dict[str, float], rule_scope: str, operator_name: str, active_symptom_family: str,
+        topology_axes: object | None, outcomes: list[DistilledRuleOutcome], admitted_ids: list[str],
+    ) -> None:
+        rule = distill_causal_rule(
+            meas.chunk, rule_id=self._allocate_rule_id(rule_id_prefix, meas.chunk.edit_kind),
+            ledger=meas.stage_a_result.ledger if meas.stage_a_result else None,
+            probe=probe, probe_metrics=metrics, scope=rule_scope,
+            origin_operator=operator_name, active_symptom_family=active_symptom_family,
+        )
+        clean_ok, clean_err = _validate_distilled_rule(rule, operator_name=operator_name)
+        if not clean_ok:
+            outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, probe, True, metrics, rule, False, clean_err))
+            return
+        self._tracker.admit_rule(rule)
+        self._tracker.record_outcome(rule.rule_id, postcondition_realized=True,
+                                     speed_gain=max(0.0, meas.relative_gain), topology_axes=topology_axes)
+        admitted_ids.append(rule.rule_id)
+        outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, probe, True, metrics, rule, True))
+
+    def _run_distill(
+        self, chunks: Sequence[AstEditChunk], *, ref_dsl: str, ref_latency_us: float,
+        report_base_us: float, report_win_us: float, reverse: bool, factory_name: str | None,
+        factory_kwargs: Mapping[str, object] | None, config_selector_name: str | None,
+        dims: Mapping[str, object] | None, resolved_shapes: Sequence[tuple[int, ...]] | None,
+        batch_latency_evaluator: Callable[[Sequence[tuple[str, str]]], Mapping[str, float]] | None,
+        topology_axes: object | None, kb_output_path: str | Path | None, rule_id_prefix: str,
+        operator_name: str, rule_scope: str, active_symptom_family: str,
+        eff_sigma: float | None, eff_mad: float | None,
+    ) -> FlywheelDistillationReport:
+        ref_sa = run_stage_a_static(ref_dsl, factory_name=factory_name, factory_kwargs=factory_kwargs,
+                                    config_selector_name=config_selector_name, dims=dims, ordered_tensor_shapes=resolved_shapes)
+        ref_cost = _ledger_cost_score(ref_sa.ledger) if ref_sa.passed and ref_sa.ledger is not None else 0.0
+        funnel_results = [
+            (c, self._funnel.evaluate(c.ablated_dsl, factory_name=factory_name, factory_kwargs=factory_kwargs,
+                                      config_selector_name=config_selector_name, dims=dims, ordered_tensor_shapes=resolved_shapes))
+            for c in chunks
+        ]
+        batch_latencies: dict[str, float] = {}
+        if batch_latency_evaluator is not None:
+            targets: list[tuple[str, str]] = []
+            seen_b: set[str] = set()
+            for c, ev in funnel_results:
+                if not ev.passed or ev.stage_a is None or ev.stage_a.ledger is None:
+                    continue
+                if not reverse and (c.edit_kind not in _SUPPORTED_PROBE_KINDS or c.edit_kind in seen_b):
+                    continue
+                seen_b.add(c.edit_kind)
+                targets.append((c.chunk_id, c.ablated_dsl))
+                if not reverse and len(targets) >= 4:
+                    break
+            if targets:
+                batch_latencies = {str(k): float(v) for k, v in dict(batch_latency_evaluator(targets)).items() if float(v) > 0.0}
+
+        kept: list[AblationMeasurement] = []
+        discarded: list[AblationMeasurement] = []
+        ref_lat = max(ref_latency_us, 1e-6)
+        base_out = ref_lat if reverse else ref_latency_us
+        for c, ev in funnel_results:
+            if not ev.passed or ev.stage_a is None or ev.stage_a.ledger is None:
+                discarded.append(AblationMeasurement(c, False, base_out, 0.0, -1.0, False, ev.stage_a,
+                                                     f"{ev.failed_stage}:{ev.error_message[:120]}"))
+                continue
+            if c.chunk_id in batch_latencies:
+                var_lat = batch_latencies[c.chunk_id]
+            elif ev.stage_c and ev.stage_c.measured_latency_us > 0.0:
+                var_lat = ev.stage_c.measured_latency_us
+            elif ref_cost > 0.0:
+                var_lat = ref_lat * (_ledger_cost_score(ev.stage_a.ledger) / ref_cost)
+            else:
+                var_lat = float(max(ev.stage_a.ledger.pipe_cycles.values(), default=100)) / 20.0
+            delta_us = (var_lat - ref_lat) if reverse else (ref_lat - var_lat)
+            rel_gain = delta_us / (max(var_lat, 1e-6) if reverse else ref_lat)
+            is_pos = (var_lat > ref_lat if reverse else True) and is_paired_gain_significant(
+                delta_us, sigma_paired_us=eff_sigma, paired_rel_mad=eff_mad, reference_us=ref_lat, sigma_multiplier=2.0
+            )
+            diag = ("positive_loo_gain" if is_pos else "redundant_or_harmful_edit") if reverse else (
+                "positive_gain" if is_pos else "negative_or_zero_gain"
+            )
+            meas = AblationMeasurement(c, True, base_out, var_lat, rel_gain, is_pos, ev.stage_a, diag)
+            (kept if is_pos else discarded).append(meas)
+
+        outcomes: list[DistilledRuleOutcome] = []
+        admitted_ids: list[str] = []
+        seen_keys: set[object] = set()
+        for meas in kept:
+            dk: object = (meas.chunk.edit_kind, meas.chunk.target_path) if reverse else meas.chunk.edit_kind
+            if dk in seen_keys:
+                continue
+            seen_keys.add(dk)
+            if reverse:
+                speedup = meas.variant_latency_us / ref_lat if ref_lat > 0.0 else 1.0
+                probe, metrics = None, {
+                    "baseline_dur_us": round(meas.variant_latency_us, 6), "optimized_dur_us": round(ref_lat, 6),
+                    "speedup": round(speedup, 6), "numerical_ok": 1.0,
+                }
+            else:
+                if (probe := synthesize_micro_probe(meas.chunk)) is None:
+                    outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, None, False, {}, None, False,
+                                                         f"unverifiable_edit_kind:{meas.chunk.edit_kind}"))
+                    continue
+                ok, metrics = verify_micro_probe_hardware(
+                    probe, probe_runner=self._probe_runner, probe_port=self._probe_port,
+                    sigma_paired_us=eff_sigma, paired_rel_mad=eff_mad,
+                )
+                if not ok:
+                    outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, probe, False, metrics, None, False,
+                                                         "micro_probe_below_threshold_or_wait_regression"))
+                    continue
+            self._admit_distilled_rule(
+                meas, rule_id_prefix=rule_id_prefix, probe=probe, metrics=metrics, rule_scope=rule_scope,
+                operator_name=operator_name, active_symptom_family=active_symptom_family,
+                topology_axes=topology_axes, outcomes=outcomes, admitted_ids=admitted_ids,
+            )
+        if kb_output_path is not None:
+            save_rules_yaml(list(self._tracker.rules.values()), kb_output_path)
+        return FlywheelDistillationReport(
+            report_base_us, report_win_us, len(chunks), tuple(kept), tuple(discarded),
+            tuple(outcomes), tuple(admitted_ids),
+        )
 
     def distill_leave_one_out(
-        self,
-        *,
-        baseline_dsl: str,
-        winner_dsl: str,
-        winner_latency_us: float,
-        baseline_latency_us: float | None = None,
-        factory_name: str | None = None,
-        factory_kwargs: Mapping[str, object] | None = None,
-        config_selector_name: str | None = None,
+        self, *, baseline_dsl: str, winner_dsl: str, winner_latency_us: float,
+        baseline_latency_us: float | None = None, factory_name: str | None = None,
+        factory_kwargs: Mapping[str, object] | None = None, config_selector_name: str | None = None,
         dims: Mapping[str, object] | None = None,
         batch_latency_evaluator: Callable[[Sequence[tuple[str, str]]], Mapping[str, float]] | None = None,
-        topology_axes: object | None = None,
-        kb_output_path: str | Path | None = None,
-        rule_id_prefix: str = "R_FLYWHEEL_LOO",
-        max_loo_chunks: int | None = 3,
-        operator_name: str = "",
-        rule_scope: str = "operator_local",
-        active_symptom_family: str = "",
-        ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
-        sigma_paired_us: float | None = None,
-        paired_rel_mad: float | None = None,
+        topology_axes: object | None = None, kb_output_path: str | Path | None = None,
+        rule_id_prefix: str = "R_FLYWHEEL_LOO", max_loo_chunks: int | None = 3,
+        operator_name: str = "", rule_scope: str = "operator_local",
+        active_symptom_family: str = "", ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
+        sigma_paired_us: float | None = None, paired_rel_mad: float | None = None,
     ) -> FlywheelDistillationReport:
         """Run Leave-One-Out AST/config ablation directly on real candidate winner_dsl."""
-        eff_sigma_arg = self._sigma_paired_us if sigma_paired_us is None else sigma_paired_us
-        eff_mad_arg = self._paired_rel_mad if paired_rel_mad is None else paired_rel_mad
-        resolved_shapes = extract_ordered_tensor_shapes(
-            dims=dims,
-            ordered_tensor_shapes=ordered_tensor_shapes,
-        )
+        eff_sigma = self._sigma_paired_us if sigma_paired_us is None else sigma_paired_us
+        eff_mad = self._paired_rel_mad if paired_rel_mad is None else paired_rel_mad
+        resolved = extract_ordered_tensor_shapes(dims=dims, ordered_tensor_shapes=ordered_tensor_shapes)
         chunks = decompose_leave_one_out_ablations(baseline_dsl, winner_dsl)
         if max_loo_chunks is not None and int(max_loo_chunks) > 0:
             chunks = chunks[: int(max_loo_chunks)]
-        kept: list[AblationMeasurement] = []
-        discarded: list[AblationMeasurement] = []
-        outcomes: list[DistilledRuleOutcome] = []
-        admitted_ids: list[str] = []
-
-        win_sa = run_stage_a_static(
-            winner_dsl,
-            factory_name=factory_name,
-            factory_kwargs=factory_kwargs,
-            config_selector_name=config_selector_name,
-            dims=dims,
-            ordered_tensor_shapes=resolved_shapes,
-        )
-        win_cost = (
-            _ledger_cost_score(win_sa.ledger)
-            if win_sa.passed and win_sa.ledger is not None
-            else 0.0
-        )
-
-        funnel_results: list[tuple[AstEditChunk, object]] = []
-        for chunk in chunks:
-            eval_res = self._funnel.evaluate(
-                chunk.ablated_dsl,
-                factory_name=factory_name,
-                factory_kwargs=factory_kwargs,
-                config_selector_name=config_selector_name,
-                dims=dims,
-                ordered_tensor_shapes=resolved_shapes,
-            )
-            funnel_results.append((chunk, eval_res))
-
-        batch_latencies: dict[str, float] = {}
-        if batch_latency_evaluator is not None:
-            batch_targets = [
-                (chunk.chunk_id, chunk.ablated_dsl)
-                for chunk, eval_res in funnel_results
-                if eval_res.passed and eval_res.stage_a is not None and eval_res.stage_a.ledger is not None
-            ]
-            if batch_targets:
-                raw_batch = batch_latency_evaluator(batch_targets)
-                batch_latencies = {
-                    str(k): float(v) for k, v in dict(raw_batch).items() if float(v) > 0.0
-                }
-
         win_lat = max(float(winner_latency_us), 1e-6)
-        eff_base_lat = float(baseline_latency_us) if baseline_latency_us is not None else win_lat
-        for chunk, eval_res in funnel_results:
-            if not eval_res.passed or eval_res.stage_a is None or eval_res.stage_a.ledger is None:
-                discarded.append(
-                    AblationMeasurement(
-                        chunk=chunk,
-                        funnel_passed=False,
-                        baseline_latency_us=win_lat,
-                        variant_latency_us=0.0,
-                        relative_gain=-1.0,
-                        positive_gain=False,
-                        stage_a_result=eval_res.stage_a,
-                        diagnostic=f"{eval_res.failed_stage}:{eval_res.error_message[:120]}",
-                    )
-                )
-                continue
-
-            if chunk.chunk_id in batch_latencies:
-                var_lat = batch_latencies[chunk.chunk_id]
-            elif eval_res.stage_c and eval_res.stage_c.measured_latency_us > 0.0:
-                var_lat = eval_res.stage_c.measured_latency_us
-            elif win_cost > 0.0:
-                var_cost = _ledger_cost_score(eval_res.stage_a.ledger)
-                var_lat = win_lat * (var_cost / win_cost)
-            else:
-                var_lat = float(max(eval_res.stage_a.ledger.pipe_cycles.values(), default=100)) / 20.0
-
-            rel_gain = (var_lat - win_lat) / max(var_lat, 1e-6)
-            delta_us = var_lat - win_lat
-            is_pos = var_lat > win_lat and is_paired_gain_significant(
-                delta_us,
-                sigma_paired_us=eff_sigma_arg,
-                paired_rel_mad=eff_mad_arg,
-                reference_us=win_lat,
-                sigma_multiplier=2.0,
-            )
-            meas = AblationMeasurement(
-                chunk=chunk,
-                funnel_passed=True,
-                baseline_latency_us=win_lat,
-                variant_latency_us=var_lat,
-                relative_gain=rel_gain,
-                positive_gain=is_pos,
-                stage_a_result=eval_res.stage_a,
-                diagnostic="positive_loo_gain" if is_pos else "redundant_or_harmful_edit",
-            )
-            if is_pos:
-                kept.append(meas)
-            else:
-                discarded.append(meas)
-
-        seen_sigs: set[tuple[str, str]] = set()
-        for meas in kept:
-            sig = (meas.chunk.edit_kind, meas.chunk.target_path)
-            if sig in seen_sigs:
-                continue
-            seen_sigs.add(sig)
-            speedup = meas.variant_latency_us / win_lat if win_lat > 0.0 else 1.0
-            metrics = {
-                "baseline_dur_us": round(meas.variant_latency_us, 6),
-                "optimized_dur_us": round(win_lat, 6),
-                "speedup": round(speedup, 6),
-                "numerical_ok": 1.0,
-            }
-            rule_num = len(self._tracker.rules) + 1
-            suffix = meas.chunk.edit_kind.upper()
-            cand_rule_id = f"{rule_id_prefix}_{rule_num:02d}_{suffix}"
-            while cand_rule_id in self._tracker.rules:
-                rule_num += 1
-                cand_rule_id = f"{rule_id_prefix}_{rule_num:02d}_{suffix}"
-            rule = distill_causal_rule(
-                meas.chunk,
-                rule_id=cand_rule_id,
-                ledger=meas.stage_a_result.ledger if meas.stage_a_result else None,
-                probe=None,
-                probe_metrics=metrics,
-                scope=rule_scope,
-                origin_operator=operator_name,
-                active_symptom_family=active_symptom_family,
-            )
-            clean_ok, clean_err = _validate_distilled_rule(rule, operator_name=operator_name)
-            if not clean_ok:
-                outcomes.append(
-                    DistilledRuleOutcome(
-                        chunk_id=meas.chunk.chunk_id,
-                        probe=None,
-                        hardware_verified=True,
-                        probe_metrics=metrics,
-                        rule=rule,
-                        admitted=False,
-                        rejection_reason=clean_err,
-                    )
-                )
-                continue
-            self._tracker.admit_rule(rule)
-            self._tracker.record_outcome(
-                rule.rule_id,
-                postcondition_realized=True,
-                speed_gain=max(0.0, meas.relative_gain),
-                topology_axes=topology_axes,
-            )
-            admitted_ids.append(rule.rule_id)
-            outcomes.append(
-                DistilledRuleOutcome(
-                    chunk_id=meas.chunk.chunk_id,
-                    probe=None,
-                    hardware_verified=True,
-                    probe_metrics=metrics,
-                    rule=rule,
-                    admitted=True,
-                )
-            )
-
-        if kb_output_path is not None:
-            save_rules_yaml(list(self._tracker.rules.values()), kb_output_path)
-
-        return FlywheelDistillationReport(
-            baseline_latency_us=eff_base_lat,
-            winner_latency_us=win_lat,
-            total_chunks=len(chunks),
-            kept_positive_chunks=tuple(kept),
-            discarded_chunks=tuple(discarded),
-            distilled_outcomes=tuple(outcomes),
-            admitted_rule_ids=tuple(admitted_ids),
+        eff_base = float(baseline_latency_us) if baseline_latency_us is not None else win_lat
+        return self._run_distill(
+            chunks, ref_dsl=winner_dsl, ref_latency_us=win_lat, report_base_us=eff_base, report_win_us=win_lat,
+            reverse=True, factory_name=factory_name, factory_kwargs=factory_kwargs,
+            config_selector_name=config_selector_name, dims=dims, resolved_shapes=resolved,
+            batch_latency_evaluator=batch_latency_evaluator, topology_axes=topology_axes,
+            kb_output_path=kb_output_path, rule_id_prefix=rule_id_prefix, operator_name=operator_name,
+            rule_scope=rule_scope, active_symptom_family=active_symptom_family, eff_sigma=eff_sigma, eff_mad=eff_mad,
         )
 
     def distill_from_pair(
-        self,
-        *,
-        baseline_dsl: str,
-        winner_dsl: str,
-        baseline_latency_us: float,
-        winner_latency_us: float,
-        factory_name: str | None = None,
-        factory_kwargs: Mapping[str, object] | None = None,
-        config_selector_name: str | None = None,
-        dims: Mapping[str, object] | None = None,
+        self, *, baseline_dsl: str, winner_dsl: str, baseline_latency_us: float, winner_latency_us: float,
+        factory_name: str | None = None, factory_kwargs: Mapping[str, object] | None = None,
+        config_selector_name: str | None = None, dims: Mapping[str, object] | None = None,
         batch_latency_evaluator: Callable[[Sequence[tuple[str, str]]], Mapping[str, float]] | None = None,
-        topology_axes: object | None = None,
-        kb_output_path: str | Path | None = None,
-        rule_id_prefix: str = "R_FLYWHEEL",
-        verify_on_candidate: bool = False,
-        max_loo_chunks: int | None = 3,
-        operator_name: str = "",
-        rule_scope: str = "cross_op",
-        active_symptom_family: str = "",
-        ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
-        sigma_paired_us: float | None = None,
-        paired_rel_mad: float | None = None,
+        topology_axes: object | None = None, kb_output_path: str | Path | None = None,
+        rule_id_prefix: str = "R_FLYWHEEL", verify_on_candidate: bool = False,
+        max_loo_chunks: int | None = 3, operator_name: str = "", rule_scope: str = "cross_op",
+        active_symptom_family: str = "", ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
+        sigma_paired_us: float | None = None, paired_rel_mad: float | None = None,
     ) -> FlywheelDistillationReport:
         """Run full counterfactual ablation, micro-probe or LOO check, and KB admission."""
-        eff_sigma_arg = self._sigma_paired_us if sigma_paired_us is None else sigma_paired_us
-        eff_mad_arg = self._paired_rel_mad if paired_rel_mad is None else paired_rel_mad
-        resolved_shapes = extract_ordered_tensor_shapes(
-            dims=dims,
-            ordered_tensor_shapes=ordered_tensor_shapes,
-        )
+        eff_sigma = self._sigma_paired_us if sigma_paired_us is None else sigma_paired_us
+        eff_mad = self._paired_rel_mad if paired_rel_mad is None else paired_rel_mad
+        resolved = extract_ordered_tensor_shapes(dims=dims, ordered_tensor_shapes=ordered_tensor_shapes)
         if not should_trigger_flywheel_checkpoint(
-            baseline_latency_us,
-            winner_latency_us,
-            sigma_paired_us=eff_sigma_arg,
-            paired_rel_mad=eff_mad_arg,
+            baseline_latency_us, winner_latency_us, sigma_paired_us=eff_sigma, paired_rel_mad=eff_mad
         ):
-            return FlywheelDistillationReport(
-                baseline_latency_us=baseline_latency_us,
-                winner_latency_us=winner_latency_us,
-                total_chunks=0,
-                kept_positive_chunks=(),
-                discarded_chunks=(),
-                distilled_outcomes=(),
-                admitted_rule_ids=(),
-            )
+            return FlywheelDistillationReport(baseline_latency_us, winner_latency_us, 0, (), ())
         if verify_on_candidate:
             return self.distill_leave_one_out(
-                baseline_dsl=baseline_dsl,
-                winner_dsl=winner_dsl,
-                winner_latency_us=winner_latency_us,
-                baseline_latency_us=baseline_latency_us,
-                factory_name=factory_name,
-                factory_kwargs=factory_kwargs,
-                config_selector_name=config_selector_name,
-                dims=dims,
-                batch_latency_evaluator=batch_latency_evaluator,
-                topology_axes=topology_axes,
-                kb_output_path=kb_output_path,
-                rule_id_prefix=rule_id_prefix,
-                max_loo_chunks=max_loo_chunks,
-                operator_name=operator_name,
-                rule_scope=rule_scope,
-                active_symptom_family=active_symptom_family,
-                ordered_tensor_shapes=resolved_shapes,
-                sigma_paired_us=eff_sigma_arg,
-                paired_rel_mad=eff_mad_arg,
+                baseline_dsl=baseline_dsl, winner_dsl=winner_dsl, winner_latency_us=winner_latency_us,
+                baseline_latency_us=baseline_latency_us, factory_name=factory_name, factory_kwargs=factory_kwargs,
+                config_selector_name=config_selector_name, dims=dims, batch_latency_evaluator=batch_latency_evaluator,
+                topology_axes=topology_axes, kb_output_path=kb_output_path, rule_id_prefix=rule_id_prefix,
+                max_loo_chunks=max_loo_chunks, operator_name=operator_name, rule_scope=rule_scope,
+                active_symptom_family=active_symptom_family, ordered_tensor_shapes=resolved,
+                sigma_paired_us=eff_sigma, paired_rel_mad=eff_mad,
             )
-        chunks = decompose_ast_ablations(baseline_dsl, winner_dsl)
-        kept: list[AblationMeasurement] = []
-        discarded: list[AblationMeasurement] = []
-        outcomes: list[DistilledRuleOutcome] = []
-        admitted_ids: list[str] = []
-
-        base_sa = run_stage_a_static(
-            baseline_dsl,
-            factory_name=factory_name,
-            factory_kwargs=factory_kwargs,
-            config_selector_name=config_selector_name,
-            dims=dims,
-            ordered_tensor_shapes=resolved_shapes,
-        )
-        base_cost = (
-            _ledger_cost_score(base_sa.ledger)
-            if base_sa.passed and base_sa.ledger is not None
-            else 0.0
-        )
-
-        funnel_results: list[tuple[AstEditChunk, object]] = []
-        for chunk in chunks:
-            eval_res = self._funnel.evaluate(
-                chunk.ablated_dsl,
-                factory_name=factory_name,
-                factory_kwargs=factory_kwargs,
-                config_selector_name=config_selector_name,
-                dims=dims,
-                ordered_tensor_shapes=resolved_shapes,
-            )
-            funnel_results.append((chunk, eval_res))
-
-        batch_latencies: dict[str, float] = {}
-        if batch_latency_evaluator is not None:
-            batch_targets: list[tuple[str, str]] = []
-            seen_batch_kinds: set[str] = set()
-            for chunk, eval_res in funnel_results:
-                if (
-                    not eval_res.passed
-                    or eval_res.stage_a is None
-                    or eval_res.stage_a.ledger is None
-                ):
-                    continue
-                if chunk.edit_kind not in _SUPPORTED_PROBE_KINDS:
-                    continue
-                if chunk.edit_kind in seen_batch_kinds:
-                    continue
-                seen_batch_kinds.add(chunk.edit_kind)
-                batch_targets.append((chunk.chunk_id, chunk.ablated_dsl))
-                if len(batch_targets) >= 4:
-                    break
-            if batch_targets:
-                raw_batch = batch_latency_evaluator(batch_targets)
-                batch_latencies = {
-                    str(k): float(v)
-                    for k, v in dict(raw_batch).items()
-                    if float(v) > 0.0
-                }
-
-        base_lat = max(baseline_latency_us, 1e-6)
-        for chunk, eval_res in funnel_results:
-            if not eval_res.passed or eval_res.stage_a is None or eval_res.stage_a.ledger is None:
-                discarded.append(
-                    AblationMeasurement(
-                        chunk=chunk,
-                        funnel_passed=False,
-                        baseline_latency_us=baseline_latency_us,
-                        variant_latency_us=0.0,
-                        relative_gain=-1.0,
-                        positive_gain=False,
-                        stage_a_result=eval_res.stage_a,
-                        diagnostic=f"{eval_res.failed_stage}:{eval_res.error_message[:120]}",
-                    )
-                )
-                continue
-
-            if chunk.chunk_id in batch_latencies:
-                var_lat = batch_latencies[chunk.chunk_id]
-            elif eval_res.stage_c and eval_res.stage_c.measured_latency_us > 0.0:
-                var_lat = eval_res.stage_c.measured_latency_us
-            elif base_cost > 0.0:
-                var_cost = _ledger_cost_score(eval_res.stage_a.ledger)
-                var_lat = base_lat * (var_cost / base_cost)
-            else:
-                var_lat = float(max(eval_res.stage_a.ledger.pipe_cycles.values(), default=100)) / 20.0
-            rel_gain = (base_lat - var_lat) / base_lat
-            delta_us = base_lat - var_lat
-            is_pos = is_paired_gain_significant(
-                delta_us,
-                sigma_paired_us=eff_sigma_arg,
-                paired_rel_mad=eff_mad_arg,
-                reference_us=base_lat,
-                sigma_multiplier=2.0,
-            )
-            meas = AblationMeasurement(
-                chunk=chunk,
-                funnel_passed=True,
-                baseline_latency_us=baseline_latency_us,
-                variant_latency_us=var_lat,
-                relative_gain=rel_gain,
-                positive_gain=is_pos,
-                stage_a_result=eval_res.stage_a,
-                diagnostic="positive_gain" if is_pos else "negative_or_zero_gain",
-            )
-            if is_pos:
-                kept.append(meas)
-            else:
-                discarded.append(meas)
-
-        seen_kinds: set[str] = set()
-        for meas in kept:
-            if meas.chunk.edit_kind in seen_kinds:
-                continue
-            seen_kinds.add(meas.chunk.edit_kind)
-            probe = synthesize_micro_probe(meas.chunk)
-            if probe is None:
-                outcomes.append(
-                    DistilledRuleOutcome(
-                        chunk_id=meas.chunk.chunk_id,
-                        probe=None,
-                        hardware_verified=False,
-                        probe_metrics={},
-                        rule=None,
-                        admitted=False,
-                        rejection_reason=f"unverifiable_edit_kind:{meas.chunk.edit_kind}",
-                    )
-                )
-                continue
-            ok, metrics = verify_micro_probe_hardware(
-                probe,
-                probe_runner=self._probe_runner,
-                probe_port=self._probe_port,
-                sigma_paired_us=eff_sigma_arg,
-                paired_rel_mad=eff_mad_arg,
-            )
-            if not ok:
-                outcomes.append(
-                    DistilledRuleOutcome(
-                        chunk_id=meas.chunk.chunk_id,
-                        probe=probe,
-                        hardware_verified=False,
-                        probe_metrics=metrics,
-                        rule=None,
-                        admitted=False,
-                        rejection_reason="micro_probe_below_threshold_or_wait_regression",
-                    )
-                )
-                continue
-
-            rule_num = len(self._tracker.rules) + 1
-            suffix = meas.chunk.edit_kind.upper()
-            cand_rule_id = f"{rule_id_prefix}_{rule_num:02d}_{suffix}"
-            while cand_rule_id in self._tracker.rules:
-                rule_num += 1
-                cand_rule_id = f"{rule_id_prefix}_{rule_num:02d}_{suffix}"
-            rule = distill_causal_rule(
-                meas.chunk,
-                rule_id=cand_rule_id,
-                ledger=meas.stage_a_result.ledger if meas.stage_a_result else None,
-                probe=probe,
-                probe_metrics=metrics,
-                scope=rule_scope,
-                origin_operator=operator_name,
-                active_symptom_family=active_symptom_family,
-            )
-            clean_ok, clean_err = _validate_distilled_rule(rule, operator_name=operator_name)
-            if not clean_ok:
-                outcomes.append(
-                    DistilledRuleOutcome(
-                        chunk_id=meas.chunk.chunk_id,
-                        probe=probe,
-                        hardware_verified=True,
-                        probe_metrics=metrics,
-                        rule=rule,
-                        admitted=False,
-                        rejection_reason=clean_err,
-                    )
-                )
-                continue
-
-            self._tracker.admit_rule(rule)
-            self._tracker.record_outcome(
-                rule.rule_id,
-                postcondition_realized=True,
-                speed_gain=max(0.0, meas.relative_gain),
-                topology_axes=topology_axes,
-            )
-            admitted_ids.append(rule.rule_id)
-            outcomes.append(
-                DistilledRuleOutcome(
-                    chunk_id=meas.chunk.chunk_id,
-                    probe=probe,
-                    hardware_verified=True,
-                    probe_metrics=metrics,
-                    rule=rule,
-                    admitted=True,
-                )
-            )
-
-        if kb_output_path is not None:
-            save_rules_yaml(list(self._tracker.rules.values()), kb_output_path)
-
-        return FlywheelDistillationReport(
-            baseline_latency_us=baseline_latency_us,
-            winner_latency_us=winner_latency_us,
-            total_chunks=len(chunks),
-            kept_positive_chunks=tuple(kept),
-            discarded_chunks=tuple(discarded),
-            distilled_outcomes=tuple(outcomes),
-            admitted_rule_ids=tuple(admitted_ids),
+        return self._run_distill(
+            decompose_ast_ablations(baseline_dsl, winner_dsl), ref_dsl=baseline_dsl,
+            ref_latency_us=baseline_latency_us, report_base_us=baseline_latency_us,
+            report_win_us=winner_latency_us, reverse=False, factory_name=factory_name,
+            factory_kwargs=factory_kwargs, config_selector_name=config_selector_name, dims=dims,
+            resolved_shapes=resolved, batch_latency_evaluator=batch_latency_evaluator,
+            topology_axes=topology_axes, kb_output_path=kb_output_path, rule_id_prefix=rule_id_prefix,
+            operator_name=operator_name, rule_scope=rule_scope,
+            active_symptom_family=active_symptom_family, eff_sigma=eff_sigma, eff_mad=eff_mad,
         )
 
     def distill_from_trajectory(
-        self,
-        *,
-        baseline_dsl: str,
-        trajectory: EvolutionTrajectory,
-        factory_name: str | None = None,
-        factory_kwargs: Mapping[str, object] | None = None,
-        dims: Mapping[str, object] | None = None,
-        kb_output_path: str | Path | None = None,
-        active_symptom_family: str = "",
+        self, *, baseline_dsl: str, trajectory: EvolutionTrajectory, factory_name: str | None = None,
+        factory_kwargs: Mapping[str, object] | None = None, dims: Mapping[str, object] | None = None,
+        kb_output_path: str | Path | None = None, active_symptom_family: str = "",
         ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
     ) -> FlywheelDistillationReport:
         """Distill and verify causal rules directly from an EvolutionTrajectory winner."""
-        resolved_shapes = extract_ordered_tensor_shapes(
-            dims=dims,
-            ordered_tensor_shapes=ordered_tensor_shapes,
-        )
+        resolved = extract_ordered_tensor_shapes(dims=dims, ordered_tensor_shapes=ordered_tensor_shapes)
         return self.distill_from_pair(
-            baseline_dsl=baseline_dsl,
-            winner_dsl=trajectory.best_dsl_source,
-            baseline_latency_us=trajectory.baseline_latency_us,
-            winner_latency_us=trajectory.best_latency_us,
-            factory_name=factory_name,
-            factory_kwargs=factory_kwargs,
-            dims=dims,
-            kb_output_path=kb_output_path,
-            active_symptom_family=active_symptom_family,
-            ordered_tensor_shapes=resolved_shapes,
+            baseline_dsl=baseline_dsl, winner_dsl=trajectory.best_dsl_source,
+            baseline_latency_us=trajectory.baseline_latency_us, winner_latency_us=trajectory.best_latency_us,
+            factory_name=factory_name, factory_kwargs=factory_kwargs, dims=dims,
+            kb_output_path=kb_output_path, active_symptom_family=active_symptom_family, ordered_tensor_shapes=resolved,
         )
 
 
 __all__ = [
-    "ALLOWED_SCHEMA_SIGNAL_VOCABULARY",
-    "AblationMeasurement",
-    "AstEditChunk",
-    "DistilledRuleOutcome",
-    "FlywheelDistillationReport",
-    "FlywheelDistiller",
-    "MicroProbeSpec",
-    "_build_disallowed_provenance_tokens",
-    "_operator_name_variants",
-    "_validate_distilled_rule",
-    "_validate_schema_closed_identifiers",
-    "decompose_ast_ablations",
-    "decompose_cpp_string_leave_one_out",
-    "decompose_leave_one_out_ablations",
-    "distill_causal_rule",
-    "is_paired_gain_significant",
-    "resolve_paired_sigma_us",
-    "should_trigger_flywheel_checkpoint",
-    "synthesize_micro_probe",
-    "verify_micro_probe_hardware",
+    "ALLOWED_SCHEMA_SIGNAL_VOCABULARY", "AblationMeasurement", "AstEditChunk",
+    "DistilledRuleOutcome", "FlywheelDistillationReport", "FlywheelDistiller", "MicroProbeSpec",
+    "_build_disallowed_provenance_tokens", "_operator_name_variants", "_validate_distilled_rule",
+    "_validate_schema_closed_identifiers", "decompose_ast_ablations",
+    "decompose_cpp_string_leave_one_out", "decompose_leave_one_out_ablations",
+    "distill_causal_rule", "is_paired_gain_significant", "resolve_paired_sigma_us",
+    "should_trigger_flywheel_checkpoint", "synthesize_micro_probe", "verify_micro_probe_hardware",
 ]
