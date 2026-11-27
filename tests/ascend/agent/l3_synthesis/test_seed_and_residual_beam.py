@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Callable, Sequence
+import json
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
@@ -19,6 +20,16 @@ from tilefoundry_ascend.agent import (
     PortfolioRunner,
     TwoLaneBeamSearch,
 )
+from tilefoundry_ascend.agent.cost_advisor import (
+    CostModelAdvisor,
+    NullCostModelAdvisor,
+    PluginCostModelAdvisor,
+    create_cost_advisor,
+)
+from tilefoundry_ascend.agent.flywheel.ablation_distiller import AstEditChunk, MicroProbeSpec
+from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import CostGateDecision, CostModelMode
+from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
+from tilefoundry_ascend.ascend.target import AscendTarget
 from tilefoundry_ascend.agent.gates import StageBResult, StageCResult
 from tilefoundry_ascend.agent.gates.gate_funnel import check_repair_monotonicity
 from tilefoundry_ascend.agent.kb import load_seed_rules
@@ -709,3 +720,159 @@ def test_portfolio_runner_rule_blind_creative_prescreen_and_repair_monotonicity(
         stage == "repair_monotonicity_violation" for _, stage, _ in mono_report.failed_candidates
     )
     mono_runner.cancel_pending_speculative()
+
+
+class _InjectedCostAdvisor:
+    """Protocol-conforming CostModelAdvisor test double for typed L3 contract checks."""
+
+    def __init__(self, *, mode: CostModelMode = CostModelMode.ADVISORY) -> None:
+        self._mode = mode
+        self._target = AscendTarget("ascend.950pr")
+        self._predictions_invoked = 0
+
+    @property
+    def mode(self) -> CostModelMode:
+        return self._mode
+
+    @property
+    def target(self) -> AscendTarget:
+        return self._target
+
+    @property
+    def predictions_invoked(self) -> int:
+        return self._predictions_invoked
+
+    @property
+    def underlying_cost_model(self) -> object | None:
+        return None
+
+    def sync_experience_lake(
+        self, lake: object | None, *, persist_calibration: bool = False,
+        exclude_run_id: str | None = None,
+    ) -> dict[str, int]:
+        _ = (lake, persist_calibration, exclude_run_id)
+        return {"replayed": 1}
+
+    def evaluate_round_policy(
+        self, *, enable_prescreen_flag: bool = True, bucket_clean_samples: int = 0,
+        out_of_sample_spearman_rho: float | None = None,
+    ) -> CostGateDecision:
+        _ = (bucket_clean_samples, out_of_sample_spearman_rho)
+        return CostGateDecision(
+            mode=self._mode, engaged=enable_prescreen_flag, reason="injected_protocol",
+            allow_prompt_guidance=True, allow_candidate_pruning=False,
+        )
+
+    def predict_candidate_us(
+        self, workload: Mapping[str, object], *, bisheng_res: object | None = None
+    ) -> object | None:
+        _ = (workload, bisheng_res)
+        self._predictions_invoked += 1
+        return SimpleNamespace(pred_us=18.5, dominant_bound="memory_bound")
+
+    def predict_anchor_mean_us(
+        self, ledger: object, *, anchors: Sequence[object], live_plan: object | None = None,
+        axes: object | None = None, blueprint: object | None = None,
+        sil_advisory: object | None = None, bisheng_res: object | None = None,
+    ) -> float:
+        _ = (ledger, anchors, live_plan, axes, blueprint, sil_advisory, bisheng_res)
+        self._predictions_invoked += 1
+        return 18.5
+
+    def build_prompt_guidance(
+        self, *, decision: CostGateDecision, base_cfg: Mapping[str, object],
+        dims: Mapping[str, int] | None, regime_tag: str = "", top_k: int = 5,
+    ) -> str:
+        _ = (dims, top_k)
+        return f"advisor:{decision.reason}:{regime_tag}:{len(base_cfg)}" if decision.engaged else ""
+
+    def filter_stage_a_passers(
+        self, candidates: Sequence[object], *, decision: CostGateDecision,
+        parent_pred_us: float, parent_axes: object | None, parent_workspace_stages: int,
+        candidate_pred_us_by_id: Mapping[str, float], candidate_axes_by_id: Mapping[str, object],
+        candidate_workspace_stages_by_id: Mapping[str, int], creative_ids: Sequence[str],
+    ) -> tuple[list[object], list[tuple[object, str]]]:
+        _ = (
+            decision, parent_pred_us, parent_axes, parent_workspace_stages,
+            candidate_pred_us_by_id, candidate_axes_by_id, candidate_workspace_stages_by_id,
+            creative_ids,
+        )
+        return list(candidates), []
+
+    def observe_surrogate_batch(
+        self, *, observations: Sequence[Mapping[str, object]],
+        msprof_records: Sequence[Mapping[str, object]] = (),
+        pair_deltas: Sequence[Mapping[str, object]] = (), refit: bool = True,
+    ) -> None:
+        _ = (observations, msprof_records, pair_deltas, refit)
+
+    def resolve_dominant_bound(
+        self, ledger: object | None, residual: object | None,
+        *, fallback_cost_pred: object | None = None,
+    ) -> str:
+        _ = (ledger, residual, fallback_cost_pred)
+        return "memory_bound"
+
+
+def _consume_advisor_contract(advisor: CostModelAdvisor, *, regime_tag: str) -> tuple[str, int]:
+    decision = advisor.evaluate_round_policy(enable_prescreen_flag=True, bucket_clean_samples=25)
+    guidance = advisor.build_prompt_guidance(
+        decision=decision, base_cfg={"bm": 64, "bn": 128}, dims={"M": 128}, regime_tag=regime_tag,
+    )
+    _ = advisor.predict_candidate_us({"m": 128})
+    return guidance, advisor.predictions_invoked
+
+
+@pytest.mark.parametrize(
+    ("record_cls", "payload", "exc_type"),
+    [
+        (AstEditChunk, {"chunk_id": "c1"}, KeyError),
+        (MicroProbeSpec, {"probe_id": "p1", "tensor_shape": "not_a_seq"}, KeyError),
+        (TwoLaneBeamSearch, {"exploit_beam": "bad_seq"}, TypeError),
+        (TwoLaneBeamSearch, {"exploited_signatures": "bad_iter"}, TypeError),
+    ],
+)
+def test_l3_typed_serialization_and_cost_advisor_contract_reject(
+    record_cls: type[AstEditChunk] | type[MicroProbeSpec] | type[TwoLaneBeamSearch],
+    payload: dict[str, object],
+    exc_type: type[Exception],
+) -> None:
+    """Reject malformed JsonRecordMixin payloads, invalid advisor modes, and incomplete stubs."""
+    with pytest.raises(exc_type):
+        record_cls.from_dict(payload)
+    with pytest.raises(ValueError, match="NullCostModelAdvisor"):
+        PluginCostModelAdvisor(mode="off")
+    assert not isinstance(SimpleNamespace(mode=CostModelMode.OFF), CostModelAdvisor)
+
+
+def test_l3_typed_serialization_and_cost_advisor_contract_accept() -> None:
+    """Accept typed JsonRecordMixin round-trips and Protocol-injected CostModelAdvisor usage."""
+    chunk = AstEditChunk("c0", "core_parallelism", "module/with_0", "T.Kernel(1)", "T.Kernel(8)", "pass")
+    assert AstEditChunk.from_json(chunk.to_json()) == chunk
+
+    probe = MicroProbeSpec("p0", "core_parallelism", "make_probe", "base", "opt", 29, 29, (2048,))
+    assert MicroProbeSpec.from_json(probe.to_json()) == probe
+
+    ledger = _ledger()
+    cand = BeamCandidate(
+        "cand_0", 1, "rule_exploit", "R01", _SEED_DSL, "tilelang_dsl", ledger,
+        compute_static_dynamic_residual(ledger, {"dur_us": 20.0}), 20.0, True,
+        structural_signature=("T.Kernel",),
+        topology_axes=TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd"),
+        case_latencies_us={1: 20.0, 2: 24.0}, policy={"bm": 64},
+    )
+    beam = TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1)
+    beam.update([cand])
+    restored_beam = TwoLaneBeamSearch.from_dict(json.loads(beam.to_json()))
+    assert restored_beam.exploit_beam[0].case_latencies_us == {1: 20.0, 2: 24.0}
+    assert restored_beam.exploited_signatures == {("T.Kernel",)}
+
+    injected: CostModelAdvisor = _InjectedCostAdvisor()
+    assert isinstance(injected, CostModelAdvisor)
+    guidance, invoked = _consume_advisor_contract(injected, regime_tag="reg_a")
+    assert guidance == "advisor:injected_protocol:reg_a:2"
+    assert invoked == 1
+
+    null_advisor = create_cost_advisor("off")
+    assert isinstance(null_advisor, NullCostModelAdvisor)
+    assert _consume_advisor_contract(null_advisor, regime_tag="reg_a") == ("", 0)

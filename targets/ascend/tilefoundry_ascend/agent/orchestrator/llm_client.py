@@ -22,7 +22,7 @@ from http.client import HTTPException, HTTPResponse
 from pathlib import Path
 from string import Formatter
 from threading import Event
-from typing import Any, Literal, Protocol, TypeAlias
+from typing import Literal, Protocol, TypeAlias
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -811,7 +811,9 @@ class AgyCliLLMBackend:
 
 
 class _NoHTTPRedirects(HTTPRedirectHandler):
-    def redirect_request(self, req: Any, fp: Any, code: Any, msg: Any, headers: Any, newurl: Any) -> None:
+    def redirect_request(
+        self, req: object, fp: object, code: object, msg: object, headers: object, newurl: object
+    ) -> None:
         return None
 
 
