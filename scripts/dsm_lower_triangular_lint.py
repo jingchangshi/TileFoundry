@@ -5,13 +5,33 @@ from __future__ import annotations
 
 import argparse
 import ast
+import io
 import json
+import re
 import sys
 import time
+import tokenize
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-VALID_CATEGORIES = ("layers", "l3_l4", "scc", "sys_modules", "reflection")
+VALID_CATEGORIES = (
+    "layers",
+    "l3_l4",
+    "scc",
+    "sys_modules",
+    "reflection",
+    "flat_typing",
+    "cross_private_write",
+    "module_loc",
+)
+
+MAX_MODULE_LOC = 1500
+_ALLOWED_SIG_FILE = "agent/gates/cpp_slice_protocol.py"
+_ALLOWED_SIG_FUNC = "cached_callable_signature_info"
+_TYPE_CHECKING_SYM = "TYPE_" "CHECKING"
+_FORBIDDEN_TYPING_NAMES = frozenset({"Any", _TYPE_CHECKING_SYM})
+_FORBIDDEN_TYPING_ATTRS = frozenset({"Any", "cast", _TYPE_CHECKING_SYM})
+_TYPE_IGNORE_RE = re.compile(r"#\s*type:\s*ignore\b")
 
 BANNED_REFLECTION_NAMES = frozenset(
     {
@@ -150,31 +170,130 @@ def _resolve_import_from_base(
     return base if _is_internal_module(base) else None
 
 
-_BASE_SCAN_TOKENS = ("modules", *BANNED_REFLECTION_NAMES)
-
-
-def _iter_import_nodes(tree: ast.Module) -> list[ast.Import | ast.ImportFrom]:
-    imports: list[ast.Import | ast.ImportFrom] = []
-    stack: list[ast.stmt] = list(tree.body)
+def _iter_written_attrs(target: ast.AST) -> list[ast.Attribute]:
+    found: list[ast.Attribute] = []
+    stack = [target]
     while stack:
-        stmt = stack.pop()
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        cur = stack.pop()
+        if isinstance(cur, ast.Attribute):
+            found.append(cur)
+        elif isinstance(cur, (ast.Tuple, ast.List)):
+            stack.extend(cur.elts)
+        elif isinstance(cur, ast.Starred):
+            stack.append(cur.value)
+    return found
+
+
+def _scan_statements(
+    rel_path: str,
+    tree: ast.Module,
+    check_flat: bool,
+    check_priv: bool,
+) -> tuple[list[ast.Import | ast.ImportFrom], list[Violation]]:
+    imports: list[ast.Import | ast.ImportFrom] = []
+    violations: list[Violation] = []
+    stack: list[tuple[ast.stmt, bool]] = [(stmt, False) for stmt in reversed(tree.body)]
+    while stack:
+        stmt, in_fn = stack.pop()
+        if isinstance(stmt, ast.Import):
             imports.append(stmt)
+            if check_flat and in_fn:
+                for alias in stmt.names:
+                    if _is_internal_module(alias.name):
+                        violations.append(
+                            Violation(
+                                rel_path,
+                                stmt.lineno,
+                                "flat_typing",
+                                f"function-local internal import `{alias.name}`; hoist internal "
+                                "imports to module top-level via L0..L5 layering.",
+                            )
+                        )
             continue
-        for attr in ("body", "orelse", "finalbody"):
+        if isinstance(stmt, ast.ImportFrom):
+            imports.append(stmt)
+            if check_flat and in_fn and (stmt.level > 0 or _is_internal_module(stmt.module or "")):
+                mod_label = ("." * stmt.level) + (stmt.module or "")
+                violations.append(
+                    Violation(
+                        rel_path,
+                        stmt.lineno,
+                        "flat_typing",
+                        f"function-local internal import `{mod_label}`; hoist internal imports "
+                        "to module top-level via L0..L5 layering.",
+                    )
+                )
+            continue
+
+        if check_priv:
+            targets: list[ast.AST] = []
+            if isinstance(stmt, ast.Assign):
+                targets = list(stmt.targets)
+            elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign, ast.For, ast.AsyncFor)):
+                targets = [stmt.target]
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                targets = [item.optional_vars for item in stmt.items if item.optional_vars]
+            for target in targets:
+                for attr_node in _iter_written_attrs(target):
+                    attr = attr_node.attr
+                    if not attr.startswith("_") or (
+                        attr.startswith("__") and attr.endswith("__")
+                    ):
+                        continue
+                    if isinstance(attr_node.value, ast.Name) and attr_node.value.id in (
+                        "self",
+                        "cls",
+                    ):
+                        continue
+                    violations.append(
+                        Violation(
+                            rel_path,
+                            attr_node.lineno,
+                            "cross_private_write",
+                            f"cross-object private write to `_.{attr}`; expose a public method "
+                            "or return a new frozen dataclass instead.",
+                        )
+                    )
+
+        child_in_fn = in_fn or isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for attr in ("finalbody", "orelse", "body"):
             sub = getattr(stmt, attr, None)
             if sub:
-                stack.extend(sub)
+                for child in reversed(sub):
+                    stack.append((child, child_in_fn))
         handlers = getattr(stmt, "handlers", None)
         if handlers:
-            for handler in handlers:
-                stack.extend(handler.body)
+            for handler in reversed(handlers):
+                for child in reversed(handler.body):
+                    stack.append((child, child_in_fn))
         cases = getattr(stmt, "cases", None)
         if cases:
-            for case in cases:
-                stack.extend(case.body)
-    imports.reverse()
-    return imports
+            for case in reversed(cases):
+                for child in reversed(case.body):
+                    stack.append((child, child_in_fn))
+    return imports, violations
+
+
+def _scan_type_ignore_comments(rel_path: str, source: str) -> list[Violation]:
+    if "type: ignore" not in source:
+        return []
+    found: list[Violation] = []
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+        for tok in tokens:
+            if tok.type == tokenize.COMMENT and _TYPE_IGNORE_RE.search(tok.string):
+                found.append(
+                    Violation(
+                        rel_path,
+                        tok.start[0],
+                        "flat_typing",
+                        "forbidden `# type: ignore` suppression; fix the underlying type "
+                        "annotation directly instead.",
+                    )
+                )
+    except tokenize.TokenError:
+        pass
+    return found
 
 
 def _extract_internal_imports(
@@ -235,39 +354,56 @@ def _is_safe_external_probe_key(node: ast.AST) -> bool:
     )
 
 
+def _allowed_signature_node_ids(rel_path: str, tree: ast.Module) -> set[int]:
+    if rel_path != _ALLOWED_SIG_FILE:
+        return set()
+    for stmt in tree.body:
+        if (
+            isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and stmt.name == _ALLOWED_SIG_FUNC
+        ):
+            return {id(node) for node in ast.walk(stmt)}
+    return set()
+
+
 def _scan_full_ast(
     rel_path: str,
-    rel_parts: tuple[str, ...],
-    tree: ast.AST,
+    tree: ast.Module,
+    import_nodes: list[ast.Import | ast.ImportFrom],
     check_sys_modules: bool,
     check_reflection: bool,
-) -> tuple[list[ast.Import | ast.ImportFrom], list[Violation]]:
-    nodes = list(ast.walk(tree))
-    imports: list[ast.Import | ast.ImportFrom] = []
+    check_flat_typing: bool,
+) -> list[Violation]:
     sys_aliases: set[str] = {"sys"}
     mod_aliases: set[str] = set()
-    in_campaign = len(rel_parts) >= 2 and rel_parts[0] == "agent" and rel_parts[1] == "campaign"
     inspect_aliases: set[str] = {"inspect"}
     signature_aliases: set[str] = set()
+    typing_aliases: set[str] = {"typing", "typing_extensions"}
+    cast_aliases: set[str] = set()
+    allowed_sig_ids = _allowed_signature_node_ids(rel_path, tree) if check_reflection else set()
 
-    for node in nodes:
+    for node in import_nodes:
         if isinstance(node, ast.Import):
-            imports.append(node)
             for alias in node.names:
                 if alias.name == "sys":
                     sys_aliases.add(alias.asname or "sys")
-                elif in_campaign and alias.name == "inspect":
+                elif alias.name == "inspect":
                     inspect_aliases.add(alias.asname or "inspect")
-        elif isinstance(node, ast.ImportFrom):
-            imports.append(node)
+                elif alias.name in ("typing", "typing_extensions"):
+                    typing_aliases.add(alias.asname or alias.name)
+        else:
             if node.module == "sys":
                 for alias in node.names:
                     if alias.name == "modules":
                         mod_aliases.add(alias.asname or "modules")
-            elif in_campaign and node.module == "inspect":
+            elif node.module == "inspect":
                 for alias in node.names:
                     if alias.name == "signature":
                         signature_aliases.add(alias.asname or "signature")
+            elif node.module in ("typing", "typing_extensions"):
+                for alias in node.names:
+                    if alias.name == "cast":
+                        cast_aliases.add(alias.asname or "cast")
 
     violations: list[Violation] = []
     seen: set[tuple[str, int, str]] = set()
@@ -278,7 +414,17 @@ def _scan_full_ast(
             seen.add(key)
             violations.append(Violation(rel_path, line, cat, msg))
 
-    for node in nodes:
+    sig_msg = (
+        "banned reflection `inspect.signature`; replace dynamic signature inspection with a "
+        "typed Protocol or external-boundary parsing in "
+        "cpp_slice_protocol.cached_callable_signature_info."
+    )
+    typing_hint = (
+        f"replace Any, typing.cast, and {_TYPE_CHECKING_SYM} with concrete Protocol, object, "
+        "or flat top-level imports."
+    )
+
+    for node in ast.walk(tree):
         if check_sys_modules:
             if isinstance(node, ast.Subscript) and _is_sys_modules_expr(
                 node.value, sys_aliases, mod_aliases
@@ -316,36 +462,87 @@ def _scan_full_ast(
                                 "sys.modules membership probe targeting internal or dynamic module",
                             )
         if check_reflection:
+            allow_sig = id(node) in allowed_sig_ids
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if node.name in BANNED_REFLECTION_NAMES:
-                    record("reflection", node.lineno, f"banned reflection symbol `{node.name}`")
+                    record(
+                        "reflection",
+                        node.lineno,
+                        f"banned reflection symbol `{node.name}`; replace dynamic hook reflection "
+                        "with explicit Protocol injection.",
+                    )
             elif isinstance(node, ast.Name):
                 if node.id in BANNED_REFLECTION_NAMES:
-                    record("reflection", node.lineno, f"banned reflection symbol `{node.id}`")
-                elif in_campaign and node.id in signature_aliases:
-                    record("reflection", node.lineno, "banned reflection symbol `inspect.signature`")
+                    record(
+                        "reflection",
+                        node.lineno,
+                        f"banned reflection symbol `{node.id}`; replace dynamic hook reflection "
+                        "with explicit Protocol injection.",
+                    )
+                elif not allow_sig and node.id in signature_aliases:
+                    record("reflection", node.lineno, sig_msg)
             elif isinstance(node, ast.Attribute):
                 if node.attr in BANNED_REFLECTION_NAMES:
-                    record("reflection", node.lineno, f"banned reflection symbol `{node.attr}`")
+                    record(
+                        "reflection",
+                        node.lineno,
+                        f"banned reflection symbol `{node.attr}`; replace dynamic hook reflection "
+                        "with explicit Protocol injection.",
+                    )
                 elif (
-                    in_campaign
+                    not allow_sig
                     and node.attr == "signature"
                     and isinstance(node.value, ast.Name)
                     and node.value.id in inspect_aliases
                 ):
-                    record("reflection", node.lineno, "banned reflection symbol `inspect.signature`")
+                    record("reflection", node.lineno, sig_msg)
             elif isinstance(node, ast.ImportFrom):
                 for alias in node.names:
                     for sym in (alias.name, alias.asname):
                         if sym and sym in BANNED_REFLECTION_NAMES:
-                            record("reflection", node.lineno, f"banned reflection symbol `{sym}`")
+                            record(
+                                "reflection",
+                                node.lineno,
+                                f"banned reflection symbol `{sym}`; replace dynamic hook "
+                                "reflection with explicit Protocol injection.",
+                            )
                 if (
-                    in_campaign
+                    not allow_sig
                     and node.module == "inspect"
                     and any(alias.name == "signature" for alias in node.names)
                 ):
-                    record("reflection", node.lineno, "banned reflection symbol `inspect.signature`")
-    return imports, violations
+                    record("reflection", node.lineno, sig_msg)
+        if check_flat_typing:
+            if isinstance(node, ast.ImportFrom) and node.module in (
+                "typing",
+                "typing_extensions",
+            ):
+                for alias in node.names:
+                    if alias.name in _FORBIDDEN_TYPING_ATTRS:
+                        record(
+                            "flat_typing",
+                            node.lineno,
+                            f"forbidden typing construct `{alias.name}`; {typing_hint}",
+                        )
+            elif isinstance(node, ast.Name):
+                if node.id in _FORBIDDEN_TYPING_NAMES or node.id in cast_aliases:
+                    record(
+                        "flat_typing",
+                        node.lineno,
+                        f"forbidden typing construct `{node.id}`; {typing_hint}",
+                    )
+            elif (
+                isinstance(node, ast.Attribute)
+                and node.attr in _FORBIDDEN_TYPING_ATTRS
+                and isinstance(node.value, ast.Name)
+                and node.value.id in typing_aliases
+            ):
+                record(
+                    "flat_typing",
+                    node.lineno,
+                    f"forbidden typing construct `{node.value.id}.{node.attr}`; {typing_hint}",
+                )
+    return violations
 
 
 def _tarjan_sccs(
@@ -427,10 +624,20 @@ def run_lint(
     for mod_name in sorted(known_modules):
         file_path = module_to_path[mod_name]
         rel_path = module_to_rel[mod_name]
-        rel_parts = file_path.relative_to(resolved_root).parts
         source = file_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(file_path))
+        line_count = len(source.splitlines())
+        if "module_loc" in active and line_count > MAX_MODULE_LOC:
+            violations.append(
+                Violation(
+                    rel_path,
+                    MAX_MODULE_LOC + 1,
+                    "module_loc",
+                    f"module has {line_count} lines (limit {MAX_MODULE_LOC}); split cohesive "
+                    "responsibilities into smaller L0..L5 modules.",
+                )
+            )
 
+        tree = ast.parse(source, filename=str(file_path))
         src_layer = classify_module(mod_name)
         if "layers" in active and src_layer is None:
             violations.append(
@@ -442,20 +649,31 @@ def run_lint(
                 )
             )
 
-        in_campaign = len(rel_parts) >= 2 and rel_parts[0] == "agent" and rel_parts[1] == "campaign"
         check_sys = "sys_modules" in active
         check_refl = "reflection" in active
-        need_full = (check_sys or check_refl) and (
-            any(tok in source for tok in _BASE_SCAN_TOKENS)
-            or (check_refl and in_campaign and "signature" in source)
+        check_flat = "flat_typing" in active
+        check_priv = "cross_private_write" in active
+        import_nodes, stmt_violations = _scan_statements(
+            rel_path, tree, check_flat, check_priv
         )
-        if need_full:
-            import_nodes, file_violations = _scan_full_ast(
-                rel_path, rel_parts, tree, check_sys, check_refl
+        violations.extend(stmt_violations)
+        if check_flat:
+            violations.extend(_scan_type_ignore_comments(rel_path, source))
+
+        need_sys = check_sys and "modules" in source
+        need_refl = check_refl and (
+            any(tok in source for tok in BANNED_REFLECTION_NAMES)
+            or ("inspect" in source and "signature" in source)
+        )
+        need_flat = check_flat and (
+            "Any" in source
+            or _TYPE_CHECKING_SYM in source
+            or ("typing" in source and "cast" in source)
+        )
+        if need_sys or need_refl or need_flat:
+            violations.extend(
+                _scan_full_ast(rel_path, tree, import_nodes, need_sys, need_refl, need_flat)
             )
-            violations.extend(file_violations)
-        else:
-            import_nodes = _iter_import_nodes(tree)
 
         imports = _extract_internal_imports(mod_name, import_nodes, known_modules)
         for lineno, dst_mod in imports:
@@ -563,7 +781,7 @@ def main(argv: list[str] | None = None) -> int:
         "--only",
         type=str,
         default=None,
-        help="Comma-separated categories: layers,l3_l4,scc,sys_modules,reflection.",
+        help="Comma-separated categories: " + ",".join(VALID_CATEGORIES) + ".",
     )
     parser.add_argument(
         "--json",

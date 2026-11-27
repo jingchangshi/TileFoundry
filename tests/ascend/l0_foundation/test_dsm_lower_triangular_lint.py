@@ -46,11 +46,13 @@ def _base_packages() -> dict[str, str]:
             "from tilefoundry_ascend.agent.kb.schema import DEVICE\n"
         ),
         "agent/gates/__init__.py": "",
-        "agent/gates/gate_funnel.py": (
+        "agent/gates/cpp_slice_protocol.py": (
             "import inspect\n"
-            "from tilefoundry_ascend.agent.router.capability_gate import DEVICE\n"
-            "def sig(fn):\n"
+            "def cached_callable_signature_info(fn):\n"
             "    return inspect.signature(fn)\n"
+        ),
+        "agent/gates/gate_funnel.py": (
+            "from tilefoundry_ascend.agent.router.capability_gate import DEVICE\n"
         ),
         "agent/orchestrator/__init__.py": "",
         "agent/orchestrator/llm_client.py": (
@@ -197,8 +199,8 @@ def test_sys_modules_reflection_detection(tmp_path: Path) -> None:
     assert report.counts_by_category["sys_modules"] == 4
 
 
-def test_banned_reflection_symbols_and_campaign_inspect_signature(tmp_path: Path) -> None:
-    """Flag banned coordinator reflection symbols everywhere and inspect.signature in campaign."""
+def test_banned_reflection_symbols_and_global_inspect_signature(tmp_path: Path) -> None:
+    """Flag banned reflection everywhere and inspect.signature outside the single boundary."""
     files = _base_packages()
     files["agent/campaign/stage_gate_coordinator.py"] = (
         "import inspect\n"
@@ -210,6 +212,12 @@ def test_banned_reflection_symbols_and_campaign_inspect_signature(tmp_path: Path
         "    return name\n"
         "def _invoke_with_optional_kwargs(fn):\n"
         "    return inspect.signature(fn), sig_fn(fn)\n"
+    )
+    files["agent/gates/gate_funnel.py"] = (
+        "import inspect\n"
+        "from tilefoundry_ascend.agent.router.capability_gate import DEVICE\n"
+        "def sig(fn):\n"
+        "    return inspect.signature(fn)\n"
     )
     files["agent/campaign/campaign_runner.py"] = (
         "class Runner:\n"
@@ -228,9 +236,173 @@ def test_banned_reflection_symbols_and_campaign_inspect_signature(tmp_path: Path
         p == "agent/campaign/stage_gate_coordinator.py" and "inspect.signature" in m
         for p, _, m in lines
     )
-    assert not any(
-        p == "agent/gates/gate_funnel.py" for p, _, _ in lines
+    assert any(
+        p == "agent/gates/gate_funnel.py" and "inspect.signature" in m
+        for p, _, m in lines
     )
+    assert not any(p == "agent/gates/cpp_slice_protocol.py" for p, _, _ in lines)
+
+
+@pytest.mark.parametrize(
+    ("category", "rel_path", "snippet", "expected_substr"),
+    [
+        (
+            "flat_typing",
+            "agent/kb/schema.py",
+            "from typing import Any\ndef f(x: Any) -> object:\n    return x\n",
+            "Any",
+        ),
+        (
+            "flat_typing",
+            "agent/kb/schema.py",
+            "import typing as t\ndef f(x: object) -> int:\n    return t.cast(int, x)\n",
+            "t.cast",
+        ),
+        (
+            "flat_typing",
+            "agent/kb/schema.py",
+            "from typing import TYPE_" "CHECKING\nif TYPE_" "CHECKING:\n    X = 1\n",
+            "TYPE_" "CHECKING",
+        ),
+        (
+            "flat_typing",
+            "agent/kb/schema.py",
+            "X: int = 'bad'  # type: " "ignore[assignment]\n",
+            "# type: ignore",
+        ),
+        (
+            "flat_typing",
+            "agent/kb/schema.py",
+            "def f():\n    from tilefoundry_ascend.agent.contracts import DEVICE\n"
+            "    return DEVICE\n",
+            "function-local internal import",
+        ),
+        (
+            "flat_typing",
+            "agent/kb/schema.py",
+            "def f():\n    from ..contracts import DEVICE\n    return DEVICE\n",
+            "function-local internal import",
+        ),
+        (
+            "reflection",
+            "agent/gates/stage_b_gate.py",
+            "import inspect\ndef probe(fn):\n    return inspect.signature(fn)\n",
+            "inspect.signature",
+        ),
+        (
+            "reflection",
+            "agent/gates/cpp_slice_protocol.py",
+            "from inspect import signature\n"
+            "def cached_callable_signature_info(fn):\n    return signature(fn)\n",
+            "inspect.signature",
+        ),
+        (
+            "reflection",
+            "agent/gates/cpp_slice_protocol.py",
+            "import inspect\n"
+            "def cached_callable_signature_info(fn):\n    return inspect.signature(fn)\n"
+            "def sneaky(fn):\n    return inspect.signature(fn)\n",
+            "inspect.signature",
+        ),
+        (
+            "cross_private_write",
+            "agent/kb/schema.py",
+            "def mutate(obj):\n    obj._secret = 1\n",
+            "_secret",
+        ),
+        (
+            "cross_private_write",
+            "agent/kb/schema.py",
+            "def mutate(obj):\n    obj._count += 1\n",
+            "_count",
+        ),
+        (
+            "cross_private_write",
+            "agent/kb/schema.py",
+            "def mutate(obj):\n    _, obj.pub._hidden = (0, 2)\n",
+            "_hidden",
+        ),
+        (
+            "module_loc",
+            "agent/kb/schema.py",
+            "X = 1\n" * 1501,
+            "1501 lines",
+        ),
+    ],
+)
+def test_strict_ratchets_reject(
+    tmp_path: Path, category: str, rel_path: str, snippet: str, expected_substr: str
+) -> None:
+    """Reject violations across all four strict ratchets with single-sentence fix hints."""
+    files = _base_packages()
+    files[rel_path] = snippet
+    root = _write_tree(tmp_path / "tilefoundry_ascend", files)
+    report = dsm_lint.run_lint(root, {category})
+    assert report.counts_by_category[category] >= 1
+    assert any(expected_substr in v.message for v in report.violations)
+    for v in report.violations:
+        assert v.category == category
+        assert "; " in v.message and v.message.endswith(".")
+
+
+@pytest.mark.parametrize(
+    ("category", "rel_path", "snippet"),
+    [
+        (
+            "flat_typing",
+            "agent/kb/schema.py",
+            "from typing import Protocol\n"
+            "class Reader(Protocol):\n"
+            "    def read(self) -> object: ...\n"
+            "def f() -> str:\n"
+            "    import json\n"
+            "    return json.dumps({'note': '# type: ' + 'ignore'})\n",
+        ),
+        (
+            "reflection",
+            "agent/gates/cpp_slice_protocol.py",
+            "import inspect\n"
+            "def cached_callable_signature_info(fn):\n"
+            "    return inspect.signature(fn)\n",
+        ),
+        (
+            "reflection",
+            "agent/gates/stage_b_gate.py",
+            "import inspect\n"
+            "def is_empty(param) -> bool:\n"
+            "    return param.default is inspect.Parameter.empty\n",
+        ),
+        (
+            "cross_private_write",
+            "agent/kb/schema.py",
+            "class Box:\n"
+            "    def __init__(self) -> None:\n"
+            "        self._val = 0\n"
+            "    @classmethod\n"
+            "    def reset(cls) -> None:\n"
+            "        cls._default = 1\n"
+            "def clean(obj) -> None:\n"
+            "    _local = 1\n"
+            "    obj.__doc__ = 'ok'\n"
+            "    obj._cache['k'] = _local\n",
+        ),
+        (
+            "module_loc",
+            "agent/kb/schema.py",
+            "X = 1\n" * 1500,
+        ),
+    ],
+)
+def test_strict_ratchets_accept(
+    tmp_path: Path, category: str, rel_path: str, snippet: str
+) -> None:
+    """Accept clean typed modules, boundary exemptions, self/cls/dunder, and <=1500 LOC."""
+    files = _base_packages()
+    files[rel_path] = snippet
+    root = _write_tree(tmp_path / "tilefoundry_ascend", files)
+    report = dsm_lint.run_lint(root, {category})
+    assert report.counts_by_category[category] == 0
+    assert report.total_violations == 0
 
 
 def test_cli_only_json_and_error_handling(
