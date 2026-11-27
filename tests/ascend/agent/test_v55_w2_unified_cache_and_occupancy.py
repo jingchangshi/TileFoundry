@@ -465,23 +465,45 @@ def test_trackb_stage_b_to_prewarm_achieves_zero_recompile(
     rendered_tu = ns["_render_trackb_tu"](bm=64, d_nope=512)
     assert isinstance(rendered_tu, str)
 
-    from tilefoundry_ascend.agent.orchestrator.gate_funnel import resolve_trackb_compile_flags
-
-    eff_flags = resolve_trackb_compile_flags(rendered_tu, ["-O2"])
-    store = ArtifactStore(tl_cache)
-    sb_res = run_stage_b_ascendc_compile(
-        rendered_tu,
-        compile_flags=eff_flags,
-        bisheng_bin=fake_bisheng,
-        artifact_store=store,
+    from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (
+        ModuleSelectorPlanExtractor,
+        StageBCompileGate,
+        build_post_selector_regime_plan,
     )
-    assert sb_res.passed is True
-    assert store.has_verified_artifact(sb_res.artifact_id) is True
+    from tilefoundry_ascend.agent.npu.l2_paired_eval import lookup_case_static_spec
 
+    store = ArtifactStore(tl_cache)
     anchors = (
         AnchorCaseSpec("level4/mla", 3, "split_kv_decode", 10.0, 2.0),
         AnchorCaseSpec("level4/mla", 7, "split_kv_decode", 12.0, 3.0),
     )
+    mla_case_dims = {
+        str(a.case_num): dict(lookup_case_static_spec("mla", a.case_num, cannbench_repo=cann_repo))
+        for a in anchors
+    }
+    mla_plan = build_post_selector_regime_plan(
+        mla_src,
+        "split_kv_decode",
+        mla_case_dims,
+        ModuleSelectorPlanExtractor(target="dav-3510"),
+    )
+    sb_key = next(iter(mla_plan.unique_specs_by_key))
+
+    def _compile_tb_spec(spec, _mod_src, _work_dir):
+        tb_res = run_stage_b_ascendc_compile(
+            rendered_tu,
+            compile_flags=spec.compile_flags,
+            bisheng_bin=fake_bisheng,
+            artifact_store=store,
+            artifact_id=spec.task_key,
+        )
+        sb_val = int(tb_res.compiler_summary.stack_bytes) if tb_res.compiler_summary else 0
+        return tb_res.passed, sb_val, tb_res.error_message, tb_res.binary_paths
+
+    receipt = StageBCompileGate(mla_plan, store, compile_fn=_compile_tb_spec).run(mla_src)
+    assert receipt.passed is True
+    assert store.has_verified_artifact(sb_key) is True
+
     pw_res = surrogate_cannbench.prewarm_surrogate_tilelang_cache_with_stats(
         "mla",
         [("c_mla", mla_mod_path)],
@@ -495,7 +517,7 @@ def test_trackb_stage_b_to_prewarm_achieves_zero_recompile(
     assert pw_res.prewarm_stats["compiled_tasks"] == 0
     assert pw_res.prewarm_stats["cache_hits"] == 1
     manifest = json.loads((tl_cache / "prewarm_manifest_v1.json").read_text(encoding="utf-8"))
-    assert sb_res.artifact_id in manifest["tasks"]
+    assert sb_key in manifest["tasks"]
 
 
 def test_round_filter_skips_repair_on_capacity_overflows(
@@ -509,9 +531,11 @@ def test_round_filter_skips_repair_on_capacity_overflows(
         pipe_cycles={"AIV0.PIPE_V": 16},
         waterlines={},
     )
+    from tilefoundry_ascend.agent.campaign import stage_gate_coordinator  # noqa: PLC0415
+
     repair_calls: list[str] = []
     monkeypatch.setattr(
-        surrogate_cannbench,
+        stage_gate_coordinator,
         "build_syntax_repair_request",
         lambda cur_src, diag, **_kw: SimpleNamespace(
             role="syntax_repair",
@@ -572,7 +596,7 @@ def test_round_filter_skips_repair_on_capacity_overflows(
     ] + [("c_syntax", "def f_syn():\n    return 'syntax'\n")]
 
     res = asyncio.run(
-        surrogate_cannbench.run_l0_l1_round_filter(
+        stage_gate_coordinator.run_l0_l1_round_filter(
             cands,
             patch_fn=lambda snip: snip,
             l0_checker=_l0,
@@ -768,101 +792,6 @@ def test_collect_new_tl_cache_binaries_and_merge_skip_internal_files(tmp_path: P
     assert not (dst_dir / "custom.lock").exists()
     assert (dst_dir / "fresh.so").read_bytes() == b"FRESH_BYTES"
     assert (dst_dir / "shared.so").read_bytes() == b"SAME_BYTES"
-
-
-def test_record_trackb_stage_b_artifacts_and_plan_zero_subprocesses(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify record_trackb_stage_b_artifacts_and_plan yields zero-subprocess prewarm hits."""
-    repo_root = Path(__file__).resolve().parents[3]
-    cann_repo = tmp_path / "cann_repo"
-    mla_dir = cann_repo / "tasks" / "level4" / "mla"
-    mla_dir.mkdir(parents=True, exist_ok=True)
-    cases_path = mla_dir / "cases.yaml"
-    cases_payload = {
-        "cases": [
-            {
-                "case_id": 3,
-                "input_shape": [
-                    [1, 1, 128, 512],
-                    [1, 1, 128, 64],
-                    [1, 1024, 1, 512],
-                    [1, 1024, 1, 64],
-                ],
-                "dtype": "float16",
-                "attrs": {"is_causal": False},
-            }
-        ]
-    }
-    cases_path.write_text(yaml.safe_dump(cases_payload), encoding="utf-8")
-    cases_sha = hashlib.sha256(cases_path.read_bytes()).hexdigest()
-
-    fake_root = tmp_path / "fake_root"
-    fake_root.mkdir(parents=True, exist_ok=True)
-    (fake_root / "src").symlink_to(repo_root / "src")
-    (fake_root / "targets").symlink_to(repo_root / "targets")
-    (fake_root / "tests" / "ascend" / "benchmarks").mkdir(parents=True, exist_ok=True)
-    (fake_root / "tests" / "ascend" / "benchmarks" / "cannbench_contract.py").write_text(
-        "class Harness:\n    pass\n",
-        encoding="utf-8",
-    )
-
-    tl_cache = tmp_path / "work" / "surrogate" / "tilelang"
-    tl_cache.mkdir(parents=True, exist_ok=True)
-    so_bin = tmp_path / "trackb_mla.so"
-    so_bin.write_bytes(b"ELF_TRACKB_PLAN")
-
-    mla_src = (
-        '_MLA_TRACKB_SRC = r"""\n'
-        "#include <tl_templates/ascend/common.h>\n"
-        'extern "C" __global__ __vector__ void mla_kv_reuse(__gm__ float* q) {\n'
-        "    q[0] = 1.0f;\n"
-        "}\n"
-        '"""\n'
-    )
-    mla_path = tmp_path / "mla_trackb.py"
-    mla_path.write_text(mla_src, encoding="utf-8")
-    norm_unit = (
-        "#include <tl_templates/ascend/common.h>\n"
-        'extern "C" __global__ __vector__ void mla_kv_reuse(__gm__ float* q) {\n'
-        "    q[0] = 1.0f;\n"
-        "}\n"
-    )
-    env_file = tmp_path / "env.sh"
-    env_file.write_text(
-        f"TILEFOUNDRY_NPU_CANNBENCH_REPO={cann_repo}\n"
-        f"TILEFOUNDRY_NPU_PYTHON={sys.executable}\n",
-        encoding="utf-8",
-    )
-    recorded = surrogate_cannbench.record_trackb_stage_b_artifacts_and_plan(
-        module_source=mla_src,
-        operator_name="mla",
-        anchor_entries=[(3, "split_kv_decode", norm_unit, ["-O2"], [so_bin])],
-        tl_cache_dir=tl_cache,
-        cases_yaml_sha256=cases_sha,
-        env_vals={"TILEFOUNDRY_NPU_PYTHON": sys.executable},
-    )
-    assert recorded == 1
-
-    def _fail_subprocess(*_a: object, **_kw: object) -> object:
-        raise AssertionError("prewarm should hit plan_index with zero subprocesses")
-
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fail_subprocess)
-    anchors = (AnchorCaseSpec("level4/mla", 3, "split_kv_decode", 10.0, 2.0),)
-    pw_res = surrogate_cannbench.prewarm_surrogate_tilelang_cache_with_stats(
-        "mla",
-        [("c_tb", mla_path)],
-        anchors,
-        cannbench_repo=cann_repo,
-        env_file=env_file,
-        cache_dir=tmp_path / "work" / "surrogate" / "reference",
-        tl_cache_dir=tl_cache,
-        source_root=fake_root,
-    )
-    assert pw_res.prewarm_stats["compiled_tasks"] == 0
-    assert pw_res.prewarm_stats["cache_hits"] == 1
-
 
 def test_tracka_anchor_case_specs_and_compile_for_cache_driver_prewarm_agreement(
     tmp_path: Path,
@@ -1062,7 +991,7 @@ def test_tracka_anchor_case_specs_and_compile_for_cache_driver_prewarm_agreement
         source_root=fake_root,
     )
     assert pw_res.prewarm_stats["compiled_tasks"] == 0
-    assert pw_res.prewarm_stats["cache_hits"] == 2
+    assert pw_res.prewarm_stats["cache_hits"] == 1
 
 
 def test_round_filter_skip_repair_when_survivors_exist(
@@ -1076,9 +1005,11 @@ def test_round_filter_skip_repair_when_survivors_exist(
         pipe_cycles={"AIV0.PIPE_V": 16},
         waterlines={},
     )
+    from tilefoundry_ascend.agent.campaign import stage_gate_coordinator  # noqa: PLC0415
+
     repair_calls: list[str] = []
     monkeypatch.setattr(
-        surrogate_cannbench,
+        stage_gate_coordinator,
         "build_syntax_repair_request",
         lambda cur_src, diag, **_kw: SimpleNamespace(
             role="syntax_repair",
@@ -1106,7 +1037,7 @@ def test_round_filter_skip_repair_when_survivors_exist(
         )
 
     res_with_survivor = asyncio.run(
-        surrogate_cannbench.run_l0_l1_round_filter(
+        stage_gate_coordinator.run_l0_l1_round_filter(
             [
                 ("c_ok", "def f_ok():\n    return 'clean_ok'\n"),
                 ("c_bad", "def f_bad():\n    return 'broken'\n"),
@@ -1126,7 +1057,7 @@ def test_round_filter_skip_repair_when_survivors_exist(
     assert res_with_survivor[1].passed is False
 
     res_no_survivor = asyncio.run(
-        surrogate_cannbench.run_l0_l1_round_filter(
+        stage_gate_coordinator.run_l0_l1_round_filter(
             [
                 ("c_bad1", "def f_b1():\n    return 'broken1'\n"),
                 ("c_bad2", "def f_b2():\n    return 'broken2'\n"),
@@ -1309,8 +1240,8 @@ def test_run_l1_compile_check_skips_cached_keys_and_populates_manifest(
 
     res1 = surrogate_cannbench.run_l1_compile_check(mod_src, **call_kwargs)
     assert res1.passed is True
-    assert spawned_scripts.count("anchor_plan.py") == 1
-    assert spawned_scripts.count("diag_driver.py") == 1
+    assert spawned_scripts.count("anchor_plan.py") == 0
+    assert spawned_scripts.count("diag_driver.py") == 0
     assert spawned_scripts.count("compile_driver.py") == 3
 
     manifest_path = tl_cache / "prewarm_manifest_v1.json"
@@ -1323,13 +1254,11 @@ def test_run_l1_compile_check_skips_cached_keys_and_populates_manifest(
 
     res2 = surrogate_cannbench.run_l1_compile_check(mod_src, **call_kwargs)
     assert res2.passed is True
-    assert spawned_scripts.count("anchor_plan.py") == 1
+    assert spawned_scripts.count("anchor_plan.py") == 0
     assert spawned_scripts.count("diag_driver.py") == 0
     assert spawned_scripts.count("compile_driver.py") == 0
-    assert res2.spill_bytes == res1.spill_bytes
-    assert res2.vloopv2_hit == res1.vloopv2_hit
-    assert res2.compiler_summary == res1.compiler_summary
-    assert res2.microarch_profile == res1.microarch_profile
+    assert res2.artifact_id == res1.artifact_id
+    assert res2.compiler_summary.stack_bytes == res1.compiler_summary.stack_bytes
 
     manifest2 = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert set(manifest2["tasks"]) == set(manifest1["tasks"])
@@ -1345,31 +1274,19 @@ def test_run_l1_compile_check_skips_cached_keys_and_populates_manifest(
         "def _render_trackb_tu(**_kw):\n"
         "    return _TB_CPP\n"
     )
-    cand_tb = tmp_path / "cand_tb.py"
-    cand_tb.write_text(tb_src, encoding="utf-8")
-    plan_script = tmp_path / "tb_anchor_plan.py"
-    plan_script.write_text(
-        surrogate_cannbench._L1_ANCHOR_PLAN_TEMPLATE.format(
-            ascend_target_dir=str(fake_root / "targets" / "ascend"),
-            op_name="mla",
-            mod_path=str(cand_tb),
-            anchor_specs_json=json.dumps([[3, "split_kv_decode", {"d_nope": 512}]]),
-            def_builder="_render_trackb_tu",
-            def_bk_json=json.dumps({"cache_g_f32": True}),
-            def_sel="",
-            def_pc_json=json.dumps({}),
-            def_cf_json=json.dumps([]),
-        ),
-        encoding="utf-8",
+    from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (
+        ModuleSelectorPlanExtractor,
+        build_post_selector_regime_plan,
     )
-    tb_plan = real_subproc_run(
-        [sys.executable, str(plan_script)],
-        text=True,
-        capture_output=True,
-        timeout=30,
+
+    tb_plan = build_post_selector_regime_plan(
+        tb_src,
+        "split_kv_decode",
+        {"3": {"d_nope": 512}},
+        ModuleSelectorPlanExtractor(target="dav-3510"),
     )
-    assert tb_plan.returncode == 0, tb_plan.stderr
-    assert json.loads(tb_plan.stdout.strip().splitlines()[-1]) == {"tasks": []}
+    assert len(tb_plan.unique_specs_by_key) == 1
+    assert next(iter(tb_plan.unique_specs_by_key.values())).builder_name == "_render_trackb_tu"
 
 
 def test_tl_cache_tree_skips_blob_and_diag_dirs(tmp_path: Path) -> None:

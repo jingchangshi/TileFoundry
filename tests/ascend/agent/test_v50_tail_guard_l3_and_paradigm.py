@@ -79,8 +79,14 @@ def _ensure_cost_gate_policy_stub() -> None:
 
 _ensure_cost_gate_policy_stub()
 
-from tilefoundry_ascend.agent.campaign import campaign_runner, cli, surrogate_cannbench
-from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec, RegimeTargetSpec
+from tilefoundry_ascend.agent.campaign import (
+    campaign_runner,
+    cli,
+    stage_gate_coordinator,
+    surrogate_cannbench,
+)
+from tilefoundry_ascend.agent.npu import l3_l4_gates
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec, PerfTargetSpec, RegimeTargetSpec
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult, StageBResult
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 
@@ -140,7 +146,7 @@ def _make_dummy_runner(
         AnchorCaseSpec(task="t", case_num=0, regime_tag="small", ref_perf_us=10.0, t_hw_us=2.0),
         AnchorCaseSpec(task="t", case_num=1, regime_tag="large", ref_perf_us=10.0, t_hw_us=2.0),
     )
-    perf_target = surrogate_cannbench.PerfTargetSpec(
+    perf_target = PerfTargetSpec(
         operator_name=operator_name,
         target_avg_speedup=1.5,
         target_min_case_speedup=1.2,
@@ -262,7 +268,7 @@ async def test_run_l0_l1_round_filter_exempts_creative_and_paradigm_shift() -> N
     def _ws_fn(_src: str, res: StageAResult) -> int:
         return 2 if res.prim_func == "cand_paradigm_ws" else 1
 
-    results = await surrogate_cannbench.run_l0_l1_round_filter(
+    results = await stage_gate_coordinator.run_l0_l1_round_filter(
         candidates,
         patch_fn=lambda snippet: snippet,
         l0_checker=_l0,
@@ -311,7 +317,7 @@ __global__   void   my_kern(float* x) {
 def _get_small_kernel():
     return KERNEL_CPP
 '''
-    results = await surrogate_cannbench.run_l0_l1_round_filter(
+    results = await stage_gate_coordinator.run_l0_l1_round_filter(
         [("cand_noop", cand_noop_src)],
         patch_fn=lambda snippet: snippet,
         l0_checker=lambda _src: StageAResult(passed=True, prim_func=None, ledger=None),
@@ -576,7 +582,7 @@ def test_l3_failure_kind_candidate_and_infra_distinction() -> None:
         "timing": {"finishedAt": "2026-11-24T00:00:00Z"},
         "nodes": [{"name": "cand_node", "status": "failed", "cases": {"0": "failed"}}],
     }
-    assert surrogate_cannbench._l3_failure_kind(cand_obs, cand_evidence, cov) == "candidate"
+    assert l3_l4_gates._l3_failure_kind(cand_obs, cand_evidence, cov) == "candidate"
 
     idem_obs: Mapping[str, object] = {
         "failureCategory": "infrastructure",
@@ -588,7 +594,7 @@ def test_l3_failure_kind_candidate_and_infra_distinction() -> None:
             "detail": "L3 cache idempotence violation",
         },
     }
-    assert surrogate_cannbench._l3_failure_kind(idem_obs, cand_evidence, cov) == "candidate"
+    assert l3_l4_gates._l3_failure_kind(idem_obs, cand_evidence, cov) == "candidate"
 
     hw_obs: Mapping[str, object] = {
         "failureCategory": "infrastructure",
@@ -600,11 +606,11 @@ def test_l3_failure_kind_candidate_and_infra_distinction() -> None:
             "detail": "aclrtGetDevice device unavailable DrvError",
         },
     }
-    assert surrogate_cannbench._l3_failure_kind(hw_obs, cand_evidence, cov) == "infrastructure"
+    assert l3_l4_gates._l3_failure_kind(hw_obs, cand_evidence, cov) == "infrastructure"
 
 
 def test_vf_stack_overflow_and_max_row_width_helpers(tmp_path: Path) -> None:
-    """Verify VF stack overflow detection and max-row-width resolution."""
+    """Verify VF stack overflow detection and regime case collection."""
     runner = _make_dummy_runner(tmp_path, cost_model_mode="advisory")
     spec = runner._regime_specs[0]
     overflow_res = StageBResult(
@@ -612,11 +618,11 @@ def test_vf_stack_overflow_and_max_row_width_helpers(tmp_path: Path) -> None:
         error_message="compile error: exceeded vf stack size",
         full_diagnostic="bisheng error",
     )
-    assert runner._has_vf_stack_overflow(overflow_res) is True
-    assert runner._has_vf_stack_overflow(StageBResult(passed=True)) is False
-    dims = runner._resolve_max_row_width_dims(spec)
-    assert dims is not None
-    assert int(dims["D"]) >= 2048
+    assert runner._stage_gate_coordinator._stage_b_has_vf_overflow(overflow_res) is True
+    assert runner._stage_gate_coordinator._stage_b_has_vf_overflow(StageBResult(passed=True)) is False
+    cases = runner._stage_gate_coordinator._collect_regime_cases_by_id(spec)
+    assert cases
+    assert any(int(c.get("D", 0)) >= 2048 for c in cases.values())
 
 
 def test_resolve_regime_config_and_bare_trackb_and_slice_contract_and_kda_helpers(
@@ -696,62 +702,42 @@ void host_launcher() {
     assert kernels == ("stage1_k", "stage2_k")
 
 
-def test_prewarm_dedup_and_strict_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Verify TileLang prewarm deduplicates identical tasks and raises on compile failure."""
-    calls: list[tuple[list[str], str]] = []
+def test_prewarm_dedup_and_strict_error(tmp_path: Path) -> None:
+    """Verify StageBCompileGate deduplicates tasks and prewarm rejects failed manifests."""
+    from tilefoundry_ascend.agent.contracts import CompileTaskSpec
+    from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (
+        ModuleSelectorPlanExtractor,
+        StageBCompileGate,
+        build_post_selector_regime_plan,
+    )
+    from tilefoundry_ascend.ascend.compile_cache.artifact_store import ArtifactStore
 
-    class _FakeCompleted:
-        def __init__(self, returncode: int, stdout: str, stderr: str) -> None:
-            self.returncode = returncode
-            self.stdout = stdout
-            self.stderr = stderr
-
-    def _fake_run(
-        cmd: list[str],
-        *,
-        capture_output: bool = False,
-        text: bool = False,
-        env: Mapping[str, str] | None = None,
-        timeout: float | None = None,
-        check: bool = False,
-        cwd: str | None = None,
-    ) -> _FakeCompleted:
-        _ = (capture_output, text, timeout, check, cwd)
-        calls.append((cmd, (env or {}).get("TILELANG_CACHE_DIR", "")))
-        script_path = Path(cmd[-1])
-        if script_path.name == "prewarm_tl_plan.py":
-            return _FakeCompleted(
-                0,
-                json.dumps(
-                    {
-                        "tasks": [
-                            {
-                                "builder_name": "b1",
-                                "mode": "tl",
-                                "kwargs": {"a": 1},
-                                "pass_configs": {},
-                                "compile_flags": [],
-                            },
-                            {
-                                "builder_name": "b1",
-                                "mode": "tl",
-                                "kwargs": {"a": 1},
-                                "pass_configs": {},
-                                "compile_flags": [],
-                            },
-                        ],
-                        "errors": [],
-                    }
-                ),
-                "",
-            )
-        return _FakeCompleted(1, "", "boom compile error")
-
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
+    mod_src = "def _build_small(a=1):\n    return a\n"
     spec_path = tmp_path / "dummy_mod.py"
-    spec_path.write_text("def x(): pass\n", encoding="utf-8")
+    spec_path.write_text(mod_src, encoding="utf-8")
+    extractor = ModuleSelectorPlanExtractor(target="dav-3510", builder_name="_build_small")
+    plan = build_post_selector_regime_plan(
+        mod_src,
+        "small",
+        {"0": {"a": 1}, "1": {"a": 1}},
+        extractor,
+    )
+    assert len(plan.unique_specs_by_key) == 1
 
-    with pytest.raises(RuntimeError, match="boom compile error"):
+    tl_cache = tmp_path / "tl_cache"
+    store = ArtifactStore(tl_cache)
+    seen: list[str] = []
+
+    def _compile_fail(spec: CompileTaskSpec, _src: str, _work: Path):
+        seen.append(spec.task_key)
+        return False, 0, "boom compile error", ()
+
+    receipt = StageBCompileGate(plan, store, compile_fn=_compile_fail).run(mod_src)
+    assert receipt.passed is False
+    assert "boom compile error" in receipt.diagnostic
+    assert len(seen) == 1
+
+    with pytest.raises(RuntimeError, match="prewarm_manifest_v1_miss: missing=0 failed=1"):
         surrogate_cannbench.prewarm_surrogate_tilelang_cache(
             "rms_norm",
             [("small", spec_path)],
@@ -766,10 +752,8 @@ def test_prewarm_dedup_and_strict_error(monkeypatch: pytest.MonkeyPatch, tmp_pat
             ],
             cannbench_repo=tmp_path,
             cache_dir=tmp_path / "ref_cache",
-            tl_cache_dir=tmp_path / "tl_cache",
+            tl_cache_dir=tl_cache,
         )
-    worker_calls = [c for c in calls if Path(c[0][-1]).name == "compile_task.py"]
-    assert len(worker_calls) == 1
 
 
 def test_recoverable_excess_launch_floors(tmp_path: Path) -> None:

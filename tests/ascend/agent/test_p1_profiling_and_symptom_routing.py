@@ -122,15 +122,17 @@ def test_collect_p2_deep_dive_and_bottleneck_msprof_via_agent_gates(
         f"TILEFOUNDRY_NPU_WORK_ROOT={tmp_path / 'work'}\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
-    monkeypatch.setattr(surrogate_cannbench, "_agent_gates_workspace_name", lambda _r: "ws")
-    monkeypatch.setattr(surrogate_cannbench, "resolve_cannbench_repo", lambda **_k: tmp_path)
-    monkeypatch.setattr(surrogate_cannbench, "prewarm_anchor_reference_cache", lambda *_a, **_k: None)
+    from tilefoundry_ascend.agent.npu import ag_transport, msprof_probe  # noqa: PLC0415
+
+    monkeypatch.setattr(msprof_probe, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(msprof_probe, "_agent_gates_workspace_name", lambda _r: "ws")
+    monkeypatch.setattr(msprof_probe, "resolve_cannbench_repo", lambda **_k: tmp_path)
+    monkeypatch.setattr(msprof_probe, "prewarm_anchor_reference_cache", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        surrogate_cannbench, "prewarm_surrogate_tilelang_cache", lambda *_a, **_k: tmp_path
+        msprof_probe, "prewarm_surrogate_tilelang_cache", lambda *_a, **_k: tmp_path
     )
-    monkeypatch.setattr(surrogate_cannbench, "_verify_fast_bindings", lambda *_a, **_k: None)
-    monkeypatch.setattr(surrogate_cannbench, "_verify_fast_coverage", lambda *_a, **_k: None)
+    monkeypatch.setattr(msprof_probe, "_verify_fast_bindings", lambda *_a, **_k: None)
+    monkeypatch.setattr(msprof_probe, "_verify_fast_coverage", lambda *_a, **_k: None)
 
     recorded_payloads: list[dict[str, object]] = []
 
@@ -155,7 +157,7 @@ def test_collect_p2_deep_dive_and_bottleneck_msprof_via_agent_gates(
             SimpleNamespace(state="FINISHED"),
         )
 
-    monkeypatch.setattr(surrogate_cannbench, "_submit_fast_gate", _fake_submit)
+    monkeypatch.setattr(msprof_probe, "_submit_fast_gate", _fake_submit)
     anchors = [AnchorCaseSpec("level1/softmax", 3, "vector_mid", 20.0, 2.0)]
 
     numeric_only = surrogate_cannbench.collect_bottleneck_msprof_via_agent_gates(

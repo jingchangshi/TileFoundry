@@ -18,9 +18,11 @@ from tilefoundry_ascend.agent import (
     extract_ordered_tensor_shapes,
 )
 from tilefoundry_ascend.agent.campaign.campaign_runner import PerfTargetCampaignRunner
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    _extract_lowered_compiler_excerpt,
+from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import (
     run_l0_l1_round_filter,
+)
+from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
+    extract_lowered_compiler_excerpt as _extract_lowered_compiler_excerpt,
 )
 from tilefoundry_ascend.agent.contracts import EvolutionTrajectory
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (

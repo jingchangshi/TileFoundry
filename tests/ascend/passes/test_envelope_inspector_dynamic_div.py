@@ -326,13 +326,13 @@ def test_ordered_tensor_shapes_extraction_and_l0_callsite_wiring(
         ),
         regime_specs=(regime,),
     )
-    monkeypatch.setattr(runner, "_resolve_operator_semantics_for_gates", lambda: None)
-    monkeypatch.setattr(
-        runner,
-        "_resolve_combine_gate_spec",
-        lambda *_a, **_kw: ("_build_combine", {}),
+    cr_cand_src = (
+        dsl_src
+        + "\ndef _build_combine(**_kw):\n    fn = make_kernel()\n    return fn\n"
+        + "\ndef main(*_args, **_kwargs):\n    return make_kernel()\n"
     )
-    cr_res = runner._default_l0_checker(mod_src, regime)
+    monkeypatch.setattr(runner, "_resolve_operator_semantics_for_gates", lambda: None)
+    cr_res = runner._default_l0_checker(cr_cand_src, regime)
     assert cr_res.passed is True
     assert seen_cr_shapes == [((256, 32), (256, 32)), ((256, 32), (256, 32))]
 

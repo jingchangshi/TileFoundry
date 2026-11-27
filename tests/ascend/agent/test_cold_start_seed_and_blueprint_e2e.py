@@ -1669,11 +1669,6 @@ def test_campaign_runner_passes_representative_case_ratios_to_static_gates(
     monkeypatch.setattr(campaign_runner_module, "evaluate_ascendc_candidate", _fake_trackb)
     monkeypatch.setattr(
         PerfTargetCampaignRunner,
-        "_resolve_combine_gate_spec",
-        lambda self, module_source, regime_spec, resolved: None,
-    )
-    monkeypatch.setattr(
-        PerfTargetCampaignRunner,
         "_instantiate_trackb_tu",
         lambda self, module_source, cpp_source, regime_spec: cpp_source,
     )

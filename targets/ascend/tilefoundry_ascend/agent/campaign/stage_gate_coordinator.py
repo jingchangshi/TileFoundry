@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,17 +24,17 @@ from typing import Protocol, TypeVar
 import yaml
 
 import tilefoundry_ascend.agent.campaign.surrogate_cannbench as _surrogate_cannbench
+from tilefoundry_ascend.agent.contracts import CompileTaskSpec, RegimeCompilePlan
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     CannbenchOpsRegistry,
     GuardrailCaseSpec,
     RegimeTargetSpec,
     _has_flat_operator_layout,
-    _static_width_signature,
     build_anchor_var_bindings,
-    collect_distinct_static_width_dims,
     compute_case_eq3_score,
     default_source_root,
+    extract_schema_driven_case_dims,
     extract_trackb_cpp_source,
     get_operator_entrypoint,
     get_operator_task,
@@ -70,17 +71,15 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     AnchorEvalMetrics,
     CandidateSurrogateResult,
     L0L1CandidateCheck,
+    L0L1RoundResults,
     L2BatchResults,
     OccupancyExhaustedError,
+    _normalized_module_ast_signature,
     aggregate_surrogate_result,
     extract_ordered_tensor_shapes,
     lookup_case_static_spec,
-    mark_hybrid_trackb_shared_sos_verified,
-    run_l0_l1_round_filter,
-    run_l1_compile_check,
     run_surrogate_batch_via_agent_gates,
 )
-_ORIG_RUN_L0_L1_ROUND_FILTER = run_l0_l1_round_filter
 from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor, create_cost_advisor
 from tilefoundry_ascend.agent.kb.bayesian_tracker import (
     BayesianRuleTracker,
@@ -109,6 +108,20 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     extract_creative_payload,
     extract_python_dsl,
 )
+from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
+    build_syntax_repair_request,
+    check_repair_monotonicity,
+    classify_stage_failure_for_repair,
+    extract_lowered_compiler_excerpt_with_lang,
+    parse_scoped_search_replace_blocks,
+)
+from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (
+    ModuleSelectorPlanExtractor,
+    StageBCompileGate,
+    build_post_selector_regime_plan,
+    has_unreserved_vf_stack_overflow,
+    run_l1_compile_check,
+)
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     rank_stage_a_candidates_with_cost_model,
 )
@@ -124,7 +137,10 @@ from tilefoundry_ascend.ascend.cost_model import (
     CostFeatures,
     build_cost_features_from_ledger,
 )
-from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import CostGateDecision
+from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (
+    CostGateDecision,
+    is_paradigm_shift_exempt,
+)
 from tilefoundry_ascend.ascend.cost_model.experience_lake import compute_source_sha256
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
@@ -141,7 +157,350 @@ from tilefoundry_ascend.ascend.target import AscendTarget
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 _MAX_L1_COMPILE_WORKERS = 8
+_GLOBAL_KERNEL_DEF_RE = re.compile(
+    r"__global__\s+(?:__aicore__|__vector__|__cube__|__mix__\([^)]*\)|\s)*void\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+)
 
+
+def _repair_timeout_message(error_message: str, is_transport: bool) -> str:
+    return f"{error_message} [repair_timeout]" if is_transport else error_message
+
+
+def _count_trackb_workspace_stages(source: str) -> int:
+    kernels = set(_GLOBAL_KERNEL_DEF_RE.findall(source))
+    has_ws = bool(
+        re.search(r"(?m)^\s*def\s+(?:_[a-z0-9_]+_)?plan_workspace_bytes\s*\(", source)
+    )
+    return len(kernels) + (1 if has_ws else 0)
+
+
+def _extract_candidate_topology_axes(stage_a: StageAResult) -> TopologyAxes | None:
+    route = getattr(stage_a, "route", None)
+    if route is None:
+        return None
+    r_axes = (
+        route.get("topology_axes")
+        if isinstance(route, Mapping)
+        else getattr(route, "topology_axes", None)
+    )
+    if isinstance(r_axes, TopologyAxes):
+        return r_axes
+    if isinstance(r_axes, Mapping) and all(
+        k in r_axes for k in ("compute_engine", "memory_ring", "iteration_regularity")
+    ):
+        return TopologyAxes.from_dict(r_axes)
+    return None
+
+
+def _is_noop_identical_failure(
+    *, failed_tier: str = "", error_message: str = "", result: object | None = None
+) -> bool:
+    fp = str(getattr(result, "fault_plane", "") or "").upper()
+    fc = str(getattr(result, "fault_code", "") or "").upper()
+    if fp == "NOOP_IDENTICAL" or fc == "NOOP_IDENTICAL":
+        return True
+    if str(failed_tier or "").lower() == "noop_identical":
+        return True
+    return "noop_identical" in str(error_message or "").lower()
+
+
+def _merge_interval_wall_sec(intervals: Sequence[tuple[float, float]]) -> float:
+    ordered = sorted((s, e) for s, e in intervals if e > s)
+    if not ordered:
+        return 0.0
+    total = 0.0
+    cur_s, cur_e = ordered[0]
+    for s, e in ordered[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+    return total + (cur_e - cur_s)
+
+
+async def run_l0_l1_round_filter(
+    candidates: Sequence[tuple[str, str]],
+    *,
+    patch_fn: Callable[[str], str],
+    l0_checker: Callable[[str], StageAResult],
+    l1_compiler: Callable[[str], StageBResult],
+    repatch_from_current_fn: Callable[[str, str], str] | None = None,
+    repair_backend: KernelLLMBackend | None = None,
+    max_syntax_repairs: int = 1,
+    slice_hint: str = "",
+    backend_kind: str = "tilelang_dsl",
+    parent_source: str = "",
+    parent_module_source: str = "",
+    trackb_prologue_line_offset: int = 0,
+    stage_a_cost_ranker: Callable[
+        [Sequence[tuple[str, str, StageAResult]]], Sequence[tuple[str, float]]
+    ]
+    | None = None,
+    cost_prescreen_top_k: int | None = None,
+    sil_advisory: object | None = None,
+    sil_verification: object | None = None,
+    freedom_mask: ConstraintRelaxationMask | None = None,
+    vector_mode: str = "simdvf",
+    ub_256kb_unlock: bool = False,
+    creative_candidate_ids: Collection[str] = (),
+    parent_analytical_us: float | None = None,
+    stage_a_analytical_scorer: Callable[[str, str, StageAResult], float] | None = None,
+    parent_topology_axes: TopologyAxes | None = None,
+    candidate_topology_axes_fn: Callable[[str, StageAResult], TopologyAxes | None] | None = None,
+    parent_workspace_stages: int | None = None,
+    candidate_workspace_stages_fn: Callable[[str, StageAResult], int] | None = None,
+    skip_repair_when_survivors_exist: bool = False,
+) -> list[L0L1CandidateCheck]:
+    """Filter candidates concurrently via noop guard, L0 static, prescreen, and L1 compile."""
+    _ = trackb_prologue_line_offset
+    max_attempts = max(0, max_syntax_repairs)
+    bisheng_sem = asyncio.Semaphore(min(8, os.cpu_count() or 4))
+    repair_intervals: list[tuple[float, float]] = []
+    cum_repair_worker_sec = 0.0
+    baseline_src = parent_module_source if parent_module_source.strip() else parent_source
+    baseline_ast_sig = (
+        _normalized_module_ast_signature(baseline_src) if baseline_src.strip() else None
+    )
+    eff_parent_ws_stages = (
+        int(parent_workspace_stages)
+        if parent_workspace_stages is not None
+        else (_count_trackb_workspace_stages(baseline_src) if baseline_src.strip() else 0)
+    )
+
+    async def _try_repair(
+        cur_src: str,
+        diag: str,
+        *,
+        lowered_excerpt: str = "",
+        lowered_excerpt_lang: str | None = None,
+    ) -> tuple[str | None, str, bool]:
+        nonlocal cum_repair_worker_sec
+        assert repair_backend is not None
+        req = build_syntax_repair_request(
+            cur_src, diag, slice_hint=slice_hint, sil_advisory=sil_advisory,
+            sil_verification=sil_verification, backend_kind=backend_kind,
+            parent_source=parent_source, freedom_mask=freedom_mask,
+            vector_mode=vector_mode, ub_256kb_unlock=ub_256kb_unlock,
+            lowered_excerpt=lowered_excerpt, lowered_excerpt_lang=lowered_excerpt_lang,
+        )
+        t_rep0 = time.monotonic()
+        try:
+            raw_reply = await repair_backend.generate(req)
+        except Exception as exc:
+            t_rep1 = time.monotonic()
+            repair_intervals.append((t_rep0, t_rep1))
+            cum_repair_worker_sec += max(0.0, t_rep1 - t_rep0)
+            return None, f"{diag} | repair_transport: {type(exc).__name__}: {exc}", True
+        t_rep1 = time.monotonic()
+        repair_intervals.append((t_rep0, t_rep1))
+        cum_repair_worker_sec += max(0.0, t_rep1 - t_rep0)
+        try:
+            repaired_src = extract_python_dsl(raw_reply)
+        except Exception as exc:
+            return None, f"{diag} | repair_parse: {type(exc).__name__}: {exc}", False
+        if parent_source.strip():
+            violations = check_repair_monotonicity(
+                parent_source, repaired_src, backend_kind=backend_kind
+            )
+            if violations:
+                return None, f"{diag} | repair_monotonicity_violation: {'; '.join(violations)}", False
+        return repaired_src, "", False
+
+    async def _run_stage_a_phase(
+        cand_id: str,
+        cur_snippet: str,
+        *,
+        start_attempt: int = 0,
+        repaired: bool = False,
+        initial_patch_fn: Callable[[str], str] | None = None,
+        attempt_limit: int | None = None,
+    ) -> tuple[L0L1CandidateCheck | None, tuple[str, str, StageAResult, bool, int] | None]:
+        snippet, is_repaired = cur_snippet, repaired
+        active_patch_fn = initial_patch_fn or patch_fn
+        eff_max = max_attempts if attempt_limit is None else max(0, attempt_limit)
+        for attempt in range(start_attempt, eff_max + 1):
+            try:
+                patched = active_patch_fn(snippet)
+            except Exception as exc:
+                err = f"ast_patch_error: {type(exc).__name__}: {exc}"
+                if _is_noop_identical_failure(error_message=err):
+                    return L0L1CandidateCheck(cand_id, False, "noop_identical", "", snippet, is_repaired, error_message=err, fault_plane="NOOP_IDENTICAL", fault_code="NOOP_IDENTICAL"), None
+                if repair_backend is None or attempt >= eff_max:
+                    return L0L1CandidateCheck(cand_id, False, "stage_a", "", snippet, is_repaired, error_message=err, fault_plane="STAGE_A_STATIC", fault_code="AST_PATCH_ERROR"), None
+                next_snip, rep_err, is_tr = await _try_repair(snippet, err)
+                if next_snip is None:
+                    return L0L1CandidateCheck(cand_id, False, "stage_a", "", snippet, is_repaired, error_message=_repair_timeout_message(rep_err, is_tr), fault_plane="STAGE_A_STATIC", fault_code="SYNTAX_REPAIR_FAILED"), None
+                snippet, is_repaired, active_patch_fn = next_snip, True, patch_fn
+                continue
+            active_patch_fn = patch_fn
+            if baseline_ast_sig is not None and (psig := _normalized_module_ast_signature(patched)) is not None and psig == baseline_ast_sig:
+                return L0L1CandidateCheck(cand_id, False, "noop_identical", patched, snippet, is_repaired, error_message="noop_identical_to_parent", fault_plane="NOOP_IDENTICAL", fault_code="NOOP_IDENTICAL"), None
+            stage_a = await asyncio.to_thread(l0_checker, patched)
+            if not stage_a.passed:
+                err = stage_a.error_message or "l0_static_failed"
+                if _is_noop_identical_failure(error_message=err, result=stage_a):
+                    return L0L1CandidateCheck(cand_id, False, "noop_identical", patched, snippet, is_repaired, stage_a=stage_a, error_message=err, fault_plane="NOOP_IDENTICAL", fault_code="NOOP_IDENTICAL"), None
+                fp = str(getattr(stage_a, "fault_plane", "") or "STAGE_A_STATIC")
+                fc = str(getattr(stage_a, "fault_code", "") or "STAGE_A_FAILED")
+                if repair_backend is None or attempt >= eff_max or not classify_stage_failure_for_repair(fc):
+                    return L0L1CandidateCheck(cand_id, False, "stage_a", patched, snippet, is_repaired, stage_a=stage_a, error_message=err, fault_plane=fp, fault_code=fc), None
+                next_snip, rep_err, is_tr = await _try_repair(snippet, err)
+                if next_snip is None:
+                    return L0L1CandidateCheck(cand_id, False, "stage_a", patched, snippet, is_repaired, stage_a=stage_a, error_message=_repair_timeout_message(rep_err, is_tr), fault_plane=fp, fault_code=fc), None
+                snippet, is_repaired = next_snip, True
+                continue
+            return None, (snippet, patched, stage_a, is_repaired, attempt)
+        raise RuntimeError("unreachable repair termination")
+
+    def _make_stage_b_repair_patch_fn(base_patched: str) -> Callable[[str], str]:
+        if repatch_from_current_fn is None or not base_patched.strip():
+            return patch_fn
+
+        def _patch_repaired(snip: str) -> str:
+            try:
+                return repatch_from_current_fn(base_patched, snip)
+            except Exception:
+                if not parse_scoped_search_replace_blocks(snip):
+                    return patch_fn(snip)
+                raise
+
+        return _patch_repaired
+
+    async def _run_stage_b_and_repairs(
+        cand_id: str, snippet: str, patched: str, stage_a: StageAResult, repaired: bool, attempt: int, *, attempt_limit: int | None = None,
+    ) -> L0L1CandidateCheck:
+        cur_snip, cur_patched, cur_sa, cur_rep, cur_att = snippet, patched, stage_a, repaired, attempt
+        eff_max = max_attempts if attempt_limit is None else max(0, attempt_limit)
+        while True:
+            async with bisheng_sem:
+                stage_b = await asyncio.to_thread(l1_compiler, cur_patched)
+            if stage_b.passed:
+                return L0L1CandidateCheck(cand_id, True, None, cur_patched, cur_snip, cur_rep, stage_a=cur_sa, stage_b=stage_b)
+            err = stage_b.error_message or "l1_compile_failed"
+            if _is_noop_identical_failure(error_message=err, result=stage_b):
+                return L0L1CandidateCheck(cand_id, False, "noop_identical", cur_patched, cur_snip, cur_rep, stage_a=cur_sa, stage_b=stage_b, error_message=err, fault_plane="NOOP_IDENTICAL", fault_code="NOOP_IDENTICAL")
+            fp = str(getattr(stage_b, "fault_plane", "") or "STAGE_B_COMPILE")
+            fc = str(getattr(stage_b, "fault_code", "") or "STAGE_B_FAILED")
+            if repair_backend is None or cur_att >= eff_max or not classify_stage_failure_for_repair(fc):
+                return L0L1CandidateCheck(cand_id, False, "stage_b", cur_patched, cur_snip, cur_rep, stage_a=cur_sa, stage_b=stage_b, error_message=err, fault_plane=fp, fault_code=fc)
+            excerpt, excerpt_lang = extract_lowered_compiler_excerpt_with_lang(stage_b)
+            next_snip, rep_err, is_tr = await _try_repair(cur_snip, err, lowered_excerpt=excerpt, lowered_excerpt_lang=excerpt_lang)
+            if next_snip is None:
+                return L0L1CandidateCheck(cand_id, False, "stage_b", cur_patched, cur_snip, cur_rep, stage_a=cur_sa, stage_b=stage_b, error_message=_repair_timeout_message(rep_err, is_tr), fault_plane=fp, fault_code=fc)
+            failed_chk, passed_state = await _run_stage_a_phase(cand_id, next_snip, start_attempt=cur_att + 1, repaired=True, initial_patch_fn=_make_stage_b_repair_patch_fn(cur_patched))
+            if failed_chk is not None:
+                return failed_chk
+            assert passed_state is not None
+            cur_snip, cur_patched, cur_sa, cur_rep, cur_att = passed_state
+
+    async def _check_one(cand_id: str, snippet: str, *, attempt_limit: int | None = None) -> L0L1CandidateCheck:
+        failed_chk, passed_state = await _run_stage_a_phase(cand_id, snippet, attempt_limit=attempt_limit)
+        if failed_chk is not None:
+            return failed_chk
+        assert passed_state is not None
+        return await _run_stage_b_and_repairs(cand_id, *passed_state, attempt_limit=attempt_limit)
+
+    async def _phase2_repair_failed(chk: L0L1CandidateCheck) -> L0L1CandidateCheck:
+        if chk.passed or chk.failed_tier == "noop_identical":
+            return chk
+        fc, fp = str(chk.fault_code or ""), str(chk.fault_plane or "")
+        if not classify_stage_failure_for_repair(fc):
+            return chk
+        err = chk.error_message or "l1_compile_failed"
+        if chk.failed_tier == "stage_b" and chk.stage_b is not None:
+            excerpt, ex_lang = extract_lowered_compiler_excerpt_with_lang(chk.stage_b)
+            next_snip, rep_err, is_tr = await _try_repair(chk.snippet_source, err, lowered_excerpt=excerpt, lowered_excerpt_lang=ex_lang)
+            if next_snip is None:
+                return replace(chk, error_message=_repair_timeout_message(rep_err, is_tr))
+            init_pf = _make_stage_b_repair_patch_fn(chk.patched_module_source)
+        else:
+            next_snip, rep_err, is_tr = await _try_repair(chk.snippet_source, err)
+            if next_snip is None:
+                out_fc = "SYNTAX_REPAIR_FAILED" if fc == "AST_PATCH_ERROR" else fc
+                return L0L1CandidateCheck(chk.candidate_id, False, "stage_a", chk.patched_module_source, chk.snippet_source, chk.repaired, stage_a=chk.stage_a, error_message=_repair_timeout_message(rep_err, is_tr), fault_plane=fp or "STAGE_A_STATIC", fault_code=out_fc or "STAGE_A_FAILED")
+            init_pf = None
+        failed_chk, passed_state = await _run_stage_a_phase(chk.candidate_id, next_snip, start_attempt=1, repaired=True, initial_patch_fn=init_pf)
+        if failed_chk is not None:
+            return failed_chk
+        assert passed_state is not None
+        return await _run_stage_b_and_repairs(chk.candidate_id, *passed_state)
+
+    def _finalize(items: Sequence[L0L1CandidateCheck]) -> L0L1RoundResults:
+        wall_sec, cum_sec = _merge_interval_wall_sec(repair_intervals), float(cum_repair_worker_sec)
+        tagged = [replace(c, wall_repair_sec=wall_sec, cum_repair_worker_sec=cum_sec) for c in items]
+        return L0L1RoundResults(tagged, wall_repair_sec=wall_sec, cum_repair_worker_sec=cum_sec)
+
+    use_prescreen = stage_a_cost_ranker is not None and cost_prescreen_top_k is not None and int(cost_prescreen_top_k) > 0
+    if not use_prescreen:
+        if skip_repair_when_survivors_exist and repair_backend is not None and max_attempts > 0:
+            phase1 = list(await asyncio.gather(*(_check_one(cid, src, attempt_limit=0) for cid, src in candidates)))
+            if any(chk.passed for chk in phase1):
+                return _finalize(phase1)
+            return _finalize(list(await asyncio.gather(*(_phase2_repair_failed(chk) for chk in phase1))))
+        return _finalize(list(await asyncio.gather(*(_check_one(cid, src) for cid, src in candidates))))
+
+    assert stage_a_cost_ranker is not None
+    top_k = int(cost_prescreen_top_k or 0)
+    sa_outcomes = list(await asyncio.gather(*(_run_stage_a_phase(cid, src) for cid, src in candidates)))
+    results_by_idx: dict[int, L0L1CandidateCheck] = {}
+    passers: list[tuple[int, str, str, str, StageAResult, bool, int]] = []
+    for idx, ((cid, _src), (failed_chk, passed_state)) in enumerate(zip(candidates, sa_outcomes)):
+        if failed_chk is not None:
+            results_by_idx[idx] = failed_chk
+        else:
+            assert passed_state is not None
+            passers.append((idx, cid, *passed_state))
+    if not passers:
+        return _finalize([results_by_idx[i] for i in range(len(candidates))])
+
+    creative_id_set = {str(cid) for cid in creative_candidate_ids}
+    exempt_passers, same_topo_passers = [], []
+    for item in passers:
+        _idx, cid, _snip, patched, sa, _rep, _att = item
+        c_axes = candidate_topology_axes_fn(patched, sa) if candidate_topology_axes_fn is not None else _extract_candidate_topology_axes(sa)
+        c_ws = int(candidate_workspace_stages_fn(patched, sa)) if candidate_workspace_stages_fn is not None else _count_trackb_workspace_stages(patched)
+        if is_paradigm_shift_exempt(c_axes, parent_topology_axes, cand_workspace_stages=c_ws, parent_workspace_stages=eff_parent_ws_stages, is_creative=(cid in creative_id_set)):
+            exempt_passers.append(item)
+        else:
+            same_topo_passers.append(item)
+
+    if len(same_topo_passers) > top_k:
+        ranked = list(stage_a_cost_ranker([(cid, patched, sa) for _i, cid, _sn, patched, sa, _r, _a in same_topo_passers]))
+        pred_by_id: dict[str, float] = {}
+        order_by_id: dict[str, int] = {}
+        for ridx, (rcid, rscore) in enumerate(ranked):
+            if (sid := str(rcid)) not in pred_by_id:
+                pred_by_id[sid], order_by_id[sid] = float(rscore), ridx
+        sorted_same = sorted(same_topo_passers, key=lambda it: (pred_by_id.get(it[1], float("inf")), order_by_id.get(it[1], len(same_topo_passers) + it[0]), it[0]))
+        kept_same, reserve_same = sorted_same[:top_k], sorted_same[top_k:]
+    else:
+        pred_by_id, kept_same, reserve_same = {}, same_topo_passers, []
+
+    kept_passers = [*exempt_passers, *kept_same]
+    kept_same_ids = {item[1] for item in kept_same}
+    passed_l1 = 0
+    if kept_passers:
+        sb_checks = await asyncio.gather(*(_run_stage_b_and_repairs(cid, cs, p, sa, r, a) for _i, cid, cs, p, sa, r, a in kept_passers))
+        for (idx, cid, *_rest), chk in zip(kept_passers, sb_checks):
+            results_by_idx[idx] = chk
+            if chk.passed and cid in kept_same_ids:
+                passed_l1 += 1
+
+    _ = (parent_analytical_us, stage_a_analytical_scorer)
+    for idx, cid, cs, p, sa, r, a in reserve_same:
+        if passed_l1 < top_k:
+            chk = await _run_stage_b_and_repairs(cid, cs, p, sa, r, a)
+            results_by_idx[idx] = chk
+            if chk.passed:
+                passed_l1 += 1
+        else:
+            results_by_idx[idx] = L0L1CandidateCheck(cid, False, "cost_prescreen", p, cs, r, stage_a=sa, stage_b=None, error_message=f"cost_prescreen_pruned:pred_us={pred_by_id.get(cid, float('inf')):.2f}", fault_plane="COST_PRESCREEN", fault_code="COST_PRESCREEN_PRUNED")
+    return _finalize([results_by_idx[i] for i in range(len(candidates))])
+
+
+_ORIG_RUN_L0_L1_ROUND_FILTER = run_l0_l1_round_filter
 _SHAPE_DIM_KEYS: frozenset[str] = frozenset(
     {
         "b",
@@ -518,20 +877,24 @@ class StageGateCoordinator:
         ) > 0
 
     @staticmethod
-    def _has_vf_stack_overflow(stage_b: StageBResult) -> bool:
-        """Detect deterministic VF stack overflow from diagnostics or stack bytes."""
-        if not stage_b.passed:
-            diag = f"{stage_b.error_message}\n{stage_b.full_diagnostic}".lower()
-            if (
-                "exceeded vf stack size" in diag
-                or "vf_stack" in diag
-                or "stack frame size" in diag
-                or "stack overflow" in diag
-            ):
-                return True
-        if stage_b.compiler_summary is not None and int(stage_b.compiler_summary.stack_bytes) > 0:
+    def _stage_b_has_vf_overflow(
+        stage_b: StageBResult,
+        compile_flags: Sequence[str] = (),
+        builder_name: str = "",
+    ) -> bool:
+        """Detect VF stack overflow using per-task unreserved-UBUF flags."""
+        if stage_b.fault_code == "VF_STACK_OVERFLOW":
             return True
-        return False
+        diag = f"{stage_b.error_message}\n{stage_b.full_diagnostic}"
+        if not stage_b.passed and ("vf_stack" in diag.lower() or "stack frame size" in diag.lower()):
+            return True
+        stack_bytes = (
+            int(stage_b.compiler_summary.stack_bytes)
+            if stage_b.compiler_summary is not None
+            else 0
+        )
+        spec = CompileTaskSpec("", builder_name, (), (), tuple(str(f) for f in compile_flags))
+        return has_unreserved_vf_stack_overflow(spec, stack_bytes, diag)
 
     @staticmethod
     def _slice_contract_instruction(
@@ -685,38 +1048,6 @@ class StageGateCoordinator:
             if static_spec is not None:
                 specs.append((cnum, str(item.regime_tag or ""), static_spec))
         return specs
-
-    @staticmethod
-    def _width_covered_by_anchor_specs(
-        w_dims: Mapping[str, object],
-        w_resolved: _ResolvedConfigLike,
-        regime_anchor_specs: Sequence[tuple[dict[str, object], _ResolvedConfigLike | None]],
-    ) -> bool:
-        if not w_dims or not regime_anchor_specs:
-            return False
-        w_sig = _static_width_signature(w_dims)
-        w_cfg = (
-            w_resolved.builder_name,
-            tuple(w_resolved.compile_flags or ()),
-            dict(w_resolved.pass_configs or {}),
-        )
-        for a_spec, a_resolved in regime_anchor_specs:
-            if dict(w_dims) == dict(a_spec):
-                if a_resolved is None or w_resolved == a_resolved:
-                    return True
-                continue
-            if a_resolved is None:
-                continue
-            if w_resolved == a_resolved and all(a_spec.get(k) == v for k, v in w_dims.items()):
-                return True
-            a_cfg = (
-                a_resolved.builder_name,
-                tuple(a_resolved.compile_flags or ()),
-                dict(a_resolved.pass_configs or {}),
-            )
-            if w_cfg == a_cfg and w_sig and w_sig == _static_width_signature(a_spec):
-                return True
-        return False
 
     def _belongs_to_regime(
         self,
@@ -888,137 +1219,6 @@ class StageGateCoordinator:
             )
         except (OSError, ValueError) as exc:
             logger.debug("KB event shard append skipped: %s", exc)
-
-    def _resolve_combine_gate_spec(
-        self,
-        module_source: str,
-        regime_spec: RegimeTargetSpec,
-        resolved: _ResolvedConfigLike,
-    ) -> tuple[str, dict[str, object]] | None:
-        """Return combine builder symbol and kwargs when combine gate applies."""
-        override = self._owner_override("_resolve_combine_gate_spec")
-        if override is not None:
-            return override(module_source, regime_spec, resolved)
-        combine_fn = next(
-            (
-                sym
-                for sym in regime_spec.editable_symbols
-                if sym.startswith("_build_") and "combine" in sym
-            ),
-            "",
-        )
-        if not combine_fn:
-            return None
-        cand_dump = self._function_ast_dump(module_source, combine_fn)
-        if not cand_dump:
-            return None
-        splits = int(resolved.builder_kwargs.get("num_kv_splits", 1) or 1)
-        modified = False
-        baseline_src = self._active_incumbent_source
-        if not baseline_src and self._target_module_path.is_file():
-            try:
-                baseline_src = self._target_module_path.read_text(encoding="utf-8")
-            except OSError:
-                baseline_src = ""
-        if not baseline_src:
-            modified = True
-        else:
-            base_dump = self._function_ast_dump(baseline_src, combine_fn)
-            modified = cand_dump != base_dump
-        if splits <= 1 and not modified:
-            return None
-        combine_splits = splits if splits > 1 else 4
-        merged_kwargs: dict[str, object] = {
-            **regime_spec.sample_builder_kwargs,
-            **resolved.builder_kwargs,
-            "num_kv_splits": combine_splits,
-            **resolved.combine_kwargs,
-        }
-        mod_tree = ast.parse(module_source)
-        fn_node = self._find_top_level_func(mod_tree, (combine_fn,))
-        if fn_node is not None and fn_node.args.kwarg is None:
-            accepted = {
-                *(a.arg for a in fn_node.args.posonlyargs),
-                *(a.arg for a in fn_node.args.args),
-                *(a.arg for a in fn_node.args.kwonlyargs),
-            }
-            combine_kwargs = {k: v for k, v in merged_kwargs.items() if k in accepted}
-        else:
-            combine_kwargs = merged_kwargs
-        return combine_fn, combine_kwargs
-
-    def _combine_covered_by_primary_anchor_plan(
-        self,
-        module_source: str,
-        combine_spec: tuple[str, dict[str, object]],
-        resolved: _ResolvedConfigLike,
-        regime_anchor_specs: Sequence[tuple[dict[str, object], _ResolvedConfigLike | None]],
-        env_vals: Mapping[str, str] | None,
-        l1_check_fn: object,
-    ) -> bool:
-        """Return whether primary_b already compiled the combine kernel via anchor planning."""
-        if self._owner_override("_run_l1") is not None or "_run_l1" in self.__dict__:
-            return False
-        if (
-            self._owner_override("_resolve_combine_gate_spec") is not None
-            or "_resolve_combine_gate_spec" in self.__dict__
-        ):
-            return False
-        if l1_check_fn is not _ORIG_CAMPAIGN_HOOKS["run_l1_compile_check"]:
-            return False
-        if not regime_anchor_specs:
-            return False
-        cann_setup = (
-            (env_vals or {}).get("TILEFOUNDRY_NPU_CANN_SETUP")
-            or os.environ.get("TILEFOUNDRY_NPU_CANN_SETUP")
-            or ""
-        ).strip()
-        tl_source = (
-            (env_vals or {}).get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
-            or os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
-            or ""
-        ).strip()
-        if not cann_setup and not tl_source:
-            return False
-        try:
-            mod_tree = ast.parse(module_source)
-        except SyntaxError:
-            return False
-        if self._find_top_level_func(mod_tree, ("_get_kernel",)) is None:
-            return False
-        comb_wrapper = self._find_top_level_func(mod_tree, ("_get_combine_kernel",))
-        if comb_wrapper is None:
-            return False
-        combine_fn, combine_kwargs = combine_spec
-        if combine_fn != "_get_combine_kernel" and not any(
-            isinstance(node, ast.Name) and node.id == combine_fn
-            for node in ast.walk(comb_wrapper)
-        ):
-            return False
-        target_splits = int(resolved.builder_kwargs.get("num_kv_splits", 1) or 1)
-        for a_spec, a_resolved in regime_anchor_specs:
-            if a_resolved is None:
-                continue
-            a_splits = int(a_resolved.builder_kwargs.get("num_kv_splits", 1) or 1)
-            if a_splits <= 1:
-                continue
-            if target_splits > 1 and a_splits != target_splits:
-                continue
-            if dict(a_resolved.combine_kwargs or {}) != dict(resolved.combine_kwargs or {}):
-                continue
-            if dict(a_resolved.pass_configs or {}) != dict(resolved.pass_configs or {}):
-                continue
-            if tuple(a_resolved.compile_flags or ()) != tuple(resolved.compile_flags or ()):
-                continue
-            if any(
-                k != "num_kv_splits"
-                and (k in a_resolved.builder_kwargs or k in a_spec)
-                and a_resolved.builder_kwargs.get(k, a_spec.get(k)) != v
-                for k, v in combine_kwargs.items()
-            ):
-                continue
-            return True
-        return False
 
     def _lookup_verified_hybrid_trackb_artifact(
         self,
@@ -1474,33 +1674,61 @@ class StageGateCoordinator:
                     regime_tag=regime_spec.regime_tag,
                 )
             return primary_res
-        combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
-        if combine_spec is not None:
-            combine_fn, combine_kwargs = combine_spec
-            combine_res = stage_a_fn(
-                module_source,
-                factory_name=combine_fn,
-                factory_kwargs=combine_kwargs,
-                pass_configs=resolved.pass_configs or None,
-                compile_flags=resolved.compile_flags or None,
-                target=self._target,
-                var_bindings=var_bindings or None,
-                enable_track_router=self._enable_track_router,
-                case_ratios=regime_spec.representative_case_ratios,
-                require_hardware_dma=req_dma,
-                require_cube_engine=False,
-                ordered_tensor_shapes=ordered_tensor_shapes,
+        combine_fn = next(
+            (s for s in regime_spec.editable_symbols if s.startswith("_build_") and "combine" in s),
+            "",
+        )
+        combine_dump = self._function_ast_dump(module_source, combine_fn) if combine_fn else ""
+        if combine_fn and combine_dump:
+            splits = int(resolved.builder_kwargs.get("num_kv_splits", 1) or 1)
+            base_src = self._active_incumbent_source
+            if not base_src and self._target_module_path.is_file():
+                try:
+                    base_src = self._target_module_path.read_text(encoding="utf-8")
+                except OSError:
+                    base_src = ""
+            modified = (not base_src) or (
+                combine_dump != self._function_ast_dump(base_src, combine_fn)
             )
-            if not combine_res.passed:
-                return StageAResult(
-                    passed=False,
-                    prim_func=primary_res.prim_func,
-                    ledger=primary_res.ledger,
-                    features=primary_res.features,
-                    route=primary_res.route,
-                    error_message=f"combine_kernel({combine_fn}): {combine_res.error_message}",
-                    elapsed_ms=primary_res.elapsed_ms + combine_res.elapsed_ms,
+            if splits > 1 or modified:
+                merged_kw: dict[str, object] = {
+                    **regime_spec.sample_builder_kwargs,
+                    **resolved.builder_kwargs,
+                    "num_kv_splits": splits if splits > 1 else 4,
+                    **resolved.combine_kwargs,
+                }
+                fn_node = self._find_top_level_func(ast.parse(module_source), (combine_fn,))
+                if fn_node is not None and fn_node.args.kwarg is None:
+                    acc = {
+                        *(a.arg for a in fn_node.args.posonlyargs),
+                        *(a.arg for a in fn_node.args.args),
+                        *(a.arg for a in fn_node.args.kwonlyargs),
+                    }
+                    merged_kw = {k: v for k, v in merged_kw.items() if k in acc}
+                combine_res = stage_a_fn(
+                    module_source,
+                    factory_name=combine_fn,
+                    factory_kwargs=merged_kw,
+                    pass_configs=resolved.pass_configs or None,
+                    compile_flags=resolved.compile_flags or None,
+                    target=self._target,
+                    var_bindings=var_bindings or None,
+                    enable_track_router=self._enable_track_router,
+                    case_ratios=regime_spec.representative_case_ratios,
+                    require_hardware_dma=req_dma,
+                    require_cube_engine=False,
+                    ordered_tensor_shapes=ordered_tensor_shapes,
                 )
+                if not combine_res.passed:
+                    return StageAResult(
+                        passed=False,
+                        prim_func=primary_res.prim_func,
+                        ledger=primary_res.ledger,
+                        features=primary_res.features,
+                        route=primary_res.route,
+                        error_message=f"combine_kernel({combine_fn}): {combine_res.error_message}",
+                        elapsed_ms=primary_res.elapsed_ms + combine_res.elapsed_ms,
+                    )
         if is_hybrid and tb_extracted is not None:
             tb_sym, tb_cpp = tb_extracted
             active_mask = self._resolve_trackb_freedom_mask(regime_spec)
@@ -1584,17 +1812,17 @@ class StageGateCoordinator:
             anchor_dims_override=anchor_dims_override,
         )
 
-    def _resolve_max_row_width_dims(
+    def _collect_regime_cases_by_id(
         self,
         regime_spec: RegimeTargetSpec,
-    ) -> dict[str, object] | None:
-        """Return the largest-row-width case dims routed to ``regime_spec``."""
-        override = self._owner_override("_resolve_max_row_width_dims")
-        if override is not None:
-            return override(regime_spec)
-        candidates: list[dict[str, object]] = []
+        *,
+        extra_dims: Sequence[Mapping[str, object]] = (),
+    ) -> dict[str, dict[str, object]]:
+        """Collect all case dim dicts routed to ``regime_spec`` for post-selector planning."""
+        cases_by_id: dict[str, dict[str, object]] = {}
+        seen_case_nums: set[int] = set()
         tasks_root = self._resolve_cannbench_tasks_root()
-        if tasks_root is not None:
+        if tasks_root is not None and self._config.operator_name:
             try:
                 task = get_operator_task(self._config.operator_name)
                 cases_path = tasks_root / task / "cases.yaml"
@@ -1603,170 +1831,49 @@ class StageGateCoordinator:
                     for row in parsed.get("cases") or ():
                         if isinstance(row, Mapping) and row.get("case_id") is not None:
                             cnum = int(row["case_id"])
-                            dims = self._lookup_case_dims_safe(cnum, regime_spec.regime_tag)
+                            dims = self._lookup_case_static_spec_safe(cnum)
+                            if dims is None:
+                                dims = self._lookup_case_dims_safe(cnum, regime_spec.regime_tag)
                             if dims and self._belongs_to_regime(dims, regime_spec):
-                                candidates.append(dict(dims))
+                                cases_by_id[str(cnum)] = dict(dims)
+                                seen_case_nums.add(cnum)
             except (FileNotFoundError, KeyError, OSError, ValueError, TypeError):
                 pass
-        for anc in self._initial_anchors:
-            if len(self._regime_specs) > 1 and anc.regime_tag != regime_spec.regime_tag:
+        for item in (*self._scoreboard_anchors, *self._guardrail_cases, *self._initial_anchors):
+            if len(self._regime_specs) > 1 and item.regime_tag and item.regime_tag != regime_spec.regime_tag:
                 continue
-            dims = self._lookup_case_dims_safe(int(anc.case_num), anc.regime_tag)
-            if dims and self._belongs_to_regime(dims, regime_spec):
-                candidates.append(dict(dims))
-        own_rep = regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-        if own_rep:
-            candidates.append(dict(own_rep))
-        if not candidates:
-            return None
-
-        row_width_keys = (
-            "D",
-            "d_dim",
-            "K",
-            "N",
-            "hidden_dim",
-            "d_nope",
-            "d_rope",
-            "inner",
-            "inner_dim",
-            "S",
-            "s_dim",
-            "seq_len",
-        )
-
-        def _row_width_score(dims: Mapping[str, object]) -> tuple[int, int]:
-            width = 1
-            has_width_key = False
-            for key in row_width_keys:
-                val = dims.get(key)
-                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
-                    width *= val
-                    has_width_key = True
-            total_prod = 1
-            for val in dims.values():
-                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
-                    total_prod *= val
-            return (width if has_width_key else total_prod, total_prod)
-
-        return max(candidates, key=_row_width_score)
-
-    def _resolve_tail_anchor_dims(
-        self,
-        regime_spec: RegimeTargetSpec,
-    ) -> dict[str, object] | None:
-        """Return the smallest-element case dims routed to ``regime_spec`` when distinct."""
-        override = self._owner_override("_resolve_tail_anchor_dims")
-        if override is not None:
-            return override(regime_spec)
-        primary_dims = dict(
-            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-        )
-        candidates: list[dict[str, object]] = []
-        tasks_root = self._resolve_cannbench_tasks_root()
-        if tasks_root is not None:
-            try:
-                task = get_operator_task(self._config.operator_name)
-                cases_path = tasks_root / task / "cases.yaml"
-                if cases_path.is_file():
-                    parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
-                    for row in parsed.get("cases") or ():
-                        if isinstance(row, Mapping) and row.get("case_id") is not None:
-                            cnum = int(row["case_id"])
-                            dims = self._lookup_case_dims_safe(cnum, regime_spec.regime_tag)
-                            if dims and self._belongs_to_regime(dims, regime_spec):
-                                candidates.append(dict(dims))
-            except (FileNotFoundError, KeyError, OSError, ValueError, TypeError):
-                pass
-        for anc in self._scoreboard_anchors:
-            if len(self._regime_specs) > 1 and anc.regime_tag != regime_spec.regime_tag:
+            cnum = int(item.case_num)
+            if cnum in seen_case_nums:
                 continue
-            dims = self._lookup_case_dims_safe(int(anc.case_num), anc.regime_tag)
+            dims = self._lookup_case_static_spec_safe(cnum)
+            if dims is None:
+                dims = self._lookup_case_dims_safe(cnum, str(item.regime_tag or regime_spec.regime_tag))
             if dims and self._belongs_to_regime(dims, regime_spec):
-                candidates.append(dict(dims))
-        if regime_spec.representative_hir_dims:
-            candidates.append(dict(regime_spec.representative_hir_dims))
-        if not candidates:
-            return None
-
-        def _elem_score(dims: Mapping[str, object]) -> tuple[int, int]:
-            prod = 1
-            count = 0
-            for val in dims.values():
-                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
-                    prod *= val
-                    count += 1
-            return (prod if count > 0 else 0, len(dims))
-
-        smallest = min(candidates, key=_elem_score)
-        if smallest == primary_dims:
-            return None
-        return smallest
-
-    def _collect_distinct_width_dims(
-        self,
-        regime_spec: RegimeTargetSpec,
-        anchor_dims: Mapping[str, object] | None,
-        uses_unreserved_ubuf: bool,
-        static_width_dims_fn: Callable[[RegimeTargetSpec], Sequence[Mapping[str, object]]]
-        | None,
-    ) -> list[dict[str, object]]:
-        seen: list[dict[str, object]] = [dict(anchor_dims)] if anchor_dims else []
-        seen_sigs: set[tuple[tuple[str, object], ...]] = set()
-        if anchor_dims:
-            anchor_sig = _static_width_signature(anchor_dims)
-            if anchor_sig:
-                seen_sigs.add(anchor_sig)
-        targets: list[dict[str, object]] = []
-
-        def _append_distinct(cand: dict[str, object], *, require_int_dim: bool) -> None:
-            if not cand or cand in seen:
-                return
-            if require_int_dim and not any(
-                isinstance(v, int) and not isinstance(v, bool) for v in cand.values()
-            ):
-                return
-            sig = _static_width_signature(cand)
-            if static_width_dims_fn is None and not any(
-                isinstance(v, int) and not isinstance(v, bool) for _, v in sig
-            ):
-                return
-            if sig:
-                if sig in seen_sigs:
-                    return
-                seen_sigs.add(sig)
-            seen.append(cand)
-            targets.append(cand)
-
-        if static_width_dims_fn is not None:
-            for item in static_width_dims_fn(regime_spec):
-                _append_distinct(dict(item), require_int_dim=False)
-        elif self._l1_compiler is None and self._config.operator_name:
-            anchors_for_width = self._scoreboard_anchors or self._initial_anchors
-            for item in collect_distinct_static_width_dims(
-                self._config.operator_name,
-                regime_spec,
-                anchors_for_width,
-                self._guardrail_cases,
-                cannbench_repo=self._cannbench_repo,
-                env_file=self._env_file,
-            ):
-                _append_distinct(dict(item), require_int_dim=True)
-        if uses_unreserved_ubuf:
-            max_dims = self._resolve_max_row_width_dims(regime_spec)
-            if max_dims:
-                _append_distinct(
-                    dict(max_dims),
-                    require_int_dim=static_width_dims_fn is None,
-                )
-        return targets
+                cases_by_id[str(cnum)] = dict(dims)
+                seen_case_nums.add(cnum)
+        for idx, e_dims in enumerate(extra_dims):
+            if e_dims:
+                cases_by_id[f"extra_{idx}"] = dict(e_dims)
+        anchor_dims = regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+        if anchor_dims and dict(anchor_dims) not in cases_by_id.values():
+            cases_by_id["__primary__"] = dict(anchor_dims)
+        elif not cases_by_id and anchor_dims:
+            cases_by_id["__primary__"] = dict(anchor_dims)
+        return cases_by_id
 
     def _build_width_failure_result(
         self,
         width_res: StageBResult,
         total_elapsed: float,
+        *,
+        compile_flags: Sequence[str] = (),
+        builder_name: str = "",
     ) -> StageBResult:
-        if self._has_vf_stack_overflow(width_res):
+        if self._stage_b_has_vf_overflow(
+            width_res,
+            compile_flags=compile_flags,
+            builder_name=builder_name,
+        ):
             stack_bytes = (
                 int(width_res.compiler_summary.stack_bytes)
                 if width_res.compiler_summary is not None
@@ -1797,8 +1904,18 @@ class StageGateCoordinator:
             failed_tier=width_res.failed_tier or "stage_b",
         )
 
-    def _normalize_primary_vf_overflow(self, res: StageBResult) -> StageBResult:
-        if not res.passed and self._has_vf_stack_overflow(res):
+    def _normalize_primary_vf_overflow(
+        self,
+        res: StageBResult,
+        *,
+        compile_flags: Sequence[str] = (),
+        builder_name: str = "",
+    ) -> StageBResult:
+        if not res.passed and self._stage_b_has_vf_overflow(
+            res,
+            compile_flags=compile_flags,
+            builder_name=builder_name,
+        ):
             return replace(
                 res,
                 fault_plane=res.fault_plane or "STAGE_B_COMPILE",
@@ -1938,13 +2055,6 @@ class StageGateCoordinator:
                 failed_tier="stage_b",
             )
             return tb_b, cached_tb_rec, tb_elapsed_sec, fail_res
-        if not has_tb_override and (self._scoreboard_anchors or self._guardrail_cases):
-            mark_hybrid_trackb_shared_sos_verified(
-                module_source,
-                unified_tl_cache,
-                self._resolve_cases_yaml_sha256(),
-                [int(a.case_num) for a in (*self._scoreboard_anchors, *self._guardrail_cases)],
-            )
         return tb_b, cached_tb_rec, tb_elapsed_sec, None
 
     def _run_l1(
@@ -1955,41 +2065,42 @@ class StageGateCoordinator:
         static_width_dims_fn: Callable[[RegimeTargetSpec], Sequence[Mapping[str, object]]]
         | None = None,
     ) -> StageBResult:
-        """Run Stage-B L1 compilation across anchor, tail, and distinct static width dims."""
+        """Run Stage-B L1 compilation over unique post-selector CompileTaskSpecs."""
         eff_width_fn = (
             static_width_dims_fn
             if static_width_dims_fn is not None
             else self._static_width_dims_fn
         )
-        tail_anchor_dims = self._resolve_tail_anchor_dims(regime_spec)
         anchor_dims = (
             regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
         )
+        extra_width_dims = list(eff_width_fn(regime_spec)) if eff_width_fn is not None else []
         if self._l1_compiler is not None:
             primary_b = self._invoke_with_optional_kwargs(
                 self._l1_compiler,
                 module_source,
                 regime_spec,
-                tail_anchor_dims=tail_anchor_dims,
             )
             if not primary_b.passed:
                 return self._normalize_primary_vf_overflow(primary_b)
-            if self._has_vf_stack_overflow(primary_b):
+            if self._stage_b_has_vf_overflow(primary_b):
                 return self._build_width_failure_result(primary_b, primary_b.elapsed_sec)
             total_elapsed = primary_b.elapsed_sec
-            for w_dims in self._collect_distinct_width_dims(
-                regime_spec, anchor_dims, False, eff_width_fn
-            ):
-                w_spec = replace(regime_spec, representative_anchor_dims=dict(w_dims))
+            seen_extra: list[dict[str, object]] = [dict(anchor_dims)] if anchor_dims else []
+            for w_dims in extra_width_dims:
+                wd = dict(w_dims)
+                if not wd or wd in seen_extra:
+                    continue
+                seen_extra.append(wd)
+                w_spec = replace(regime_spec, representative_anchor_dims=wd)
                 w_b = self._invoke_with_optional_kwargs(
                     self._l1_compiler,
                     module_source,
                     w_spec,
-                    dims=dict(w_dims),
-                    tail_anchor_dims=tail_anchor_dims,
+                    dims=wd,
                 )
                 total_elapsed += w_b.elapsed_sec
-                if not w_b.passed or self._has_vf_stack_overflow(w_b):
+                if not w_b.passed or self._stage_b_has_vf_overflow(w_b):
                     return self._build_width_failure_result(w_b, total_elapsed)
             if total_elapsed != primary_b.elapsed_sec:
                 return replace(primary_b, elapsed_sec=total_elapsed)
@@ -2020,63 +2131,44 @@ class StageGateCoordinator:
                 regime_tag=regime_spec.regime_tag,
             )
             if not tb_res.passed:
-                return self._normalize_primary_vf_overflow(tb_res)
-            uses_unreserved_ubuf = any(
-                "--cce-disable-vf-stack-reserved-ubuf" in str(fl) for fl in effective_flags
-            )
-            if uses_unreserved_ubuf and self._has_vf_stack_overflow(tb_res):
-                return self._build_width_failure_result(tb_res, tb_res.elapsed_sec)
+                return self._normalize_primary_vf_overflow(
+                    tb_res, compile_flags=effective_flags, builder_name="_render_trackb_tu"
+                )
+            if self._stage_b_has_vf_overflow(
+                tb_res, compile_flags=effective_flags, builder_name="_render_trackb_tu"
+            ):
+                return self._build_width_failure_result(
+                    tb_res,
+                    tb_res.elapsed_sec,
+                    compile_flags=effective_flags,
+                    builder_name="_render_trackb_tu",
+                )
 
             compiled_by_key: dict[tuple[str, tuple[str, ...]], StageBResult] = {
                 (instantiated_tu, effective_flags): tb_res
             }
             pending_compiles: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
             pending_keys: set[tuple[str, tuple[str, ...]]] = set()
-            anchor_tu_specs: list[tuple[int, str, str, tuple[str, ...]]] = []
-
-            for anc in self._scoreboard_anchors:
-                if len(self._regime_specs) > 1 and anc.regime_tag != regime_spec.regime_tag:
+            all_tb_cases = self._collect_regime_cases_by_id(
+                regime_spec, extra_dims=extra_width_dims
+            )
+            for c_dims in all_tb_cases.values():
+                if not c_dims:
                     continue
-                cnum = int(anc.case_num)
-                anc_rtag = str(anc.regime_tag or regime_spec.regime_tag)
-                anc_dims = self._lookup_case_static_spec_safe(cnum)
-                if anc_dims is None:
-                    anc_dims = self._lookup_case_dims_safe(cnum, anc_rtag)
-                if not anc_dims:
-                    continue
-                anc_spec = replace(regime_spec, representative_anchor_dims=dict(anc_dims))
-                a_tu = self._invoke_with_optional_kwargs(
+                c_spec = replace(regime_spec, representative_anchor_dims=dict(c_dims))
+                c_tu = self._invoke_with_optional_kwargs(
                     self._instantiate_trackb_tu,
                     module_source,
                     tb_extracted[1],
-                    anc_spec,
-                    anchor_dims_override=dict(anc_dims),
+                    c_spec,
+                    anchor_dims_override=dict(c_dims),
                 )
-                a_flags = self._resolve_trackb_selector_flags(module_source, anc_spec)
-                a_eff_flags = tuple(resolve_trackb_compile_flags(a_tu, a_flags))
-                anchor_tu_specs.append((cnum, anc_rtag, a_tu, a_eff_flags))
-                key = (a_tu, a_eff_flags)
+                c_flags = self._resolve_trackb_selector_flags(module_source, c_spec)
+                c_eff_flags = tuple(resolve_trackb_compile_flags(c_tu, c_flags))
+                key = (c_tu, c_eff_flags)
                 if key not in compiled_by_key and key not in pending_keys:
                     pending_keys.add(key)
-                    pending_compiles.append((a_tu, a_flags, a_eff_flags))
-
-            for w_dims in self._collect_distinct_width_dims(
-                regime_spec, anchor_dims, uses_unreserved_ubuf, eff_width_fn
-            ):
-                w_spec = replace(regime_spec, representative_anchor_dims=dict(w_dims))
-                w_tu = self._invoke_with_optional_kwargs(
-                    self._instantiate_trackb_tu,
-                    module_source,
-                    tb_extracted[1],
-                    w_spec,
-                    anchor_dims_override=dict(w_dims),
-                )
-                w_flags = self._resolve_trackb_selector_flags(module_source, w_spec)
-                w_eff_flags = tuple(resolve_trackb_compile_flags(w_tu, w_flags))
-                key = (w_tu, w_eff_flags)
-                if key not in compiled_by_key and key not in pending_keys:
-                    pending_keys.add(key)
-                    pending_compiles.append((w_tu, w_flags, w_eff_flags))
+                    pending_compiles.append((c_tu, c_flags, c_eff_flags))
 
             def _compile_extra_tb(
                 item: tuple[str, tuple[str, ...], tuple[str, ...]],
@@ -2103,36 +2195,15 @@ class StageGateCoordinator:
             for key, w_b in extra_tb_results:
                 compiled_by_key[key] = w_b
                 total_elapsed += w_b.elapsed_sec
-            for _key, w_b in extra_tb_results:
-                if not w_b.passed or self._has_vf_stack_overflow(w_b):
-                    return self._build_width_failure_result(w_b, total_elapsed)
-
-            record_fn = getattr(
-                _surrogate_cannbench,
-                "record_trackb_stage_b_artifacts_and_plan",
-                None,
-            )
-            if callable(record_fn) and self._config.operator_name and anchor_tu_specs:
-                anchor_entries: list[
-                    tuple[int, str, str, Sequence[str], Sequence[Path]]
-                ] = []
-                for cnum, anc_rtag, a_tu, a_eff_flags in anchor_tu_specs:
-                    a_res = compiled_by_key.get((a_tu, a_eff_flags))
-                    if a_res is None or not a_res.passed or not a_res.binary_paths:
-                        continue
-                    bin_paths = [Path(p) for p in a_res.binary_paths if Path(p).is_file()]
-                    if not bin_paths:
-                        continue
-                    norm_tu = _normalize_trackb_unit_source(a_tu, regime_tag=anc_rtag)
-                    anchor_entries.append((cnum, anc_rtag, norm_tu, a_eff_flags, bin_paths))
-                if anchor_entries:
-                    record_fn(
-                        module_source=module_source,
-                        operator_name=self._config.operator_name,
-                        anchor_entries=anchor_entries,
-                        tl_cache_dir=unified_tl_cache,
-                        cases_yaml_sha256=self._resolve_cases_yaml_sha256(),
-                        env_vals=env_vals,
+            for (_tu, eff_fl), w_b in extra_tb_results:
+                if not w_b.passed or self._stage_b_has_vf_overflow(
+                    w_b, compile_flags=eff_fl, builder_name="_render_trackb_tu"
+                ):
+                    return self._build_width_failure_result(
+                        w_b,
+                        total_elapsed,
+                        compile_flags=eff_fl,
+                        builder_name="_render_trackb_tu",
                     )
             if total_elapsed != tb_res.elapsed_sec:
                 return replace(tb_res, elapsed_sec=total_elapsed)
@@ -2195,47 +2266,28 @@ class StageGateCoordinator:
             if fail_res is not None:
                 return fail_res
 
-        uses_unreserved_ubuf = any(
-            "--cce-disable-vf-stack-reserved-ubuf" in str(fl) for fl in resolved.compile_flags
-        )
         anchor_case_specs = self._resolve_stage_b_anchor_case_specs()
         cases_yaml_sha256 = self._resolve_cases_yaml_sha256()
-        regime_anchor_specs: list[
-            tuple[dict[str, object], _ResolvedConfigLike | None]
-        ] = []
-        for _cnum, a_rtag, a_spec in anchor_case_specs:
-            if (
-                len(self._regime_specs) > 1
-                and a_rtag
-                and regime_spec.regime_tag
-                and a_rtag != regime_spec.regime_tag
-            ):
-                continue
-            try:
-                a_resolved = resolve_cfg_fn(module_source, regime_spec, dims=a_spec)
-            except (
-                SyntaxError,
-                AttributeError,
-                ImportError,
-                KeyError,
-                NameError,
-                RuntimeError,
-                TypeError,
-                ValueError,
-            ):
-                a_resolved = None
-            regime_anchor_specs.append((a_spec, a_resolved))
-        width_dims = self._collect_distinct_width_dims(
-            regime_spec,
-            anchor_dims,
-            uses_unreserved_ubuf,
-            eff_width_fn,
+        cases_by_id = self._collect_regime_cases_by_id(
+            regime_spec, extra_dims=extra_width_dims
         )
-        same_cfg_widths: list[dict[str, object]] = []
-        extra_width_checks: list[tuple[dict[str, object], _ResolvedConfigLike]] = []
-        for w_dims in width_dims:
+        plan: RegimeCompilePlan | None = None
+        if cases_by_id:
             try:
-                w_resolved = resolve_cfg_fn(module_source, regime_spec, dims=w_dims)
+                extractor = ModuleSelectorPlanExtractor(
+                    target=self._target,
+                    builder_name=resolved.builder_name,
+                    config_selector_name=regime_spec.config_selector_fn or "",
+                    default_builder_kwargs=dict(resolved.builder_kwargs),
+                    default_pass_configs=dict(resolved.pass_configs or {}),
+                    default_compile_flags=tuple(resolved.compile_flags or ()),
+                )
+                plan = build_post_selector_regime_plan(
+                    module_source,
+                    regime_spec.regime_tag or "default",
+                    cases_by_id,
+                    extractor,
+                )
             except (
                 SyntaxError,
                 AttributeError,
@@ -2246,37 +2298,228 @@ class StageGateCoordinator:
                 TypeError,
                 ValueError,
             ):
-                w_resolved = resolved
-            if self._width_covered_by_anchor_specs(w_dims, w_resolved, regime_anchor_specs):
-                continue
-            if (
-                eff_width_fn is None
-                and w_resolved.builder_name == resolved.builder_name
-                and tuple(w_resolved.compile_flags or ()) == tuple(resolved.compile_flags or ())
-                and dict(w_resolved.pass_configs or {}) == dict(resolved.pass_configs or {})
-            ):
-                same_cfg_widths.append(w_dims)
+                plan = None
+
+        cann_setup = (
+            (env_vals or {}).get("TILEFOUNDRY_NPU_CANN_SETUP")
+            or os.environ.get("TILEFOUNDRY_NPU_CANN_SETUP")
+            or ""
+        ).strip()
+        tl_source = (
+            (env_vals or {}).get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
+            or os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
+            or ""
+        ).strip()
+        use_direct_gate = (
+            l1_check_fn is _ORIG_CAMPAIGN_HOOKS["run_l1_compile_check"]
+            and (bool(cann_setup) or bool(tl_source))
+            and plan is not None
+            and bool(plan.unique_specs_by_key)
+        )
+
+        primary_b: StageBResult | None = None
+        total_elapsed = 0.0
+        if use_direct_gate and plan is not None:
+            receipt = StageBCompileGate(
+                plan,
+                eff_store,
+                env_file=self._env_file,
+                source_root=self._source_root,
+            ).run(module_source)
+            total_elapsed = receipt.elapsed_sec
+            summary = BishengResourceSummary(stack_bytes=receipt.max_stack_bytes)
+            if not receipt.passed:
+                fc = receipt.fault_code or "L1_COMPILE_FAILED"
+                pfx = "l1_vf_stack_overflow" if fc == "VF_STACK_OVERFLOW" else "l1_compile_failed"
+                primary_b = StageBResult(
+                    passed=False,
+                    error_message=f"{pfx}: {receipt.diagnostic}",
+                    full_diagnostic=receipt.diagnostic,
+                    compiler_summary=summary,
+                    elapsed_sec=receipt.elapsed_sec,
+                    fault_plane="STAGE_B_COMPILE",
+                    fault_code=fc,
+                    failed_tier="stage_b",
+                )
             else:
-                extra_width_checks.append((w_dims, w_resolved))
-        primary_b = self._invoke_with_optional_kwargs(
-            l1_check_fn,
-            module_source,
-            builder_name=resolved.builder_name,
-            builder_kwargs=resolved.builder_kwargs,
-            config_selector_name=regime_spec.config_selector_fn or None,
-            pass_configs=resolved.pass_configs or None,
-            compile_flags=resolved.compile_flags or None,
-            dims=dict(anchor_dims) if anchor_dims else None,
-            static_spec_dims_list=same_cfg_widths or None,
-            anchor_case_specs=anchor_case_specs or None,
-            operator_name=self._config.operator_name,
-            cases_yaml_sha256=cases_yaml_sha256,
-            source_root=self._source_root,
-            env_file=self._env_file,
-            tail_anchor_dims=tail_anchor_dims,
-            regime_tag=regime_spec.regime_tag,
-            tl_cache_dir=unified_tl_cache,
-        )
+                first_key = next(iter(plan.unique_specs_by_key))
+                art = eff_store.get_verified_artifact(first_key)
+                primary_b = StageBResult(
+                    passed=True,
+                    elapsed_sec=receipt.elapsed_sec,
+                    compiler_summary=summary,
+                    artifact_id=art.artifact_id if art else first_key,
+                    binary_paths=art.binary_paths if art else (),
+                )
+        elif plan is not None and plan.unique_specs_by_key:
+            first_case_dims_by_key: dict[str, dict[str, object]] = {}
+            for cid, c_specs in plan.tasks_by_case_id.items():
+                for c_spec in c_specs:
+                    if c_spec.task_key not in first_case_dims_by_key:
+                        first_case_dims_by_key[c_spec.task_key] = dict(
+                            cases_by_id.get(cid) or anchor_dims or {}
+                        )
+            spec_items = list(plan.unique_specs_by_key.values())
+
+            def _run_spec_hook(spec: CompileTaskSpec) -> tuple[CompileTaskSpec, StageBResult]:
+                spec_dims = first_case_dims_by_key.get(spec.task_key) or (
+                    dict(anchor_dims) if anchor_dims else None
+                )
+                spec_kw = {k: v for k, v in spec.static_kwargs}
+                spec_pc = {k: v for k, v in spec.pass_configs}
+                res = self._invoke_with_optional_kwargs(
+                    l1_check_fn,
+                    module_source,
+                    builder_name=spec.builder_name,
+                    builder_kwargs=spec_kw,
+                    config_selector_name=regime_spec.config_selector_fn or None,
+                    pass_configs=spec_pc or None,
+                    compile_flags=list(spec.compile_flags) or None,
+                    dims=spec_dims,
+                    anchor_case_specs=anchor_case_specs or None,
+                    operator_name=self._config.operator_name,
+                    cases_yaml_sha256=cases_yaml_sha256,
+                    source_root=self._source_root,
+                    env_file=self._env_file,
+                    regime_tag=regime_spec.regime_tag,
+                    tl_cache_dir=unified_tl_cache,
+                    artifact_store=eff_store,
+                )
+                return spec, res
+
+            primary_spec = spec_items[0]
+            _, primary_b = _run_spec_hook(primary_spec)
+            total_elapsed = primary_b.elapsed_sec
+            if primary_b.passed:
+                if self._stage_b_has_vf_overflow(
+                    primary_b,
+                    compile_flags=primary_spec.compile_flags,
+                    builder_name=primary_spec.builder_name,
+                ):
+                    return self._build_width_failure_result(
+                        primary_b,
+                        total_elapsed,
+                        compile_flags=primary_spec.compile_flags,
+                        builder_name=primary_spec.builder_name,
+                    )
+                extra_specs = spec_items[1:]
+                if len(extra_specs) > 1:
+                    workers = min(_MAX_L1_COMPILE_WORKERS, len(extra_specs))
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        extra_results = list(pool.map(_run_spec_hook, extra_specs))
+                else:
+                    extra_results = [_run_spec_hook(sp) for sp in extra_specs]
+                for _sp, w_b in extra_results:
+                    total_elapsed += w_b.elapsed_sec
+                for sp, w_b in extra_results:
+                    if not w_b.passed or self._stage_b_has_vf_overflow(
+                        w_b,
+                        compile_flags=sp.compile_flags,
+                        builder_name=sp.builder_name,
+                    ):
+                        return self._build_width_failure_result(
+                            w_b,
+                            total_elapsed,
+                            compile_flags=sp.compile_flags,
+                            builder_name=sp.builder_name,
+                        )
+            else:
+                primary_b = self._normalize_primary_vf_overflow(
+                    primary_b,
+                    compile_flags=primary_spec.compile_flags,
+                    builder_name=primary_spec.builder_name,
+                )
+        else:
+            primary_b = self._invoke_with_optional_kwargs(
+                l1_check_fn,
+                module_source,
+                builder_name=resolved.builder_name,
+                builder_kwargs=resolved.builder_kwargs,
+                config_selector_name=regime_spec.config_selector_fn or None,
+                pass_configs=resolved.pass_configs or None,
+                compile_flags=resolved.compile_flags or None,
+                dims=dict(anchor_dims) if anchor_dims else None,
+                anchor_case_specs=anchor_case_specs or None,
+                operator_name=self._config.operator_name,
+                cases_yaml_sha256=cases_yaml_sha256,
+                source_root=self._source_root,
+                env_file=self._env_file,
+                regime_tag=regime_spec.regime_tag,
+                tl_cache_dir=unified_tl_cache,
+                artifact_store=eff_store,
+            )
+            total_elapsed = primary_b.elapsed_sec
+            if primary_b.passed:
+                if self._stage_b_has_vf_overflow(
+                    primary_b,
+                    compile_flags=resolved.compile_flags,
+                    builder_name=resolved.builder_name,
+                ):
+                    return self._build_width_failure_result(
+                        primary_b,
+                        total_elapsed,
+                        compile_flags=resolved.compile_flags,
+                        builder_name=resolved.builder_name,
+                    )
+                extra_checks: list[tuple[dict[str, object], _ResolvedConfigLike]] = []
+                seen_fb: list[dict[str, object]] = [dict(anchor_dims)] if anchor_dims else []
+                for w_dims in extra_width_dims:
+                    wd = dict(w_dims)
+                    if not wd or wd in seen_fb:
+                        continue
+                    seen_fb.append(wd)
+                    try:
+                        w_res = resolve_cfg_fn(module_source, regime_spec, dims=wd)
+                    except (
+                        SyntaxError,
+                        AttributeError,
+                        ImportError,
+                        KeyError,
+                        NameError,
+                        RuntimeError,
+                        TypeError,
+                        ValueError,
+                    ):
+                        w_res = resolved
+                    extra_checks.append((wd, w_res))
+                for wd, w_res in extra_checks:
+                    w_b = self._invoke_with_optional_kwargs(
+                        l1_check_fn,
+                        module_source,
+                        builder_name=w_res.builder_name,
+                        builder_kwargs=w_res.builder_kwargs,
+                        config_selector_name=regime_spec.config_selector_fn or None,
+                        pass_configs=w_res.pass_configs or None,
+                        compile_flags=w_res.compile_flags or None,
+                        dims=wd,
+                        operator_name=self._config.operator_name,
+                        cases_yaml_sha256=cases_yaml_sha256,
+                        source_root=self._source_root,
+                        env_file=self._env_file,
+                        regime_tag=regime_spec.regime_tag,
+                        tl_cache_dir=unified_tl_cache,
+                        artifact_store=eff_store,
+                    )
+                    total_elapsed += w_b.elapsed_sec
+                    if not w_b.passed or self._stage_b_has_vf_overflow(
+                        w_b,
+                        compile_flags=w_res.compile_flags,
+                        builder_name=w_res.builder_name,
+                    ):
+                        return self._build_width_failure_result(
+                            w_b,
+                            total_elapsed,
+                            compile_flags=w_res.compile_flags,
+                            builder_name=w_res.builder_name,
+                        )
+            else:
+                primary_b = self._normalize_primary_vf_overflow(
+                    primary_b,
+                    compile_flags=resolved.compile_flags,
+                    builder_name=resolved.builder_name,
+                )
+
+        assert primary_b is not None
         if not primary_b.passed:
             if (
                 regime_spec.runtime_backend == "hybrid_trackb"
@@ -2303,7 +2546,11 @@ class StageGateCoordinator:
                         if tb_elapsed_sec != tb_b.elapsed_sec
                         else tb_b
                     )
-                    return self._normalize_primary_vf_overflow(tb_out)
+                    return self._normalize_primary_vf_overflow(
+                        tb_out,
+                        compile_flags=resolved.compile_flags,
+                        builder_name="_render_trackb_tu",
+                    )
                 if cached_tb_rec is not None:
                     return StageBResult(
                         passed=True,
@@ -2311,80 +2558,9 @@ class StageGateCoordinator:
                         artifact_id=cached_tb_rec.artifact_id,
                         binary_paths=cached_tb_rec.binary_paths,
                     )
-            return self._normalize_primary_vf_overflow(primary_b)
+            return primary_b
 
         final_b = primary_b
-        if uses_unreserved_ubuf and self._has_vf_stack_overflow(final_b):
-            return self._build_width_failure_result(final_b, final_b.elapsed_sec)
-        total_elapsed = final_b.elapsed_sec
-
-        def _run_extra_width(
-            item: tuple[dict[str, object], _ResolvedConfigLike],
-        ) -> StageBResult:
-            w_dims, w_resolved = item
-            return self._invoke_with_optional_kwargs(
-                l1_check_fn,
-                module_source,
-                builder_name=w_resolved.builder_name,
-                builder_kwargs=w_resolved.builder_kwargs,
-                config_selector_name=regime_spec.config_selector_fn or None,
-                pass_configs=w_resolved.pass_configs or None,
-                compile_flags=w_resolved.compile_flags or None,
-                dims=w_dims,
-                operator_name=self._config.operator_name,
-                cases_yaml_sha256=cases_yaml_sha256,
-                source_root=self._source_root,
-                env_file=self._env_file,
-                regime_tag=regime_spec.regime_tag,
-                tl_cache_dir=unified_tl_cache,
-            )
-
-        if len(extra_width_checks) > 1:
-            workers = min(_MAX_L1_COMPILE_WORKERS, len(extra_width_checks))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                extra_width_results = list(pool.map(_run_extra_width, extra_width_checks))
-        elif len(extra_width_checks) == 1:
-            extra_width_results = [_run_extra_width(extra_width_checks[0])]
-        else:
-            extra_width_results = []
-        for w_b in extra_width_results:
-            total_elapsed += w_b.elapsed_sec
-        for w_b in extra_width_results:
-            if not w_b.passed or self._has_vf_stack_overflow(w_b):
-                return self._build_width_failure_result(w_b, total_elapsed)
-
-        combine_elapsed_sec = 0.0
-        combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
-        if combine_spec is not None and not self._combine_covered_by_primary_anchor_plan(
-            module_source,
-            combine_spec,
-            resolved,
-            regime_anchor_specs,
-            env_vals,
-            l1_check_fn,
-        ):
-            combine_fn, combine_kwargs = combine_spec
-            combine_b = self._invoke_with_optional_kwargs(
-                l1_check_fn,
-                module_source,
-                builder_name=combine_fn,
-                builder_kwargs=combine_kwargs,
-                config_selector_name=None,
-                pass_configs=resolved.pass_configs or None,
-                compile_flags=resolved.compile_flags or None,
-                source_root=self._source_root,
-                env_file=self._env_file,
-                regime_tag=regime_spec.regime_tag,
-                tl_cache_dir=unified_tl_cache,
-            )
-            if not combine_b.passed:
-                return StageBResult(
-                    passed=False,
-                    error_message=f"combine_kernel({combine_fn}): {combine_b.error_message}",
-                    full_diagnostic=combine_b.full_diagnostic,
-                    elapsed_sec=total_elapsed + combine_b.elapsed_sec,
-                )
-            combine_elapsed_sec = combine_b.elapsed_sec
         if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
             if defer_hybrid_trackb:
                 tb_b, cached_tb_rec, tb_elapsed_sec, fail_res = (
@@ -2401,9 +2577,9 @@ class StageGateCoordinator:
                 if fail_res is not None:
                     return replace(
                         fail_res,
-                        elapsed_sec=total_elapsed + combine_elapsed_sec + tb_elapsed_sec,
+                        elapsed_sec=total_elapsed + tb_elapsed_sec,
                     )
-            agg_elapsed_sec = total_elapsed + combine_elapsed_sec + tb_elapsed_sec
+            agg_elapsed_sec = total_elapsed + tb_elapsed_sec
             if tb_b is not None:
                 return replace(tb_b, elapsed_sec=agg_elapsed_sec)
             if cached_tb_rec is not None:

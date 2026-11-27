@@ -24,7 +24,7 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     _detect_trackb_prologue_line_offset,
     render_active_symbol_closure_view,
 )
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import (
     run_l0_l1_round_filter,
 )
 from tilefoundry_ascend.agent.kb.schema import (

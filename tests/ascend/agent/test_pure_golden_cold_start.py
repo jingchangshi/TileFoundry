@@ -45,20 +45,35 @@ from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
     prepare_operator_seed_or_takeover,
     validate_entrypoint_signature_compatibility,
 )
+from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import run_l0_l1_round_filter
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     FAST_RESPONSE_SCHEMA,
     L3AcceptanceResult,
-    _NPU_COMPARE_SHIM_SOURCE,
-    _V2GateExecution,
-    _collect_profile_via_agent_gates,
-    _fast_wire_operator_name,
-    _format_l3_failure_detail,
-    _format_worst_element_diagnostic,
-    _submit_fast_gate,
-    run_l0_l1_round_filter,
     run_l4_official_cannbench_via_agent_gates,
     run_multi_operator_surrogate_batch_via_agent_gates,
 )
+from tilefoundry_ascend.agent.npu import ag_transport, l2_paired_eval, l3_l4_gates, msprof_probe
+from tilefoundry_ascend.agent.npu.ag_transport import (
+    _V2GateExecution,
+    _fast_wire_operator_name,
+    _submit_fast_gate,
+)
+from tilefoundry_ascend.agent.npu.l2_paired_eval import _NPU_COMPARE_SHIM_SOURCE
+from tilefoundry_ascend.agent.npu.l3_l4_gates import _format_l3_failure_detail
+from tilefoundry_ascend.agent.npu.msprof_probe import _collect_profile_via_agent_gates
+
+
+def _format_worst_element_diagnostic(actual: object, golden: object) -> str:
+    ns: dict[str, object] = {}
+    exec(
+        _NPU_COMPARE_SHIM_SOURCE.format(cann_repo="/tmp").replace(
+            "_COMPARE_TENSORS = _load_compare_tensors()",
+            "_COMPARE_TENSORS = None",
+        ),
+        ns,
+    )
+    fn = ns["_format_worst_element_diagnostic"]
+    return str(fn(actual, golden))
 from tilefoundry_ascend.agent.orchestrator import gate_funnel
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
@@ -1455,13 +1470,13 @@ def test_l4_official_cannbench_retries_transient_build_lock_unless_resuming(
         calls.append(str(kwargs.get("resume_execution_id") or ""))
         return executions[min(len(calls) - 1, len(executions) - 1)]
 
-    monkeypatch.setattr(surrogate_cannbench, "get_operator_task", lambda _op: "level2/softmax")
-    monkeypatch.setattr(surrogate_cannbench, "_workspace_relative_candidate", lambda _r, _p: "cand.py")
-    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
-    monkeypatch.setattr(surrogate_cannbench, "_agent_gates_workspace_name", lambda _r: "tilefoundry")
-    monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _fake_v2)
-    monkeypatch.setattr(surrogate_cannbench, "_validate_l4_report", lambda *_a, **_kw: ("", ""))
-    monkeypatch.setattr(surrogate_cannbench.time, "sleep", lambda sec: sleeps.append(float(sec)))
+    monkeypatch.setattr(l3_l4_gates, "get_operator_task", lambda _op: "level2/softmax")
+    monkeypatch.setattr(l3_l4_gates, "_workspace_relative_candidate", lambda _r, _p: "cand.py")
+    monkeypatch.setattr(l3_l4_gates, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(l3_l4_gates, "_agent_gates_workspace_name", lambda _r: "tilefoundry")
+    monkeypatch.setattr(l3_l4_gates, "_run_v2_gate", _fake_v2)
+    monkeypatch.setattr(l3_l4_gates, "_validate_l4_report", lambda *_a, **_kw: ("", ""))
+    monkeypatch.setattr(l3_l4_gates.time, "sleep", lambda sec: sleeps.append(float(sec)))
 
     fresh_res = run_l4_official_cannbench_via_agent_gates(
         operator_name="level2/softmax",
@@ -1482,9 +1497,9 @@ def test_l4_official_cannbench_retries_transient_build_lock_unless_resuming(
         calls.append(str(kwargs.get("resume_execution_id") or ""))
         return resume_executions[0]
 
-    monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _fake_v2_resume)
+    monkeypatch.setattr(l3_l4_gates, "_run_v2_gate", _fake_v2_resume)
     monkeypatch.setattr(
-        surrogate_cannbench,
+        l3_l4_gates,
         "_validate_l4_report",
         lambda *_a, **_kw: ("blocked_env_build", "environment"),
     )
@@ -1636,14 +1651,22 @@ def test_fast_wire_operator_name_normalization_in_batch_and_profile(
         encoding="utf-8",
     )
     anchor = AnchorCaseSpec("level2/softmax", 1, "reduce_tail", 10.0, 5.0)
-    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
-    monkeypatch.setattr(surrogate_cannbench, "_agent_gates_workspace_name", lambda _r: "tilefoundry")
-    monkeypatch.setattr(surrogate_cannbench, "get_operator_entrypoint", lambda _op: "softmax")
+    monkeypatch.setattr(l2_paired_eval, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(l2_paired_eval, "_agent_gates_workspace_name", lambda _r: "tilefoundry")
+    monkeypatch.setattr(msprof_probe, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(msprof_probe, "_agent_gates_workspace_name", lambda _r: "tilefoundry")
+    monkeypatch.setattr(l2_paired_eval, "get_operator_entrypoint", lambda _op: "softmax")
     monkeypatch.setattr(
-        surrogate_cannbench, "prewarm_anchor_reference_cache", lambda *_a, **_kw: None
+        l2_paired_eval, "prewarm_anchor_reference_cache", lambda *_a, **_kw: None
     )
     monkeypatch.setattr(
-        surrogate_cannbench, "prewarm_surrogate_tilelang_cache", lambda *_a, **_kw: None
+        l2_paired_eval, "prewarm_surrogate_tilelang_cache", lambda *_a, **_kw: None
+    )
+    monkeypatch.setattr(
+        msprof_probe, "prewarm_anchor_reference_cache", lambda *_a, **_kw: None
+    )
+    monkeypatch.setattr(
+        msprof_probe, "prewarm_surrogate_tilelang_cache", lambda *_a, **_kw: None
     )
 
     seen_payloads: list[dict[str, object]] = []
@@ -1740,7 +1763,8 @@ def test_fast_wire_operator_name_normalization_in_batch_and_profile(
             elapsed_sec=1.0,
         )
 
-    monkeypatch.setattr(surrogate_cannbench, "_submit_fast_gate", _fake_submit)
+    monkeypatch.setattr(l2_paired_eval, "_submit_fast_gate", _fake_submit)
+    monkeypatch.setattr(msprof_probe, "_submit_fast_gate", _fake_submit)
     by_op, run_id, _rcp, _held = run_multi_operator_surrogate_batch_via_agent_gates(
         [("level2/softmax", [("c0", cand)], [anchor])],
         source_root=source_root,
@@ -1846,9 +1870,9 @@ def test_submit_fast_gate_retries_transient_build_lock_backoff(
         calls.append(str(kwargs.get("target")))
         return executions[len(calls) - 1]
 
-    monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _fake_v2)
-    monkeypatch.setattr(surrogate_cannbench, "_source_identity_matches", lambda *_a: True)
-    monkeypatch.setattr(surrogate_cannbench.time, "sleep", lambda sec: sleeps.append(float(sec)))
+    monkeypatch.setattr(ag_transport, "_run_v2_gate", _fake_v2)
+    monkeypatch.setattr(ag_transport, "_source_identity_matches", lambda *_a: True)
+    monkeypatch.setattr(ag_transport.time, "sleep", lambda sec: sleeps.append(float(sec)))
 
     raw, final_exec = _submit_fast_gate(
         agent_gates_bin="agent-gates",

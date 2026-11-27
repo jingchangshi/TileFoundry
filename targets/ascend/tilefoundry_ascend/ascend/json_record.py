@@ -122,8 +122,9 @@ def _coerce_value(hint: Any, raw: Any, *, has_default: bool = False, default_val
             if is_opt:
                 return None
             raise TypeError(f"Expected Mapping for dict field, got {type(raw).__name__}")
+        key_hint = args[0] if len(args) == 2 else str
         val_hint = args[1] if len(args) == 2 else Any
-        return {str(k): _coerce_value(val_hint, v) for k, v in raw.items()}
+        return {_coerce_value(key_hint, k): _coerce_value(val_hint, v) for k, v in raw.items()}
 
     if origin is Literal:
         return str(raw) if all(isinstance(a, str) for a in args) else raw

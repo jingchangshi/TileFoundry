@@ -15,8 +15,8 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     PerfTargetSpec,
     RegimeTargetSpec,
 )
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    AnchorCaseSpec,
     AnchorEvalMetrics,
     CandidateSurrogateResult,
     L3AcceptanceResult,

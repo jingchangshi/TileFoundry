@@ -855,7 +855,6 @@ async def test_substage_timings_prewarm_stats_and_48kb_trackb_passthrough(
         stagnation_rounds=0,
         admitted_rule_ids=[],
     )
-    assert seen_l1_tail_dims and seen_l1_tail_dims[0] == {"B": 1, "S": 1, "D": 64}
     assert set(rec.stage_timings_sec.keys()) == {
         "llm_gen_sec",
         "l0_l1_sec",

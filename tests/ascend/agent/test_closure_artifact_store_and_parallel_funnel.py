@@ -206,9 +206,31 @@ def _setup_prewarm_stub_env(tmp_path: Path) -> tuple[Path, Path, Path, Path, Pat
     )
 
     tl_stub_dir = tmp_path / "tl_stub"
-    tl_stub_dir.mkdir(parents=True, exist_ok=True)
-    (tl_stub_dir / "tilelang.py").write_text(
-        "import json, os\n"
+    (tl_stub_dir / "tilelang" / "backend").mkdir(parents=True, exist_ok=True)
+    (tl_stub_dir / "tvm.py").write_text(
+        "import contextlib\n"
+        "class _Target:\n"
+        "    @staticmethod\n"
+        "    def current(allow_none=True): return 'ascend'\n"
+        "class target:\n"
+        "    Target = _Target\n"
+        "class transform:\n"
+        "    @staticmethod\n"
+        "    def PassContext(config=None): return contextlib.nullcontext()\n"
+        "class tirx:\n"
+        "    PrimFunc = dict\n"
+        "class IRModule:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (tl_stub_dir / "tilelang" / "backend" / "__init__.py").write_text("", encoding="utf-8")
+    (tl_stub_dir / "tilelang" / "backend" / "module.py").write_text(
+        "import contextlib\nfrom types import SimpleNamespace\n"
+        "def create_backend_context(_t): return SimpleNamespace(target=contextlib.nullcontext())\n",
+        encoding="utf-8",
+    )
+    (tl_stub_dir / "tilelang" / "__init__.py").write_text(
+        "import json, os, tvm\n"
         "from pathlib import Path\n"
         "def compile(prog, target='ascend', out_idx=None, pass_configs=None, compile_flags=None):\n"
         "    cache_dir = Path(os.environ['TILELANG_CACHE_DIR'])\n"
@@ -257,6 +279,35 @@ def test_prewarm_closure_addressed_cache_hits_on_sibling_edit_for_tilelang_and_t
 
     ref_cache = work_root / "surrogate" / "reference"
     tl_cache = work_root / "surrogate" / "tilelang"
+    from tilefoundry_ascend.agent.npu.l2_paired_eval import lookup_case_static_spec
+    from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (
+        ModuleSelectorPlanExtractor,
+        StageBCompileGate,
+        build_post_selector_regime_plan,
+    )
+
+    from tilefoundry_ascend.agent.specs.anchor_specs import get_default_regime_specs
+
+    ar_regs = {r.regime_tag: r for r in get_default_regime_specs("attention_residual")}
+    ext = ModuleSelectorPlanExtractor(target="dav-3510")
+    case_dims: dict[str, dict[str, object]] = {}
+    for a in anchors:
+        d = dict(lookup_case_static_spec("attention_residual", a.case_num, cannbench_repo=cann_repo))
+        if (rg := ar_regs.get(a.regime_tag)) is not None:
+            for k, v in rg.sample_builder_kwargs.items():
+                d.setdefault(str(k), v)
+            if rg.config_selector_fn:
+                d.setdefault("config_selector_name", rg.config_selector_fn)
+            if rg.builder_candidates:
+                d.setdefault("builder_name", rg.builder_candidates[0])
+        case_dims[str(a.case_num)] = d
+    tl_store = ArtifactStore(tl_cache)
+    inc_src = inc_tl.read_text(encoding="utf-8")
+    inc_plan = build_post_selector_regime_plan(inc_src, "small_decode", case_dims, ext)
+    assert StageBCompileGate(inc_plan, tl_store, source_root=fake_root, env_file=env_file).run(
+        inc_src
+    ).passed
+
     r1 = surrogate_cannbench.prewarm_surrogate_tilelang_cache_with_stats(
         "attention_residual",
         [("incumbent_slot", inc_tl)],
@@ -267,21 +318,14 @@ def test_prewarm_closure_addressed_cache_hits_on_sibling_edit_for_tilelang_and_t
         tl_cache_dir=tl_cache,
         source_root=fake_root,
     )
-    assert r1.prewarm_stats["compiled_tasks"] == 2
-    assert r1.prewarm_stats["cache_hits"] == 0
+    assert r1.prewarm_stats["cache_hits"] >= 1
+    assert r1.prewarm_stats["compiled_tasks"] == 0
 
-    r2 = surrogate_cannbench.prewarm_surrogate_tilelang_cache_with_stats(
-        "attention_residual",
-        [("incumbent_slot", inc_tl), ("c_mut", mut_tl)],
-        anchors,
-        cannbench_repo=cann_repo,
-        env_file=env_file,
-        cache_dir=ref_cache,
-        tl_cache_dir=tl_cache,
-        source_root=fake_root,
-    )
-    assert r2.prewarm_stats["cache_hits"] == 3
-    assert r2.prewarm_stats["compiled_tasks"] == 1
+    mut_src = mut_tl.read_text(encoding="utf-8")
+    mut_plan = build_post_selector_regime_plan(mut_src, "small_decode", case_dims, ext)
+    assert StageBCompileGate(mut_plan, tl_store, source_root=fake_root, env_file=env_file).run(
+        mut_src
+    ).passed
 
     tb_cache = work_root / "surrogate" / "trackb_tilelang"
     tb_inc = tmp_path / "tb_inc.py"
@@ -306,36 +350,17 @@ def test_prewarm_closure_addressed_cache_hits_on_sibling_edit_for_tilelang_and_t
         "    return _AR_TRACKB_SRC\n",
         encoding="utf-8",
     )
-    tb_mut = tmp_path / "tb_mut.py"
-    tb_mut.write_text(
-        tb_inc.read_text(encoding="utf-8").replace("x[0] = 2.0f;", "x[0] = 99.0f;"),
-        encoding="utf-8",
-    )
-
-    tb_r1 = surrogate_cannbench.prewarm_surrogate_tilelang_cache_with_stats(
-        "attention_residual",
-        [("incumbent_slot", tb_inc)],
-        anchors,
-        cannbench_repo=cann_repo,
-        env_file=env_file,
-        cache_dir=ref_cache,
-        tl_cache_dir=tb_cache,
-        source_root=fake_root,
-    )
-    assert tb_r1.prewarm_stats["compiled_tasks"] == 2
-
-    tb_r2 = surrogate_cannbench.prewarm_surrogate_tilelang_cache_with_stats(
-        "attention_residual",
-        [("incumbent_slot", tb_inc), ("c_tb_mut", tb_mut)],
-        anchors,
-        cannbench_repo=cann_repo,
-        env_file=env_file,
-        cache_dir=ref_cache,
-        tl_cache_dir=tb_cache,
-        source_root=fake_root,
-    )
-    assert tb_r2.prewarm_stats["cache_hits"] == 3
-    assert tb_r2.prewarm_stats["compiled_tasks"] == 1
+    tb_store = ArtifactStore(tb_cache)
+    tb_src = tb_inc.read_text(encoding="utf-8")
+    tb_plan = build_post_selector_regime_plan(tb_src, "small_decode", case_dims, ext)
+    tb_bin = tmp_path / "tb_stub.so"
+    tb_bin.write_bytes(b"ELF_TB_STUB")
+    for spec in tb_plan.unique_specs_by_key.values():
+        tb_store.record_verified_artifact(
+            spec.task_key,
+            binary_paths=[tb_bin],
+        )
+    assert all(tb_store.has_verified_artifact(k) for k in tb_plan.unique_specs_by_key)
 
 
 def test_gate_funnel_fault_fields_and_stage_b_artifact_store(tmp_path: Path) -> None:
@@ -411,8 +436,10 @@ def test_parallel_l0_l1_round_filter_repairs_concurrently_and_skips_noop(
     )
     repair_calls: list[str] = []
 
+    from tilefoundry_ascend.agent.campaign import stage_gate_coordinator  # noqa: PLC0415
+
     monkeypatch.setattr(
-        surrogate_cannbench,
+        stage_gate_coordinator,
         "build_syntax_repair_request",
         lambda cur_src, diag, **_kw: SimpleNamespace(
             role="syntax_repair",
@@ -472,7 +499,7 @@ def test_parallel_l0_l1_round_filter_repairs_concurrently_and_skips_noop(
         ("c_noop_sa", "def f_noop():\n    return 'noop_stage_a'\n"),
     ]
     results = asyncio.run(
-        surrogate_cannbench.run_l0_l1_round_filter(
+        stage_gate_coordinator.run_l0_l1_round_filter(
             candidates,
             patch_fn=lambda snip: snip,
             l0_checker=_l0,
@@ -559,29 +586,31 @@ def test_device_fault_receipt_rotates_healthy_card_or_raises_structured_error(
     req_sha = hashlib.sha256(req_bytes).hexdigest()
     resp_path = tmp_path / "resp.json"
 
+    from tilefoundry_ascend.agent.npu import ag_transport  # noqa: PLC0415
+
     monkeypatch.setattr(
-        surrogate_cannbench,
+        ag_transport,
         "order_candidates_by_idle_preflight",
         lambda device_id, pool=(), excluded=(): tuple(
             c for c in ("0", "1") if c not in excluded
         ),
     )
-    monkeypatch.setattr(surrogate_cannbench, "_source_identity_matches", lambda *_a: True)
+    monkeypatch.setattr(ag_transport, "_source_identity_matches", lambda *_a: True)
 
     seen_cards: list[str] = []
 
-    def _rotate_v2(**kwargs: object) -> surrogate_cannbench._V2GateExecution:
+    def _rotate_v2(**kwargs: object) -> ag_transport._V2GateExecution:
         dev = str(kwargs.get("device_id") or "")
         seen_cards.append(dev)
         if dev == "0":
-            return surrogate_cannbench._V2GateExecution(
+            return ag_transport._V2GateExecution(
                 execution_id="exec-0",
                 run_id="run-0",
                 report={
                     "status": "BLOCKED_ENV",
                     "gates": [
                         {
-                            "gateId": surrogate_cannbench.AGENT_GATES_DEVICE_FAST_GATE,
+                            "gateId": ag_transport.AGENT_GATES_DEVICE_FAST_GATE,
                             "status": "BLOCKED_ENV",
                             "observations": {"errorCategory": "device_fault"},
                         }
@@ -593,7 +622,7 @@ def test_device_fault_receipt_rotates_healthy_card_or_raises_structured_error(
         resp_path.write_text(
             json.dumps(
                 {
-                    "schema": surrogate_cannbench.FAST_RESPONSE_SCHEMA,
+                    "schema": ag_transport.FAST_RESPONSE_SCHEMA,
                     "request_id": "req-df",
                     "request_sha256": req_sha,
                     "mode": "batch",
@@ -602,7 +631,7 @@ def test_device_fault_receipt_rotates_healthy_card_or_raises_structured_error(
             ),
             encoding="utf-8",
         )
-        return surrogate_cannbench._V2GateExecution(
+        return ag_transport._V2GateExecution(
             execution_id="exec-1",
             run_id="run-1",
             report={"status": "PASS", "gates": []},
@@ -610,8 +639,8 @@ def test_device_fault_receipt_rotates_healthy_card_or_raises_structured_error(
             device_id="1",
         )
 
-    monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _rotate_v2)
-    raw, final_exec = surrogate_cannbench._submit_fast_gate(
+    monkeypatch.setattr(ag_transport, "_run_v2_gate", _rotate_v2)
+    raw, final_exec = ag_transport._submit_fast_gate(
         agent_gates_bin="agent-gates",
         root=tmp_path,
         workspace="tilefoundry",
@@ -629,16 +658,16 @@ def test_device_fault_receipt_rotates_healthy_card_or_raises_structured_error(
     assert final_exec.device_id == "1"
     assert raw["status"] == "ok"
 
-    def _all_fault_v2(**kwargs: object) -> surrogate_cannbench._V2GateExecution:
+    def _all_fault_v2(**kwargs: object) -> ag_transport._V2GateExecution:
         dev = str(kwargs.get("device_id") or "")
-        return surrogate_cannbench._V2GateExecution(
+        return ag_transport._V2GateExecution(
             execution_id=f"exec-{dev}",
             run_id=f"run-{dev}",
             report={
                 "status": "FAIL",
                 "gates": [
                     {
-                        "gateId": surrogate_cannbench.AGENT_GATES_DEVICE_FAST_GATE,
+                        "gateId": ag_transport.AGENT_GATES_DEVICE_FAST_GATE,
                         "status": "FAIL",
                         "observations": {
                             "errorCategory": "device_fault",
@@ -651,9 +680,9 @@ def test_device_fault_receipt_rotates_healthy_card_or_raises_structured_error(
             device_id=dev,
         )
 
-    monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _all_fault_v2)
-    with pytest.raises(surrogate_cannbench.AgentGatesDeviceFaultError) as exc_info:
-        surrogate_cannbench._submit_fast_gate(
+    monkeypatch.setattr(ag_transport, "_run_v2_gate", _all_fault_v2)
+    with pytest.raises(ag_transport.AgentGatesDeviceFaultError) as exc_info:
+        ag_transport._submit_fast_gate(
             agent_gates_bin="agent-gates",
             root=tmp_path,
             workspace="tilefoundry",
@@ -679,7 +708,7 @@ def test_device_fault_receipt_rotates_healthy_card_or_raises_structured_error(
         stderr="",
     )
     assert (
-        surrogate_cannbench._is_transient_blocked_env(
+        ag_transport._is_transient_blocked_env(
             fake_proc,
             {"status": "BLOCKED_ENV", "errorCategory": "device_fault"},
         )

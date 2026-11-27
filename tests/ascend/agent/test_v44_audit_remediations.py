@@ -41,12 +41,13 @@ from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
     select_initial_track_from_semantics,
 )
 from tilefoundry_ascend.agent.campaign import surrogate_cannbench
+from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import run_l0_l1_round_filter
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    _NPU_COMPARE_SHIM_SOURCE,
     AnchorEvalMetrics,
     CandidateSurrogateResult,
-    run_l0_l1_round_filter,
 )
+from tilefoundry_ascend.agent.npu import l3_l4_gates
+from tilefoundry_ascend.agent.npu.l2_paired_eval import _NPU_COMPARE_SHIM_SOURCE
 from tilefoundry_ascend.agent.kb import (
     SymptomFamily,
     build_predicate_context,
@@ -996,7 +997,6 @@ def test_p1_2_hybrid_and_tracka_cube_dma_aggregate_gate(
         entry_name="gqa",
     )
     monkeypatch.setattr(runner, "_resolve_operator_semantics_for_gates", lambda: matmul_sem)
-    monkeypatch.setattr(runner, "_resolve_combine_gate_spec", lambda *_a: None)
     monkeypatch.setattr(
         runner,
         "_resolve_trackb_freedom_mask",
@@ -1270,12 +1270,12 @@ def test_p1_r1_kernel_cache_bloat_classified_as_candidate_failure(tmp_path: Path
     coverage = payload["coverage"]
     assert isinstance(coverage, dict)
     assert (
-        surrogate_cannbench._l3_failure_kind(
-            observation={"failureCategory": "numeric"},
-            evidence=payload,
-            coverage=coverage,
+        l3_l4_gates._l3_failure_kind(
+            {"failureCategory": "numeric"},
+            payload,
+            coverage,
         )
-        == surrogate_cannbench.FAILURE_KIND_CANDIDATE
+        == l3_l4_gates.FAILURE_KIND_CANDIDATE
     )
 
 

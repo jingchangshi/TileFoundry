@@ -7,12 +7,11 @@ from pathlib import Path
 import pytest
 
 from tilefoundry_ascend.agent.campaign import marathon, surrogate_cannbench
+from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import run_l0_l1_round_filter
 from tilefoundry_ascend.agent.specs.anchor_specs import CannbenchOpsRegistry
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    L3AcceptanceResult,
-    _resolve_agent_gates_bin,
-    run_l0_l1_round_filter,
-)
+from tilefoundry_ascend.agent.campaign.surrogate_cannbench import L3AcceptanceResult
+from tilefoundry_ascend.agent.npu import ag_transport, l3_l4_gates
+from tilefoundry_ascend.agent.npu.ag_transport import _resolve_agent_gates_bin
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
     AstEditChunk,
     FlywheelDistiller,
@@ -79,7 +78,7 @@ def test_resolve_agent_gates_bin_relative_and_env_file_discovery(
 ) -> None:
     monkeypatch.delenv("TILEFOUNDRY_NPU_AGENT_GATES_BIN", raising=False)
     monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
-    monkeypatch.setattr(surrogate_cannbench.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(ag_transport.shutil, "which", lambda _name: None)
 
     ag_from_env = tmp_path / "env_ag"
     env_bin = ag_from_env / ".venv" / "bin" / "agent-gates"
@@ -97,12 +96,12 @@ def test_resolve_agent_gates_bin_relative_and_env_file_discovery(
         / "ascend"
         / "tilefoundry_ascend"
         / "agent"
-        / "campaign"
-        / "surrogate_cannbench.py"
+        / "npu"
+        / "ag_transport.py"
     )
     fake_module.parent.mkdir(parents=True)
     fake_module.write_text("", encoding="utf-8")
-    monkeypatch.setattr(surrogate_cannbench, "__file__", str(fake_module))
+    monkeypatch.setattr(ag_transport, "__file__", str(fake_module))
 
     assert _resolve_agent_gates_bin() == str(env_bin)
 
@@ -219,19 +218,19 @@ def test_stage0_oracle_and_marathon_propagate_file_not_found(
         / "ascend"
         / "tilefoundry_ascend"
         / "agent"
-        / "campaign"
-        / "surrogate_cannbench.py"
+        / "npu"
+        / "ag_transport.py"
     )
     fake_module.parent.mkdir(parents=True)
     fake_module.write_text("", encoding="utf-8")
-    monkeypatch.setattr(surrogate_cannbench, "__file__", str(fake_module))
+    monkeypatch.setattr(ag_transport, "__file__", str(fake_module))
     monkeypatch.delenv("TILEFOUNDRY_NPU_AGENT_GATES_BIN", raising=False)
     monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
-    monkeypatch.setattr(surrogate_cannbench.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(ag_transport.shutil, "which", lambda _name: None)
     cand = tmp_path / "iso" / "TileFoundry" / "kernels.py"
     cand.write_text("x = 1\n", encoding="utf-8")
     monkeypatch.setattr(
-        surrogate_cannbench,
+        l3_l4_gates,
         "get_operator_task",
         lambda _op: "level4/attention_residual",
     )

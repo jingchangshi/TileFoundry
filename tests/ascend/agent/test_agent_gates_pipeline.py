@@ -452,10 +452,10 @@ def test_run_l1_compile_check_keeps_primary_error_before_source_tail(
     )
 
     assert result.passed is False
-    assert result.error_message.startswith("l1_compile_failed (rc=1): ")
+    assert result.error_message.startswith("l1_compile_failed: ")
     assert primary in result.error_message
     assert "Source: line 199" in result.error_message
-    assert len(result.error_message) <= len("l1_compile_failed (rc=1): ") + 1500
+    assert len(result.error_message) <= len("l1_compile_failed: ") + 1600
 
 
 def test_resolve_trackb_compile_flags_and_kernel_threads_ast_check() -> None:

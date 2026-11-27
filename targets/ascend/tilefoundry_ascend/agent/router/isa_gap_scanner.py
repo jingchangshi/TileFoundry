@@ -78,237 +78,56 @@ class PipeGapReport:
         }
 
 
-DAV3510_CANN_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
-    IsaPrimitiveSpec(
-        name="fp4_e2m1_dtype",
-        hardware_pipe="pipe_m_cube",
-        cann_intrinsic="fp4_e2m1fnx2",
-        tilelang_symbols=("float4_e2m1fn", "float4_e2m1fnx2"),
-        workaround_track="ascendc_template",
-        description="Packed 4-bit FP4 E2M1 tensor representation",
-    ),
-    IsaPrimitiveSpec(
-        name="mx_e8m0_blockscale_gemm",
-        hardware_pipe="pipe_m_cube",
-        cann_intrinsic="MmadBlockScaled<e8m0>",
-        tilelang_symbols=("gemm_blockscaled", "float8_e8m0fnu"),
-        workaround_track="ascendc_template",
-        description="Block-scaled MX GEMM with E8M0 microscaling factors",
-    ),
-    IsaPrimitiveSpec(
-        name="mx_spr_scale_config",
-        hardware_pipe="pipe_s_scalar_spr",
-        cann_intrinsic="SetMxScaleSPR / QuantMx",
-        tilelang_symbols=("set_mx_scale_spr", "ascend_mx_quant"),
-        workaround_track="ascendc_template",
-        description="Hardware SPR microscaling configuration and online MX quantization",
-    ),
-    IsaPrimitiveSpec(
-        name="subbyte_q4_bitshift_unpack",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="BitUnpackQ4_0 / FixPipeDeqScale",
-        tilelang_symbols=("bit_unpack_q4", "fixpipe_deq_scale"),
-        workaround_track="ascendc_template",
-        description="Sub-byte INT4/Q4_0 register bitshift unpack and FixPipe dequant scale",
-    ),
-    IsaPrimitiveSpec(
-        name="cube_mmad_sparse",
-        hardware_pipe="pipe_m_cube",
-        cann_intrinsic="MmadSparse",
-        tilelang_symbols=("gemm_sparse", "mmad_sparse", "ascend_mmad_sparse"),
-        workaround_track="ascendc_template",
-        description="2:4 structured sparse Cube MMAD execution primitive",
-    ),
-    IsaPrimitiveSpec(
-        name="fixpipe_deq_scale",
-        hardware_pipe="pipe_fix_fixpipe",
-        cann_intrinsic="FixPipeDeqScale",
-        tilelang_symbols=("fixpipe_deq_scale", "ascend_fixpipe_deq_scale"),
-        workaround_track="ascendc_template",
-        description="FixPipe hardware per-channel/block dequantization scaling",
-    ),
-    IsaPrimitiveSpec(
-        name="scalar_set_ctrl_spr",
-        hardware_pipe="pipe_s_scalar_spr",
-        cann_intrinsic="SetCtrlSpr",
-        tilelang_symbols=("set_ctrl_spr", "ascend_set_ctrl_spr"),
-        workaround_track="ascendc_template",
-        description="Scalar SPR control register configuration for quantized/MX modes",
-    ),
-    IsaPrimitiveSpec(
-        name="simd_vld_vst",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="Reg::Load / Reg::Store",
-        tilelang_symbols=("simd.vld", "simd.vst2", "simd.vsts"),
-        workaround_track="inline_ascendc_vf",
-        description="Register-base UB load/store intrinsics",
-    ),
-    IsaPrimitiveSpec(
-        name="simd_vgather_vscatter",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="Reg::Gather / Reg::Scatter",
-        tilelang_symbols=("simd.vgather2", "simd.vgatherb", "simd.vscatter"),
-        workaround_track="inline_ascendc_vf",
-        description="Register-base indexed gather/scatter",
-    ),
-    IsaPrimitiveSpec(
-        name="regbase_dist_unpack_pack",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="LoadDist::DIST_UNPACK_B16 / StoreDist::DIST_PACK_B32",
-        tilelang_symbols=("simd.dist_unpack_b16", "simd.dist_pack_b32"),
-        workaround_track="inline_ascendc_vf",
-        description="Explicit RegBase DIST_UNPACK_B16 / DIST_PACK_B32 lane distribution",
-    ),
-    IsaPrimitiveSpec(
-        name="regbase_reduce_data_block",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="Reg::ReduceDataBlock",
-        tilelang_symbols=("simd.reduce_data_block", "simd.reduce_datablock"),
-        workaround_track="inline_ascendc_vf",
-        description="Hardware 32B DataBlock intra-vector reduction intrinsic",
-    ),
-    IsaPrimitiveSpec(
-        name="crosscore_flag_set_wait",
-        hardware_pipe="pipe_sync_barrier_mutex",
-        cann_intrinsic="CrossCoreSetFlag / CrossCoreWaitFlag",
-        tilelang_symbols=("ascend_cross_core_set_flag", "ascend_cross_core_wait_flag"),
-        workaround_track="ascendc_template",
-        description="Cross-core AIC/AIV synchronization flags",
-    ),
-    IsaPrimitiveSpec(
-        name="crosscore_mode4_dual_dst",
-        hardware_pipe="pipe_sync_barrier_mutex",
-        cann_intrinsic="CrossCoreSetFlag<mode=4, dualDstCtl>",
-        tilelang_symbols=("ascend_cross_core_mode4", "cross_core_dual_dst"),
-        workaround_track="ascendc_template",
-        description="Mode-4 symmetric 1C2V dual-destination cross-core signaling",
-    ),
-    IsaPrimitiveSpec(
-        name="hardware_mutex_28",
-        hardware_pipe="pipe_sync_barrier_mutex",
-        cann_intrinsic="HwMutexLock / HwMutexUnlock",
-        tilelang_symbols=("ascend_hw_mutex_lock", "hw_mutex_lock"),
-        workaround_track="ascendc_template",
-        description="28 hardware mutex locks for inter-core atomic serialization",
-    ),
-    IsaPrimitiveSpec(
-        name="simt_warp_shuffle_ballot",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="__shfl / __ballot",
-        tilelang_symbols=("shfl_sync", "ballot_sync", "activemask"),
-        workaround_track="ascendc_template",
-        description="SIMT warp shuffle and ballot collectives",
-    ),
-    IsaPrimitiveSpec(
-        name="simt_atomic_add_minmax",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="atomicAdd / atomicMax / atomicMin",
-        tilelang_symbols=("atomic_add", "atomic_max", "atomic_min"),
-        workaround_track="ascendc_template",
-        description="Standard warp/block atomic arithmetic",
-    ),
-    IsaPrimitiveSpec(
-        name="simt_gm_atomic_cas",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="asc_atomic_cas",
-        tilelang_symbols=("atomic_cas", "asc_atomic_cas"),
-        workaround_track="ascendc_template",
-        description="In-place global memory compare-and-swap atomic",
-    ),
-    IsaPrimitiveSpec(
-        name="simt_uint_div_fast",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="Simt::UintDiv",
-        tilelang_symbols=("simt.uint_div", "uint_div"),
-        workaround_track="ascendc_template",
-        description="Strength-reduced integer divider for dynamic SIMT stride indexing",
-    ),
-    IsaPrimitiveSpec(
-        name="dma_dual_copy_and_nd2nz",
-        hardware_pipe="pipe_mte2_mte3_dma",
-        cann_intrinsic="DataCopy / Nd2NzParams",
-        tilelang_symbols=("dual_copy", "ascend_nd2nz_post_copy", "copy"),
-        workaround_track="ascendc_template",
-        description="Dual-core copy and UB->L1 ND2NZ fractal layout conversion",
-    ),
-    IsaPrimitiveSpec(
-        name="dma_l2_cache_mode_disable",
-        hardware_pipe="pipe_mte2_mte3_dma",
-        cann_intrinsic="CACHE_MODE_DISABLE / L2BypassHint",
-        tilelang_symbols=("dma_cache_mode_disable", "l2_cache_bypass_hint"),
-        workaround_track="ascendc_template",
-        description="Per-operand GM->L1/UB L2 cache bypass hint",
-    ),
-    IsaPrimitiveSpec(
-        name="dma_datacopy_pad_unaligned",
-        hardware_pipe="pipe_mte2_mte3_dma",
-        cann_intrinsic="DataCopyPad",
-        tilelang_symbols=("datacopy_pad", "ascend_datacopy_pad"),
-        workaround_track="ascendc_template",
-        description="Hardware 32B-unaligned DataCopyPad tail DMA",
-    ),
-    IsaPrimitiveSpec(
-        name="mte1_load_2d_3d",
-        hardware_pipe="pipe_mte1_l1_to_l0",
-        cann_intrinsic="Load2D / Load3D",
-        tilelang_symbols=("load_2d", "load_3d", "ascend_load2d", "ascend_load3d"),
-        workaround_track="ascendc_template",
-        description="MTE1 L1->L0A/L0B 2D fractal and 3D im2col tile loading",
-    ),
-    IsaPrimitiveSpec(
-        name="fixpipe_l0c_to_ub_split_m",
-        hardware_pipe="pipe_fix_fixpipe",
-        cann_intrinsic="L0CToUbSplitM",
-        tilelang_symbols=("l0c_to_ub_split_m", "ascend_l0c_to_ub_split_m", "fixpipe_l0c_to_ub"),
-        workaround_track="ascendc_template",
-        description="FixPipe direct L0C->UB SPLIT_M routing across coupled AIV sub-blocks",
-    ),
-    IsaPrimitiveSpec(
-        name="scalar_dcci_cache_invalidate",
-        hardware_pipe="pipe_s_scalar_spr",
-        cann_intrinsic="dcci",
-        tilelang_symbols=("dcci", "ascend_dcci"),
-        workaround_track="ascendc_template",
-        description="Scalar data-cache clean/invalidate for SIMT-to-SIMD/GM coherence",
-    ),
-    IsaPrimitiveSpec(
-        name="simd_vci_vcmax",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="Reg::Vci / Reg::Vcmax",
-        tilelang_symbols=("simd.vci", "simd.vcmax", "simd.vcmin"),
-        workaround_track="inline_ascendc_vf",
-        description="Index generation and vector max/min reduction",
-    ),
-    IsaPrimitiveSpec(
-        name="hardware_bitonic_sort32",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="BitonicSort32 / Sort32",
-        tilelang_symbols=("bitonic_sort32", "simd.sort32"),
-        workaround_track="ascendc_template",
-        description="Hardware 32-element bitonic sort unit",
-    ),
-    IsaPrimitiveSpec(
-        name="hardware_mrgsort4_topk",
-        hardware_pipe="pipe_v_simd_simt",
-        cann_intrinsic="MrgSort4 / TopK",
-        tilelang_symbols=("mrgsort4", "hardware_topk", "simd.mrgsort4"),
-        workaround_track="ascendc_template",
-        description="Hardware 4-way merge sort and TopK selector",
-    ),
+_CATALOG_ROWS: tuple[tuple[str, str, str, tuple[str, ...], str, str], ...] = (
+    ("fp4_e2m1_dtype", "pipe_m_cube", "fp4_e2m1fnx2", ("float4_e2m1fn", "float4_e2m1fnx2"), "ascendc_template", "Packed 4-bit FP4 E2M1 tensor representation"),
+    ("mx_e8m0_blockscale_gemm", "pipe_m_cube", "MmadBlockScaled<e8m0>", ("gemm_blockscaled", "float8_e8m0fnu"), "ascendc_template", "Block-scaled MX GEMM with E8M0 microscaling factors"),
+    ("mx_spr_scale_config", "pipe_s_scalar_spr", "SetMxScaleSPR / QuantMx", ("set_mx_scale_spr", "ascend_mx_quant"), "ascendc_template", "Hardware SPR microscaling configuration and online MX quantization"),
+    ("subbyte_q4_bitshift_unpack", "pipe_v_simd_simt", "BitUnpackQ4_0 / FixPipeDeqScale", ("bit_unpack_q4", "fixpipe_deq_scale"), "ascendc_template", "Sub-byte INT4/Q4_0 register bitshift unpack and FixPipe dequant scale"),
+    ("cube_mmad_sparse", "pipe_m_cube", "MmadSparse", ("gemm_sparse", "mmad_sparse", "ascend_mmad_sparse"), "ascendc_template", "2:4 structured sparse Cube MMAD execution primitive"),
+    ("fixpipe_deq_scale", "pipe_fix_fixpipe", "FixPipeDeqScale", ("fixpipe_deq_scale", "ascend_fixpipe_deq_scale"), "ascendc_template", "FixPipe hardware per-channel/block dequantization scaling"),
+    ("scalar_set_ctrl_spr", "pipe_s_scalar_spr", "SetCtrlSpr", ("set_ctrl_spr", "ascend_set_ctrl_spr"), "ascendc_template", "Scalar SPR control register configuration for quantized/MX modes"),
+    ("simd_vld_vst", "pipe_v_simd_simt", "Reg::Load / Reg::Store", ("simd.vld", "simd.vst2", "simd.vsts"), "inline_ascendc_vf", "Register-base UB load/store intrinsics"),
+    ("simd_vgather_vscatter", "pipe_v_simd_simt", "Reg::Gather / Reg::Scatter", ("simd.vgather2", "simd.vgatherb", "simd.vscatter"), "inline_ascendc_vf", "Register-base indexed gather/scatter"),
+    ("regbase_dist_unpack_pack", "pipe_v_simd_simt", "LoadDist::DIST_UNPACK_B16 / StoreDist::DIST_PACK_B32", ("simd.dist_unpack_b16", "simd.dist_pack_b32"), "inline_ascendc_vf", "Explicit RegBase DIST_UNPACK_B16 / DIST_PACK_B32 lane distribution"),
+    ("regbase_reduce_data_block", "pipe_v_simd_simt", "Reg::ReduceDataBlock", ("simd.reduce_data_block", "simd.reduce_datablock"), "inline_ascendc_vf", "Hardware 32B DataBlock intra-vector reduction intrinsic"),
+    ("crosscore_flag_set_wait", "pipe_sync_barrier_mutex", "CrossCoreSetFlag / CrossCoreWaitFlag", ("ascend_cross_core_set_flag", "ascend_cross_core_wait_flag"), "ascendc_template", "Cross-core AIC/AIV synchronization flags"),
+    ("crosscore_mode4_dual_dst", "pipe_sync_barrier_mutex", "CrossCoreSetFlag<mode=4, dualDstCtl>", ("ascend_cross_core_mode4", "cross_core_dual_dst"), "ascendc_template", "Mode-4 symmetric 1C2V dual-destination cross-core signaling"),
+    ("hardware_mutex_28", "pipe_sync_barrier_mutex", "HwMutexLock / HwMutexUnlock", ("ascend_hw_mutex_lock", "hw_mutex_lock"), "ascendc_template", "28 hardware mutex locks for inter-core atomic serialization"),
+    ("simt_warp_shuffle_ballot", "pipe_v_simd_simt", "__shfl / __ballot", ("shfl_sync", "ballot_sync", "activemask"), "ascendc_template", "SIMT warp shuffle and ballot collectives"),
+    ("simt_atomic_add_minmax", "pipe_v_simd_simt", "atomicAdd / atomicMax / atomicMin", ("atomic_add", "atomic_max", "atomic_min"), "ascendc_template", "Standard warp/block atomic arithmetic"),
+    ("simt_gm_atomic_cas", "pipe_v_simd_simt", "asc_atomic_cas", ("atomic_cas", "asc_atomic_cas"), "ascendc_template", "In-place global memory compare-and-swap atomic"),
+    ("simt_uint_div_fast", "pipe_v_simd_simt", "Simt::UintDiv", ("simt.uint_div", "uint_div"), "ascendc_template", "Strength-reduced integer divider for dynamic SIMT stride indexing"),
+    ("dma_dual_copy_and_nd2nz", "pipe_mte2_mte3_dma", "DataCopy / Nd2NzParams", ("dual_copy", "ascend_nd2nz_post_copy", "copy"), "ascendc_template", "Dual-core copy and UB->L1 ND2NZ fractal layout conversion"),
+    ("dma_l2_cache_mode_disable", "pipe_mte2_mte3_dma", "CACHE_MODE_DISABLE / L2BypassHint", ("dma_cache_mode_disable", "l2_cache_bypass_hint"), "ascendc_template", "Per-operand GM->L1/UB L2 cache bypass hint"),
+    ("dma_datacopy_pad_unaligned", "pipe_mte2_mte3_dma", "DataCopyPad", ("datacopy_pad", "ascend_datacopy_pad"), "ascendc_template", "Hardware 32B-unaligned DataCopyPad tail DMA"),
+    ("mte1_load_2d_3d", "pipe_mte1_l1_to_l0", "Load2D / Load3D", ("load_2d", "load_3d", "ascend_load2d", "ascend_load3d"), "ascendc_template", "MTE1 L1->L0A/L0B 2D fractal and 3D im2col tile loading"),
+    ("fixpipe_l0c_to_ub_split_m", "pipe_fix_fixpipe", "L0CToUbSplitM", ("l0c_to_ub_split_m", "ascend_l0c_to_ub_split_m", "fixpipe_l0c_to_ub"), "ascendc_template", "FixPipe direct L0C->UB SPLIT_M routing across coupled AIV sub-blocks"),
+    ("scalar_dcci_cache_invalidate", "pipe_s_scalar_spr", "dcci", ("dcci", "ascend_dcci"), "ascendc_template", "Scalar data-cache clean/invalidate for SIMT-to-SIMD/GM coherence"),
+    ("simd_vci_vcmax", "pipe_v_simd_simt", "Reg::Vci / Reg::Vcmax", ("simd.vci", "simd.vcmax", "simd.vcmin"), "inline_ascendc_vf", "Index generation and vector max/min reduction"),
+    ("hardware_bitonic_sort32", "pipe_v_simd_simt", "BitonicSort32 / Sort32", ("bitonic_sort32", "simd.sort32"), "ascendc_template", "Hardware 32-element bitonic sort unit"),
+    ("hardware_mrgsort4_topk", "pipe_v_simd_simt", "MrgSort4 / TopK", ("mrgsort4", "hardware_topk", "simd.mrgsort4"), "ascendc_template", "Hardware 4-way merge sort and TopK selector"),
+)
+
+DAV3510_CANN_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = tuple(
+    IsaPrimitiveSpec(*row) for row in _CATALOG_ROWS
 )
 
 
 def _default_ascend_sdk_header_roots() -> tuple[str, ...]:
     roots: list[str] = []
     for env_key in ("ASCEND_TOOLKIT_HOME", "ASCEND_HOME_PATH"):
-        cann = os.environ.get(env_key, "").strip()
-        if cann:
+        if cann := os.environ.get(env_key, "").strip():
             base = Path(cann).expanduser()
-            roots.append(str(base / "x86_64-linux" / "asc" / "include"))
-            roots.append(str(base / "aarch64-linux" / "asc" / "include"))
-            roots.append(str(base / "asc" / "include"))
-            roots.append(str(base / "x86_64-linux" / "include"))
-            roots.append(str(base / "include"))
+            roots.extend(
+                str(base / sub)
+                for sub in (
+                    "x86_64-linux/asc/include",
+                    "aarch64-linux/asc/include",
+                    "asc/include",
+                    "x86_64-linux/include",
+                    "include",
+                )
+            )
     sibling_tl = Path(__file__).resolve().parents[5].parent / "tilelang" / "src" / "tl_templates" / "ascend"
     if sibling_tl.is_dir():
         roots.append(str(sibling_tl))
@@ -320,11 +139,8 @@ def _default_tilelang_codegen_path() -> str:
         os.environ.get("TILEFOUNDRY_NPU_TILELANG_REPO", "").strip()
         or os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE", "").strip()
     )
-    if env_tl:
-        return str(Path(env_tl).expanduser() / "tilelang" / "ascend" / "codegen.py")
-    return str(
-        Path(__file__).resolve().parents[5].parent / "tilelang" / "tilelang" / "ascend" / "codegen.py"
-    )
+    root = Path(env_tl).expanduser() if env_tl else Path(__file__).resolve().parents[5].parent / "tilelang"
+    return str(root / "tilelang" / "ascend" / "codegen.py")
 
 
 DEFAULT_ASCEND_SDK_HEADER_ROOTS: tuple[str, ...] = _default_ascend_sdk_header_roots()
@@ -379,22 +195,13 @@ class SdkHeaderScanResult:
         }
 
 
-_QUALIFIED_SDK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("Reg", re.compile(r"\bReg::([A-Za-z_][A-Za-z0-9_]*)")),
-    ("Simt", re.compile(r"\bSimt::([A-Za-z_][A-Za-z0-9_]*)")),
-    ("LoadDist", re.compile(r"\bLoadDist::([A-Za-z_][A-Za-z0-9_]*)")),
-    ("StoreDist", re.compile(r"\bStoreDist::([A-Za-z_][A-Za-z0-9_]*)")),
-)
-
+_QUALIFIED_SDK_RE = re.compile(r"\b(Reg|Simt|LoadDist|StoreDist)::([A-Za-z_][A-Za-z0-9_]*)")
 _NS_DECL_RE = re.compile(
     r"(?:__aicore__|__simd_callee__|__simt_callee__|inline|static|constexpr|template\s*<[^>]*>)*"
     r"\s*(?:void|bool|int\d*_t|uint\d*_t|float|double|auto|T|U|struct|class)\s+"
     r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|<|\{)"
 )
-_ENUM_BLOCK_RE = re.compile(
-    r"enum\s+(?:class\s+)?(LoadDist|StoreDist)\b[^{]*\{([^}]*)\}",
-    re.DOTALL,
-)
+_ENUM_BLOCK_RE = re.compile(r"enum\s+(?:class\s+)?(LoadDist|StoreDist)\b[^{]*\{([^}]*)\}", re.DOTALL)
 _ENUM_MEMBER_RE = re.compile(r"\b([A-Z][A-Z0-9_]+)\b")
 _NAMED_ISA_INTRINSICS_RE = re.compile(
     r"\b("
@@ -407,26 +214,19 @@ _NAMED_ISA_INTRINSICS_RE = re.compile(
     r"asc_atomic_[A-Za-z0-9_]+|__shfl[A-Za-z0-9_]*|__ballot[A-Za-z0-9_]*"
     r")\b"
 )
+_SDK_SKIP_IDENTS = frozenset({"if", "for", "while", "switch", "return", "inline", "void"})
 
 
 def _extract_namespace_symbols(text: str, ns_name: str, out: set[str]) -> None:
     ns_pat = re.compile(rf"\bnamespace\s+{ns_name}\s*\{{")
+    n = len(text)
     for m in ns_pat.finditer(text):
-        start = m.end()
-        depth = 1
-        pos = start
-        n = len(text)
+        start, pos, depth = m.end(), m.end(), 1
         while pos < n and depth > 0:
-            ch = text[pos]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
+            depth += (text[pos] == "{") - (text[pos] == "}")
             pos += 1
-        block = text[start : pos - 1]
-        for dm in _NS_DECL_RE.finditer(block):
-            ident = dm.group(1)
-            if ident not in ("if", "for", "while", "switch", "return", "inline", "void"):
+        for dm in _NS_DECL_RE.finditer(text[start : pos - 1]):
+            if (ident := dm.group(1)) not in _SDK_SKIP_IDENTS:
                 out.add(f"{ns_name}::{ident}")
 
 
@@ -445,154 +245,102 @@ def scan_ascend_sdk_headers(
 
     existing_roots = [r for r in roots if r.is_dir()]
     symbols: set[str] = set()
-    reg_syms: set[str] = set()
-    simt_syms: set[str] = set()
-    load_dist_syms: set[str] = set()
-    store_dist_syms: set[str] = set()
-    other_syms: set[str] = set()
+    cats: dict[str, set[str]] = {
+        "Reg": set(),
+        "Simt": set(),
+        "LoadDist": set(),
+        "StoreDist": set(),
+        "sync_dma_compute": set(),
+    }
 
-    seen_real_files: set[Path] = set()
+    def _add_sym(sym: str, cat: str | None = None) -> None:
+        symbols.add(sym)
+        if cat is not None:
+            cats[cat].add(sym)
+            return
+        prefix = sym.split("::", 1)[0] if "::" in sym else ""
+        cats[prefix if prefix in cats else "sync_dma_compute"].add(sym)
+
+    seen_real: set[Path] = set()
     scanned_count = 0
-
     for root in existing_roots:
         for dirpath, _dirnames, filenames in os.walk(root, followlinks=True):
             for fname in filenames:
                 if not fname.endswith((".h", ".hpp")):
                     continue
-                fpath = Path(dirpath) / fname
                 try:
-                    resolved = fpath.resolve()
+                    resolved = (Path(dirpath) / fname).resolve()
                 except OSError:
                     continue
-                if resolved in seen_real_files or not resolved.is_file():
+                if resolved in seen_real or not resolved.is_file():
                     continue
-                seen_real_files.add(resolved)
+                seen_real.add(resolved)
                 scanned_count += 1
                 try:
                     content = resolved.read_text(encoding="utf-8", errors="ignore")
                 except OSError:
                     continue
-
-                for prefix, pat in _QUALIFIED_SDK_PATTERNS:
-                    for m in pat.finditer(content):
-                        sym = f"{prefix}::{m.group(1)}"
-                        symbols.add(sym)
-                        if prefix == "Reg":
-                            reg_syms.add(sym)
-                        elif prefix == "Simt":
-                            simt_syms.add(sym)
-                        elif prefix == "LoadDist":
-                            load_dist_syms.add(sym)
-                        elif prefix == "StoreDist":
-                            store_dist_syms.add(sym)
-
-                if "namespace Reg" in content:
-                    before = len(reg_syms)
-                    _extract_namespace_symbols(content, "Reg", reg_syms)
-                    if len(reg_syms) > before:
-                        symbols.update(reg_syms)
-                if "namespace Simt" in content:
-                    before = len(simt_syms)
-                    _extract_namespace_symbols(content, "Simt", simt_syms)
-                    if len(simt_syms) > before:
-                        symbols.update(simt_syms)
-
+                for m in _QUALIFIED_SDK_RE.finditer(content):
+                    _add_sym(f"{m.group(1)}::{m.group(2)}", m.group(1))
+                for ns in ("Reg", "Simt"):
+                    if f"namespace {ns}" in content:
+                        before = len(cats[ns])
+                        _extract_namespace_symbols(content, ns, cats[ns])
+                        if len(cats[ns]) > before:
+                            symbols.update(cats[ns])
                 if "LoadDist" in content or "StoreDist" in content:
                     for em in _ENUM_BLOCK_RE.finditer(content):
                         enum_name, body = em.group(1), em.group(2)
                         for mem in _ENUM_MEMBER_RE.finditer(body):
-                            sym = f"{enum_name}::{mem.group(1)}"
-                            symbols.add(sym)
-                            if enum_name == "LoadDist":
-                                load_dist_syms.add(sym)
-                            else:
-                                store_dist_syms.add(sym)
-
+                            _add_sym(f"{enum_name}::{mem.group(1)}", enum_name)
                 for im in _NAMED_ISA_INTRINSICS_RE.finditer(content):
-                    tok = im.group(1)
-                    symbols.add(tok)
-                    other_syms.add(tok)
+                    _add_sym(im.group(1), "sync_dma_compute")
 
-    if scanned_count == 0 or not symbols:
+    fallback = scanned_count == 0 or not symbols
+    if fallback:
         if not allow_offline_catalog:
-            roots_preview = tuple(str(r) for r in existing_roots)
             raise FileNotFoundError(
-                f"No Ascend SDK or tl_templates headers found under {roots_preview}"
+                f"No Ascend SDK or tl_templates headers found under {tuple(str(r) for r in existing_roots)}"
             )
         for spec in DAV3510_CANN_ISA_CATALOG:
             for part in spec.cann_intrinsic.split("/"):
-                tok = part.strip()
-                if not tok:
-                    continue
-                symbols.add(tok)
-                if tok.startswith("Reg::"):
-                    reg_syms.add(tok)
-                elif tok.startswith("Simt::"):
-                    simt_syms.add(tok)
-                elif tok.startswith("LoadDist::"):
-                    load_dist_syms.add(tok)
-                elif tok.startswith("StoreDist::"):
-                    store_dist_syms.add(tok)
-                else:
-                    other_syms.add(tok)
-        return SdkHeaderScanResult(
-            source="catalog_fallback",
-            fallback_used=True,
-            scanned_roots=tuple(str(r) for r in existing_roots),
-            header_files_scanned=0,
-            symbols=frozenset(symbols),
-            by_category={
-                "Reg": tuple(sorted(reg_syms)),
-                "Simt": tuple(sorted(simt_syms)),
-                "LoadDist": tuple(sorted(load_dist_syms)),
-                "StoreDist": tuple(sorted(store_dist_syms)),
-                "sync_dma_compute": tuple(sorted(other_syms)),
-            },
-        )
+                if tok := part.strip():
+                    _add_sym(tok)
 
     return SdkHeaderScanResult(
-        source="sdk_headers",
-        fallback_used=False,
+        source="catalog_fallback" if fallback else "sdk_headers",
+        fallback_used=fallback,
         scanned_roots=tuple(str(r) for r in existing_roots),
-        header_files_scanned=scanned_count,
+        header_files_scanned=0 if fallback else scanned_count,
         symbols=frozenset(symbols),
-        by_category={
-            "Reg": tuple(sorted(reg_syms)),
-            "Simt": tuple(sorted(simt_syms)),
-            "LoadDist": tuple(sorted(load_dist_syms)),
-            "StoreDist": tuple(sorted(store_dist_syms)),
-            "sync_dma_compute": tuple(sorted(other_syms)),
-        },
+        by_category={k: tuple(sorted(v)) for k, v in cats.items()},
     )
 
 
 def _scan_tilelang_codegen_file(codegen_path: Path) -> set[str]:
-    """Scan tilelang/ascend/codegen.py (and sibling C++ codegen tables) for lowering symbols."""
     found: set[str] = set()
-    if codegen_path.is_file():
-        text = codegen_path.read_text(encoding="utf-8", errors="ignore")
-        for m in re.finditer(r'["\'](target\.build\.[A-Za-z0-9_]+)["\']', text):
-            found.add(m.group(1))
-        for m in re.finditer(r'\b([A-Z][A-Z0-9_]*_CODEGEN)\b', text):
-            found.add(m.group(1))
-        for m in re.finditer(r'DeviceCodegen\(\s*["\']([A-Za-z0-9_]+)["\']', text):
-            found.add(f"codegen:{m.group(1)}")
+    if not codegen_path.is_file():
+        return found
+    text = codegen_path.read_text(encoding="utf-8", errors="ignore")
+    for pat, fmt in (
+        (r'["\'](target\.build\.[A-Za-z0-9_]+)["\']', "{}"),
+        (r'\b([A-Z][A-Z0-9_]*_CODEGEN)\b', "{}"),
+        (r'DeviceCodegen\(\s*["\']([A-Za-z0-9_]+)["\']', "codegen:{}"),
+    ):
+        found.update(fmt.format(m.group(1)) for m in re.finditer(pat, text))
 
-        repo_root = codegen_path.resolve().parents[2]
-        cpp_candidates = (
-            repo_root / "src" / "ascend" / "codegen" / "codegen_ascend.cc",
-            repo_root / "src" / "ascend" / "codegen" / "intrin_rule_ascend.cc",
-        )
-        for cpp_file in cpp_candidates:
-            if not cpp_file.is_file():
-                continue
-            cpp_text = cpp_file.read_text(encoding="utf-8", errors="ignore")
-            for m in re.finditer(r"\btl::(ascend_[A-Za-z0-9_]+)\s*\(", cpp_text):
-                found.add(m.group(1))
-            for m in re.finditer(r'["\']tl\.(ascend_[A-Za-z0-9_]+)["\']', cpp_text):
-                found.add(m.group(1))
-            for m in re.finditer(r'["\']tl\.(simd\.[A-Za-z0-9_]+)["\']', cpp_text):
-                found.add(m.group(1))
+    repo_root = codegen_path.resolve().parents[2]
+    for cpp_name in ("codegen_ascend.cc", "intrin_rule_ascend.cc"):
+        cpp_file = repo_root / "src" / "ascend" / "codegen" / cpp_name
+        if not cpp_file.is_file():
+            continue
+        cpp_text = cpp_file.read_text(encoding="utf-8", errors="ignore")
+        for pat in (
+            r"\btl::(ascend_[A-Za-z0-9_]+)\s*\(",
+            r'["\']tl\.(ascend_[A-Za-z0-9_]+)["\']',
+            r'["\']tl\.(simd\.[A-Za-z0-9_]+)["\']',
+        ):
+            found.update(m.group(1) for m in re.finditer(pat, cpp_text))
     return found
 
 
@@ -603,33 +351,24 @@ def discover_tilelang_lowering_surface(
     allow_offline_catalog: bool = False,
 ) -> tuple[str, frozenset[str]]:
     """Discover registered TileLang Ascend lowering symbols from language + codegen.py."""
-    mod = tilelang_module
-    source = "explicit_module"
+    mod, source = tilelang_module, "explicit_module"
     if mod is None:
         try:
             import tilelang.ascend.language as tl_ascend  # noqa: PLC0415
 
-            mod = tl_ascend
-            source = "tilelang.ascend.language"
+            mod, source = tl_ascend, "tilelang.ascend.language"
         except ImportError:
             mod = None
 
     symbols: set[str] = set()
     if mod is not None:
-        for name in dir(mod):
-            if not name.startswith("_"):
-                symbols.add(name)
+        symbols.update(n for n in dir(mod) if not n.startswith("_"))
         for sub_attr in ("simd", "simt"):
-            sub_obj = getattr(mod, sub_attr, None)
-            if sub_obj is not None:
-                for name in dir(sub_obj):
-                    if not name.startswith("_"):
-                        symbols.add(f"{sub_attr}.{name}")
+            if (sub_obj := getattr(mod, sub_attr, None)) is not None:
+                symbols.update(f"{sub_attr}.{n}" for n in dir(sub_obj) if not n.startswith("_"))
 
-    cg_candidates: list[Path] = []
-    if codegen_path is not None:
-        cg_candidates.append(Path(codegen_path))
-    else:
+    cg_candidates: list[Path] = [Path(codegen_path)] if codegen_path is not None else []
+    if codegen_path is None:
         if mod is not None and getattr(mod, "__file__", None):
             cg_candidates.append(Path(str(mod.__file__)).resolve().parents[1] / "codegen.py")
         cg_candidates.append(Path(DEFAULT_TILELANG_CODEGEN_PATH))
@@ -643,11 +382,9 @@ def discover_tilelang_lowering_surface(
 
     if mod is None and not codegen_scanned:
         if not allow_offline_catalog:
-            raise ImportError(
-                "tilelang.ascend.language and codegen.py are both unavailable"
-            )
+            raise ImportError("tilelang.ascend.language and codegen.py are both unavailable")
         return "baseline_fallback", BASELINE_TILELANG_ASCEND_SURFACE
-    if mod is not None and codegen_scanned and source == "tilelang.ascend.language":
+    if codegen_scanned and source == "tilelang.ascend.language":
         source = "tilelang.ascend.language+codegen"
     elif mod is None and codegen_scanned:
         source = "tilelang.ascend.codegen"
@@ -660,15 +397,10 @@ def _resolve_surface(
     allow_offline_catalog: bool = False,
 ) -> tuple[str, frozenset[str]]:
     if tilelang_surface is None:
-        return discover_tilelang_lowering_surface(
-            allow_offline_catalog=allow_offline_catalog
-        )
+        return discover_tilelang_lowering_surface(allow_offline_catalog=allow_offline_catalog)
     if isinstance(tilelang_surface, (set, frozenset, list, tuple)):
         return "explicit_surface", frozenset(str(s) for s in tilelang_surface)
-    return discover_tilelang_lowering_surface(
-        tilelang_surface,
-        allow_offline_catalog=allow_offline_catalog,
-    )
+    return discover_tilelang_lowering_surface(tilelang_surface, allow_offline_catalog=allow_offline_catalog)
 
 
 def scan_tilelang_pipe_gaps(
@@ -680,52 +412,39 @@ def scan_tilelang_pipe_gaps(
 ) -> PipeGapReport:
     """Diff CANN dav-3510 hardware capabilities against TileLang across the 7 hardware pipes."""
     surface_source, surface = _resolve_surface(
-        tilelang_surface,
-        allow_offline_catalog=allow_offline_catalog,
+        tilelang_surface, allow_offline_catalog=allow_offline_catalog
     )
-
     selected_pipes = tuple(pipes) if pipes is not None else VALID_HARDWARE_PIPES
     for pipe in selected_pipes:
         if pipe not in VALID_HARDWARE_PIPES:
-            raise ValueError(
-                f"Unknown hardware pipe {pipe!r}; expected one of {VALID_HARDWARE_PIPES}"
-            )
-
+            raise ValueError(f"Unknown hardware pipe {pipe!r}; expected one of {VALID_HARDWARE_PIPES}")
     catalog = tuple(cann_catalog) if cann_catalog is not None else DAV3510_CANN_ISA_CATALOG
 
     pipe_reports: dict[str, PipeGapBreakdown] = {}
     all_supported: list[str] = []
     all_missing: list[str] = []
-
     for pipe in selected_pipes:
-        pipe_specs = [spec for spec in catalog if spec.hardware_pipe == pipe]
-        supported: list[str] = []
-        missing: list[str] = []
-        for spec in pipe_specs:
-            if any(sym in surface for sym in spec.tilelang_symbols):
-                supported.append(spec.name)
-            else:
-                missing.append(spec.name)
+        pipe_specs = [s for s in catalog if s.hardware_pipe == pipe]
+        supported = [s.name for s in pipe_specs if any(sym in surface for sym in s.tilelang_symbols)]
+        missing = [s.name for s in pipe_specs if not any(sym in surface for sym in s.tilelang_symbols)]
         total = len(pipe_specs)
-        ratio = (len(supported) / float(total)) if total > 0 else 1.0
         pipe_reports[pipe] = PipeGapBreakdown(
             pipe=pipe,
             total_capabilities=total,
             supported_primitives=tuple(supported),
             missing_primitives=tuple(missing),
-            coverage_ratio=round(ratio, 4),
+            coverage_ratio=round((len(supported) / float(total)) if total > 0 else 1.0, 4),
         )
         all_supported.extend(supported)
         all_missing.extend(missing)
 
     total_all = len(all_supported) + len(all_missing)
-    overall_ratio = (len(all_supported) / float(total_all)) if total_all > 0 else 1.0
     return PipeGapReport(
         surface_source=surface_source,
         pipes=pipe_reports,
         supported_primitives=tuple(all_supported),
         missing_primitives=tuple(all_missing),
-        coverage_ratio=round(overall_ratio, 4),
+        coverage_ratio=round((len(all_supported) / float(total_all)) if total_all > 0 else 1.0, 4),
     )
 
 

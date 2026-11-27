@@ -31,91 +31,31 @@ from tilefoundry_ascend.ascend.sil.schema import (
 from tilefoundry_ascend.ascend.target import Ascend950PR, AscendSpaceFacts, AscendTarget
 
 _CONV_CALL_NAMES = frozenset(
-    {
-        "conv1d",
-        "conv2d",
-        "conv3d",
-        "conv_transpose1d",
-        "conv_transpose2d",
-        "conv_transpose3d",
-    }
+    {"conv1d", "conv2d", "conv3d", "conv_transpose1d", "conv_transpose2d", "conv_transpose3d"}
 )
 _MATMUL_CALL_NAMES = frozenset(
     {
-        "addmm",
-        "addmv",
-        "baddbmm",
-        "bmm",
-        "einsum",
-        "grouped_matmul",
-        "linear",
-        "matmul",
-        "matmul_",
-        "mm",
-        "mv",
-        "scaled_dot_product_attention",
+        "addmm", "addmv", "baddbmm", "bmm", "einsum", "grouped_matmul",
+        "linear", "matmul", "matmul_", "mm", "mv", "scaled_dot_product_attention",
         *_CONV_CALL_NAMES,
     }
 )
 _REDUCTION_CALL_NAMES = frozenset(
     {
-        "all",
-        "amax",
-        "amin",
-        "any",
-        "argmax",
-        "argmin",
-        "cross_entropy",
-        "cumprod",
-        "cumsum",
-        "group_norm",
-        "layer_norm",
-        "log_softmax",
-        "logsumexp",
-        "max",
-        "mean",
-        "norm",
-        "prod",
-        "rms_norm",
-        "scaled_dot_product_attention",
-        "softmax",
-        "std",
-        "sum",
-        "var",
+        "all", "amax", "amin", "any", "argmax", "argmin", "cross_entropy",
+        "cumprod", "cumsum", "group_norm", "layer_norm", "log_softmax", "logsumexp",
+        "max", "mean", "norm", "prod", "rms_norm", "scaled_dot_product_attention",
+        "softmax", "std", "sum", "var",
     }
 )
 _TRANSCENDENTAL_CALL_NAMES = frozenset(
     {
-        "rsqrt",
-        "silu",
-        "gelu",
-        "sigmoid",
-        "tanh",
-        "sin",
-        "cos",
-        "erf",
-        "exp",
-        "exp2",
-        "expm1",
-        "log",
-        "log2",
-        "log10",
-        "softmax",
-        "log_softmax",
-        "pow",
-        "sqrt",
+        "rsqrt", "silu", "gelu", "sigmoid", "tanh", "sin", "cos", "erf",
+        "exp", "exp2", "expm1", "log", "log2", "log10", "softmax", "log_softmax", "pow", "sqrt",
     }
 )
 _SHAPE_PRESERVING_CALL_NAMES = frozenset(
-    {
-        "cumprod",
-        "cumsum",
-        "group_norm",
-        "layer_norm",
-        "log_softmax",
-        "rms_norm",
-        "softmax",
-    }
+    {"cumprod", "cumsum", "group_norm", "layer_norm", "log_softmax", "rms_norm", "softmax"}
 )
 _EXP_CALL_NAMES = frozenset({"exp", "exp2", "expm1"})
 _MAX_CALL_NAMES = frozenset(
@@ -123,84 +63,28 @@ _MAX_CALL_NAMES = frozenset(
 )
 _INDIRECT_CALL_NAMES = frozenset(
     {
-        "bucketize",
-        "embedding",
-        "gather",
-        "index",
-        "index_add",
-        "index_select",
-        "scatter",
-        "scatter_",
-        "scatter_add",
-        "searchsorted",
-        "take",
-        "topk",
+        "bucketize", "embedding", "gather", "index", "index_add", "index_select",
+        "scatter", "scatter_", "scatter_add", "searchsorted", "take", "topk",
     }
 )
 _SUBBYTE_OR_QUANT_CALL_TOKENS = (
-    "dequant",
-    "antiquant",
-    "int4",
-    "uint4",
-    "quint4x2",
-    "q4",
-    "w4",
-    "awq",
-    "gptq",
-    "nf4",
-    "fp4",
-    "mxfp",
-    "block_quant",
+    "dequant", "antiquant", "int4", "uint4", "quint4x2", "q4", "w4",
+    "awq", "gptq", "nf4", "fp4", "mxfp", "block_quant",
 )
 _SUBBYTE_OR_QUANT_IDENT_TOKENS = (
-    "dequant",
-    "antiquant",
-    "qweight",
-    "mxscale",
-    "block_size",
-    "blocksize",
-    "group_size",
-    "groupsize",
-    "weight_scale",
-    "activation_scale",
-    "int4",
-    "uint4",
-    "quint4x2",
-    "fp4",
-    "mxfp",
-    "q4_",
-    "awq",
-    "gptq",
-    "nf4",
+    "dequant", "antiquant", "qweight", "mxscale", "block_size", "blocksize",
+    "group_size", "groupsize", "weight_scale", "activation_scale", "int4",
+    "uint4", "quint4x2", "fp4", "mxfp", "q4_", "awq", "gptq", "nf4",
 )
 _SUBBYTE_OR_QUANT_DTYPE_ATTRS = frozenset(
     {
-        "int4",
-        "uint4",
-        "quint4x2",
-        "qint8",
-        "float4_e2m1",
-        "float4_e1m2",
-        "float8_e4m3fn",
-        "float8_e5m2",
-        "float8_e8m0fnu",
-        "float8_e4m3fnuz",
-        "float8_e5m2fnuz",
+        "int4", "uint4", "quint4x2", "qint8", "float4_e2m1", "float4_e1m2",
+        "float8_e4m3fn", "float8_e5m2", "float8_e8m0fnu", "float8_e4m3fnuz", "float8_e5m2fnuz",
     }
 )
 _STANDARD_8BIT_DTYPE_ATTRS = frozenset({"int8", "uint8"})
 _BLOCK_SCALE_IDENT_NAMES = frozenset(
-    {
-        "scales",
-        "scale_inv",
-        "zero_point",
-        "zeros",
-        "qzeros",
-        "block_size",
-        "blocksize",
-        "group_size",
-        "groupsize",
-    }
+    {"scales", "scale_inv", "zero_point", "zeros", "qzeros", "block_size", "blocksize", "group_size", "groupsize"}
 )
 _DIM_KEYWORDS = frozenset({"dim", "axis"})
 _TRANSCENDENTAL_OP_EQUIV = 8
@@ -210,21 +94,9 @@ _ProvenanceFlag = Literal["input", "reduction"]
 _PROVENANCE_INPUT: _ProvenanceFlag = "input"
 _PROVENANCE_REDUCTION: _ProvenanceFlag = "reduction"
 _SHAPE_TRANSPARENT_METHODS = frozenset(
-    {
-        "bfloat16",
-        "clone",
-        "contiguous",
-        "cpu",
-        "cuda",
-        "detach",
-        "double",
-        "float",
-        "half",
-        "npu",
-        "to",
-        "type",
-    }
+    {"bfloat16", "clone", "contiguous", "cpu", "cuda", "detach", "double", "float", "half", "npu", "to", "type"}
 )
+_NONLINEAR_STATE_WRAPPERS = frozenset({"tanh", "sigmoid", "relu", "gelu", "silu", "softmax", "exp", "rsqrt"})
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -250,9 +122,8 @@ class PyTorchOpSemantics:
         if not self.entry_name.strip():
             raise ValueError("PyTorchOpSemantics.entry_name must be a non-empty string")
         axes = tuple(self.reduction_axes)
-        for axis in axes:
-            if isinstance(axis, bool) or not isinstance(axis, int):
-                raise ValueError("PyTorchOpSemantics.reduction_axes must contain only ints")
+        if any(isinstance(a, bool) or not isinstance(a, int) for a in axes):
+            raise ValueError("PyTorchOpSemantics.reduction_axes must contain only ints")
         if self.transcendental_op_count < 0:
             raise ValueError("PyTorchOpSemantics.transcendental_op_count must be non-negative")
         object.__setattr__(self, "reduction_axes", axes)
@@ -269,13 +140,7 @@ class PyTorchOpSemantics:
             or self.has_indirect_index
             or self.has_recurrent_loop
         )
-        if coupled:
-            compute_engine = "coupled_1c2v"
-        elif is_gemm:
-            compute_engine = "aic_only"
-        else:
-            compute_engine = "aiv_only"
-
+        compute_engine = "coupled_1c2v" if coupled else ("aic_only" if is_gemm else "aiv_only")
         if self.has_recurrent_loop and not is_gemm:
             memory_ring = "persistent_onchip_state"
         elif coupled and self.has_online_exp_max:
@@ -288,14 +153,10 @@ class PyTorchOpSemantics:
             memory_ring = "ub_random_atomic"
         else:
             memory_ring = "gm_ub_stream"
-
-        iteration_regularity = (
-            "irregular_simt" if self.has_indirect_index else "affine_simd"
-        )
         return TopologyAxes(
             compute_engine=compute_engine,
             memory_ring=memory_ring,
-            iteration_regularity=iteration_regularity,
+            iteration_regularity="irregular_simt" if self.has_indirect_index else "affine_simd",
         )
 
 
@@ -312,29 +173,23 @@ class RepresentativeCase:
     attrs: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if isinstance(self.case_id, bool) or not isinstance(self.case_id, int):
+        if isinstance(self.case_id, bool) or not isinstance(self.case_id, int) or self.case_id < 1:
             raise ValueError("RepresentativeCase.case_id must be a positive integer")
-        if self.case_id < 1:
-            raise ValueError("RepresentativeCase.case_id must be a positive integer")
-        shapes = tuple(tuple(int(dim) for dim in shape) for shape in self.input_shapes)
+        shapes = tuple(tuple(int(d) for d in sh) for sh in self.input_shapes)
         dtypes = tuple(self.input_dtypes)
         out_dtypes = tuple(self.output_dtypes)
-        out_shapes = tuple(tuple(int(dim) for dim in shape) for shape in self.output_shapes)
+        out_shapes = tuple(tuple(int(d) for d in sh) for sh in self.output_shapes)
         if not shapes:
             raise ValueError("RepresentativeCase.input_shapes must not be empty")
         if len(shapes) != len(dtypes):
-            raise ValueError(
-                "RepresentativeCase.input_shapes and input_dtypes must have equal length"
-            )
-        if any(dim < 0 for shape in shapes for dim in shape):
+            raise ValueError("RepresentativeCase.input_shapes and input_dtypes must have equal length")
+        if any(d < 0 for sh in shapes for d in sh):
             raise ValueError("RepresentativeCase.input_shapes must not contain negative dims")
-        if any(dtype is not None and not dtype.strip() for dtype in dtypes):
+        if any(dt is not None and not dt.strip() for dt in dtypes):
             raise ValueError("RepresentativeCase.input_dtypes must be non-empty strings or None")
         if self.output_dtype is not None and not self.output_dtype.strip():
-            raise ValueError(
-                "RepresentativeCase.output_dtype must be a non-empty string or None"
-            )
-        if any(dtype is not None and not dtype.strip() for dtype in out_dtypes):
+            raise ValueError("RepresentativeCase.output_dtype must be a non-empty string or None")
+        if any(dt is not None and not dt.strip() for dt in out_dtypes):
             raise ValueError("RepresentativeCase.output_dtypes must be non-empty strings or None")
         object.__setattr__(self, "input_shapes", shapes)
         object.__setattr__(self, "input_dtypes", dtypes)
@@ -352,14 +207,10 @@ class RepresentativeCase:
         case_id = case_entry.get("case_id")
         if isinstance(case_id, bool) or not isinstance(case_id, int) or case_id < 1:
             raise ValueError("case entry requires a positive integer case_id")
-        shapes, dtypes = _pair_case_shapes_and_dtypes(
-            case_entry.get("input_shape"),
-            case_entry.get("dtype"),
-        )
+        shapes, dtypes = _pair_case_shapes_and_dtypes(case_entry.get("input_shape"), case_entry.get("dtype"))
         if not shapes:
             raise ValueError(f"case {case_id} requires at least one integer input shape")
         raw_attrs = case_entry.get("attrs")
-        attrs = dict(raw_attrs) if isinstance(raw_attrs, Mapping) else {}
         output_dtype, output_dtypes = _resolve_proto_output_dtypes(proto, dtypes)
         return cls(
             case_id=case_id,
@@ -367,16 +218,12 @@ class RepresentativeCase:
             input_dtypes=dtypes,
             output_dtype=output_dtype,
             output_dtypes=output_dtypes,
-            attrs=attrs,
+            attrs=dict(raw_attrs) if isinstance(raw_attrs, Mapping) else {},
         )
 
 
 def _is_int_sequence(raw: object) -> bool:
-    return (
-        isinstance(raw, (list, tuple))
-        and len(raw) > 0
-        and all(isinstance(dim, int) and not isinstance(dim, bool) for dim in raw)
-    )
+    return isinstance(raw, (list, tuple)) and len(raw) > 0 and all(isinstance(d, int) and not isinstance(d, bool) for d in raw)
 
 
 def _pair_case_shapes_and_dtypes(
@@ -386,81 +233,63 @@ def _pair_case_shapes_and_dtypes(
     if not isinstance(raw_shapes, (list, tuple)):
         return (), ()
     if _is_int_sequence(raw_shapes):
-        shape = tuple(int(dim) for dim in raw_shapes)
+        shape = tuple(int(d) for d in raw_shapes)
         if isinstance(raw_dtypes, str) and raw_dtypes.strip():
             return (shape,), (raw_dtypes.strip(),)
-        flat_dtypes = flatten_str_values(raw_dtypes)
-        if len(flat_dtypes) == 1:
-            return (shape,), (flat_dtypes[0],)
-        return (shape,), (None,)
+        flat = flatten_str_values(raw_dtypes)
+        return (shape,), (flat[0],) if len(flat) == 1 else (None,)
 
     slots = list(raw_shapes)
     shapes: list[tuple[int, ...]] = []
-    paired_dtypes: list[str | None] = []
-    broadcast_dtype: str | None = None
+    paired: list[str | None] = []
+    broadcast = raw_dtypes.strip() if isinstance(raw_dtypes, str) and raw_dtypes.strip() else None
     slot_dtypes: list[object] | None = None
-
-    if isinstance(raw_dtypes, str) and raw_dtypes.strip():
-        broadcast_dtype = raw_dtypes.strip()
-    elif isinstance(raw_dtypes, (list, tuple)):
+    if isinstance(raw_dtypes, (list, tuple)):
         if len(raw_dtypes) == len(slots):
             slot_dtypes = list(raw_dtypes)
-        elif (
-            len(raw_dtypes) == 1
-            and isinstance(raw_dtypes[0], str)
-            and raw_dtypes[0].strip()
-        ):
-            broadcast_dtype = raw_dtypes[0].strip()
+        elif len(raw_dtypes) == 1 and isinstance(raw_dtypes[0], str) and raw_dtypes[0].strip():
+            broadcast = raw_dtypes[0].strip()
 
     desynced = False
     for idx, slot in enumerate(slots):
         if slot is None:
             continue
-        dt_slot = slot_dtypes[idx] if slot_dtypes is not None else broadcast_dtype
+        dt_slot = slot_dtypes[idx] if slot_dtypes is not None else broadcast
         if _is_int_sequence(slot):
-            shapes.append(tuple(int(dim) for dim in slot))
+            shapes.append(tuple(int(d) for d in slot))
             if isinstance(dt_slot, str) and dt_slot.strip():
-                paired_dtypes.append(dt_slot.strip())
-            elif (
-                isinstance(dt_slot, (list, tuple))
-                and len(dt_slot) == 1
-                and isinstance(dt_slot[0], str)
-                and dt_slot[0].strip()
-            ):
-                paired_dtypes.append(dt_slot[0].strip())
-            elif slot_dtypes is None and broadcast_dtype is not None:
-                paired_dtypes.append(broadcast_dtype)
+                paired.append(dt_slot.strip())
+            elif isinstance(dt_slot, (list, tuple)) and len(dt_slot) == 1 and isinstance(dt_slot[0], str) and dt_slot[0].strip():
+                paired.append(dt_slot[0].strip())
+            elif slot_dtypes is None and broadcast is not None:
+                paired.append(broadcast)
             else:
                 desynced = True
         elif isinstance(slot, (list, tuple)):
-            sub_shapes = [
-                tuple(int(dim) for dim in sub)
-                for sub in slot
-                if _is_int_sequence(sub)
-            ]
-            if not sub_shapes:
+            subs = [tuple(int(d) for d in sub) for sub in slot if _is_int_sequence(sub)]
+            if not subs:
                 continue
-            shapes.extend(sub_shapes)
+            shapes.extend(subs)
             if isinstance(dt_slot, str) and dt_slot.strip():
-                paired_dtypes.extend([dt_slot.strip()] * len(sub_shapes))
+                paired.extend([dt_slot.strip()] * len(subs))
             elif isinstance(dt_slot, (list, tuple)):
                 sub_dt = [str(item).strip() for item in dt_slot if item is not None]
-                if len(sub_dt) == len(sub_shapes) and all(sub_dt):
-                    paired_dtypes.extend(sub_dt)
+                if len(sub_dt) == len(subs) and all(sub_dt):
+                    paired.extend(sub_dt)
                 elif len(sub_dt) == 1 and sub_dt[0]:
-                    paired_dtypes.extend([sub_dt[0]] * len(sub_shapes))
+                    paired.extend([sub_dt[0]] * len(subs))
                 else:
                     desynced = True
-            elif slot_dtypes is None and broadcast_dtype is not None:
-                paired_dtypes.extend([broadcast_dtype] * len(sub_shapes))
+            elif slot_dtypes is None and broadcast is not None:
+                paired.extend([broadcast] * len(subs))
             else:
                 desynced = True
 
     if not shapes:
         return (), ()
-    if desynced or len(paired_dtypes) != len(shapes):
+    if desynced or len(paired) != len(shapes):
         return tuple(shapes), (None,) * len(shapes)
-    return tuple(shapes), tuple(paired_dtypes)
+    return tuple(shapes), tuple(paired)
 
 
 def _resolve_proto_output_dtypes(
@@ -469,11 +298,7 @@ def _resolve_proto_output_dtypes(
 ) -> tuple[str | None, tuple[str | None, ...]]:
     if not isinstance(proto, Mapping):
         return None, ()
-    op_block = (
-        proto["operator"]
-        if "outputs" not in proto and isinstance(proto.get("operator"), Mapping)
-        else proto
-    )
+    op_block = proto["operator"] if "outputs" not in proto and isinstance(proto.get("operator"), Mapping) else proto
     raw_outputs = op_block.get("outputs") if isinstance(op_block, Mapping) else None
     if not isinstance(raw_outputs, Sequence) or isinstance(raw_outputs, (str, bytes)):
         return None, ()
@@ -485,22 +310,19 @@ def _resolve_proto_output_dtypes(
         raw_dt = out_item.get("dtype")
         if isinstance(raw_dt, str) and raw_dt.strip():
             resolved.append(raw_dt.strip())
-            continue
-        if isinstance(raw_dt, Sequence) and not isinstance(raw_dt, (str, bytes)):
+        elif isinstance(raw_dt, Sequence) and not isinstance(raw_dt, (str, bytes)):
             cands = [str(item).strip() for item in raw_dt if item is not None and str(item).strip()]
             if len(cands) == 1:
                 resolved.append(cands[0])
             elif cands:
-                matched = next((dt for dt in declared_inputs if dt in cands), None)
-                resolved.append(matched)
+                resolved.append(next((dt for dt in declared_inputs if dt in cands), None))
             else:
                 resolved.append(None)
         else:
             resolved.append(None)
     if not resolved:
         return None, ()
-    first_non_null = next((dt for dt in resolved if dt is not None), None)
-    return first_non_null, tuple(resolved)
+    return next((dt for dt in resolved if dt is not None), None), tuple(resolved)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -517,8 +339,6 @@ class _AnalyticalWork:
 
 @dataclass(frozen=True, kw_only=True)
 class _TrafficCharge:
-    """One HBM tensor charge priced at a declared dtype or a marked fallback width."""
-
     element_count: int
     element_bytes: float
     dtype_declared: bool
@@ -527,13 +347,19 @@ class _TrafficCharge:
 def _call_leaf_name(func: ast.expr) -> str | None:
     if isinstance(func, ast.Name):
         return func.id
-    if isinstance(func, ast.Attribute):
-        return func.attr
-    return None
+    return func.attr if isinstance(func, ast.Attribute) else None
 
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
 _CallResolver = Callable[[str, _FunctionNode], _FunctionNode | None]
+
+
+def _iter_assign_pairs(node: ast.AST) -> tuple[Sequence[ast.expr], ast.expr] | None:
+    if isinstance(node, ast.Assign):
+        return node.targets, node.value
+    if isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value is not None:
+        return (node.target,), node.value
+    return None
 
 
 def _entry_parameters(entry: _FunctionNode) -> frozenset[str]:
@@ -553,35 +379,23 @@ def _direct_nested_functions(node: _FunctionNode) -> dict[str, _FunctionNode]:
         child = pending.pop()
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             nested.setdefault(child.name, child)
-            continue
-        pending.extend(ast.iter_child_nodes(child))
+        else:
+            pending.extend(ast.iter_child_nodes(child))
     return nested
 
 
 def _function_scopes(
     tree: ast.Module,
-) -> tuple[
-    dict[str, _FunctionNode],
-    dict[_FunctionNode, _FunctionNode | None],
-    dict[_FunctionNode, dict[str, _FunctionNode]],
-    dict[str, dict[str, _FunctionNode]],
-    dict[str, str],
-    dict[str, str],
-    dict[_FunctionNode, str],
-]:
+):
     top_level: dict[str, _FunctionNode] = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     class_methods: dict[str, dict[str, _FunctionNode]] = {}
     owner_class: dict[_FunctionNode, str] = {}
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
             methods = {
-                item.name: item
-                for item in node.body
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                item.name: item for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
             }
             if methods:
                 class_methods[node.name] = methods
@@ -591,21 +405,14 @@ def _function_scopes(
     func_aliases: dict[str, str] = {}
     class_instances: dict[str, str] = {}
     for node in tree.body:
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-            value = node.value
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            targets = [node.target]
-            value = node.value
-        else:
-            continue
-        for target in targets:
-            if not isinstance(target, ast.Name):
-                continue
-            if isinstance(value, ast.Name):
-                func_aliases[target.id] = value.id
-            elif isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
-                if value.func.id in class_methods:
+        if pair := _iter_assign_pairs(node):
+            targets, value = pair
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if isinstance(value, ast.Name):
+                    func_aliases[target.id] = value.id
+                elif isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id in class_methods:
                     class_instances[target.id] = value.func.id
 
     parents: dict[_FunctionNode, _FunctionNode | None] = {}
@@ -613,9 +420,8 @@ def _function_scopes(
 
     def register(node: _FunctionNode, parent: _FunctionNode | None) -> None:
         parents[node] = parent
-        child_functions = _direct_nested_functions(node)
-        nested[node] = child_functions
-        for child in child_functions.values():
+        nested[node] = (child_fns := _direct_nested_functions(node))
+        for child in child_fns.values():
             register(child, node)
 
     for node in top_level.values():
@@ -623,23 +429,11 @@ def _function_scopes(
     for methods in class_methods.values():
         for method in methods.values():
             register(method, None)
-    return (
-        top_level,
-        parents,
-        nested,
-        class_methods,
-        func_aliases,
-        class_instances,
-        owner_class,
-    )
+    return top_level, parents, nested, class_methods, func_aliases, class_instances, owner_class
 
 
-def _resolve_alias_target(
-    name: str,
-    func_aliases: Mapping[str, str],
-) -> str:
-    current = name
-    seen: set[str] = set()
+def _resolve_alias_target(name: str, func_aliases: Mapping[str, str]) -> str:
+    current, seen = name, set()
     while current in func_aliases and current not in seen:
         seen.add(current)
         current = func_aliases[current]
@@ -650,21 +444,15 @@ def _local_bindings(function: _FunctionNode) -> tuple[dict[str, str], dict[str, 
     local_aliases: dict[str, str] = {}
     local_calls: dict[str, str] = {}
     for node in _walk_executed_nodes(function):
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-            value = node.value
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            targets = [node.target]
-            value = node.value
-        else:
-            continue
-        for target in targets:
-            if not isinstance(target, ast.Name):
-                continue
-            if isinstance(value, ast.Name):
-                local_aliases[target.id] = value.id
-            elif isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
-                local_calls[target.id] = value.func.id
+        if pair := _iter_assign_pairs(node):
+            targets, value = pair
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if isinstance(value, ast.Name):
+                    local_aliases[target.id] = value.id
+                elif isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+                    local_calls[target.id] = value.func.id
     return local_aliases, local_calls
 
 
@@ -678,16 +466,12 @@ def _resolve_function(
 ) -> _FunctionNode | None:
     current: _FunctionNode | None = scope
     while current is not None:
-        target = nested[current].get(name)
-        if target is not None:
+        if (target := nested[current].get(name)) is not None:
             return target
         current = parents[current]
     if name in top_level:
         return top_level[name]
-    if func_aliases:
-        resolved_name = _resolve_alias_target(name, func_aliases)
-        return top_level.get(resolved_name)
-    return None
+    return top_level.get(_resolve_alias_target(name, func_aliases)) if func_aliases else None
 
 
 def _walk_executed_nodes(node: _FunctionNode) -> Iterable[ast.AST]:
@@ -695,22 +479,13 @@ def _walk_executed_nodes(node: _FunctionNode) -> Iterable[ast.AST]:
     while pending:
         child = pending.pop()
         yield child
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        pending.extend(ast.iter_child_nodes(child))
+        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            pending.extend(ast.iter_child_nodes(child))
 
 
-def _class_entry_targets(
-    cls_name: str,
-    class_methods: Mapping[str, Mapping[str, _FunctionNode]],
-) -> list[_FunctionNode]:
+def _class_entry_targets(cls_name: str, class_methods: Mapping[str, Mapping[str, _FunctionNode]]) -> list[_FunctionNode]:
     methods = class_methods.get(cls_name, {})
-    targets: list[_FunctionNode] = []
-    for method_name in ("__call__", "forward"):
-        fn = methods.get(method_name)
-        if fn is not None:
-            targets.append(fn)
-    return targets
+    return [methods[m] for m in ("__call__", "forward") if m in methods]
 
 
 def _reachable_functions(
@@ -744,26 +519,13 @@ def _reachable_functions(
             if not isinstance(node, ast.Call):
                 continue
             if isinstance(node.func, ast.Name):
-                call_id = node.func.id
-                target = _resolve_function(
-                    call_id,
-                    function,
-                    top_level,
-                    parents,
-                    nested,
-                    merged_aliases,
-                )
+                cid = node.func.id
+                target = _resolve_function(cid, function, top_level, parents, nested, merged_aliases)
                 if target is not None:
                     pending.append(target)
                     continue
-                resolved_id = _resolve_alias_target(call_id, merged_aliases)
-                inst_cls = (
-                    local_calls.get(call_id)
-                    or cls_instances.get(call_id)
-                    or local_calls.get(resolved_id)
-                    or cls_instances.get(resolved_id)
-                    or (resolved_id if resolved_id in cls_methods else None)
-                )
+                rid = _resolve_alias_target(cid, merged_aliases)
+                inst_cls = local_calls.get(cid) or cls_instances.get(cid) or local_calls.get(rid) or cls_instances.get(rid) or (rid if rid in cls_methods else None)
                 if inst_cls is not None:
                     pending.extend(_class_entry_targets(inst_cls, cls_methods))
             elif isinstance(node.func, ast.Call) and isinstance(node.func.func, ast.Name):
@@ -771,93 +533,63 @@ def _reachable_functions(
                 if cls_name in cls_methods:
                     pending.extend(_class_entry_targets(cls_name, cls_methods))
             elif isinstance(node.func, ast.Attribute):
-                attr = node.func.attr
-                recv = node.func.value
+                attr, recv = node.func.attr, node.func.value
                 if isinstance(recv, ast.Name):
-                    if recv.id == "self" and current_cls in cls_methods:
-                        method = cls_methods[current_cls].get(attr)
-                        if method is not None:
-                            pending.append(method)
-                            continue
-                    recv_cls = (
-                        local_calls.get(recv.id)
-                        or cls_instances.get(recv.id)
-                        or (_resolve_alias_target(recv.id, merged_aliases))
-                    )
-                    if recv_cls in cls_methods:
-                        method = cls_methods[recv_cls].get(attr)
-                        if method is not None:
-                            pending.append(method)
+                    if recv.id == "self" and current_cls in cls_methods and (m := cls_methods[current_cls].get(attr)) is not None:
+                        pending.append(m)
+                        continue
+                    recv_cls = local_calls.get(recv.id) or cls_instances.get(recv.id) or _resolve_alias_target(recv.id, merged_aliases)
                 elif isinstance(recv, ast.Call) and isinstance(recv.func, ast.Name):
                     recv_cls = _resolve_alias_target(recv.func.id, merged_aliases)
-                    if recv_cls in cls_methods:
-                        method = cls_methods[recv_cls].get(attr)
-                        if method is not None:
-                            pending.append(method)
+                else:
+                    recv_cls = None
+                if recv_cls in cls_methods and (m := cls_methods[recv_cls].get(attr)) is not None:
+                    pending.append(m)
     return tuple(reachable)
 
 
-def _detect_input_mutation(
-    nodes: Iterable[ast.AST],
-    input_names: frozenset[str],
-) -> bool:
+def _detect_input_mutation(nodes: Iterable[ast.AST], input_names: frozenset[str]) -> bool:
     if not input_names:
         return False
     for node in nodes:
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr.endswith("_")
-            and not node.func.attr.startswith("__")
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in input_names
-        ):
-            return True
         if isinstance(node, ast.Call):
-            for keyword in node.keywords:
-                if (
-                    keyword.arg == "out"
-                    and isinstance(keyword.value, ast.Name)
-                    and keyword.value.id in input_names
-                ):
-                    return True
-        targets: list[ast.expr] = []
-        if isinstance(node, ast.Assign):
-            targets = list(node.targets)
-        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
-            targets = [node.target]
-        for target in targets:
-            if isinstance(target, ast.Name) and target.id in input_names:
+            fn = node.func
+            if (
+                isinstance(fn, ast.Attribute)
+                and fn.attr.endswith("_")
+                and not fn.attr.startswith("__")
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id in input_names
+            ):
                 return True
-            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-                if target.value.id in input_names:
+            if any(
+                kw.arg == "out" and isinstance(kw.value, ast.Name) and kw.value.id in input_names
+                for kw in node.keywords
+            ):
+                return True
+        if pair := _iter_assign_pairs(node):
+            for target in pair[0]:
+                if isinstance(target, ast.Name) and target.id in input_names:
                     return True
-            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
-                if target.value.id in input_names:
+                if isinstance(target, (ast.Subscript, ast.Attribute)) and isinstance(target.value, ast.Name) and target.value.id in input_names:
                     return True
     return False
 
 
 def _has_keepdim_true(node: ast.Call) -> bool:
-    for keyword in node.keywords:
-        if keyword.arg == "keepdim":
-            return isinstance(keyword.value, ast.Constant) and keyword.value.value is True
-    return False
+    return any(kw.arg == "keepdim" and isinstance(kw.value, ast.Constant) and kw.value.value is True for kw in node.keywords)
 
 
 def _expression_provenance(
     node: ast.expr | ast.keyword,
     assignments: Mapping[str, frozenset[_ProvenanceFlag]],
 ) -> frozenset[_ProvenanceFlag]:
-    """Propagate entry-input and keepdim-reduction provenance through one expression."""
     if isinstance(node, ast.keyword):
         return _expression_provenance(node.value, assignments)
     if isinstance(node, ast.Name):
         return assignments.get(node.id, frozenset())
-    if isinstance(node, ast.Call):
-        leaf = _call_leaf_name(node.func)
-        if leaf in _REDUCTION_CALL_NAMES and _has_keepdim_true(node):
-            return frozenset({_PROVENANCE_REDUCTION})
+    if isinstance(node, ast.Call) and _call_leaf_name(node.func) in _REDUCTION_CALL_NAMES and _has_keepdim_true(node):
+        return frozenset({_PROVENANCE_REDUCTION})
     if isinstance(node, ast.Lambda):
         return frozenset()
     flags: set[_ProvenanceFlag] = set()
@@ -868,22 +600,16 @@ def _expression_provenance(
 
 
 def _returned_expressions(function: _FunctionNode) -> tuple[ast.expr, ...]:
-    """Return the value expressions of every executed return statement in *function*."""
-    return tuple(
-        node.value
-        for node in _walk_executed_nodes(function)
-        if isinstance(node, ast.Return) and node.value is not None
-    )
+    return tuple(n.value for n in _walk_executed_nodes(function) if isinstance(n, ast.Return) and n.value is not None)
 
 
 def _assignment_target_names(target: ast.expr) -> frozenset[str]:
-    """Collect the local names one assignment target binds or writes."""
     if isinstance(target, ast.Name):
         return frozenset({target.id})
     if isinstance(target, (ast.Tuple, ast.List)):
         names: set[str] = set()
-        for element in target.elts:
-            names |= _assignment_target_names(element)
+        for elt in target.elts:
+            names |= _assignment_target_names(elt)
         return frozenset(names)
     if isinstance(target, (ast.Subscript, ast.Attribute)) and isinstance(target.value, ast.Name):
         return frozenset({target.value.id})
@@ -891,33 +617,20 @@ def _assignment_target_names(target: ast.expr) -> frozenset[str]:
 
 
 def _function_assignments(function: _FunctionNode) -> dict[str, tuple[ast.expr, ...]]:
-    """Map every locally assigned name to the values written to it."""
-    definitions: dict[str, list[ast.expr]] = {}
+    defs: dict[str, list[ast.expr]] = {}
     for node in _walk_executed_nodes(function):
-        targets: Sequence[ast.expr]
-        value: ast.expr
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-            value = node.value
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value is not None:
-            targets = (node.target,)
-            value = node.value
-        else:
-            continue
-        for target in targets:
-            for name in _assignment_target_names(target):
-                definitions.setdefault(name, []).append(value)
-    return {name: tuple(values) for name, values in definitions.items()}
+        if pair := _iter_assign_pairs(node):
+            for target in pair[0]:
+                for name in _assignment_target_names(target):
+                    defs.setdefault(name, []).append(pair[1])
+    return {name: tuple(vals) for name, vals in defs.items()}
 
 
 def _shape_transparent_base(node: ast.expr) -> ast.expr:
-    """Peel dtype and storage-view methods that never change tensor shape."""
-    current = node
-    while isinstance(current, ast.Call) and isinstance(current.func, ast.Attribute):
-        if current.func.attr not in _SHAPE_TRANSPARENT_METHODS:
-            break
-        current = current.func.value
-    return current
+    cur = node
+    while isinstance(cur, ast.Call) and isinstance(cur.func, ast.Attribute) and cur.func.attr in _SHAPE_TRANSPARENT_METHODS:
+        cur = cur.func.value
+    return cur
 
 
 def _resolved_return_head(
@@ -925,15 +638,14 @@ def _resolved_return_head(
     definitions: Mapping[str, tuple[ast.expr, ...]],
     seen: set[str],
 ) -> ast.expr:
-    """Resolve single-assignment names on the return path down to the defining expression."""
-    current = _shape_transparent_base(node)
-    while isinstance(current, ast.Name):
-        values = definitions.get(current.id, ())
-        if len(values) != 1 or current.id in seen:
+    cur = _shape_transparent_base(node)
+    while isinstance(cur, ast.Name):
+        vals = definitions.get(cur.id, ())
+        if len(vals) != 1 or cur.id in seen:
             break
-        seen.add(current.id)
-        current = _shape_transparent_base(values[0])
-    return current
+        seen.add(cur.id)
+        cur = _shape_transparent_base(vals[0])
+    return cur
 
 
 def _return_value_is_shape_reduced(
@@ -941,39 +653,23 @@ def _return_value_is_shape_reduced(
     definitions: Mapping[str, tuple[ast.expr, ...]],
     seen: set[str],
 ) -> bool:
-    """Return True when evaluating *node* ends in a non-keepdim reduction."""
     if isinstance(node, (ast.Tuple, ast.List)):
-        elements = tuple(
-            element for element in node.elts if not isinstance(element, ast.Starred)
-        )
-        return bool(elements) and all(
-            _return_value_is_shape_reduced(element, definitions, set(seen))
-            for element in elements
-        )
+        elts = tuple(e for e in node.elts if not isinstance(e, ast.Starred))
+        return bool(elts) and all(_return_value_is_shape_reduced(e, definitions, set(seen)) for e in elts)
     head = _resolved_return_head(node, definitions, seen)
     if isinstance(head, ast.BinOp):
-        return _return_value_is_shape_reduced(
-            head.left, definitions, set(seen)
-        ) or _return_value_is_shape_reduced(head.right, definitions, set(seen))
+        return _return_value_is_shape_reduced(head.left, definitions, set(seen)) or _return_value_is_shape_reduced(
+            head.right, definitions, set(seen)
+        )
     if not isinstance(head, ast.Call):
         return False
     leaf = _call_leaf_name(head.func)
-    if (
-        leaf in _REDUCTION_CALL_NAMES
-        and leaf not in _SHAPE_PRESERVING_CALL_NAMES
-        and not _has_keepdim_true(head)
-    ):
+    if leaf in _REDUCTION_CALL_NAMES and leaf not in _SHAPE_PRESERVING_CALL_NAMES and not _has_keepdim_true(head):
         return True
-    children: list[ast.expr] = [
-        *head.args,
-        *(keyword.value for keyword in head.keywords),
-    ]
+    children: list[ast.expr] = [*head.args, *(kw.value for kw in head.keywords)]
     if isinstance(head.func, ast.Attribute):
         children.append(head.func.value)
-    return any(
-        _return_value_is_shape_reduced(child, definitions, set(seen))
-        for child in children
-    )
+    return any(_return_value_is_shape_reduced(c, definitions, set(seen)) for c in children)
 
 
 def _return_path_groups(
@@ -981,180 +677,129 @@ def _return_path_groups(
     resolve: _CallResolver,
     seen_functions: set[int],
 ) -> dict[int, tuple[_FunctionNode, list[ast.AST]]]:
-    """Collect return-path AST nodes per function, following local helper calls."""
     groups: dict[int, tuple[_FunctionNode, list[ast.AST]]] = {}
     if id(function) in seen_functions:
         return groups
     seen_functions.add(id(function))
-    definitions = _function_assignments(function)
+    defs = _function_assignments(function)
     expanded: set[str] = set()
     nodes: list[ast.AST] = []
     pending: list[ast.expr] = list(_returned_expressions(function))
     while pending:
-        expression = pending.pop()
-        for node in ast.walk(expression):
+        for node in ast.walk(pending.pop()):
             nodes.append(node)
-            if (
-                isinstance(node, ast.Name)
-                and isinstance(node.ctx, ast.Load)
-                and node.id not in expanded
-            ):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in expanded:
                 expanded.add(node.id)
-                pending.extend(definitions.get(node.id, ()))
+                pending.extend(defs.get(node.id, ()))
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                target = resolve(node.func.id, function)
-                if target is not None:
-                    for key, value in _return_path_groups(
-                        target, resolve, seen_functions
-                    ).items():
-                        groups[key] = value
+                if (target := resolve(node.func.id, function)) is not None:
+                    groups.update(_return_path_groups(target, resolve, seen_functions))
     groups[id(function)] = (function, nodes)
     return groups
 
 
-def _closure_has_keepdim_broadcast(
-    function: _FunctionNode,
-    nodes: Sequence[ast.AST],
-) -> bool:
-    """Detect input-shaped data combined with a keepdim reduction of input data."""
-    definitions = _function_assignments(function)
+def _closure_has_keepdim_broadcast(function: _FunctionNode, nodes: Sequence[ast.AST]) -> bool:
+    defs = _function_assignments(function)
     assignments: dict[str, frozenset[_ProvenanceFlag]] = {
-        name: frozenset({_PROVENANCE_INPUT})
-        for name in _entry_parameters(function)
+        name: frozenset({_PROVENANCE_INPUT}) for name in _entry_parameters(function)
     }
     changed = True
     while changed:
         changed = False
-        for name, values in definitions.items():
+        for name, values in defs.items():
             flags: frozenset[_ProvenanceFlag] = frozenset()
-            for value in values:
-                flags |= _expression_provenance(value, assignments)
-            current = assignments.get(name, frozenset())
-            merged = current | flags
-            if merged != current:
+            for v in values:
+                flags |= _expression_provenance(v, assignments)
+            cur = assignments.get(name, frozenset())
+            if (merged := cur | flags) != cur:
                 assignments[name] = merged
                 changed = True
     for node in nodes:
-        if not isinstance(node, ast.BinOp):
-            continue
-        left = _expression_provenance(node.left, assignments)
-        right = _expression_provenance(node.right, assignments)
-        if _PROVENANCE_INPUT in left and _PROVENANCE_REDUCTION in right:
-            return True
-        if _PROVENANCE_REDUCTION in left and _PROVENANCE_INPUT in right:
-            return True
+        if isinstance(node, ast.BinOp):
+            left = _expression_provenance(node.left, assignments)
+            right = _expression_provenance(node.right, assignments)
+            if (_PROVENANCE_INPUT in left and _PROVENANCE_REDUCTION in right) or (
+                _PROVENANCE_REDUCTION in left and _PROVENANCE_INPUT in right
+            ):
+                return True
     return False
 
 
-def _detect_return_shape_preservation(
-    entry: _FunctionNode,
-    resolve: _CallResolver,
-) -> bool:
-    """Decide shape preservation from the values the entry function actually returns."""
+def _detect_return_shape_preservation(entry: _FunctionNode, resolve: _CallResolver) -> bool:
     groups = tuple(_return_path_groups(entry, resolve, set()).values())
-    returns = _returned_expressions(entry)
-    definitions = _function_assignments(entry)
-    if not returns or all(
-        _return_value_is_shape_reduced(value, definitions, set()) for value in returns
+    returns, defs = _returned_expressions(entry), _function_assignments(entry)
+    if not returns or all(_return_value_is_shape_reduced(v, defs, set()) for v in returns):
+        return False
+    node_groups = tuple(g[1] for g in groups)
+    if any(
+        isinstance(n, ast.Call) and _call_leaf_name(n.func) in _SHAPE_PRESERVING_CALL_NAMES
+        for nodes in node_groups
+        for n in nodes
+    ):
+        return True
+    if not all(
+        _has_keepdim_true(n)
+        for nodes in node_groups
+        for n in nodes
+        if isinstance(n, ast.Call)
+        and (leaf := _call_leaf_name(n.func)) in _REDUCTION_CALL_NAMES
+        and leaf not in _SHAPE_PRESERVING_CALL_NAMES
     ):
         return False
-    node_groups = tuple(group[1] for group in groups)
-    for nodes in node_groups:
-        for node in nodes:
-            if (
-                isinstance(node, ast.Call)
-                and _call_leaf_name(node.func) in _SHAPE_PRESERVING_CALL_NAMES
-            ):
-                return True
-    reductions_keepdim = all(
-        _has_keepdim_true(node)
-        for nodes in node_groups
-        for node in nodes
-        if isinstance(node, ast.Call)
-        and _call_leaf_name(node.func) in _REDUCTION_CALL_NAMES
-        and _call_leaf_name(node.func) not in _SHAPE_PRESERVING_CALL_NAMES
-    )
-    if not reductions_keepdim:
-        return False
-    return any(
-        _closure_has_keepdim_broadcast(function, nodes) for function, nodes in groups
-    )
+    return any(_closure_has_keepdim_broadcast(fn, nodes) for fn, nodes in groups)
 
 
 def _constant_int(node: ast.expr) -> int | None:
-    if isinstance(node, ast.Constant) and isinstance(node.value, int):
-        if isinstance(node.value, bool):
-            return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
         return node.value
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
-        operand = _constant_int(node.operand)
-        if operand is None:
-            return None
-        return -operand if isinstance(node.op, ast.USub) else operand
+        op_val = _constant_int(node.operand)
+        return None if op_val is None else (-op_val if isinstance(node.op, ast.USub) else op_val)
     return None
 
 
-def _has_quant_evidence(
-    nodes: Iterable[ast.AST],
-    call_names: Iterable[str],
-) -> bool:
-    for call_name in call_names:
-        lowered = call_name.lower()
-        if any(marker in lowered for marker in _SUBBYTE_OR_QUANT_CALL_TOKENS):
-            return True
-    has_8bit_dtype = False
-    has_block_scale_ident = False
+def _has_quant_evidence(nodes: Iterable[ast.AST], call_names: Iterable[str]) -> bool:
+    if any(tok in cn.lower() for cn in call_names for tok in _SUBBYTE_OR_QUANT_CALL_TOKENS):
+        return True
+    has_8bit = has_scale = False
     for node in nodes:
         if isinstance(node, ast.Attribute):
             if node.attr in _SUBBYTE_OR_QUANT_DTYPE_ATTRS:
                 return True
             if node.attr in _STANDARD_8BIT_DTYPE_ATTRS:
-                has_8bit_dtype = True
+                has_8bit = True
         elif isinstance(node, (ast.Name, ast.arg)):
-            ident = node.id if isinstance(node, ast.Name) else node.arg
-            lowered_ident = ident.lower()
-            if any(marker in lowered_ident for marker in _SUBBYTE_OR_QUANT_IDENT_TOKENS):
+            ident = (node.id if isinstance(node, ast.Name) else node.arg).lower()
+            if any(m in ident for m in _SUBBYTE_OR_QUANT_IDENT_TOKENS):
                 return True
-            if lowered_ident in _BLOCK_SCALE_IDENT_NAMES:
-                has_block_scale_ident = True
-    return has_8bit_dtype and has_block_scale_ident
+            if ident in _BLOCK_SCALE_IDENT_NAMES:
+                has_scale = True
+    return has_8bit and has_scale
 
 
 def _positive_dim(dims: Mapping[str, int], names: Sequence[str]) -> int | None:
-    for name in names:
-        value = dims.get(name)
-        if value is not None and value > 0:
-            return value
-    return None
+    return next((v for n in names if (v := dims.get(n)) is not None and v > 0), None)
 
 
 def _require_positive_dim(dims: Mapping[str, int], names: Sequence[str], what: str) -> int:
-    value = _positive_dim(dims, names)
-    if value is None:
+    if (val := _positive_dim(dims, names)) is None:
         raise ValueError(f"{what} requires one of anchor dims {tuple(names)} to be positive")
-    return value
+    return val
 
 
 def _dim_or(dims: Mapping[str, int], names: Sequence[str], default: int) -> int:
-    value = _positive_dim(dims, names)
-    return default if value is None else value
+    return default if (val := _positive_dim(dims, names)) is None else val
 
 
 def _shape_leading_dim_product(dims: Mapping[str, int], prefix: str) -> int | None:
     factors: list[int] = []
-    index = 0
-    while f"{prefix}_dim_{index}" in dims:
-        value = dims[f"{prefix}_dim_{index}"]
-        if value <= 0:
+    idx = 0
+    while f"{prefix}_dim_{idx}" in dims:
+        if (val := dims[f"{prefix}_dim_{idx}"]) <= 0:
             return None
-        factors.append(value)
-        index += 1
-    if not factors:
-        return None
-    leading = 1
-    for value in factors[:-1]:
-        leading *= value
-    return leading
+        factors.append(val)
+        idx += 1
+    return math.prod(factors[:-1]) if factors else None
 
 
 def _validated_dtype_bytes(dtype_bytes: float) -> float:
@@ -1165,101 +810,63 @@ def _validated_dtype_bytes(dtype_bytes: float) -> float:
 
 
 def _declared_element_bytes(dtype_name: str | None) -> float | None:
-    """Return a declared element width, or None when absent, unknown, or sub-byte packed."""
     if dtype_name is None:
         return None
     try:
-        element_bytes = dtype_bytes_for(dtype_name)
+        eb = dtype_bytes_for(dtype_name)
     except ValueError:
         return None
-    return element_bytes if element_bytes >= 1.0 else None
+    return eb if eb >= 1.0 else None
 
 
-def _declared_input_charges(
-    representative_case: RepresentativeCase,
-    fallback_dtype_bytes: float,
-) -> list[_TrafficCharge]:
-    charges: list[_TrafficCharge] = []
-    for shape, dtype_name in zip(
-        representative_case.input_shapes, representative_case.input_dtypes
-    ):
-        element_bytes = _declared_element_bytes(dtype_name)
-        charges.append(
-            _TrafficCharge(
-                element_count=math.prod(shape),
-                element_bytes=(
-                    fallback_dtype_bytes if element_bytes is None else element_bytes
-                ),
-                dtype_declared=element_bytes is not None,
-            )
-        )
-    return charges
+def _make_charge(count: int, dtype_name: str | None, fallback: float) -> _TrafficCharge:
+    eb = _declared_element_bytes(dtype_name)
+    return _TrafficCharge(
+        element_count=count,
+        element_bytes=fallback if eb is None else eb,
+        dtype_declared=eb is not None,
+    )
 
 
-def _declared_output_charges(
-    representative_case: RepresentativeCase,
+def _build_case_charges(
+    representative_case: RepresentativeCase | None,
     *,
-    element_count: int,
-    fallback_dtype_bytes: float,
+    dtype_bytes: float,
+    output_elements: int,
+    fallback_charges: Sequence[_TrafficCharge],
 ) -> list[_TrafficCharge]:
+    if representative_case is None:
+        return list(fallback_charges)
+    charges = [
+        _make_charge(math.prod(sh), dt, dtype_bytes)
+        for sh, dt in zip(representative_case.input_shapes, representative_case.input_dtypes)
+    ]
     if len(representative_case.output_dtypes) > 1:
-        charges: list[_TrafficCharge] = []
-        for idx, dtype_name in enumerate(representative_case.output_dtypes):
+        for idx, dt in enumerate(representative_case.output_dtypes):
             out_elems = (
                 math.prod(representative_case.output_shapes[idx])
                 if idx < len(representative_case.output_shapes)
-                else element_count
+                else output_elements
             )
-            element_bytes = _declared_element_bytes(dtype_name)
-            charges.append(
-                _TrafficCharge(
-                    element_count=out_elems,
-                    element_bytes=(
-                        fallback_dtype_bytes if element_bytes is None else element_bytes
-                    ),
-                    dtype_declared=element_bytes is not None,
-                )
-            )
-        return charges
-    dtype_name = (
-        representative_case.output_dtypes[0]
-        if representative_case.output_dtypes
-        else representative_case.output_dtype
-    )
-    element_bytes = _declared_element_bytes(dtype_name)
-    return [
-        _TrafficCharge(
-            element_count=element_count,
-            element_bytes=fallback_dtype_bytes if element_bytes is None else element_bytes,
-            dtype_declared=element_bytes is not None,
-        )
-    ]
+            charges.append(_make_charge(out_elems, dt, dtype_bytes))
+    else:
+        dt = representative_case.output_dtypes[0] if representative_case.output_dtypes else representative_case.output_dtype
+        charges.append(_make_charge(output_elements, dt, dtype_bytes))
+    return charges
 
 
-def _priced_traffic(
-    charges: Sequence[_TrafficCharge],
-    *,
-    packed: bool,
-) -> tuple[int, TrafficBasis]:
-    total_bytes = int(
-        math.ceil(sum(charge.element_count * charge.element_bytes for charge in charges))
+def _priced_traffic(charges: Sequence[_TrafficCharge], *, packed: bool) -> tuple[int, TrafficBasis]:
+    total = int(math.ceil(sum(c.element_count * c.element_bytes for c in charges)))
+    basis: TrafficBasis = (
+        "declared_io_exact" if not packed and all(c.dtype_declared for c in charges) else "estimated_shape_dtype"
     )
-    traffic_basis: TrafficBasis = (
-        "declared_io_exact"
-        if not packed and all(charge.dtype_declared for charge in charges)
-        else "estimated_shape_dtype"
-    )
-    return total_bytes, traffic_basis
+    return total, basis
 
 
 def _einsum_is_gemm_contraction(call_node: ast.Call) -> bool:
-    """Return True iff *call_node* represents a rank-2+ bilinear GEMM-style contraction."""
-    if not call_node.args:
+    if not call_node.args or not (isinstance(first := call_node.args[0], ast.Constant) and isinstance(first.value, str)):
         return True
-    first_arg = call_node.args[0]
-    if not (isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str)):
-        return True
-    eq = first_arg.value.replace(" ", "").replace("...", "")
+    eq = first.value.replace(" ", "").replace("...", "")
     if "->" in eq:
         lhs_str, rhs_str = eq.split("->", 1)
     else:
@@ -1269,83 +876,46 @@ def _einsum_is_gemm_contraction(call_node: ast.Call) -> bool:
     terms = lhs_str.split(",")
     if len(terms) != 2:
         return True
-    a0 = {ch for ch in terms[0] if ch.isalpha()}
-    a1 = {ch for ch in terms[1] if ch.isalpha()}
-    out = {ch for ch in rhs_str if ch.isalpha()}
+    a0, a1, out = ({ch for ch in s if ch.isalpha()} for s in (terms[0], terms[1], rhs_str))
     return bool((a0 & a1) - out) and bool((a0 - a1) & out) and bool((a1 - a0) & out)
 
 
-_NONLINEAR_STATE_WRAPPERS = frozenset(
-    {"tanh", "sigmoid", "relu", "gelu", "silu", "softmax", "exp", "rsqrt"}
-)
-
-
 def _loop_has_linear_outer_state_recurrence(nodes: Sequence[ast.AST]) -> bool:
-    """Detect loop-carried linear state updates with bilinear outer-product terms.
-
-    Matches any loop body updating a state variable via additive accumulation
-    combined with a rank-expanding bilinear product (unsqueeze multiply, outer,
-    einsum, or matmul/vec-mat projection) without nonlinear state wrapping.
-    """
+    """Detect loop-carried linear state updates with bilinear outer-product terms."""
     for node in nodes:
         if not isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
             continue
         body_nodes = [sub for stmt in node.body for sub in ast.walk(stmt)]
-        has_additive_carry = any(
-            isinstance(sub, ast.AugAssign) and isinstance(sub.op, (ast.Add, ast.Sub))
-            for sub in body_nodes
-        ) or any(
-            isinstance(sub, ast.Assign)
-            and any(isinstance(op, (ast.Add, ast.Sub)) for op in ast.walk(sub.value))
-            for sub in body_nodes
+        has_add = any(isinstance(s, ast.AugAssign) and isinstance(s.op, (ast.Add, ast.Sub)) for s in body_nodes) or any(
+            isinstance(s, ast.Assign) and any(isinstance(op, (ast.Add, ast.Sub)) for op in ast.walk(s.value))
+            for s in body_nodes
         )
-        if not has_additive_carry:
+        if not has_add:
             continue
-        loop_calls = {
-            name
-            for sub in body_nodes
-            if isinstance(sub, ast.Call)
-            and (name := _call_leaf_name(sub.func)) is not None
-        }
-        has_bilinear_term = (
-            any(isinstance(sub, ast.MatMult) for sub in body_nodes)
+        loop_calls = {name for s in body_nodes if isinstance(s, ast.Call) and (name := _call_leaf_name(s.func)) is not None}
+        has_bilinear = (
+            any(isinstance(s, ast.MatMult) for s in body_nodes)
             or bool(loop_calls & {"outer", "einsum", "matmul", "bmm", "mm", "addmm"})
-            or (
-                "unsqueeze" in loop_calls
-                and any(
-                    isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mult)
-                    for sub in body_nodes
-                )
-            )
+            or ("unsqueeze" in loop_calls and any(isinstance(s, ast.BinOp) and isinstance(s.op, ast.Mult) for s in body_nodes))
         )
-        if not has_bilinear_term:
+        if not has_bilinear:
             continue
-        state_wrapped_nonlinear = False
+        wrapped = False
         for sub in body_nodes:
             if not isinstance(sub, ast.Assign):
                 continue
             base_val = _shape_transparent_base(sub.value)
-            if not isinstance(base_val, ast.Call):
-                continue
-            cname = _call_leaf_name(base_val.func)
-            if cname not in _NONLINEAR_STATE_WRAPPERS:
+            if not isinstance(base_val, ast.Call) or _call_leaf_name(base_val.func) not in _NONLINEAR_STATE_WRAPPERS:
                 continue
             target_names: set[str] = set()
-            for target in sub.targets:
-                target_names |= _assignment_target_names(target)
-            loaded_in_call = {
-                inner.id
-                for inner in ast.walk(base_val)
-                if isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load)
-            }
-            has_carry_expr = any(
-                isinstance(inner, (ast.Add, ast.Sub, ast.MatMult))
-                for inner in ast.walk(base_val)
-            )
-            if (target_names & loaded_in_call) or has_carry_expr:
-                state_wrapped_nonlinear = True
+            for t in sub.targets:
+                target_names |= _assignment_target_names(t)
+            loaded = {i.id for i in ast.walk(base_val) if isinstance(i, ast.Name) and isinstance(i.ctx, ast.Load)}
+            has_carry = any(isinstance(i, (ast.Add, ast.Sub, ast.MatMult)) for i in ast.walk(base_val))
+            if (target_names & loaded) or has_carry:
+                wrapped = True
                 break
-        if not state_wrapped_nonlinear:
+        if not wrapped:
             return True
     return False
 
@@ -1357,27 +927,18 @@ class PyTorchSemanticAnalyzer:
         self.target = AscendTarget("ascend.950pr") if target is None else target
         device = self.target.device
         if not isinstance(device, Ascend950PR):
-            raise RuntimeError(
-                f"PyTorchSemanticAnalyzer requires Ascend950PR, got {type(device).__name__}"
-            )
+            raise RuntimeError(f"PyTorchSemanticAnalyzer requires Ascend950PR, got {type(device).__name__}")
         self.device = device
         facts = self.target.get_facts(AscendSpaceFacts)
         if not isinstance(facts, AscendSpaceFacts):
-            raise RuntimeError(
-                f"AscendTarget.get_facts returned {type(facts).__name__}, expected AscendSpaceFacts"
-            )
+            raise RuntimeError(f"AscendTarget.get_facts returned {type(facts).__name__}, expected AscendSpaceFacts")
         self.facts = facts
         unit_rates = device.unit_flops_per_second
-        aic_rates = unit_rates.get("aic", {})
-        aiv_rates = unit_rates.get("aiv", {})
+        aic_rates, aiv_rates = unit_rates.get("aic", {}), unit_rates.get("aiv", {})
         aic_by_name = {getattr(k, "name", str(k)): v for k, v in aic_rates.items()}
         aiv_by_name = {getattr(k, "name", str(k)): v for k, v in aiv_rates.items()}
         cube_peak = aic_by_name.get("bf16") or aic_by_name.get("f16") or 0
-        vector_peak = (
-            aiv_by_name.get("f32")
-            or max(aiv_rates.values(), default=0)
-            or device.aiv_lane_events_per_second
-        )
+        vector_peak = aiv_by_name.get("f32") or max(aiv_rates.values(), default=0) or device.aiv_lane_events_per_second
         if cube_peak <= 0 or vector_peak <= 0:
             raise RuntimeError("Ascend950PR must declare positive AIC and AIV peak rates")
         if device.hbm_bandwidth_bytes_per_second <= 0:
@@ -1398,32 +959,21 @@ class PyTorchSemanticAnalyzer:
             raise ValueError("entry_name must be a non-empty string")
         if proto is not None and not isinstance(proto, Mapping):
             raise ValueError("proto must be a mapping")
-        tree = ast.parse(source)
-        (
-            top_level,
-            parents,
-            nested,
-            class_methods,
-            func_aliases,
-            class_instances,
-            owner_class,
-        ) = _function_scopes(tree)
-        entry = top_level.get(entry_name)
-        if entry is None:
-            resolved_entry = _resolve_alias_target(entry_name, func_aliases)
-            entry = top_level.get(resolved_entry)
+        top_level, parents, nested, class_methods, func_aliases, class_instances, owner_class = _function_scopes(
+            ast.parse(source)
+        )
+        entry = top_level.get(entry_name) or top_level.get(_resolve_alias_target(entry_name, func_aliases))
         if entry is None and entry_name in class_instances:
             targets = _class_entry_targets(class_instances[entry_name], class_methods)
-            if targets:
-                entry = targets[0]
+            entry = targets[0] if targets else None
         if entry is None and entry_name in class_methods:
             targets = _class_entry_targets(entry_name, class_methods)
-            if targets:
-                entry = targets[0]
+            entry = targets[0] if targets else None
         if entry is None and len(top_level) == 1:
             entry = next(iter(top_level.values()))
         if entry is None:
             raise ValueError(f"entry function {entry_name!r} not found in PyTorch source")
+
         reachable = _reachable_functions(
             entry,
             top_level=top_level,
@@ -1434,67 +984,49 @@ class PyTorchSemanticAnalyzer:
             class_instances=class_instances,
             owner_class=owner_class,
         )
-        nodes = tuple(
-            node for function in reachable for node in _walk_executed_nodes(function)
-        )
+        nodes = tuple(n for fn in reachable for n in _walk_executed_nodes(fn))
         call_names: set[str] = set()
         reduction_axes: set[int] = set()
-        has_matmult = False
-        has_loop = False
-        has_einsum_gemm = False
+        has_matmult = has_loop = has_einsum_gemm = False
         transcendental_op_count = 0
         for node in nodes:
             if isinstance(node, ast.MatMult):
                 has_matmult = True
-            if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
                 has_loop = True
-            if isinstance(node, ast.Call):
-                call_name = _call_leaf_name(node.func)
-                if call_name is not None:
-                    call_names.add(call_name)
-                    if call_name in _TRANSCENDENTAL_CALL_NAMES:
+            elif isinstance(node, ast.Call):
+                if (cn := _call_leaf_name(node.func)) is not None:
+                    call_names.add(cn)
+                    if cn in _TRANSCENDENTAL_CALL_NAMES:
                         transcendental_op_count += 1
-                    if call_name == "einsum" and _einsum_is_gemm_contraction(node):
+                    if cn == "einsum" and _einsum_is_gemm_contraction(node):
                         has_einsum_gemm = True
-                if call_name in _REDUCTION_CALL_NAMES:
-                    for keyword in node.keywords:
-                        if keyword.arg in _DIM_KEYWORDS:
-                            axis = _constant_int(keyword.value)
-                            if axis is not None:
-                                reduction_axes.add(axis)
-        has_online_normalization = bool(
-            call_names & {"log_softmax", "softmax", "scaled_dot_product_attention"}
-        )
-        has_exp = bool(call_names & _EXP_CALL_NAMES) or has_online_normalization
-        has_max = bool(call_names & _MAX_CALL_NAMES) or (
-            "scaled_dot_product_attention" in call_names
-        )
+                if cn in _REDUCTION_CALL_NAMES:
+                    for kw in node.keywords:
+                        if kw.arg in _DIM_KEYWORDS and (ax := _constant_int(kw.value)) is not None:
+                            reduction_axes.add(ax)
+
+        has_online_norm = bool(call_names & {"log_softmax", "softmax", "scaled_dot_product_attention"})
+        has_exp = bool(call_names & _EXP_CALL_NAMES) or has_online_norm
+        has_max = bool(call_names & _MAX_CALL_NAMES) or ("scaled_dot_product_attention" in call_names)
 
         def resolve_call(name: str, scope: _FunctionNode) -> _FunctionNode | None:
-            return _resolve_function(
-                name, scope, top_level, parents, nested, func_aliases
-            )
+            return _resolve_function(name, scope, top_level, parents, nested, func_aliases)
 
-        preserves_input_shape = _detect_return_shape_preservation(entry, resolve_call)
-        non_einsum_gemm_names = _MATMUL_CALL_NAMES - {"einsum", "mv", "addmv"}
-        has_gemm_contraction = (
-            has_matmult or bool(call_names & non_einsum_gemm_names) or has_einsum_gemm
-        )
+        has_gemm = has_matmult or bool(call_names & (_MATMUL_CALL_NAMES - {"einsum", "mv", "addmv"})) or has_einsum_gemm
         return PyTorchOpSemantics(
             entry_name=entry_name,
             has_matmul=has_matmult or bool(call_names & _MATMUL_CALL_NAMES),
-            has_gemm_contraction=has_gemm_contraction,
+            has_gemm_contraction=has_gemm,
             has_reduction=bool(call_names & _REDUCTION_CALL_NAMES),
             reduction_axes=tuple(sorted(reduction_axes)),
             has_online_exp_max=has_exp and has_max,
             has_indirect_index=bool(call_names & _INDIRECT_CALL_NAMES),
             has_subbyte_or_block_quant=_has_quant_evidence(nodes, call_names),
             has_recurrent_loop=has_loop,
-            has_associative_outer_recurrence=bool(
-                has_loop and _loop_has_linear_outer_state_recurrence(nodes)
-            ),
+            has_associative_outer_recurrence=bool(has_loop and _loop_has_linear_outer_state_recurrence(nodes)),
             mutates_inputs=_detect_input_mutation(nodes, _entry_parameters(entry)),
-            preserves_input_shape=preserves_input_shape,
+            preserves_input_shape=_detect_return_shape_preservation(entry, resolve_call),
             has_conv=bool(call_names & _CONV_CALL_NAMES),
             transcendental_op_count=transcendental_op_count,
         )
@@ -1507,7 +1039,7 @@ class PyTorchSemanticAnalyzer:
         dtype_bytes: float = 2.0,
     ) -> CasePhysicsRatios:
         """Compute the six dimensionless physics ratios for one concrete case entry."""
-        fallback_dtype_bytes = _validated_dtype_bytes(dtype_bytes)
+        fallback_eb = _validated_dtype_bytes(dtype_bytes)
         case_id = case_entry.get("case_id")
         if isinstance(case_id, bool) or not isinstance(case_id, int) or case_id < 1:
             raise ValueError("case entry requires a positive integer case_id")
@@ -1522,28 +1054,19 @@ class PyTorchSemanticAnalyzer:
         else:
             raise ValueError(f"case {case_id} attrs must be a mapping")
         dtypes = flatten_str_values(case_entry.get("dtype"))
-        element_bytes = (
-            dtype_bytes_for(dtypes[0]) if dtypes else fallback_dtype_bytes
-        )
+        elem_b = dtype_bytes_for(dtypes[0]) if dtypes else fallback_eb
         axes = semantics.base_axes
         kind = infer_case_physics_kind(axes, has_reduction=semantics.has_reduction)
-        dims = infer_case_dims_structural(
-            shapes,
-            attrs,
-            axes=axes,
-            uses_cube=axes.uses_cube,
-        )
-        reduction_axis = semantics.reduction_axes[0] if semantics.reduction_axes else -1
-        context = build_case_physics_context(
+        dims = infer_case_dims_structural(shapes, attrs, axes=axes, uses_cube=axes.uses_cube)
+        ctx = build_case_physics_context(
             kind,
-            element_bytes,
+            elem_b,
             self.facts,
-            reduction_axis=reduction_axis,
+            reduction_axis=semantics.reduction_axes[0] if semantics.reduction_axes else -1,
             strided_gather=semantics.has_indirect_index,
             has_empty_group=has_empty_group_attrs(attrs),
         )
-        raw_case = derive_case_physics_input(case_id, shapes, attrs, dims, context)
-        return compute_case_physics_ratios(raw_case)
+        return compute_case_physics_ratios(derive_case_physics_input(case_id, shapes, attrs, dims, ctx))
 
     def build_universal_blueprint(
         self,
@@ -1554,47 +1077,31 @@ class PyTorchSemanticAnalyzer:
         representative_case: RepresentativeCase | None = None,
     ) -> HirBlueprintPacket:
         """Build a semantic-first blueprint anchored to real dimensions and PyTorch semantics."""
-        element_bytes = _validated_dtype_bytes(dtype_bytes)
-        dims = {str(key): int(value) for key, value in anchor_dims.items()}
-        work = self._estimate_analytical_work(
-            semantics, dims, element_bytes, representative_case
-        )
+        eb = _validated_dtype_bytes(dtype_bytes)
+        dims = {str(k): int(v) for k, v in anchor_dims.items()}
+        work = self._estimate_analytical_work(semantics, dims, eb, representative_case)
         compute_flops = work.cube_flops + work.vector_flops
-        cube_floor_s = (
-            work.cube_flops / self.cube_peak_flops if work.cube_flops > 0 else 0.0
-        )
-        vec_floor_s = (
-            work.vector_flops / self.vector_peak_flops if work.vector_flops > 0 else 0.0
-        )
-        cube_floor_us = cube_floor_s * 1e6
-        vec_floor_us = vec_floor_s * 1e6
-        compute_floor_us = (
-            vec_floor_us if work.cube_flops == 0 else max(cube_floor_us, vec_floor_us)
-        )
+        cube_us = (work.cube_flops / self.cube_peak_flops * 1e6) if work.cube_flops > 0 else 0.0
+        vec_us = (work.vector_flops / self.vector_peak_flops * 1e6) if work.vector_flops > 0 else 0.0
+        compute_floor_us = vec_us if work.cube_flops == 0 else max(cube_us, vec_us)
         memory_floor_us = work.min_gm_bytes / self.hbm_bytes_per_second * 1e6
-        ideal_roofline_us = max(compute_floor_us, memory_floor_us)
-        if ideal_roofline_us <= 0.0:
-            dominant_bound = "none"
-        elif abs(compute_floor_us - memory_floor_us) <= 1e-12 * max(1.0, ideal_roofline_us):
-            dominant_bound = "balanced"
-        elif memory_floor_us > compute_floor_us:
-            dominant_bound = "memory"
+        ideal_us = max(compute_floor_us, memory_floor_us)
+        if ideal_us <= 0.0:
+            bound = "none"
+        elif abs(compute_floor_us - memory_floor_us) <= 1e-12 * max(1.0, ideal_us):
+            bound = "balanced"
         else:
-            dominant_bound = "compute"
-        arithmetic_intensity = (
-            round(compute_flops / float(work.min_gm_bytes), 4)
-            if work.min_gm_bytes > 0
-            else 0.0
-        )
+            bound = "memory" if memory_floor_us > compute_floor_us else "compute"
+        ai = round(compute_flops / float(work.min_gm_bytes), 4) if work.min_gm_bytes > 0 else 0.0
         roofline = HirRooflineSummary(
             anchor_dims=dict(work.resolved_dims),
             compute_flops=compute_flops,
             min_gm_bytes=work.min_gm_bytes,
-            arithmetic_intensity=arithmetic_intensity,
+            arithmetic_intensity=ai,
             compute_floor_us=compute_floor_us,
             memory_floor_us=memory_floor_us,
-            ideal_roofline_us=ideal_roofline_us,
-            dominant_bound=dominant_bound,
+            ideal_roofline_us=ideal_us,
+            dominant_bound=bound,
             requested_anchor_dims=dict(dims),
             resolved_hir_dims=dict(work.resolved_dims),
             shape_exact_match=True,
@@ -1602,13 +1109,8 @@ class PyTorchSemanticAnalyzer:
             cube_flops=work.cube_flops,
             vector_flops=work.vector_flops,
             special_ops=work.special_ops,
-            cube_floor_us=cube_floor_us,
-            vec_floor_us=vec_floor_us,
-        )
-        provenance = BlueprintProvenance(
-            semantic_source="pytorch_golden",
-            traffic_basis=work.traffic_basis,
-            coordinate_scope="representative_anchor",
+            cube_floor_us=cube_us,
+            vec_floor_us=vec_us,
         )
         return HirBlueprintPacket(
             entry_name=semantics.entry_name,
@@ -1618,7 +1120,11 @@ class PyTorchSemanticAnalyzer:
             resolved_hir_dims=dict(work.resolved_dims),
             shape_exact_match=True,
             fallback_reason=None,
-            provenance=provenance,
+            provenance=BlueprintProvenance(
+                semantic_source="pytorch_golden",
+                traffic_basis=work.traffic_basis,
+                coordinate_scope="representative_anchor",
+            ),
         )
 
     build_blueprint = build_universal_blueprint
@@ -1630,27 +1136,19 @@ class PyTorchSemanticAnalyzer:
         dtype_bytes: float,
         representative_case: RepresentativeCase | None,
     ) -> _AnalyticalWork:
-        kind = infer_case_physics_kind(
-            semantics.base_axes,
-            has_reduction=semantics.has_reduction,
-        )
+        kind = infer_case_physics_kind(semantics.base_axes, has_reduction=semantics.has_reduction)
         if kind == "attention":
             return _attention_work(semantics, dims, dtype_bytes, representative_case)
         if kind == "matmul":
             if semantics.has_indirect_index and _has_attention_anchor_dims(dims):
-                return _attention_work(
-                    semantics, dims, dtype_bytes, representative_case
-                )
+                return _attention_work(semantics, dims, dtype_bytes, representative_case)
             return _matmul_work(semantics, dims, dtype_bytes, representative_case)
-        return _stream_work(
-            semantics, dims, kind, dtype_bytes, representative_case
-        )
+        return _stream_work(semantics, dims, kind, dtype_bytes, representative_case)
 
 
 def _has_attention_anchor_dims(dims: Mapping[str, int]) -> bool:
-    sequence = ("S_q", "S", "s_dim")
     return (
-        _positive_dim(dims, sequence) is not None
+        _positive_dim(dims, ("S_q", "S", "s_dim")) is not None
         and _positive_dim(dims, ("N_q", "n_q", "H_q", "h_q", "N_h", "n_h")) is not None
         and _positive_dim(dims, ("N_kv", "n_kv")) is not None
     )
@@ -1667,101 +1165,55 @@ def _attention_work(
     num_q_heads = _dim_or(dims, ("N_q", "n_q", "H_q", "h_q", "N_h", "n_h"), 1)
     num_kv_heads = _dim_or(dims, ("N_kv", "n_kv"), num_q_heads)
     s_q = _require_positive_dim(dims, ("S_q", "S", "s_dim", "M", "m_rows"), "attention")
-    s_kv = _positive_dim(dims, ("S_kv", "s_kv"))
-    if s_kv is None:
-        sequence_index = 2 if layout == "BNSD" else 1
-        s_kv = _positive_dim(
-            dims,
-            (f"shape_1_dim_{sequence_index}", "shape_1_dim_1", "shape_1_dim_0"),
-        )
-    if s_kv is None:
-        s_kv = s_q
-    d_nope = _positive_dim(dims, ("D_nope", "d_nope"))
-    d_rope = _positive_dim(dims, ("D_rope", "d_rope"))
+    seq_idx = 2 if layout == "BNSD" else 1
+    s_kv = _positive_dim(dims, ("S_kv", "s_kv")) or _positive_dim(
+        dims, (f"shape_1_dim_{seq_idx}", "shape_1_dim_1", "shape_1_dim_0")
+    ) or s_q
+    d_nope, d_rope = _positive_dim(dims, ("D_nope", "d_nope")), _positive_dim(dims, ("D_rope", "d_rope"))
     d_qk = _positive_dim(dims, ("D_qk", "D", "d_dim", "dk"))
     if d_qk is None and d_nope is not None and d_rope is not None:
         d_qk = d_nope + d_rope
     if d_qk is None:
-        raise ValueError(
-            "attention analytical Roofline requires D_qk, D, or D_nope+D_rope anchor dims"
-        )
+        raise ValueError("attention analytical Roofline requires D_qk, D, or D_nope+D_rope anchor dims")
     d_v = _positive_dim(dims, ("D_v", "dv", "d_v")) or d_nope or d_qk
     score_pairs = batch * num_q_heads * s_q * s_kv
     cube_flops = 2 * score_pairs * (d_qk + d_v)
     special_ops = score_pairs if semantics.has_online_exp_max else 0
     vector_flops = 5 * score_pairs + special_ops * _TRANSCENDENTAL_OP_EQUIV
-    output_elements = batch * num_q_heads * s_q * d_v
-    gm_elements = batch * (
-        num_q_heads * s_q * d_qk
-        + num_kv_heads * s_kv * d_qk
-        + num_kv_heads * s_kv * d_v
-        + num_q_heads * s_q * d_v
+    out_elems = batch * num_q_heads * s_q * d_v
+    gm_elems = batch * (num_q_heads * s_q * d_qk + num_kv_heads * s_kv * (d_qk + d_v) + num_q_heads * s_q * d_v)
+    charges = _build_case_charges(
+        representative_case,
+        dtype_bytes=dtype_bytes,
+        output_elements=out_elems,
+        fallback_charges=[_TrafficCharge(element_count=gm_elems, element_bytes=dtype_bytes, dtype_declared=False)],
     )
-    if representative_case is None:
-        charges = [
-            _TrafficCharge(
-                element_count=gm_elements,
-                element_bytes=dtype_bytes,
-                dtype_declared=False,
-            )
-        ]
-    else:
-        charges = _declared_input_charges(representative_case, dtype_bytes)
-        charges.extend(
-            _declared_output_charges(
-                representative_case,
-                element_count=output_elements,
-                fallback_dtype_bytes=dtype_bytes,
-            )
-        )
-    min_gm_bytes, traffic_basis = _priced_traffic(
-        charges, packed=semantics.has_subbyte_or_block_quant
-    )
+    min_gm_bytes, traffic_basis = _priced_traffic(charges, packed=semantics.has_subbyte_or_block_quant)
     return _AnalyticalWork(
         cube_flops=cube_flops,
         vector_flops=vector_flops,
         min_gm_bytes=max(1, min_gm_bytes),
         special_ops=special_ops,
-        resolved_dims={
-            "B": batch,
-            "S_q": s_q,
-            "S_kv": s_kv,
-            "N_q": num_q_heads,
-            "N_kv": num_kv_heads,
-            "D_qk": d_qk,
-            "D_v": d_v,
-        },
+        resolved_dims={"B": batch, "S_q": s_q, "S_kv": s_kv, "N_q": num_q_heads, "N_kv": num_kv_heads, "D_qk": d_qk, "D_v": d_v},
         work_model="analytical_attention_online" if special_ops else "analytical_attention",
         traffic_basis=traffic_basis,
         compute_basis="estimated",
     )
 
 
-def _conv_attr_item(
-    attrs: Mapping[str, object],
-    keys: Sequence[str],
-    axis: int,
-    default: int,
-) -> int:
+def _conv_attr_item(attrs: Mapping[str, object], keys: Sequence[str], axis: int, default: int) -> int:
     for key in keys:
         if key not in attrs:
             continue
         raw = attrs[key]
         if isinstance(raw, int) and not isinstance(raw, bool):
             return max(1, int(raw))
-        if isinstance(raw, (list, tuple)) and axis < len(raw):
-            val = raw[axis]
-            if isinstance(val, int) and not isinstance(val, bool):
-                return max(1, int(val))
+        if isinstance(raw, (list, tuple)) and axis < len(raw) and isinstance(raw[axis], int) and not isinstance(raw[axis], bool):
+            return max(1, int(raw[axis]))
     return default
 
 
-def _conv_pad_pair(
-    attrs: Mapping[str, object],
-    keys: Sequence[str],
-    axis: int,
-    spatial_rank: int,
-) -> int:
+def _conv_pad_pair(attrs: Mapping[str, object], keys: Sequence[str], axis: int, spatial_rank: int) -> int:
     for key in keys:
         if key not in attrs:
             continue
@@ -1786,94 +1238,67 @@ def _derive_matmul_dims_from_case(
     shapes = representative_case.input_shapes
     if len(shapes) < 2:
         return None
-    attrs = representative_case.attrs
-    s0, s1 = shapes[0], shapes[1]
-    transpose_a = bool(attrs.get("transpose_a", attrs.get("trans_a", False)))
-    transpose_b = bool(
-        attrs.get("transpose_b", attrs.get("trans_b", attrs.get("transpose_weight", False)))
-    )
+    attrs, s0, s1 = representative_case.attrs, shapes[0], shapes[1]
+    ta = bool(attrs.get("transpose_a", attrs.get("trans_a", False)))
+    tb = bool(attrs.get("transpose_b", attrs.get("trans_b", attrs.get("transpose_weight", False))))
     group_list = attrs.get("group_list")
 
     if semantics.has_conv and len(s0) >= 3 and len(s1) >= 3:
-        batch = max(1, s0[0])
-        c_out = max(1, s1[0])
-        spatial_rank = len(s0) - 2
-        if len(s1) == len(s0):
-            c_in_g = max(1, s1[1])
-            k_spatial = s1[2:]
-        else:
-            c_in_g = 1
-            k_spatial = s1[1:]
-        spatial_out: list[int] = []
-        for ax in range(spatial_rank):
-            stride = _conv_attr_item(attrs, ("strides", "stride"), ax, 1)
-            pad = _conv_pad_pair(attrs, ("pads", "padding"), ax, spatial_rank)
-            dilation = _conv_attr_item(attrs, ("dilations", "dilation"), ax, 1)
-            k_ext = k_spatial[ax] if ax < len(k_spatial) else 1
-            out_ext = max(
+        batch, c_out, rank = max(1, s0[0]), max(1, s1[0]), len(s0) - 2
+        c_in_g, k_sp = (max(1, s1[1]), s1[2:]) if len(s1) == len(s0) else (1, s1[1:])
+        sp_out = [
+            max(
                 1,
-                (s0[2 + ax] + pad - dilation * (k_ext - 1) - 1) // stride + 1,
+                (
+                    s0[2 + ax]
+                    + _conv_pad_pair(attrs, ("pads", "padding"), ax, rank)
+                    - _conv_attr_item(attrs, ("dilations", "dilation"), ax, 1) * ((k_sp[ax] if ax < len(k_sp) else 1) - 1)
+                    - 1
+                )
+                // _conv_attr_item(attrs, ("strides", "stride"), ax, 1)
+                + 1,
             )
-            spatial_out.append(out_ext)
-        m_dim = math.prod(spatial_out)
-        n_dim = c_out
-        k_dim = max(1, c_in_g * math.prod(k_spatial))
-        return batch, 1, m_dim, n_dim, k_dim, batch * m_dim * n_dim
+            for ax in range(rank)
+        ]
+        m_dim = math.prod(sp_out)
+        return batch, 1, m_dim, c_out, max(1, c_in_g * math.prod(k_sp)), batch * m_dim * c_out
 
     if group_list is not None or (len(s0) == 2 and len(s1) == 3):
-        m_dim, k_dim = (s0[1], s0[0]) if transpose_a else (s0[0], s0[1])
-        groups = (
-            len(group_list)
-            if isinstance(group_list, (list, tuple)) and len(group_list) > 0
-            else max(1, s1[0])
-        )
+        m_dim, k_dim = (s0[1], s0[0]) if ta else (s0[0], s0[1])
+        groups = len(group_list) if isinstance(group_list, (list, tuple)) and group_list else max(1, s1[0])
         if len(s1) >= 3:
-            if transpose_b or (s1[2] == k_dim and s1[1] != k_dim):
-                n_dim = s1[1]
-            else:
-                n_dim = s1[2]
+            n_dim = s1[1] if (tb or (s1[2] == k_dim and s1[1] != k_dim)) else s1[2]
         else:
-            n_dim = s1[0] if transpose_b else s1[-1]
+            n_dim = s1[0] if tb else s1[-1]
         return 1, groups, m_dim, n_dim, k_dim, m_dim * n_dim
 
     if len(s0) == 3 and len(s1) == 3:
         batch = max(1, s0[0], s1[0])
-        m_dim, k_dim = (s0[2], s0[1]) if transpose_a else (s0[1], s0[2])
-        n_dim = s1[1] if transpose_b else s1[2]
+        m_dim, k_dim = (s0[2], s0[1]) if ta else (s0[1], s0[2])
+        n_dim = s1[1] if tb else s1[2]
         return batch, 1, m_dim, n_dim, k_dim, batch * m_dim * n_dim
 
     if len(s0) == 2 and len(s1) == 2:
-        if (
-            semantics.has_subbyte_or_block_quant
-            and "in_features" in dims
-            and "out_features" in dims
-        ):
-            m_dim = s0[0]
-            k_dim = dims["in_features"]
-            n_dim = dims["out_features"]
+        if semantics.has_subbyte_or_block_quant and "in_features" in dims and "out_features" in dims:
+            m_dim, k_dim, n_dim = s0[0], dims["in_features"], dims["out_features"]
         else:
-            m_dim, k_dim = (s0[1], s0[0]) if transpose_a else (s0[0], s0[1])
-            n_dim = s1[0] if transpose_b else s1[1]
+            m_dim, k_dim = (s0[1], s0[0]) if ta else (s0[0], s0[1])
+            n_dim = s1[0] if tb else s1[1]
         return 1, 1, m_dim, n_dim, k_dim, m_dim * n_dim
 
     if len(s0) >= 3 and len(s1) == 2:
-        batch = math.prod(s0[:-2])
-        m_dim = s0[-2]
+        batch, m_dim = math.prod(s0[:-2]), s0[-2]
         if "in_features" in dims and "out_features" in dims:
-            k_dim = dims["in_features"]
-            n_dim = dims["out_features"]
+            k_dim, n_dim = dims["in_features"], dims["out_features"]
         else:
             k_dim = s0[-1]
-            n_dim = (
-                s1[0] if (transpose_b or (s1[1] == k_dim and s1[0] != k_dim)) else s1[1]
-            )
+            n_dim = s1[0] if (tb or (s1[1] == k_dim and s1[0] != k_dim)) else s1[1]
         return batch, 1, m_dim, n_dim, k_dim, batch * m_dim * n_dim
 
     if len(s0) >= 4 and len(s1) == len(s0):
         batch = math.prod(max(a, b) for a, b in zip(s0[:-2], s1[:-2]))
-        m_dim, k_dim = (s0[-1], s0[-2]) if transpose_a else (s0[-2], s0[-1])
-        n_dim = s1[-2] if transpose_b else s1[-1]
-        return batch, 1, m_dim, n_dim, k_dim, batch * m_dim * n_dim
+        m_dim, k_dim = (s0[-1], s0[-2]) if ta else (s0[-2], s0[-1])
+        return batch, 1, m_dim, s1[-2] if tb else s1[-1], k_dim, batch * m_dim * (s1[-2] if tb else s1[-1])
 
     return None
 
@@ -1893,106 +1318,58 @@ def _matmul_work(
     ):
         return _attention_work(semantics, dims, dtype_bytes, representative_case)
 
-    derived = (
-        _derive_matmul_dims_from_case(semantics, dims, representative_case)
-        if representative_case is not None
-        else None
-    )
+    derived = _derive_matmul_dims_from_case(semantics, dims, representative_case) if representative_case else None
     if derived is not None:
-        batch, groups, m_dim, n_dim, k_dim, output_elements = derived
+        batch, groups, m_dim, n_dim, k_dim, out_elems = derived
     else:
-        k_dim = _require_positive_dim(
-            dims,
-            ("K", "in_features", "k_dim", "shape_0_dim_1"),
-            "matmul",
-        )
+        k_dim = _require_positive_dim(dims, ("K", "in_features", "k_dim", "shape_0_dim_1"), "matmul")
         m_dim = _positive_dim(dims, ("M", "m_rows", "rows", "T"))
-        if m_dim is None:
-            activation_elements = _positive_dim(dims, ("total_elements", "total_elems"))
-            if activation_elements is not None and activation_elements % k_dim == 0:
-                m_dim = activation_elements // k_dim
+        if m_dim is None and (act_e := _positive_dim(dims, ("total_elements", "total_elems"))) and act_e % k_dim == 0:
+            m_dim = act_e // k_dim
         if m_dim is None:
             m_dim = _shape_leading_dim_product(dims, "shape_0")
         if m_dim is None:
             raise ValueError(
-                "matmul analytical Roofline requires M, rows, total_elements divisible by K, "
-                "or a rank-2 activation shape"
+                "matmul analytical Roofline requires M, rows, total_elements divisible by K, or a rank-2 activation shape"
             )
-        n_dim = _positive_dim(dims, ("out_features", "N", "n_dim", "cols", "D_v", "dv"))
+        n_dim = _positive_dim(dims, ("out_features", "N", "n_dim", "cols", "D_v", "dv")) or (
+            _positive_dim(dims, ("shape_1_dim_2",)) if "shape_1_dim_2" in dims else _positive_dim(dims, ("shape_1_dim_1", "shape_1_dim_0"))
+        )
         if n_dim is None:
-            if "shape_1_dim_2" in dims:
-                n_dim = _positive_dim(dims, ("shape_1_dim_2",))
-            else:
-                n_dim = _positive_dim(dims, ("shape_1_dim_1", "shape_1_dim_0"))
-        if n_dim is None:
-            raise ValueError(
-                "matmul analytical Roofline requires N, out_features, or weight N dims"
-            )
+            raise ValueError("matmul analytical Roofline requires N, out_features, or weight N dims")
         batch = _dim_or(dims, ("B", "b_dim"), 1)
         groups = _dim_or(dims, ("E", "num_groups"), 1)
         if groups == 1 and "shape_1_dim_2" in dims:
             groups = _dim_or(dims, ("shape_1_dim_0",), 1)
-        output_elements = batch * m_dim * n_dim
+        out_elems = batch * m_dim * n_dim
 
-    activation_elements = batch * m_dim * k_dim
-    weight_elements = groups * k_dim * n_dim
+    act_elems, w_elems = batch * m_dim * k_dim, groups * k_dim * n_dim
     cube_flops = 2 * batch * m_dim * n_dim * k_dim
-    vector_flops = 0
-    special_ops = 0
+    vector_flops, special_ops = 0, 0
     if semantics.has_subbyte_or_block_quant:
-        padding_elements = max(1, k_dim // 32) * n_dim * groups
-        vector_flops += 2 * (weight_elements + padding_elements)
+        vector_flops += 2 * (w_elems + max(1, k_dim // 32) * n_dim * groups)
     if semantics.has_online_exp_max:
-        special_ops = output_elements
+        special_ops = out_elems
         vector_flops += special_ops * _TRANSCENDENTAL_OP_EQUIV
-    if representative_case is None:
-        weight_dtype_bytes = 0.5 if semantics.has_subbyte_or_block_quant else dtype_bytes
-        charges = [
-            _TrafficCharge(
-                element_count=activation_elements,
-                element_bytes=dtype_bytes,
-                dtype_declared=False,
-            ),
-            _TrafficCharge(
-                element_count=weight_elements,
-                element_bytes=weight_dtype_bytes,
-                dtype_declared=False,
-            ),
-            _TrafficCharge(
-                element_count=output_elements,
-                element_bytes=dtype_bytes,
-                dtype_declared=False,
-            ),
-        ]
-    else:
-        charges = _declared_input_charges(representative_case, dtype_bytes)
-        charges.extend(
-            _declared_output_charges(
-                representative_case,
-                element_count=output_elements,
-                fallback_dtype_bytes=dtype_bytes,
-            )
-        )
-    gm_bytes, traffic_basis = _priced_traffic(
-        charges, packed=semantics.has_subbyte_or_block_quant
+    w_eb = 0.5 if semantics.has_subbyte_or_block_quant else dtype_bytes
+    charges = _build_case_charges(
+        representative_case,
+        dtype_bytes=dtype_bytes,
+        output_elements=out_elems,
+        fallback_charges=[
+            _TrafficCharge(element_count=act_elems, element_bytes=dtype_bytes, dtype_declared=False),
+            _TrafficCharge(element_count=w_elems, element_bytes=w_eb, dtype_declared=False),
+            _TrafficCharge(element_count=out_elems, element_bytes=dtype_bytes, dtype_declared=False),
+        ],
     )
+    gm_bytes, traffic_basis = _priced_traffic(charges, packed=semantics.has_subbyte_or_block_quant)
     return _AnalyticalWork(
         cube_flops=cube_flops,
         vector_flops=vector_flops,
         min_gm_bytes=max(1, gm_bytes),
         special_ops=special_ops,
-        resolved_dims={
-            "M": m_dim,
-            "N": n_dim,
-            "K": k_dim,
-            "B": batch,
-            "E": groups,
-        },
-        work_model=(
-            "analytical_matmul_quant"
-            if semantics.has_subbyte_or_block_quant
-            else "analytical_matmul"
-        ),
+        resolved_dims={"M": m_dim, "N": n_dim, "K": k_dim, "B": batch, "E": groups},
+        work_model="analytical_matmul_quant" if semantics.has_subbyte_or_block_quant else "analytical_matmul",
         traffic_basis=traffic_basis,
         compute_basis="exact_work_count" if vector_flops == 0 else "estimated",
     )
@@ -2003,24 +1380,14 @@ def _reduction_extent(
     dims: Mapping[str, int],
     representative_case: RepresentativeCase | None,
 ) -> int | None:
-    """Return the product of reduced-axis extents, or None for a full-tensor reduction."""
     if not reduction_axes:
         return None
     if representative_case is not None:
         for shape in representative_case.input_shapes:
-            normalized: list[int] = []
-            valid = True
-            for axis in reduction_axes:
-                index = axis + len(shape) if axis < 0 else axis
-                if index < 0 or index >= len(shape):
-                    valid = False
-                    break
-                normalized.append(index)
-            if not valid:
-                continue
-            extent = math.prod(shape[index] for index in sorted(set(normalized)))
-            if extent > 0:
-                return extent
+            norm = [ax + len(shape) if ax < 0 else ax for ax in reduction_axes]
+            if all(0 <= idx < len(shape) for idx in norm):
+                if (extent := math.prod(shape[idx] for idx in sorted(set(norm)))) > 0:
+                    return extent
     return _positive_dim(dims, ("d_dim", "D", "cols", "inner"))
 
 
@@ -2031,13 +1398,10 @@ def _stream_output_elements(
     dims: Mapping[str, int],
     representative_case: RepresentativeCase | None,
 ) -> int:
-    """Price the result tensor written back by a stream or reduction work model."""
     if kind != "reduction" or semantics.preserves_input_shape:
         return elements
     extent = _reduction_extent(semantics.reduction_axes, dims, representative_case)
-    if extent is None:
-        return 1
-    return max(1, elements // extent)
+    return 1 if extent is None else max(1, elements // extent)
 
 
 def _stream_work(
@@ -2048,73 +1412,40 @@ def _stream_work(
     representative_case: RepresentativeCase | None,
 ) -> _AnalyticalWork:
     elements = _positive_dim(dims, ("total_elements", "total_elems"))
-    if elements is None and "M" in dims and "D" in dims:
-        m_dim = dims["M"]
-        d_dim = dims["D"]
-        if m_dim > 0 and d_dim > 0:
-            elements = m_dim * d_dim
-    if elements is None and "rows" in dims and "cols" in dims:
-        rows = dims["rows"]
-        cols = dims["cols"]
-        if rows > 0 and cols > 0:
-            elements = rows * cols
+    if elements is None and dims.get("M", 0) > 0 and dims.get("D", 0) > 0:
+        elements = dims["M"] * dims["D"]
+    if elements is None and dims.get("rows", 0) > 0 and dims.get("cols", 0) > 0:
+        elements = dims["rows"] * dims["cols"]
     d_col = _positive_dim(dims, ("D", "d_dim", "cols"))
-    seq_or_m = _positive_dim(
-        dims, ("S", "s_dim", "T", "t_dim", "seq_len", "M", "m_rows", "rows")
-    )
-    n_depth = _positive_dim(dims, ("N", "n_depth", "n_layers"))
-    batch = _positive_dim(dims, ("B", "batch"))
+    seq_or_m = _positive_dim(dims, ("S", "s_dim", "T", "t_dim", "seq_len", "M", "m_rows", "rows"))
+    n_depth, batch = _positive_dim(dims, ("N", "n_depth", "n_layers")), _positive_dim(dims, ("B", "batch"))
     if elements is None and d_col is not None and seq_or_m is not None:
         elements = (n_depth or 1) * (batch or 1) * seq_or_m * d_col
     if elements is None:
-        raise ValueError(
-            "analytical Roofline requires total_elements, M x D, or rows x cols anchor dims"
-        )
+        raise ValueError("analytical Roofline requires total_elements, M x D, or rows x cols anchor dims")
     resolved_dims: dict[str, int] = {"elements": elements}
-    if "M" in dims and "D" in dims and dims["M"] > 0 and dims["D"] > 0:
-        resolved_dims["M"] = dims["M"]
-        resolved_dims["D"] = dims["D"]
-    elif "rows" in dims and "cols" in dims and dims["rows"] > 0 and dims["cols"] > 0:
-        resolved_dims["rows"] = dims["rows"]
-        resolved_dims["cols"] = dims["cols"]
+    if dims.get("M", 0) > 0 and dims.get("D", 0) > 0:
+        resolved_dims.update({"M": dims["M"], "D": dims["D"]})
+    elif dims.get("rows", 0) > 0 and dims.get("cols", 0) > 0:
+        resolved_dims.update({"rows": dims["rows"], "cols": dims["cols"]})
     elif representative_case is not None and representative_case.input_shapes:
-        first_shape = representative_case.input_shapes[0]
-        if len(first_shape) >= 2 and all(dim > 0 for dim in first_shape):
-            resolved_dims["rows"] = math.prod(first_shape[:-1])
-            resolved_dims["cols"] = first_shape[-1]
+        sh0 = representative_case.input_shapes[0]
+        if len(sh0) >= 2 and all(d > 0 for d in sh0):
+            resolved_dims.update({"rows": math.prod(sh0[:-1]), "cols": sh0[-1]})
     elif d_col is not None and seq_or_m is not None:
-        resolved_dims["rows"] = (n_depth or 1) * (batch or 1) * seq_or_m
-        resolved_dims["cols"] = d_col
-    ops_per_element = 3 if kind == "reduction" else 1
-    sfu_multiplier = max(
-        1 if semantics.has_online_exp_max else 0,
-        semantics.transcendental_op_count,
+        resolved_dims.update({"rows": (n_depth or 1) * (batch or 1) * seq_or_m, "cols": d_col})
+
+    sfu_mult = max(1 if semantics.has_online_exp_max else 0, semantics.transcendental_op_count)
+    special_ops = elements * sfu_mult
+    vector_flops = (3 if kind == "reduction" else 1) * elements + special_ops * _TRANSCENDENTAL_OP_EQUIV
+    out_elems = _stream_output_elements(semantics, elements, kind, dims, representative_case)
+    charges = _build_case_charges(
+        representative_case,
+        dtype_bytes=dtype_bytes,
+        output_elements=out_elems,
+        fallback_charges=[_TrafficCharge(element_count=elements + out_elems, element_bytes=dtype_bytes, dtype_declared=False)],
     )
-    special_ops = elements * sfu_multiplier
-    vector_flops = ops_per_element * elements + special_ops * _TRANSCENDENTAL_OP_EQUIV
-    output_elements = _stream_output_elements(
-        semantics, elements, kind, dims, representative_case
-    )
-    if representative_case is None:
-        charges = [
-            _TrafficCharge(
-                element_count=elements + output_elements,
-                element_bytes=dtype_bytes,
-                dtype_declared=False,
-            )
-        ]
-    else:
-        charges = _declared_input_charges(representative_case, dtype_bytes)
-        charges.extend(
-            _declared_output_charges(
-                representative_case,
-                element_count=output_elements,
-                fallback_dtype_bytes=dtype_bytes,
-            )
-        )
-    min_gm_bytes, traffic_basis = _priced_traffic(
-        charges, packed=semantics.has_subbyte_or_block_quant
-    )
+    min_gm_bytes, traffic_basis = _priced_traffic(charges, packed=semantics.has_subbyte_or_block_quant)
     return _AnalyticalWork(
         cube_flops=0,
         vector_flops=vector_flops,
@@ -2127,9 +1458,4 @@ def _stream_work(
     )
 
 
-__all__ = [
-    "CasePhysicsRatios",
-    "PyTorchOpSemantics",
-    "PyTorchSemanticAnalyzer",
-    "RepresentativeCase",
-]
+__all__ = ["CasePhysicsRatios", "PyTorchOpSemantics", "PyTorchSemanticAnalyzer", "RepresentativeCase"]

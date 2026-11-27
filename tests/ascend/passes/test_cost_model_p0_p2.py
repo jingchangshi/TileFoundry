@@ -16,11 +16,13 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     PerfTargetCampaignRunner,
     RegimeTargetSpec,
 )
+from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import (
+    run_l0_l1_round_filter,
+)
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     AnchorEvalMetrics,
     CandidateSurrogateResult,
     L3AcceptanceResult,
-    run_l0_l1_round_filter,
 )
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (

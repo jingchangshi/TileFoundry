@@ -11,7 +11,7 @@ from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
     OracleAccuracyResult,
     prepare_operator_seed_or_takeover,
 )
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import run_l0_l1_round_filter
+from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import run_l0_l1_round_filter
 from tilefoundry_ascend.agent.kb.schema import load_seed_rules
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult, StageBResult
 from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest

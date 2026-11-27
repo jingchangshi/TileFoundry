@@ -604,22 +604,23 @@ def _build_large():
         ),
     )
 
-    resolved_small = runner._resolve_max_row_width_dims(small_spec)
-    assert resolved_small == {"N": 2, "B": 1, "S": 1, "D": 128}
+    cases = runner._stage_gate_coordinator._collect_regime_cases_by_id(small_spec)
+    assert {"N": 2, "B": 1, "S": 1, "D": 128} in cases.values()
+    assert {"N": 8, "B": 1, "S": 4096, "D": 6144} not in cases.values()
 
     non_stack_fail = StageBResult(
         passed=False,
         error_message="error: undeclared identifier in call_stack_helper",
         full_diagnostic="fatal error: invalid argument in stack_alloc_stub",
     )
-    assert runner._has_vf_stack_overflow(non_stack_fail) is False
+    assert runner._stage_gate_coordinator._stage_b_has_vf_overflow(non_stack_fail) is False
 
     stack_fail = StageBResult(
         passed=False,
         error_message="bisheng error: exceeded vf stack size",
         full_diagnostic="",
     )
-    assert runner._has_vf_stack_overflow(stack_fail) is True
+    assert runner._stage_gate_coordinator._stage_b_has_vf_overflow(stack_fail) is True
 
     compile_calls: list[str] = []
 
@@ -636,16 +637,15 @@ def _build_large():
     )
     monkeypatch.setattr(
         runner._stage_gate_coordinator,
-        "_resolve_max_row_width_dims",
-        lambda _reg: {"N": 2, "B": 1, "S": 2, "D": 256},
-    )
-    monkeypatch.setattr(
-        runner._stage_gate_coordinator,
         "_instantiate_trackb_tu",
         lambda _src, cpp, spec, **_kw: f"// D={spec.representative_anchor_dims.get('D')}\n{cpp}",
     )
 
-    stage_b = runner._run_l1(trackb_src, small_spec)
+    stage_b = runner._stage_gate_coordinator._run_l1(
+        trackb_src,
+        small_spec,
+        static_width_dims_fn=lambda _reg: [{"N": 2, "B": 1, "S": 2, "D": 256}],
+    )
     assert stage_b.passed is False
     assert stage_b.error_message.startswith("stage_b_max_row_width_compile_failed:")
     assert "vf_stack_overflow" not in stage_b.error_message

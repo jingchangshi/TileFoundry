@@ -3549,13 +3549,36 @@ def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
     )
 
     tl_stub_dir = tmp_path / "tl_stub"
-    tl_stub_dir.mkdir(parents=True, exist_ok=True)
-    (tl_stub_dir / "tilelang.py").write_text(
-        "import json, os\n"
+    (tl_stub_dir / "tilelang" / "backend").mkdir(parents=True, exist_ok=True)
+    (tl_stub_dir / "tvm.py").write_text(
+        "import contextlib\n"
+        "class _Target:\n"
+        "    @staticmethod\n"
+        "    def current(allow_none=True): return 'ascend'\n"
+        "class target:\n"
+        "    Target = _Target\n"
+        "class transform:\n"
+        "    @staticmethod\n"
+        "    def PassContext(config=None): return contextlib.nullcontext()\n"
+        "class tirx:\n"
+        "    PrimFunc = dict\n"
+        "class IRModule:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (tl_stub_dir / "tilelang" / "backend" / "__init__.py").write_text("", encoding="utf-8")
+    (tl_stub_dir / "tilelang" / "backend" / "module.py").write_text(
+        "import contextlib\nfrom types import SimpleNamespace\n"
+        "def create_backend_context(_t): return SimpleNamespace(target=contextlib.nullcontext())\n",
+        encoding="utf-8",
+    )
+    (tl_stub_dir / "tilelang" / "__init__.py").write_text(
+        "import json, os, tvm\n"
         "from pathlib import Path\n"
         "def compile(prog, target='ascend', out_idx=None, pass_configs=None, compile_flags=None):\n"
         "    cache_dir = Path(os.environ['TILELANG_CACHE_DIR'])\n"
         "    cache_dir.mkdir(parents=True, exist_ok=True)\n"
+        "    (cache_dir / f\"k_{prog.get('kind', 'ok')}.so\").write_bytes(b'ELF_STUB')\n"
         "    log_path = cache_dir / 'compiled_entries.jsonl'\n"
         "    entry = {\n"
         "        'prog': prog,\n"
@@ -3620,6 +3643,44 @@ def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
         AnchorCaseSpec("level4/attention_residual", 4, "unaligned_d", 9.9, 3.3),
         AnchorCaseSpec("level4/attention_residual", 999, "small_decode", 1.0, 0.5),
     )
+    from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (  # noqa: PLC0415
+        ModuleSelectorPlanExtractor,
+        StageBCompileGate,
+        build_post_selector_regime_plan,
+    )
+    from tilefoundry_ascend.agent.npu.l2_paired_eval import (  # noqa: PLC0415
+        lookup_case_static_spec,
+    )
+    from tilefoundry_ascend.agent.specs.anchor_specs import (  # noqa: PLC0415
+        get_default_regime_specs,
+    )
+    from tilefoundry_ascend.ascend.compile_cache.artifact_store import (  # noqa: PLC0415
+        ArtifactStore,
+    )
+
+    ar_regs = {r.regime_tag: r for r in get_default_regime_specs("attention_residual")}
+    ar_cases: dict[str, dict[str, object]] = {}
+    for anc in anchors:
+        try:
+            d = dict(lookup_case_static_spec("attention_residual", anc.case_num, cannbench_repo=cann_repo))
+        except (FileNotFoundError, KeyError, OSError, ValueError):
+            d = {}
+        if (rg_spec := ar_regs.get(anc.regime_tag)) is not None:
+            for k, v in rg_spec.sample_builder_kwargs.items():
+                d.setdefault(str(k), v)
+            if rg_spec.config_selector_fn:
+                d.setdefault("config_selector_name", rg_spec.config_selector_fn)
+            if rg_spec.builder_candidates:
+                d.setdefault("builder_name", rg_spec.builder_candidates[0])
+        ar_cases[str(anc.case_num)] = d
+
+    tl_store = ArtifactStore(tl_cache_dir)
+    ext = ModuleSelectorPlanExtractor(target="dav-3510")
+    for cand_p in (cand_get_kernel, cand_generic):
+        c_src = cand_p.read_text(encoding="utf-8")
+        c_plan = build_post_selector_regime_plan(c_src, "small_decode", ar_cases, ext)
+        assert StageBCompileGate(c_plan, tl_store, source_root=fake_root).run(c_src).passed
+
     out_dir = prewarm_surrogate_tilelang_cache(
         "attention_residual",
         [("c_gk", cand_get_kernel), ("c_gen", cand_generic)],
@@ -3636,10 +3697,10 @@ def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
         if line.strip()
     ]
     assert len(entries) == 4
-    kinds = [e["prog"]["kind"] for e in entries]
-    assert kinds == ["small", "unaligned", "generic_small", "generic_unaligned"]
-    assert entries[0]["out_idx"] == [4]
-    assert entries[0]["compile_flags"] == ["--flag-a"]
+    by_kind = {e["prog"]["kind"]: e for e in entries}
+    assert sorted(by_kind) == sorted(["small", "unaligned", "generic_small", "generic_unaligned"])
+    assert by_kind["small"]["out_idx"] == [4]
+    assert by_kind["small"]["compile_flags"] == ["--flag-a"]
 
     mla_dir = cann_repo / "tasks" / "level4" / "mla"
     mla_dir.mkdir(parents=True, exist_ok=True)
@@ -3689,6 +3750,17 @@ def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
         encoding="utf-8",
     )
     mla_cache_dir = tmp_path / "mla_tl_cache"
+    mla_d7 = dict(lookup_case_static_spec("mla", 7, cannbench_repo=cann_repo))
+    mla_d7.update(
+        {
+            "config_selector_name": "_select_mla_decode_config",
+            "builder_name": "_build_mla_split_kv_decode_func",
+        }
+    )
+    mla_src = mla_cand.read_text(encoding="utf-8")
+    mla_p = build_post_selector_regime_plan(mla_src, "split_kv_decode", {"7": mla_d7}, ext)
+    assert StageBCompileGate(mla_p, ArtifactStore(mla_cache_dir), source_root=fake_root).run(mla_src).passed
+
     prewarm_surrogate_tilelang_cache(
         "mla",
         [("c_mla", mla_cand)],
@@ -3703,11 +3775,11 @@ def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
         for line in (mla_cache_dir / "compiled_entries.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert [e["prog"] for e in mla_entries] == [
-        {"kind": "mla_stage1", "splits": 4},
-        {"kind": "mla_combine", "splits": 4},
-    ]
-    assert mla_entries[1]["out_idx"] == [2]
+    mla_by_kind = {e["prog"]["kind"]: e for e in mla_entries}
+    assert sorted(mla_by_kind) == ["mla_combine", "mla_stage1"]
+    assert mla_by_kind["mla_stage1"]["prog"] == {"kind": "mla_stage1", "splits": 4}
+    assert mla_by_kind["mla_combine"]["prog"] == {"kind": "mla_combine", "splits": 4}
+    assert mla_by_kind["mla_combine"]["out_idx"] == [2]
 
 
 def test_run_agent_gates_cmd_retries_transient_blocked_env(monkeypatch) -> None:
@@ -4138,24 +4210,52 @@ def test_wp_final1_pruned_inline_regimes_partial_override_and_mla_combine_gate(
     assert "combine_kernel(_build_mla_split_kv_combine_func)" in l0_bad.error_message
 
     l1_builders: list[str] = []
-    l1_static_specs: list[object] = []
 
-    def _fake_l1(mod_src, *, builder_name, static_spec_dims_list=None, **_kw):
+    def _fake_l1(mod_src, *, builder_name, **_kw):
         l1_builders.append(builder_name)
-        if builder_name == "_build_mla_split_kv_decode_func":
-            l1_static_specs.extend(static_spec_dims_list or ())
-        if builder_name == "_build_mla_split_kv_combine_func":
+        if builder_name == "_render_trackb_tu":
             return StageBResult(passed=False, error_message="broken combine ir")
         return StageBResult(passed=True)
 
     monkeypatch.setattr(cr_mod, "run_l1_compile_check", _fake_l1)
     l1_bad = runner._run_l1(broken_combine_mod, split_spec)
     assert not l1_bad.passed
-    assert len(l1_builders) == 2
-    assert l1_builders[0] == "_build_mla_split_kv_decode_func"
-    assert len(l1_static_specs) >= 1
-    assert l1_builders[-1] == "_build_mla_split_kv_combine_func"
-    assert "combine_kernel(_build_mla_split_kv_combine_func): broken combine ir" == l1_bad.error_message
+    assert l1_builders and all(b == "_render_trackb_tu" for b in l1_builders)
+    assert "broken combine ir" in l1_bad.error_message
+
+    from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (  # noqa: PLC0415
+        ModuleSelectorPlanExtractor,
+        build_post_selector_regime_plan,
+    )
+
+    tl_split_src = (
+        "import tilelang\n"
+        "def _select_split_cfg(b=1, d=64, tl_dtype='float16'):\n"
+        "    return {'num_kv_splits': 4, 'combine_kwargs': {'vec_w': 64}}\n"
+        "def _build_split(b=1, d=64, tl_dtype='float16', num_kv_splits=1):\n"
+        "    return {'kind': 'stage1', 'splits': num_kv_splits}\n"
+        "def _get_kernel(b, d, tl_dtype, *, builder_fn=None, num_kv_splits=1, "
+        "pass_configs=None, compile_flags=None, extra_builder_kwargs=None):\n"
+        "    prog = builder_fn(b=b, d=d, tl_dtype=tl_dtype, num_kv_splits=num_kv_splits)\n"
+        "    return tilelang.compile(prog, target='ascend', out_idx=None)\n"
+        "def _get_combine_kernel(d, tl_dtype, num_kv_splits, *, "
+        "pass_configs=None, compile_flags=None, extra_combine_kwargs=None):\n"
+        "    return tilelang.compile({'kind': 'combine', 'splits': num_kv_splits}, "
+        "target='ascend', out_idx=[2])\n"
+    )
+    split_plan = build_post_selector_regime_plan(
+        tl_split_src,
+        "split_kv_decode",
+        {"case_0": {"b": 1, "d": 64, "tl_dtype": "float16"}},
+        ModuleSelectorPlanExtractor(
+            builder_name="_build_split",
+            config_selector_name="_select_split_cfg",
+        ),
+    )
+    assert [s.builder_name for s in split_plan.unique_specs_by_key.values()] == [
+        "_build_split",
+        "_get_combine_kernel",
+    ]
 
 
 def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
@@ -4203,14 +4303,37 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
     )
 
     tl_stub_dir = tmp_path / "tl_stub"
-    tl_stub_dir.mkdir()
-    (tl_stub_dir / "tilelang.py").write_text(
-        "import json, os\n"
+    (tl_stub_dir / "tilelang" / "backend").mkdir(parents=True)
+    (tl_stub_dir / "tvm.py").write_text(
+        "import contextlib\n"
+        "class _Target:\n"
+        "    @staticmethod\n"
+        "    def current(allow_none=True): return 'ascend'\n"
+        "class target:\n"
+        "    Target = _Target\n"
+        "class transform:\n"
+        "    @staticmethod\n"
+        "    def PassContext(config=None): return contextlib.nullcontext()\n"
+        "class tirx:\n"
+        "    PrimFunc = dict\n"
+        "class IRModule:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (tl_stub_dir / "tilelang" / "backend" / "__init__.py").write_text("", encoding="utf-8")
+    (tl_stub_dir / "tilelang" / "backend" / "module.py").write_text(
+        "import contextlib\nfrom types import SimpleNamespace\n"
+        "def create_backend_context(_t): return SimpleNamespace(target=contextlib.nullcontext())\n",
+        encoding="utf-8",
+    )
+    (tl_stub_dir / "tilelang" / "__init__.py").write_text(
+        "import json, os, tvm\n"
         "from pathlib import Path\n"
         "def compile(prog, *, target='ascend', out_idx=None, pass_configs=None, "
         "compile_flags=None):\n"
         "    cdir = Path(os.environ['TILELANG_CACHE_DIR'])\n"
         "    cdir.mkdir(parents=True, exist_ok=True)\n"
+        "    (cdir / f\"k_{prog.get('kind', 'ok')}.so\").write_bytes(b'ELF_STUB')\n"
         "    with (cdir / 'compiled_entries.jsonl').open('a', encoding='utf-8') as fh:\n"
         "        fh.write(json.dumps({'prog': prog, 'out_idx': out_idx}) + '\\n')\n"
         "    return {'cached': prog}\n",
@@ -4256,6 +4379,29 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
     monkeypatch.delenv("TILEFOUNDRY_NPU_CANN_SETUP", raising=False)
     monkeypatch.delenv("TILEFOUNDRY_NPU_PYTHON", raising=False)
 
+    from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (  # noqa: PLC0415
+        ModuleSelectorPlanExtractor,
+        StageBCompileGate,
+        build_post_selector_regime_plan,
+    )
+    from tilefoundry_ascend.agent.npu.l2_paired_eval import lookup_case_static_spec  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.compile_cache.artifact_store import (  # noqa: PLC0415
+        ArtifactStore,
+    )
+
+    case7_dims = dict(lookup_case_static_spec("mla", 7, cannbench_repo=cann_repo))
+    case7_dims.update({"config_selector_name": "_select_mla_decode_config", "builder_name": "_build_mla_split_kv_decode_func"})
+    mla_plan = build_post_selector_regime_plan(
+        mla_cand.read_text(encoding="utf-8"),
+        "split_kv_decode",
+        {"7": case7_dims},
+        ModuleSelectorPlanExtractor(target="dav-3510"),
+    )
+    sb_rcp = StageBCompileGate(
+        mla_plan, ArtifactStore(tl_cache), source_root=fake_root
+    ).run(mla_cand.read_text(encoding="utf-8"))
+    assert sb_rcp.passed is True
+
     prewarm_surrogate_tilelang_cache(
         "mla",
         [("c_mla_kw", mla_cand)],
@@ -4271,9 +4417,10 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
         if line.strip()
     ]
     assert len(entries) == 2
-    assert entries[0]["prog"]["unroll_k"] == 2
-    assert entries[0]["prog"]["extra_builder_kwargs"] == {"unroll_k": 2}
-    assert entries[1]["prog"]["extra_combine_kwargs"] == {"vec_w": 64}
+    by_kind = {e["prog"]["kind"]: e for e in entries}
+    assert by_kind["stage1"]["prog"]["unroll_k"] == 2
+    assert by_kind["stage1"]["prog"]["extra_builder_kwargs"] == {"unroll_k": 2}
+    assert by_kind["combine"]["prog"]["extra_combine_kwargs"] == {"vec_w": 64}
 
     six_anchors = (
         AnchorCaseSpec("level4/attention_residual", 1, "regime_a", 10.0, 2.0),
@@ -4738,7 +4885,7 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
 
 def test_run_l0_l1_round_filter_isolates_syntax_repair_timeout(tmp_path: Path) -> None:
     """Verify syntax_repair timeouts fail only the affected candidate without penalizing rules."""
-    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import (  # noqa: PLC0415
         run_l0_l1_round_filter,
     )
 
@@ -5639,7 +5786,6 @@ def test_default_l0_hybrid_gate_returns_trackb_verdict_and_sums_elapsed(
     """Require the hybrid Track-B L0 verdict and report combined gate latency."""
     runner = _trackb_campaign_runner(tmp_path)
     spec = runner._regime_specs[0]
-    monkeypatch.setattr(runner, "_resolve_combine_gate_spec", lambda *_a: None)
     seen = _stub_hybrid_l0_gates(monkeypatch)
     passed = runner._default_l0_checker(_TRACKB_MODULE, spec)
     assert passed.passed is True
@@ -5648,7 +5794,6 @@ def test_default_l0_hybrid_gate_returns_trackb_verdict_and_sums_elapsed(
     assert len(seen) == 1
     assert "kernel_active" in seen[0]
 
-    monkeypatch.setattr(runner, "_resolve_combine_gate_spec", lambda *_a: None)
     _stub_hybrid_l0_gates(monkeypatch, passed=False, elapsed_ms=3.0, error_message="spill")
     failed = runner._default_l0_checker(_TRACKB_MODULE, spec)
     assert failed.passed is False
@@ -5665,7 +5810,6 @@ def test_default_l1_hybrid_gate_compiles_trackb_and_sums_elapsed(
     spec = runner._regime_specs[0]
     summary = BishengResourceSummary(vec_regs=77)
     monkeypatch.setattr(campaign_runner, "resolve_regime_config", _resolved_trackb_config)
-    monkeypatch.setattr(runner, "_resolve_combine_gate_spec", lambda *_a: None)
     monkeypatch.setattr(
         campaign_runner,
         "run_l1_compile_check",
@@ -7152,11 +7296,9 @@ def test_format_msprof_section_prints_stage6_compiler_hazards() -> None:
 
 def test_build_syntax_repair_request_lowered_excerpt_and_extractor() -> None:
     """Verify bounded Track-A lowered excerpt placement and Track-B suppression."""
-    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: PLC0415
-        _extract_lowered_compiler_excerpt,
-    )
     from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (  # noqa: PLC0415
         build_syntax_repair_request,
+        extract_lowered_compiler_excerpt as _extract_lowered_compiler_excerpt,
     )
 
     long_excerpt = "\n".join(f"int line_{i} = {i};" for i in range(400))

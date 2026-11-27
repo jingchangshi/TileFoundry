@@ -19,10 +19,12 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     extract_regime_snippet,
     patch_regime_into_module,
 )
+from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import (
+    run_l0_l1_round_filter,
+)
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     AnchorEvalMetrics,
     CandidateSurrogateResult,
-    run_l0_l1_round_filter,
 )
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, load_seed_rules
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (

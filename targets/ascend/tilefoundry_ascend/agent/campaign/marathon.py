@@ -64,12 +64,12 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     _validate_llm_api_key_env,
     collect_bottleneck_msprof_via_agent_gates,
     extract_ordered_tensor_shapes,
-    run_l1_compile_check,
     run_l3_full_contract_via_agent_gates,
     run_l4_official_cannbench_via_agent_gates,
     run_micro_probe_via_agent_gates,
     run_surrogate_batch_via_agent_gates,
 )
+from tilefoundry_ascend.agent.orchestrator.stage_b_gate import run_l1_compile_check
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (

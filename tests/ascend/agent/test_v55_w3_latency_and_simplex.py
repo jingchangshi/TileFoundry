@@ -13,7 +13,6 @@ from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     GuardrailCaseSpec,
     RegimeTargetSpec,
-    collect_distinct_static_width_dims,
     compute_case_aligned_eta,
 )
 from tilefoundry_ascend.agent.specs.latency_algebra import (
@@ -174,112 +173,14 @@ def test_null_launch_helper_and_fast_response_payload(monkeypatch: pytest.Monkey
     assert "null_launch_us" not in profile_payload
 
 
-def test_case_aligned_eta_and_static_width_collection(tmp_path: Path) -> None:
-    """Verify compute_case_aligned_eta clamping and static width deduplication."""
+def test_case_aligned_eta() -> None:
+    """Verify compute_case_aligned_eta clamping."""
     anchor = AnchorCaseSpec("level4/attention_residual", 2, "small_decode", 1.5, 0.5)
     assert compute_case_aligned_eta(anchor, 2.0) == pytest.approx(0.25)
     assert compute_case_aligned_eta(anchor, 0.25) == pytest.approx(1.0)
     assert compute_case_aligned_eta(anchor, 0.0) == pytest.approx(0.0)
     assert compute_case_aligned_eta(anchor, -5.0) == pytest.approx(0.0)
     assert compute_case_aligned_eta(anchor, float("nan")) == pytest.approx(0.0)
-
-    task_dir = tmp_path / "tasks" / "level4" / "attention_residual"
-    task_dir.mkdir(parents=True)
-    (task_dir / "cases.yaml").write_text(
-        "\n".join(
-            [
-                "cases:",
-                "  - case_id: 2",
-                "    input_shape: [[2, 1, 1, 4096], [1, 1, 4096]]",
-                "    dtype: bfloat16",
-                "  - case_id: 4",
-                "    input_shape: [[8, 1, 16, 1000], [1, 16, 1000]]",
-                "    dtype: bfloat16",
-                "  - case_id: 5",
-                "    input_shape: [[8, 1, 32, 1000], [1, 32, 1000]]",
-                "    dtype: bfloat16",
-                "  - case_id: 14",
-                "    input_shape: [[8, 1, 8, 777], [1, 8, 777]]",
-                "    dtype: float16",
-                "  - case_id: 16",
-                "    input_shape: [[8, 1, 4096, 4096], [1, 4096, 4096]]",
-                "    dtype: bfloat16",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    unaligned_spec = RegimeTargetSpec(
-        regime_tag="unaligned_d",
-        builder_candidates=("_build_ar_unaligned_func",),
-        sample_builder_kwargs={"tl_dtype": "bfloat16"},
-        representative_anchor_dims={"N": 8, "B": 1, "S": 16, "D": 1000},
-    )
-    anchors = (
-        AnchorCaseSpec("level4/attention_residual", 2, "small_decode", 1.5, 0.5),
-        AnchorCaseSpec("level4/attention_residual", 4, "unaligned_d", 9.93, 3.31),
-        AnchorCaseSpec("level4/attention_residual", 16, "aligned_prefill", 1098.0, 366.0),
-    )
-    guardrails = (
-        GuardrailCaseSpec("level4/attention_residual", 14, "unaligned_d", 67.0, 22.0),
-    )
-    widths = collect_distinct_static_width_dims(
-        "attention_residual",
-        unaligned_spec,
-        anchors,
-        guardrails,
-        cannbench_repo=tmp_path,
-    )
-    extracted = sorted((int(w["D"]), str(w["tl_dtype"])) for w in widths)
-    assert extracted == [(777, "float16"), (1000, "bfloat16")]
-
-
-def test_static_width_collection_collapses_same_bytewidth_dtypes(tmp_path: Path) -> None:
-    """Collapse equal-bytewidth float16/bfloat16 widths while keeping float32 distinct."""
-    task_dir = tmp_path / "tasks" / "level4" / "attention_residual"
-    task_dir.mkdir(parents=True)
-    (task_dir / "cases.yaml").write_text(
-        "\n".join(
-            [
-                "cases:",
-                "  - case_id: 1",
-                "    input_shape: [[8, 1, 4096, 4096], [1, 4096, 4096]]",
-                "    dtype: float16",
-                "  - case_id: 2",
-                "    input_shape: [[8, 1, 4096, 4096], [1, 4096, 4096]]",
-                "    dtype: bfloat16",
-                "  - case_id: 3",
-                "    input_shape: [[8, 1, 4096, 4096], [1, 4096, 4096]]",
-                "    dtype: float32",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    aligned_spec = RegimeTargetSpec(
-        regime_tag="aligned_prefill",
-        builder_candidates=("_build_ar_aligned_func",),
-        sample_builder_kwargs={"tl_dtype": "bfloat16"},
-        representative_anchor_dims={"N": 8, "B": 1, "S": 4096, "D": 4096},
-    )
-    anchors = (
-        AnchorCaseSpec("level4/attention_residual", 1, "aligned_prefill", 1098.0, 366.0),
-        AnchorCaseSpec("level4/attention_residual", 2, "aligned_prefill", 1098.0, 366.0),
-        AnchorCaseSpec("level4/attention_residual", 3, "aligned_prefill", 2196.0, 732.0),
-    )
-    widths = collect_distinct_static_width_dims(
-        "attention_residual",
-        aligned_spec,
-        anchors,
-        cannbench_repo=tmp_path,
-    )
-    assert len(widths) == 2
-    assert [(int(w["D"]), str(w["tl_dtype"])) for w in widths] == [
-        (4096, "float16"),
-        (4096, "float32"),
-    ]
 
 
 def test_observation_5d_prefers_case_aligned_eta_and_clamps() -> None:

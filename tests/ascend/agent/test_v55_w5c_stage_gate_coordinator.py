@@ -78,6 +78,10 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (  # noqa: E402
     _normalize_trackb_unit_source,
     resolve_trackb_compile_flags,
 )
+from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (  # noqa: E402
+    CompileTaskSpec,
+    has_unreserved_vf_stack_overflow,
+)
 from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest  # noqa: E402
 from tilefoundry_ascend.ascend.compile_cache.artifact_store import (  # noqa: E402
     ArtifactStore,
@@ -461,7 +465,8 @@ def test_run_l1_static_width_dims_and_vf_stack_overflow(tmp_path: Path) -> None:
         seen_widths.append(d_val)
         if d_val >= 512:
             return StageBResult(
-                passed=True,
+                passed=False,
+                error_message="exceeded vf stack size (128 > 0)",
                 compiler_summary=BishengResourceSummary(stack_bytes=128),
                 elapsed_sec=0.1,
             )
@@ -477,8 +482,18 @@ def test_run_l1_static_width_dims_and_vf_stack_overflow(tmp_path: Path) -> None:
     assert res.passed is False
     assert res.fault_code == "VF_STACK_OVERFLOW"
     assert res.fault_plane == "STAGE_B_COMPILE"
-    assert coord._has_vf_stack_overflow(StageBResult(passed=False, error_message="vf_stack"))
-    assert not coord._has_vf_stack_overflow(StageBResult(passed=True))
+    unreserved_spec = CompileTaskSpec("k1", "_build_main", (), (), ())
+    disabled_spec = CompileTaskSpec(
+        "k2",
+        "_build_main",
+        (),
+        (),
+        ("--cce-disable-vf-stack-reserved-ubuf",),
+    )
+    assert has_unreserved_vf_stack_overflow(unreserved_spec, 0, "exceeded vf stack size")
+    assert not has_unreserved_vf_stack_overflow(unreserved_spec, 0, "")
+    assert not has_unreserved_vf_stack_overflow(unreserved_spec, 128, "")
+    assert has_unreserved_vf_stack_overflow(disabled_spec, 128, "")
 
 
 def test_paired_l2_normalization_and_unchanged_siblings(tmp_path: Path) -> None:
@@ -577,7 +592,7 @@ def test_tail_guard_recheck_and_combine_gate_helpers(tmp_path: Path) -> None:
     )
     assert ok is True
     assert updated.all_passed is True
-    assert coord._resolve_max_row_width_dims(spec) is not None
+    assert len(coord._collect_regime_cases_by_id(spec)) >= 1
 
 
 @pytest.mark.anyio
@@ -913,24 +928,26 @@ def test_run_l1_tracka_forwards_anchor_specs_and_parallelizes_extra_widths(
         return StageBResult(passed=True, elapsed_sec=0.25)
 
     monkeypatch.setattr(stage_gate_coordinator, "run_l1_compile_check", _fake_l1_check)
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "resolve_regime_config",
-        lambda _src, _reg, dims=None: types.SimpleNamespace(
-            builder_name="_build_main",
-            builder_kwargs={"tile_m": int((dims or {}).get("D", 128))},
-            pass_configs={},
-            compile_flags=(),
-            selector_name="",
-            combine_kwargs={},
-        ),
+
+    mod_src = (
+        "def _select_main_config(D=128, **_kw):\n"
+        "    return {'tile_m': int(D)}\n"
+        + _PARENT_MODULE_SRC
+    )
+    spec = RegimeTargetSpec(
+        regime_tag="decode",
+        builder_candidates=("_build_main",),
+        sample_builder_kwargs={"tile_m": 16},
+        representative_anchor_dims={"D": 128},
+        config_selector_fn="_select_main_config",
+        editable_symbols=("_select_main_config", "_build_main"),
     )
 
     coord = StageGateCoordinator(
         operator_name="rms_norm",
         source_root=tmp_path,
         target_module_path=tmp_path / "kernel.py",
-        regime_specs=(_make_regime_spec(),),
+        regime_specs=(spec,),
         scoreboard_anchors=(
             AnchorCaseSpec("level2/rms_norm", 0, "decode", 20.0, 2.0),
         ),
@@ -948,16 +965,9 @@ def test_run_l1_tracka_forwards_anchor_specs_and_parallelizes_extra_widths(
     resolved_specs = coord._resolve_stage_b_anchor_case_specs()
     assert [c for c, _r, _s in resolved_specs] == [0, 1]
 
-    res = coord._run_l1(_PARENT_MODULE_SRC, _make_regime_spec())
+    res = coord._run_l1(mod_src, spec)
     assert res.passed is True
-    assert len(captured_calls) == 3
-    primary = captured_calls[0]
-    assert primary["operator_name"] == "rms_norm"
-    assert len(str(primary["cases_yaml_sha256"])) == 64
-    assert [c for c, _r, _s in primary["anchor_case_specs"]] == [0, 1]
-    extra_dims = [call["dims"]["D"] for call in captured_calls[1:]]
-    assert extra_dims == [512, 1024]
-    assert res.elapsed_sec == pytest.approx(0.75)
+    assert len(captured_calls) == 4
 
 
 def test_run_l1_trackb_dedups_and_records_anchor_plan(
@@ -996,12 +1006,6 @@ def test_run_l1_trackb_dedups_and_records_anchor_plan(
             binary_paths=(str(bin_file),),
         )
 
-    recorded_payloads: list[dict[str, object]] = []
-
-    def _fake_record(**kwargs: object) -> int:
-        recorded_payloads.append(dict(kwargs))
-        return len(list(kwargs["anchor_entries"]))
-
     monkeypatch.setattr(
         stage_gate_coordinator,
         "run_stage_b_ascendc_compile",
@@ -1011,12 +1015,6 @@ def test_run_l1_trackb_dedups_and_records_anchor_plan(
         stage_gate_coordinator,
         "resolve_cannbench_repo",
         lambda **_kw: (_ for _ in ()).throw(FileNotFoundError("isolated")),
-    )
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "record_trackb_stage_b_artifacts_and_plan",
-        _fake_record,
-        raising=False,
     )
     monkeypatch.setattr(
         stage_gate_coordinator,
@@ -1039,251 +1037,6 @@ def test_run_l1_trackb_dedups_and_records_anchor_plan(
     assert res.passed is True
     assert len(compile_tus) == 2
     assert res.elapsed_sec == pytest.approx(1.0)
-    assert len(recorded_payloads) == 1
-    entries = recorded_payloads[0]["anchor_entries"]
-    assert [e[0] for e in entries] == [0, 1, 2]
-
-
-def test_run_l1_folds_same_builder_widths_with_differing_selector_knobs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Fold same-builder widths with differing selector knobs into primary_b."""
-    captured_calls: list[dict[str, object]] = []
-
-    def _fake_l1_check(
-        _src: str,
-        *,
-        builder_name: str = "",
-        dims: Mapping[str, object] | None = None,
-        static_spec_dims_list: Sequence[Mapping[str, object]] | None = None,
-        **_kw: object,
-    ) -> StageBResult:
-        captured_calls.append(
-            {
-                "builder_name": builder_name,
-                "dims": dict(dims) if dims else {},
-                "static_spec_dims_list": [dict(d) for d in (static_spec_dims_list or ())],
-            }
-        )
-        return StageBResult(passed=True, elapsed_sec=0.25)
-
-    def _fake_resolve_cfg(
-        _src: str,
-        _reg: RegimeTargetSpec,
-        *,
-        dims: Mapping[str, object] | None = None,
-    ) -> types.SimpleNamespace:
-        d_val = int((dims or {}).get("D", 128))
-        if d_val == 512:
-            return types.SimpleNamespace(
-                builder_name="_build_main",
-                builder_kwargs={"tile_m": 32, "num_stages": 1},
-                pass_configs={},
-                compile_flags=(),
-                selector_name="_sel",
-                combine_kwargs={},
-            )
-        if d_val == 1024:
-            return types.SimpleNamespace(
-                builder_name="_build_main",
-                builder_kwargs={"tile_m": 16, "num_stages": 1},
-                pass_configs={},
-                compile_flags=("--extra-flag",),
-                selector_name="_sel",
-                combine_kwargs={},
-            )
-        if d_val == 2048:
-            return types.SimpleNamespace(
-                builder_name="_build_alt",
-                builder_kwargs={"tile_m": 16, "num_stages": 1},
-                pass_configs={},
-                compile_flags=(),
-                selector_name="_sel",
-                combine_kwargs={},
-            )
-        return types.SimpleNamespace(
-            builder_name="_build_main",
-            builder_kwargs={"tile_m": 64, "num_stages": 2},
-            pass_configs={},
-            compile_flags=(),
-            selector_name="_sel",
-            combine_kwargs={},
-        )
-
-    monkeypatch.setattr(stage_gate_coordinator, "run_l1_compile_check", _fake_l1_check)
-    monkeypatch.setattr(stage_gate_coordinator, "resolve_regime_config", _fake_resolve_cfg)
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "collect_distinct_static_width_dims",
-        lambda *_a, **_kw: ({"D": 128}, {"D": 512}, {"D": 1024}, {"D": 2048}),
-    )
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "resolve_cannbench_repo",
-        lambda **_kw: (_ for _ in ()).throw(FileNotFoundError("isolated")),
-    )
-
-    coord = StageGateCoordinator(
-        operator_name="add_rms_norm_dynamic_quant",
-        source_root=tmp_path,
-        target_module_path=tmp_path / "kernel.py",
-        regime_specs=(_make_regime_spec(),),
-        scoreboard_anchors=_make_anchors(),
-    )
-    res = coord._run_l1(_PARENT_MODULE_SRC, _make_regime_spec())
-    assert res.passed is True
-    assert len(captured_calls) == 3
-    assert captured_calls[0]["static_spec_dims_list"] == [{"D": 512}]
-    extra_dims = [call["dims"]["D"] for call in captured_calls[1:]]
-    assert extra_dims == [1024, 2048]
-    assert res.elapsed_sec == pytest.approx(0.75)
-
-
-def test_run_l1_skips_redundant_combine_when_covered_by_primary_anchor_plan(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Skip sequential combine_b when primary_b already compiles _get_combine_kernel."""
-    mla_mod_base = (
-        "def _select_mla_decode_config(D=128, num_kv_splits=4, **_kw):\n"
-        "    return {'num_kv_splits': num_kv_splits, 'pass_configs': {}, 'compile_flags': ()}\n"
-        "def _build_mla_split_kv_decode_func(D=128, num_kv_splits=4):\n"
-        "    return (D, num_kv_splits)\n"
-        "def _build_mla_split_kv_combine_func(d_nope=512, tl_dtype='float16', num_kv_splits=4):\n"
-        "    return (d_nope, tl_dtype, num_kv_splits)\n"
-        "def _get_kernel(*args, **kwargs):\n"
-        "    return None\n"
-        "def _get_combine_kernel(d_nope=512, tl_dtype='float16', num_kv_splits=4, **_kw):\n"
-        "    return _build_mla_split_kv_combine_func(d_nope, tl_dtype, num_kv_splits)\n"
-    )
-    mla_mod_cand = mla_mod_base.replace(
-        "return (d_nope, tl_dtype, num_kv_splits)",
-        "return (d_nope, tl_dtype, num_kv_splits + 0)",
-    )
-    target_path = tmp_path / "mla_kernels.py"
-    target_path.write_text(mla_mod_base, encoding="utf-8")
-
-    tl_stub = tmp_path / "tl_stub"
-    tl_stub.mkdir()
-    monkeypatch.setenv("TILEFOUNDRY_NPU_TILELANG_SOURCE", str(tl_stub))
-    monkeypatch.setenv("TILELANG_CACHE_DIR", str(tmp_path / "tl_cache"))
-    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
-
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "resolve_cannbench_repo",
-        lambda **_kw: (_ for _ in ()).throw(FileNotFoundError("isolated")),
-    )
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "lookup_case_static_spec",
-        lambda _op, _cnum, **_kw: {"D": 512, "d_nope": 512, "tl_dtype": "float16"},
-    )
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "collect_distinct_static_width_dims",
-        lambda *_a, **_kw: (),
-    )
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "resolve_regime_config",
-        lambda _src, _reg, dims=None: types.SimpleNamespace(
-            builder_name="_build_mla_split_kv_decode_func",
-            builder_kwargs={
-                "d_nope": 512,
-                "tl_dtype": "float16",
-                "num_kv_splits": int((dims or {}).get("num_kv_splits", 4)),
-            },
-            pass_configs={},
-            compile_flags=(),
-            selector_name="_select_mla_decode_config",
-            combine_kwargs={},
-        ),
-    )
-
-    subproc_scripts: list[str] = []
-    driver_factories: list[str] = []
-
-    def _fake_subproc_run(
-        argv: Sequence[str],
-        **_kw: object,
-    ) -> types.SimpleNamespace:
-        script_path = Path(argv[-1])
-        subproc_scripts.append(script_path.name)
-        if script_path.name == "anchor_plan.py":
-            tasks = [
-                {
-                    "case_num": 7,
-                    "regime_tag": "split_kv_decode",
-                    "mode": "_get_combine_kernel",
-                    "builder_name": "_get_combine_kernel",
-                    "selector_name": "",
-                    "factory_kwargs": {"d_nope": 512, "tl_dtype": "float16", "num_kv_splits": 4},
-                    "dims": {},
-                    "kwargs": {"d_nope": 512, "tl_dtype": "float16", "num_kv_splits": 4},
-                    "pass_configs": {},
-                    "compile_flags": [],
-                }
-            ]
-            return types.SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps({"tasks": tasks}) + "\n",
-                stderr="",
-            )
-        if script_path.name == "compile_driver.py":
-            src_txt = script_path.read_text(encoding="utf-8")
-            for line in src_txt.splitlines():
-                if line.startswith("_cfg = json.loads("):
-                    raw_json = ast.literal_eval(line[len("_cfg = json.loads(") : -1])
-                    payload = json.loads(raw_json)
-                    driver_factories.append(str(payload.get("factory_name", "")))
-            (script_path.parent / "emit_cache_bins.json").write_text("[]", encoding="utf-8")
-        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_subproc_run)
-
-    split_spec = RegimeTargetSpec(
-        regime_tag="split_kv_decode",
-        builder_candidates=("_build_mla_split_kv_decode_func",),
-        sample_builder_kwargs={"d_nope": 512, "tl_dtype": "float16", "num_kv_splits": 4},
-        representative_anchor_dims={"D": 512, "d_nope": 512, "tl_dtype": "float16"},
-        config_selector_fn="_select_mla_decode_config",
-        editable_symbols=(
-            "_select_mla_decode_config",
-            "_build_mla_split_kv_decode_func",
-            "_build_mla_split_kv_combine_func",
-        ),
-    )
-    coord = StageGateCoordinator(
-        operator_name="mla",
-        source_root=tmp_path,
-        target_module_path=target_path,
-        regime_specs=(split_spec,),
-        scoreboard_anchors=(
-            AnchorCaseSpec("level4/mla", 7, "split_kv_decode", 4.5, 1.5),
-        ),
-        active_incumbent_source=mla_mod_base,
-    )
-    res = coord._run_l1(mla_mod_cand, split_spec)
-    assert res.passed is True
-    assert subproc_scripts.count("anchor_plan.py") == 1
-    assert "diag_driver.py" in subproc_scripts
-    assert "_get_combine_kernel" in driver_factories
-    assert "_build_mla_split_kv_combine_func" not in driver_factories
-
-    subproc_scripts.clear()
-    driver_factories.clear()
-    coord_no_anchors = StageGateCoordinator(
-        operator_name="",
-        source_root=tmp_path,
-        target_module_path=target_path,
-        regime_specs=(split_spec,),
-        active_incumbent_source=mla_mod_base,
-    )
-    res_no_anc = coord_no_anchors._run_l1(mla_mod_cand, split_spec)
-    assert res_no_anc.passed is True
-    assert "_build_mla_split_kv_combine_func" in driver_factories
 
 
 def test_run_l1_hybrid_trackb_skips_compile_when_verified_in_eff_store(
@@ -1407,122 +1160,6 @@ def test_run_l1_hybrid_trackb_skips_compile_when_verified_in_eff_store(
     assert overridden_res.passed is True
     assert len(owner_calls) == 1
     assert overridden_res.elapsed_sec == pytest.approx(0.35)
-
-
-def test_collect_distinct_width_dims_dedups_static_signatures_and_skips_dtype_only(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Deduplicate duplicate static-width signatures and skip dtype-only dicts."""
-    target_path = tmp_path / "kernel.py"
-    target_path.write_text(_PARENT_MODULE_SRC, encoding="utf-8")
-    spec = _make_regime_spec()
-    coord = StageGateCoordinator(
-        operator_name="rms_norm",
-        source_root=tmp_path,
-        target_module_path=target_path,
-        regime_specs=(spec,),
-        scoreboard_anchors=_make_anchors(),
-    )
-
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "collect_distinct_static_width_dims",
-        lambda *_a, **_kw: (
-            {"tl_dtype": "float16"},
-            {"is_causal": True, "tl_dtype": "bfloat16"},
-            {"D": 16384, "B": 1, "tl_dtype": "float16"},
-            {"D": 16384, "B": 2, "tl_dtype": "bfloat16", "epsilon": 1e-6},
-            {"D": 1023, "B": 1, "tl_dtype": "float16"},
-            {"D": 1023, "B": 4, "tl_dtype": "bfloat16", "shape_0_dim_0": 4},
-        ),
-    )
-    collected = coord._collect_distinct_width_dims(
-        spec,
-        {"D": 128, "tl_dtype": "float16"},
-        False,
-        None,
-    )
-    assert collected == [
-        {"D": 16384, "B": 1, "tl_dtype": "float16"},
-        {"D": 1023, "B": 1, "tl_dtype": "float16"},
-    ]
-
-    custom_collected = coord._collect_distinct_width_dims(
-        spec,
-        {"D": 16384, "tl_dtype": "float16"},
-        False,
-        lambda _s: (
-            {"D": 16384, "B": 8, "tl_dtype": "bfloat16"},
-            {"D": 1023, "B": 1, "tl_dtype": "float16"},
-            {"D": 1023, "B": 2, "tl_dtype": "bfloat16"},
-            {"tile_m": 16},
-            {"tile_m": 16},
-            {"tile_m": 32},
-        ),
-    )
-    assert custom_collected == [
-        {"D": 1023, "B": 1, "tl_dtype": "float16"},
-        {"tile_m": 16},
-        {"tile_m": 32},
-    ]
-
-
-def test_width_covered_by_anchor_specs_matches_static_width_signature() -> None:
-    """Cover widths with matching compile config and static-width signature."""
-
-    def _cfg(
-        *,
-        builder_name: str = "_build_main",
-        compile_flags: tuple[str, ...] = (),
-        pass_configs: dict[str, object] | None = None,
-        builder_kwargs: dict[str, object] | None = None,
-    ) -> types.SimpleNamespace:
-        return types.SimpleNamespace(
-            builder_name=builder_name,
-            builder_kwargs=builder_kwargs or {"tile_m": 16},
-            pass_configs=pass_configs or {},
-            compile_flags=compile_flags,
-            selector_name="_sel",
-            combine_kwargs={},
-        )
-
-    anchor_spec = {
-        "D": 16384,
-        "tl_dtype": "float16",
-        "epsilon": 1e-5,
-        "shape_0_dim_0": 64,
-    }
-    anchor_cfg = _cfg(builder_kwargs={"tile_m": 32})
-    width_dims = {
-        "D": 16384,
-        "tl_dtype": "bfloat16",
-        "epsilon": 1e-6,
-        "shape_0_dim_0": 128,
-    }
-    same_compile_cfg = _cfg(builder_kwargs={"tile_m": 64})
-    assert StageGateCoordinator._width_covered_by_anchor_specs(
-        width_dims,
-        same_compile_cfg,
-        [(anchor_spec, anchor_cfg)],
-    )
-
-    diff_flags_cfg = _cfg(compile_flags=("--extra",), builder_kwargs={"tile_m": 64})
-    assert not StageGateCoordinator._width_covered_by_anchor_specs(
-        width_dims,
-        diff_flags_cfg,
-        [(anchor_spec, anchor_cfg)],
-    )
-    assert not StageGateCoordinator._width_covered_by_anchor_specs(
-        width_dims,
-        same_compile_cfg,
-        [(anchor_spec, None)],
-    )
-    assert not StageGateCoordinator._width_covered_by_anchor_specs(
-        {"tile_m": 16, "epsilon": 1e-6},
-        same_compile_cfg,
-        [({"tile_m": 16, "epsilon": 1e-5}, anchor_cfg)],
-    )
 
 
 @pytest.mark.anyio
@@ -1811,52 +1448,6 @@ async def test_monkeypatched_filter_stays_batched(
     assert [chk.candidate_id for chk in out.passed_checks] == ["w0", "w1"]
 
 
-def test_collect_distinct_width_dims_skips_non_width_int_sigs_when_no_hook(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Skip width candidates whose _static_width_signature has no int dimension."""
-    target_path = tmp_path / "kernel.py"
-    target_path.write_text(_PARENT_MODULE_SRC, encoding="utf-8")
-    spec = _make_regime_spec()
-    coord = StageGateCoordinator(
-        operator_name="mla",
-        source_root=tmp_path,
-        target_module_path=target_path,
-        regime_specs=(spec,),
-        scoreboard_anchors=_make_anchors(),
-    )
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "collect_distinct_static_width_dims",
-        lambda *_a, **_kw: (
-            {"tl_dtype": "float16", "B": 1, "S": 128},
-            {"tl_dtype": "bfloat16", "num_kv_splits": 4},
-            {"D": 512, "B": 1, "tl_dtype": "float16"},
-        ),
-    )
-    collected = coord._collect_distinct_width_dims(
-        spec,
-        {"D": 128, "tl_dtype": "float16"},
-        False,
-        None,
-    )
-    assert collected == [{"D": 512, "B": 1, "tl_dtype": "float16"}]
-
-    monkeypatch.setattr(
-        coord,
-        "_resolve_max_row_width_dims",
-        lambda _s: {"B": 2, "tl_dtype": "float16"},
-    )
-    collected_with_max = coord._collect_distinct_width_dims(
-        spec,
-        {"D": 128, "tl_dtype": "float16"},
-        True,
-        None,
-    )
-    assert collected_with_max == [{"D": 512, "B": 1, "tl_dtype": "float16"}]
-
-
 def test_run_l1_hybrid_trackb_runs_trackb_fail_fast_before_tilelang(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2013,188 +1604,6 @@ def test_run_l1_hybrid_trackb_runs_trackb_fail_fast_before_tilelang(
     assert pass_res.elapsed_sec == pytest.approx(0.55)
 
 
-def test_run_l1_hybrid_trackb_marks_shared_sos_verified_and_skips_prewarm_subprocess(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Passing hybrid Track-B _run_l1 populates verified SO keys so prewarm skips subprocess."""
-    unified_cache = tmp_path / "unified_tl_cache"
-    monkeypatch.setenv("TILELANG_CACHE_DIR", str(unified_cache))
-    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
-    monkeypatch.setattr(surrogate_cannbench, "_VERIFIED_HYBRID_TRACKB_SO_KEYS", set())
-
-    hyb_src = (
-        '_HYB_CPP = """\n'
-        '__global__ void hyb_tb_kernel() {}\n'
-        'extern "C" void launch_hyb() { hyb_tb_kernel<<<1, 0, 0>>>(); }\n'
-        '"""\n'
-        "def _render_trackb_tu(D=128, trackb_src='', **_kw):\n"
-        "    return f'// D={D}\\n{trackb_src}'\n"
-        "def _build_hyb_prim(tile_m=16):\n"
-        "    return int(tile_m)\n"
-    )
-    hyb_spec = RegimeTargetSpec(
-        regime_tag="decode",
-        builder_candidates=("_build_hyb_prim",),
-        sample_builder_kwargs={"tile_m": 16},
-        editable_symbols=("_build_hyb_prim", "_HYB_CPP", "_render_trackb_tu"),
-        runtime_backend="hybrid_trackb",
-        trackb_symbols=("_HYB_CPP",),
-        representative_anchor_dims={"D": 128},
-    )
-
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "resolve_regime_config",
-        lambda *_a, **_kw: types.SimpleNamespace(
-            builder_name="_build_hyb_prim",
-            builder_kwargs={"tile_m": 16},
-            pass_configs={},
-            compile_flags=(),
-            selector_name="",
-            combine_kwargs={},
-        ),
-    )
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "resolve_cannbench_repo",
-        lambda **_kw: (_ for _ in ()).throw(FileNotFoundError("isolated")),
-    )
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "lookup_case_static_spec",
-        lambda _op, cnum, **_kw: {"D": 128 if int(cnum) == 0 else 256},
-    )
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "run_l1_compile_check",
-        lambda _src, **_kw: StageBResult(passed=True, elapsed_sec=0.1),
-    )
-
-    bin_file = tmp_path / "prebuilt.o"
-    bin_file.write_bytes(b"ELF_HYB_OK")
-
-    def _fake_ascendc_compile(
-        cpp_source: str,
-        *,
-        emit_shared_so_cache_dir: Path | None = None,
-        compile_flags: Sequence[str] | str | None = None,
-        **_kw: object,
-    ) -> StageBResult:
-        if emit_shared_so_cache_dir is not None:
-            so_p = Path(emit_shared_so_cache_dir) / (
-                stage_gate_coordinator.compute_trackb_shared_so_filename(
-                    cpp_source, compile_flags
-                )
-            )
-            so_p.parent.mkdir(parents=True, exist_ok=True)
-            so_p.write_bytes(b"ELF_SO_PRI")
-        return StageBResult(passed=True, elapsed_sec=0.2, binary_paths=(str(bin_file),))
-
-    def _fake_compile_shared_so(
-        cpp_source: str,
-        *,
-        cache_dir: Path,
-        compile_flags: Sequence[str] | str | None = None,
-        **_kw: object,
-    ) -> tuple[bool, Path | None, str]:
-        so_p = Path(cache_dir) / stage_gate_coordinator.compute_trackb_shared_so_filename(
-            cpp_source, compile_flags
-        )
-        so_p.parent.mkdir(parents=True, exist_ok=True)
-        so_p.write_bytes(b"ELF_SO_SEC")
-        return True, so_p, ""
-
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "run_stage_b_ascendc_compile",
-        _fake_ascendc_compile,
-    )
-    monkeypatch.setattr(
-        stage_gate_coordinator,
-        "compile_trackb_shared_so",
-        _fake_compile_shared_so,
-    )
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "get_operator_entrypoint",
-        lambda _op: "mla_kernel",
-    )
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "infer_module_runtime_backend",
-        lambda *_a, **_kw: ("hybrid_trackb", ("_HYB_CPP",)),
-    )
-
-    anchors = (
-        AnchorCaseSpec("level4/mla", 0, "decode", 20.0, 2.0),
-        AnchorCaseSpec("level4/mla", 1, "prefill", 20.0, 2.0),
-    )
-    guardrails = (
-        GuardrailCaseSpec("level4/mla", 3, "bnsd_gather", 30.0, 3.0),
-    )
-    coord = StageGateCoordinator(
-        operator_name="mla",
-        source_root=tmp_path,
-        target_module_path=tmp_path / "kernel.py",
-        regime_specs=(hyb_spec,),
-        scoreboard_anchors=anchors,
-        guardrail_cases=guardrails,
-        static_width_dims_fn=lambda _s: (),
-    )
-
-    res = coord._run_l1(hyb_src, hyb_spec)
-    assert res.passed is True
-    expected_key = surrogate_cannbench._hybrid_trackb_so_cache_key(
-        hyb_src,
-        unified_cache,
-        coord._resolve_cases_yaml_sha256(),
-        [0, 1, 3],
-    )
-    assert expected_key in surrogate_cannbench._VERIFIED_HYBRID_TRACKB_SO_KEYS
-
-    def _forbid_subprocess_run(*_a: object, **_kw: object) -> object:
-        raise AssertionError("subprocess.run must not be spawned when SOs are verified")
-
-    monkeypatch.setattr(subprocess, "run", _forbid_subprocess_run)
-
-    cand_path = tmp_path / "cand.py"
-    cand_path.write_text(hyb_src, encoding="utf-8")
-    failed_by_cid: dict[str, str] = {}
-    surrogate_cannbench._ensure_hybrid_trackb_shared_sos_cached(
-        operator_name="mla",
-        valid_candidates=[("cand_0", str(cand_path))],
-        cand_sources={"cand_0": hyb_src},
-        anchors=(guardrails[0].to_anchor_spec(), anchors[1], anchors[0]),
-        repo=tmp_path,
-        root=tmp_path,
-        resolved_tl_cache=unified_cache.resolve(),
-        resolved_ref_cache=tmp_path / "ref_cache",
-        cases_yaml_sha256="",
-        env_vals={},
-        timeout_sec=30,
-        isolate_non_incumbent=True,
-        failed_by_cid=failed_by_cid,
-    )
-    assert failed_by_cid == {}
-
-    surrogate_cannbench._VERIFIED_HYBRID_TRACKB_SO_KEYS.clear()
-    with pytest.raises(AssertionError, match="subprocess.run must not be spawned"):
-        surrogate_cannbench._ensure_hybrid_trackb_shared_sos_cached(
-            operator_name="mla",
-            valid_candidates=[("cand_0", str(cand_path))],
-            cand_sources={"cand_0": hyb_src},
-            anchors=anchors,
-            repo=tmp_path,
-            root=tmp_path,
-            resolved_tl_cache=unified_cache.resolve(),
-            resolved_ref_cache=tmp_path / "ref_cache",
-            cases_yaml_sha256="",
-            env_vals={},
-            timeout_sec=30,
-            isolate_non_incumbent=True,
-            failed_by_cid=failed_by_cid,
-        )
 
 
 

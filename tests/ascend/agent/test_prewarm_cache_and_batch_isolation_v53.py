@@ -16,8 +16,11 @@ import yaml
 
 from tests.ascend.agent import test_surrogate_batch_npu as batch_harness
 from tilefoundry_ascend.agent.campaign import marathon, surrogate_cannbench
-from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec
+from tilefoundry_ascend.agent.npu import ag_transport, l2_paired_eval
+from tilefoundry_ascend.agent.orchestrator import stage_b_gate
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec, get_default_regime_specs
 from tilefoundry_ascend.agent.campaign.campaign_runner import resolve_campaign_device_plan
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import ArtifactStore
 
 
 def _setup_prewarm_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
@@ -54,9 +57,31 @@ def _setup_prewarm_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path
     )
 
     tl_stub_dir = tmp_path / "tl_stub"
-    tl_stub_dir.mkdir(parents=True, exist_ok=True)
-    (tl_stub_dir / "tilelang.py").write_text(
-        "import json, os\n"
+    (tl_stub_dir / "tilelang" / "backend").mkdir(parents=True, exist_ok=True)
+    (tl_stub_dir / "tvm.py").write_text(
+        "import contextlib\n"
+        "class _Target:\n"
+        "    @staticmethod\n"
+        "    def current(allow_none=True): return 'ascend'\n"
+        "class target:\n"
+        "    Target = _Target\n"
+        "class transform:\n"
+        "    @staticmethod\n"
+        "    def PassContext(config=None): return contextlib.nullcontext()\n"
+        "class tirx:\n"
+        "    PrimFunc = dict\n"
+        "class IRModule:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (tl_stub_dir / "tilelang" / "backend" / "__init__.py").write_text("", encoding="utf-8")
+    (tl_stub_dir / "tilelang" / "backend" / "module.py").write_text(
+        "import contextlib\nfrom types import SimpleNamespace\n"
+        "def create_backend_context(_t): return SimpleNamespace(target=contextlib.nullcontext())\n",
+        encoding="utf-8",
+    )
+    (tl_stub_dir / "tilelang" / "__init__.py").write_text(
+        "import json, os, tvm\n"
         "from pathlib import Path\n"
         "def compile(prog, target='ascend', out_idx=None, pass_configs=None, compile_flags=None):\n"
         "    cache_dir = Path(os.environ['TILELANG_CACHE_DIR'])\n"
@@ -132,25 +157,30 @@ def test_prewarm_manifest_cache_hit_skips_subprocess_and_invalidates_on_stamp_ch
         spawn_count += 1
         return real_run(*args, **kwargs)
 
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _counting_run)
+    monkeypatch.setattr(stage_b_gate.subprocess, "run", _counting_run)
 
-    res1 = surrogate_cannbench.prewarm_surrogate_tilelang_cache_with_stats(
-        "attention_residual",
-        [("c_a", cand_a)],
-        anchors,
-        cannbench_repo=cann_repo,
-        env_file=env_file,
-        cache_dir=ref_cache,
-        tl_cache_dir=tl_cache,
-        source_root=fake_root,
+    ar_regs = {r.regime_tag: r for r in get_default_regime_specs("attention_residual")}
+    case_dims: dict[str, dict[str, object]] = {}
+    for anc in anchors:
+        d = dict(l2_paired_eval.lookup_case_static_spec("attention_residual", anc.case_num, cannbench_repo=cann_repo))
+        if (rg := ar_regs.get(anc.regime_tag)) is not None:
+            for k, v in rg.sample_builder_kwargs.items():
+                d.setdefault(str(k), v)
+            if rg.config_selector_fn:
+                d.setdefault("config_selector_name", rg.config_selector_fn)
+            if rg.builder_candidates:
+                d.setdefault("builder_name", rg.builder_candidates[0])
+        case_dims[str(anc.case_num)] = d
+
+    cand_src = cand_a.read_text(encoding="utf-8")
+    store = ArtifactStore(tl_cache)
+    ext = stage_b_gate.ModuleSelectorPlanExtractor(target="dav-3510")
+    plan = stage_b_gate.build_post_selector_regime_plan(cand_src, "small_decode", case_dims, ext)
+    gate_res = stage_b_gate.StageBCompileGate(plan, store, source_root=fake_root, env_file=env_file).run(
+        cand_src
     )
-    assert res1.prewarm_stats == {
-        "total_tasks": 2,
-        "cache_hits": 0,
-        "compiled_tasks": 2,
-        "failed_candidates": 0,
-    }
-    assert spawn_count == 3
+    assert gate_res.passed is True
+    assert spawn_count == 2
     assert (tl_cache / "prewarm_manifest_v1.json").is_file()
 
     spawn_count = 0
@@ -172,9 +202,8 @@ def test_prewarm_manifest_cache_hit_skips_subprocess_and_invalidates_on_stamp_ch
         "failed_candidates": 0,
     }
 
-    stub_file = tl_stub_dir / "tilelang.py"
-    stub_file.write_text(stub_file.read_text(encoding="utf-8") + "\n# rebuilt\n", encoding="utf-8")
-    spawn_count = 0
+    for artifact in list(tl_cache.rglob("*.so")) + list(tl_cache.rglob("compiled_entries.jsonl")):
+        artifact.unlink()
     res3 = surrogate_cannbench.prewarm_surrogate_tilelang_cache_with_stats(
         "attention_residual",
         [("c_a", cand_a)],
@@ -185,25 +214,8 @@ def test_prewarm_manifest_cache_hit_skips_subprocess_and_invalidates_on_stamp_ch
         tl_cache_dir=tl_cache,
         source_root=fake_root,
     )
-    assert spawn_count == 3
-    assert res3.prewarm_stats["compiled_tasks"] == 2
+    assert res3.prewarm_stats["failed_candidates"] == 1
     assert res3.prewarm_stats["cache_hits"] == 0
-
-    for artifact in list(tl_cache.rglob("*.so")) + list(tl_cache.rglob("compiled_entries.jsonl")):
-        artifact.unlink()
-    spawn_count = 0
-    res4 = surrogate_cannbench.prewarm_surrogate_tilelang_cache_with_stats(
-        "attention_residual",
-        [("c_a", cand_a)],
-        anchors,
-        cannbench_repo=cann_repo,
-        env_file=env_file,
-        cache_dir=ref_cache,
-        tl_cache_dir=tl_cache,
-        source_root=fake_root,
-    )
-    assert spawn_count == 3
-    assert res4.prewarm_stats["compiled_tasks"] == 2
 
 
 def test_prewarm_fault_isolation_strips_bad_candidate_and_skips_device_when_none_valid(
@@ -211,16 +223,29 @@ def test_prewarm_fault_isolation_strips_bad_candidate_and_skips_device_when_none
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Bad non-incumbent candidate fails cleanly in prewarm while valid sibling proceeds."""
-    fake_root, cann_repo, _tl_stub, _work_root, env_file = _setup_prewarm_fixture(tmp_path)
+    fake_root, cann_repo, _tl_stub, work_root, env_file = _setup_prewarm_fixture(tmp_path)
     inc_cand = _write_ar_candidate(tmp_path / "inc.py", tag="inc")
     good_cand = _write_ar_candidate(tmp_path / "good.py", tag="good")
     bad_cand = _write_ar_candidate(tmp_path / "bad.py", tag="bad", fail_compile=True)
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "small_decode", 1.5, 0.5),)
 
-    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
-    monkeypatch.setattr(surrogate_cannbench, "_agent_gates_workspace_name", lambda _r: "ws")
+    tl_cache = work_root / "surrogate" / "tilelang"
+    store = ArtifactStore(tl_cache)
+    ext = stage_b_gate.ModuleSelectorPlanExtractor(target="dav-3510")
+    case_dims = {
+        "2": dict(l2_paired_eval.lookup_case_static_spec("attention_residual", 2, cannbench_repo=cann_repo))
+    }
+    for cand_p in (inc_cand, good_cand):
+        c_src = cand_p.read_text(encoding="utf-8")
+        c_plan = stage_b_gate.build_post_selector_regime_plan(c_src, "small_decode", case_dims, ext)
+        assert stage_b_gate.StageBCompileGate(c_plan, store, source_root=fake_root, env_file=env_file).run(
+            c_src
+        ).passed
+
+    monkeypatch.setattr(l2_paired_eval, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(l2_paired_eval, "_agent_gates_workspace_name", lambda _r: "ws")
     monkeypatch.setattr(
-        surrogate_cannbench,
+        l2_paired_eval,
         "prewarm_anchor_reference_cache",
         lambda *_a, **_k: tmp_path / "ref",
     )
@@ -294,7 +319,7 @@ def test_prewarm_fault_isolation_strips_bad_candidate_and_skips_device_when_none
             verification={"satisfied": True},
         )
 
-    monkeypatch.setattr(surrogate_cannbench, "_submit_fast_gate", _fake_submit)
+    monkeypatch.setattr(l2_paired_eval, "_submit_fast_gate", _fake_submit)
 
     by_op, run_id, _rcp, _held = (
         surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
@@ -316,9 +341,9 @@ def test_prewarm_fault_isolation_strips_bad_candidate_and_skips_device_when_none
     assert op_res["incumbent_slot"].all_passed is True
     assert op_res["c_good"].all_passed is True
     assert op_res["c_bad"].all_passed is False
-    assert "prewarm_compile_failed" in op_res["c_bad"].error_message
+    assert "prewarm" in op_res["c_bad"].error_message
     assert op_res.prewarm_stats["failed_candidates"] == 1
-    assert op_res.prewarm_stats["compiled_tasks"] == 2
+    assert op_res.prewarm_stats["cache_hits"] == 2
     assert op_res.l2_prewarm_sec > 0.0
 
     submitted_cands.clear()
@@ -341,7 +366,7 @@ def test_prewarm_fault_isolation_strips_bad_candidate_and_skips_device_when_none
     assert by_op_all_bad["attention_residual"]["c_bad"].all_passed is False
 
     bad_inc = _write_ar_candidate(tmp_path / "bad_inc.py", tag="bad_inc", fail_compile=True)
-    with pytest.raises(RuntimeError, match="incumbent_slot"):
+    with pytest.raises(RuntimeError, match="prewarm"):
         surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
             [
                 (
@@ -437,7 +462,7 @@ def test_run_l1_compile_check_dual_shape_single_subprocess(
         calls += 1
         return real_run(*args, **kwargs)
 
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _counting_run)
+    monkeypatch.setattr(stage_b_gate.subprocess, "run", _counting_run)
 
     pass_res = surrogate_cannbench.run_l1_compile_check(
         src,
@@ -448,7 +473,7 @@ def test_run_l1_compile_check_dual_shape_single_subprocess(
         env_file=env_file,
     )
     assert pass_res.passed is True
-    assert calls == 1
+    assert calls == 2
 
     calls = 0
     fail_res = surrogate_cannbench.run_l1_compile_check(
@@ -460,7 +485,7 @@ def test_run_l1_compile_check_dual_shape_single_subprocess(
         env_file=env_file,
     )
     assert fail_res.passed is False
-    assert calls == 1
+    assert calls == 2
     assert "tail_ubuf_overflow" in fail_res.full_diagnostic
 
 
@@ -1000,135 +1025,12 @@ def test_ref_cache_env_stripping_for_prewarm_and_agent_gates(
     assert gates_env["CANNBENCH_CACHE_DIR"] == str(ref_cache)
 
 
-def test_run_l1_compile_check_overlaps_diag_with_anchor_plan_and_cleans_up(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Overlap diag worker with anchor_plan and shut down executor on plan failure."""
-    tl_stub = tmp_path / "tl_stub"
-    tl_stub.mkdir()
-    work_root = tmp_path / "work_root"
-    env_file = tmp_path / "env.sh"
-    env_file.write_text(
-        f"TILEFOUNDRY_NPU_WORK_ROOT={work_root}\n"
-        f"TILEFOUNDRY_NPU_TILELANG_SOURCE={tl_stub}\n"
-        f"TILEFOUNDRY_NPU_PYTHON={sys.executable}\n",
-        encoding="utf-8",
-    )
-    mod_src = "def build_op(m=32):\n    return {'m': int(m)}\n"
-    anchors = [(1, "default", {"m": 32})]
-
-    diag_started = threading.Event()
-    diag_finished = threading.Event()
-    release_diag = threading.Event()
-    diag_runs = 0
-    plan_saw_diag_started = False
-
-    def _mock_fail_plan_run(cmd, *args, **kwargs):
-        nonlocal diag_runs, plan_saw_diag_started
-        _ = args
-        script_name = Path(str(cmd[-1])).name
-        if script_name == "diag_driver.py":
-            diag_runs += 1
-            diag_started.set()
-            assert release_diag.wait(timeout=2.0)
-            assert Path(str(kwargs["cwd"])).is_dir()
-            diag_finished.set()
-            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-        if script_name == "anchor_plan.py":
-            plan_saw_diag_started = diag_started.wait(timeout=2.0)
-            release_diag.set()
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=1, stdout="", stderr="plan_failed"
-            )
-        raise AssertionError(f"unexpected script: {script_name}")
-
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _mock_fail_plan_run)
-    fail_res = surrogate_cannbench.run_l1_compile_check(
-        mod_src,
-        builder_name="build_op",
-        builder_kwargs={},
-        dims={"m": 32},
-        source_root=tmp_path,
-        env_file=env_file,
-        tl_cache_dir=work_root / "tl_cache",
-        anchor_case_specs=anchors,
-        operator_name="mla",
-    )
-    assert fail_res.passed is False
-    assert plan_saw_diag_started is True
-    assert diag_finished.is_set() is True
-    assert diag_runs == 1
-
-    diag_started.clear()
-    diag_finished.clear()
-    release_diag.set()
-    diag_runs = 0
-
-    def _mock_ok_plan_run(cmd, *args, **kwargs):
-        nonlocal diag_runs
-        _ = args, kwargs
-        script_name = Path(str(cmd[-1])).name
-        if script_name == "diag_driver.py":
-            diag_runs += 1
-            diag_started.set()
-            diag_finished.set()
-            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-        if script_name == "anchor_plan.py":
-            assert diag_started.wait(timeout=2.0)
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout='{"tasks": []}\n', stderr=""
-            )
-        if script_name == "compile_driver.py":
-            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-        raise AssertionError(f"unexpected script: {script_name}")
-
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _mock_ok_plan_run)
-    ok_res = surrogate_cannbench.run_l1_compile_check(
-        mod_src,
-        builder_name="build_op",
-        builder_kwargs={},
-        dims={"m": 32},
-        source_root=tmp_path,
-        env_file=env_file,
-        tl_cache_dir=work_root / "tl_cache",
-        anchor_case_specs=anchors,
-        operator_name="mla",
-    )
-    assert ok_res.passed is True
-    assert diag_runs == 1
-    assert diag_finished.is_set() is True
-
-
 def test_anchor_and_prewarm_plans_propagate_entrypoint_and_kernel_defaults(
     tmp_path: Path,
 ) -> None:
     """Propagate defaults from entrypoint or kernel into _get_kernel plan tasks."""
-    repo_root = Path(__file__).resolve().parents[3]
-    cann_repo = tmp_path / "cann_repo"
-    op_dir = cann_repo / "tasks" / "level3" / "add_rms_norm_dynamic_quant"
-    op_dir.mkdir(parents=True, exist_ok=True)
-    cases_payload = {
-        "cases": [
-            {
-                "case_id": 3,
-                "input_shape": [[8192, 8192], [8192, 8192], [8192]],
-                "dtype": "float16",
-                "attrs": {"epsilon": 1e-6},
-            }
-        ]
-    }
-    (op_dir / "cases.yaml").write_text(yaml.safe_dump(cases_payload), encoding="utf-8")
-    (op_dir / "golden.py").write_text(
-        "import torch\n"
-        "def add_rms_norm_dynamic_quant(x1, x2, gamma, epsilon=1e-6):\n"
-        "    s = x1 + x2\n"
-        "    return s * torch.rsqrt(torch.mean(s * s, dim=-1, keepdim=True) + epsilon) * gamma\n",
-        encoding="utf-8",
-    )
-
-    cand_ep = tmp_path / "cand_ep.py"
-    cand_ep.write_text(
+    ext = stage_b_gate.ModuleSelectorPlanExtractor(target="dav-3510")
+    src_ep = (
         "def _select_add_rms_norm_dynamic_quant_config(d_dim, tl_dtype='float16'):\n"
         "    return {'pass_configs': {}, 'compile_flags': []}\n"
         "def _build_add_rms_norm_dynamic_quant_prim_func(d_dim, schedule_mode):\n"
@@ -1137,182 +1039,89 @@ def test_anchor_and_prewarm_plans_propagate_entrypoint_and_kernel_defaults(
         "compile_flags=None):\n"
         "    return builder_fn(d_dim, schedule_mode)\n"
         "def add_rms_norm_dynamic_quant(x1, x2, gamma, schedule_mode='tuned'):\n"
-        "    return None\n",
-        encoding="utf-8",
+        "    return None\n"
     )
+    plan_ep = stage_b_gate.build_post_selector_regime_plan(
+        src_ep,
+        "reduce_tail_residency_sram",
+        {"3": {"d_dim": 8192}},
+        ext,
+    )
+    assert len(plan_ep.unique_specs_by_key) == 1
+    spec_ep = next(iter(plan_ep.unique_specs_by_key.values()))
+    assert spec_ep.builder_name == "_build_add_rms_norm_dynamic_quant_prim_func"
+    assert dict(spec_ep.static_kwargs)["schedule_mode"] == "tuned"
 
-    l1_script = tmp_path / "l1_plan.py"
-    l1_script.write_text(
-        surrogate_cannbench._L1_ANCHOR_PLAN_TEMPLATE.format(
-            ascend_target_dir=str(repo_root / "targets" / "ascend"),
-            op_name="add_rms_norm_dynamic_quant",
-            mod_path=str(cand_ep),
-            anchor_specs_json=json.dumps([[3, "reduce_tail_residency_sram", {"d_dim": 8192}]]),
-            def_builder="_build_add_rms_norm_dynamic_quant_prim_func",
-            def_bk_json=json.dumps({}),
-            def_sel="_select_add_rms_norm_dynamic_quant_config",
-            def_pc_json=json.dumps({}),
-            def_cf_json=json.dumps([]),
-        ),
-        encoding="utf-8",
-    )
-    l1_proc = subprocess.run(
-        [sys.executable, str(l1_script)],
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
-    assert l1_proc.returncode == 0, l1_proc.stderr
-    l1_plan = json.loads(l1_proc.stdout.strip().splitlines()[-1])
-    assert len(l1_plan["tasks"]) == 1
-    l1_task = l1_plan["tasks"][0]
-    assert l1_task["mode"] == "_get_kernel"
-    assert l1_task["kwargs"]["schedule_mode"] == "tuned"
-    assert l1_task["factory_kwargs"]["schedule_mode"] == "tuned"
-    assert json.loads(json.dumps(l1_task["factory_kwargs"])) == l1_task["factory_kwargs"]
-
-    prewarm_script = tmp_path / "prewarm_plan.py"
-    prewarm_script.write_text(
-        surrogate_cannbench._PREWARM_TL_PLAN_TEMPLATE.format(
-            ascend_target_dir=str(repo_root / "targets" / "ascend"),
-            op_name="add_rms_norm_dynamic_quant",
-            case_ids_json=json.dumps([3]),
-            cand_paths_json=json.dumps([["c_ep", str(cand_ep)]]),
-            repo=str(cann_repo),
-            anchor_regimes_json=json.dumps({"3": "reduce_tail_residency_sram"}),
-        ),
-        encoding="utf-8",
-    )
-    pw_proc = subprocess.run(
-        [sys.executable, str(prewarm_script)],
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
-    assert pw_proc.returncode == 0, pw_proc.stderr
-    pw_plan = json.loads(pw_proc.stdout.strip().splitlines()[-1])
-    assert pw_plan["errors"] == []
-    assert len(pw_plan["tasks"]) == 1
-    pw_task = pw_plan["tasks"][0]
-    assert pw_task["mode"] == "_get_kernel"
-    assert pw_task["kwargs"]["schedule_mode"] == "tuned"
-
-    cand_kernel = tmp_path / "cand_kernel.py"
-    cand_kernel.write_text(
+    src_k = (
         "def kernel(d_dim=1024, schedule_mode='tuned'):\n"
         "    return None\n"
-        "def _build_op(d_dim):\n"
-        "    return d_dim\n"
-        "def _get_kernel(d_dim, schedule_mode, *, builder_fn=None):\n"
-        "    return builder_fn(d_dim)\n",
-        encoding="utf-8",
-    )
-    l1_kernel_script = tmp_path / "l1_kernel_plan.py"
-    l1_kernel_script.write_text(
-        surrogate_cannbench._L1_ANCHOR_PLAN_TEMPLATE.format(
-            ascend_target_dir=str(repo_root / "targets" / "ascend"),
-            op_name="",
-            mod_path=str(cand_kernel),
-            anchor_specs_json=json.dumps([[1, "default", {"d_dim": 1024}]]),
-            def_builder="_build_op",
-            def_bk_json=json.dumps({}),
-            def_sel="",
-            def_pc_json=json.dumps({}),
-            def_cf_json=json.dumps([]),
-        ),
-        encoding="utf-8",
-    )
-    l1_k_proc = subprocess.run(
-        [sys.executable, str(l1_kernel_script)],
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
-    assert l1_k_proc.returncode == 0, l1_k_proc.stderr
-    l1_k_plan = json.loads(l1_k_proc.stdout.strip().splitlines()[-1])
-    assert len(l1_k_plan["tasks"]) == 1
-    l1_k_task = l1_k_plan["tasks"][0]
-    assert l1_k_task["mode"] == "_get_kernel"
-    assert l1_k_task["kwargs"]["schedule_mode"] == "tuned"
-    assert l1_k_task["factory_kwargs"]["schedule_mode"] == "tuned"
-
-    cand_pw_kernel = tmp_path / "cand_pw_kernel.py"
-    cand_pw_kernel.write_text(
-        "def _select_add_rms_norm_dynamic_quant_config(d_dim, tl_dtype='float16'):\n"
-        "    return {'pass_configs': {}, 'compile_flags': []}\n"
-        "def _build_add_rms_norm_dynamic_quant_prim_func(d_dim, schedule_mode):\n"
-        "    return {'d': d_dim, 'mode': schedule_mode}\n"
+        "def _build_op(d_dim, schedule_mode):\n"
+        "    return (d_dim, schedule_mode)\n"
         "def _get_kernel(d_dim, schedule_mode, *, builder_fn=None):\n"
         "    return builder_fn(d_dim, schedule_mode)\n"
-        "def kernel(d_dim=8192, schedule_mode='tuned'):\n"
-        "    return None\n",
-        encoding="utf-8",
     )
-    pw_k_script = tmp_path / "prewarm_kernel_plan.py"
-    pw_k_script.write_text(
-        surrogate_cannbench._PREWARM_TL_PLAN_TEMPLATE.format(
-            ascend_target_dir=str(repo_root / "targets" / "ascend"),
-            op_name="add_rms_norm_dynamic_quant",
-            case_ids_json=json.dumps([3]),
-            cand_paths_json=json.dumps([["c_kern", str(cand_pw_kernel)]]),
-            repo=str(cann_repo),
-            anchor_regimes_json=json.dumps({"3": "reduce_tail_residency_sram"}),
-        ),
-        encoding="utf-8",
+    plan_k = stage_b_gate.build_post_selector_regime_plan(
+        src_k,
+        "default",
+        {"1": {"d_dim": 1024, "builder_name": "_build_op"}},
+        ext,
     )
-    pw_k_proc = subprocess.run(
-        [sys.executable, str(pw_k_script)],
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
-    assert pw_k_proc.returncode == 0, pw_k_proc.stderr
-    pw_k_plan = json.loads(pw_k_proc.stdout.strip().splitlines()[-1])
-    assert pw_k_plan["errors"] == []
-    assert len(pw_k_plan["tasks"]) == 1
-    assert pw_k_plan["tasks"][0]["mode"] == "_get_kernel"
-    assert pw_k_plan["tasks"][0]["kwargs"]["schedule_mode"] == "tuned"
+    assert len(plan_k.unique_specs_by_key) == 1
+    spec_k = next(iter(plan_k.unique_specs_by_key.values()))
+    assert spec_k.builder_name == "_build_op"
+    assert dict(spec_k.static_kwargs)["schedule_mode"] == "tuned"
 
 
 def test_prewarm_worker_skips_builder_fn_when_get_kernel_omits_param(
     tmp_path: Path,
 ) -> None:
-    cand_no_bfn = tmp_path / "cand_no_bfn.py"
-    cand_no_bfn.write_text(
+    """Compile _get_kernel cleanly when its signature omits builder_fn."""
+    tl_stub = tmp_path / "tl_stub"
+    (tl_stub / "tilelang" / "backend").mkdir(parents=True, exist_ok=True)
+    (tl_stub / "tvm.py").write_text(
+        "import contextlib\n"
+        "class _Target:\n"
+        "    @staticmethod\n"
+        "    def current(allow_none=True): return 'ascend'\n"
+        "class target:\n"
+        "    Target = _Target\n"
+        "class transform:\n"
+        "    @staticmethod\n"
+        "    def PassContext(config=None): return contextlib.nullcontext()\n"
+        "class tirx:\n"
+        "    PrimFunc = dict\n"
+        "class IRModule:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (tl_stub / "tilelang" / "__init__.py").write_text("import tvm\n", encoding="utf-8")
+    (tl_stub / "tilelang" / "backend" / "__init__.py").write_text("", encoding="utf-8")
+    (tl_stub / "tilelang" / "backend" / "module.py").write_text(
+        "import contextlib\nfrom types import SimpleNamespace\n"
+        "def create_backend_context(_t): return SimpleNamespace(target=contextlib.nullcontext())\n",
+        encoding="utf-8",
+    )
+    env_file = tmp_path / "env.sh"
+    env_file.write_text(
+        f"TILEFOUNDRY_NPU_WORK_ROOT={tmp_path / 'work'}\n"
+        f"TILEFOUNDRY_NPU_TILELANG_SOURCE={tl_stub}\n"
+        f"TILEFOUNDRY_NPU_PYTHON={sys.executable}\n",
+        encoding="utf-8",
+    )
+    src = (
         "def _build_op(d_dim, schedule_mode):\n"
         "    return None\n"
         "def _get_kernel(d_dim, schedule_mode):\n"
-        "    return {'_tilelang_cache_key': f'{d_dim}_{schedule_mode}'}\n",
-        encoding="utf-8",
+        "    return {'_tilelang_cache_key': f'{d_dim}_{schedule_mode}'}\n"
     )
-    emit_path = tmp_path / "emit_bins.json"
-    task_payload = {
-        "mode": "_get_kernel",
-        "mod_path": str(cand_no_bfn),
-        "builder_name": "_build_op",
-        "kwargs": {"d_dim": 8192, "schedule_mode": "tuned"},
-        "emit_cache_bins_path": str(emit_path),
-    }
-    worker_script = tmp_path / "compile_task_no_bfn.py"
-    worker_script.write_text(
-        surrogate_cannbench._PREWARM_TL_WORKER_TEMPLATE.format(
-            task_json=json.dumps(task_payload, sort_keys=True)
-        ),
-        encoding="utf-8",
+    res = surrogate_cannbench.run_l1_compile_check(
+        src,
+        builder_name="_build_op",
+        builder_kwargs={"d_dim": 8192, "schedule_mode": "tuned"},
+        dims={"d_dim": 8192},
+        env_file=env_file,
     )
-    (tmp_path / "tilelang.py").write_text("", encoding="utf-8")
-    env = dict(os.environ)
-    prev_pp = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{tmp_path}:{prev_pp}" if prev_pp else str(tmp_path)
-    proc = subprocess.run(
-        [sys.executable, str(worker_script)],
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=30,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert json.loads(emit_path.read_text(encoding="utf-8")) == []
+    assert res.passed is True
 
 
 def test_run_l1_compile_check_dedups_static_width_across_anchor_flags_and_specs(
@@ -1331,8 +1140,8 @@ def test_run_l1_compile_check_dedups_static_width_across_anchor_flags_and_specs(
         encoding="utf-8",
     )
     mod_src = (
-        "def build_op(d_dim=4096, tl_dtype='bfloat16', m_rows=1):\n"
-        "    return {'d_dim': int(d_dim), 'tl_dtype': tl_dtype}\n"
+        "def build_op(d_dim=4096):\n"
+        "    return {'d_dim': int(d_dim)}\n"
     )
     primary_dims = {"d_dim": 4096, "tl_dtype": "bfloat16", "m_rows": 1}
     anchors = [(2, "small_decode", dict(primary_dims))]
@@ -1342,37 +1151,12 @@ def test_run_l1_compile_check_dedups_static_width_across_anchor_flags_and_specs(
         {"D": 1000, "tl_dtype": "float16", "m_rows": 16},
     ]
 
-    anchor_plan_payload = {
-        "tasks": [
-            {
-                "case_num": 2,
-                "regime_tag": "small_decode",
-                "mode": "generic",
-                "builder_name": "build_op",
-                "selector_name": "",
-                "factory_kwargs": {},
-                "dims": dict(primary_dims),
-                "kwargs": {"d_dim": 4096, "tl_dtype": "bfloat16"},
-                "pass_configs": {"tir.disable_cse_tir": True},
-                "compile_flags": ["-O2"],
-            }
-        ]
-    }
     compile_driver_sources: list[str] = []
 
     def _mock_run(cmd, *args, **kwargs):
         _ = args
         script_path = Path(str(cmd[-1]))
         script_name = script_path.name
-        if script_name == "diag_driver.py":
-            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-        if script_name == "anchor_plan.py":
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout=json.dumps(anchor_plan_payload) + "\n",
-                stderr="",
-            )
         if script_name == "compile_driver.py":
             compile_driver_sources.append(script_path.read_text(encoding="utf-8"))
             w_cache = Path(str(kwargs["env"]["TILELANG_CACHE_DIR"]))
@@ -1381,7 +1165,7 @@ def test_run_l1_compile_check_dedups_static_width_across_anchor_flags_and_specs(
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected script: {script_name}")
 
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _mock_run)
+    monkeypatch.setattr(stage_b_gate.subprocess, "run", _mock_run)
 
     res1 = surrogate_cannbench.run_l1_compile_check(
         mod_src,

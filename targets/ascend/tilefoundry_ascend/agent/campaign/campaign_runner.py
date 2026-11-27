@@ -76,17 +76,18 @@ from tilefoundry_ascend.agent.campaign.round_context_builder import (
     ChampionState, RoundContextBuilder, RoundSynthesisBundle, _format_anchor_telemetry,
 )
 from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import (
-    CandidateBatch, StageGateCoordinator, StageGateOutcome,
+    CandidateBatch, StageGateCoordinator, StageGateOutcome, run_l0_l1_round_filter,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     FAILURE_KIND_CANDIDATE, FAILURE_KIND_INFRASTRUCTURE, AnchorEvalMetrics,
     CandidateSurrogateResult, L0L1CandidateCheck, L2BatchResults, L3AcceptanceResult,
     L4CannbenchResult, OccupancyExhaustedError, aggregate_surrogate_result,
     bottleneck_anchor_for_regime, collect_bottleneck_msprof_via_agent_gates,
-    collect_p2_deep_dive_via_agent_gates, run_l0_l1_round_filter, run_l1_compile_check,
+    collect_p2_deep_dive_via_agent_gates,
     run_l3_full_contract_via_agent_gates, run_l4_official_cannbench_via_agent_gates,
     run_micro_probe_via_agent_gates, run_surrogate_batch_via_agent_gates,
 )
+from tilefoundry_ascend.agent.orchestrator.stage_b_gate import run_l1_compile_check
 from tilefoundry_ascend.agent.campaign.telemetry_ledger_writer import (
     TelemetryLedgerWriter, source_sha256,
 )
@@ -934,26 +935,6 @@ class PerfTargetCampaignRunner:
     def _lookup_case_dims_safe(self, case_num: int, regime_tag: str = "") -> dict[str, object]:
         self._sync_coordinators()
         return self._stage_gate_coordinator._lookup_case_dims_safe(case_num, regime_tag)
-
-    def _has_vf_stack_overflow(self, stage_b: StageBResult) -> bool:
-        return StageGateCoordinator._has_vf_stack_overflow(stage_b)
-
-    def _resolve_max_row_width_dims(self, regime_spec: RegimeTargetSpec) -> dict[str, object]:
-        self._sync_coordinators()
-        return self._stage_gate_coordinator._resolve_max_row_width_dims(regime_spec)
-
-    def _resolve_combine_gate_spec(
-        self,
-        module_source: str,
-        regime_spec: RegimeTargetSpec,
-        resolved: ResolvedRegimeConfig,
-    ) -> tuple[str, dict[str, object]] | None:
-        self._sync_coordinators()
-        return self._stage_gate_coordinator._resolve_combine_gate_spec(
-            module_source,
-            regime_spec,
-            resolved,
-        )
 
     def _compile_trackb_stage_b(
         self,

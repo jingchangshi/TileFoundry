@@ -4,67 +4,47 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import fcntl
-import hashlib
+import importlib.util
 import json
 import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from tilefoundry_ascend.agent.specs.latency_algebra import (
-    StaticDynamicResidual,
-    compute_static_dynamic_residual,
+from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (
+    StageBResult, _bounded_compile_diagnostic, _classify_stage_b_overflow_fault_code,
+    _detect_cann_include_dirs, _detect_tilelang_include_dir, _disassemble_object,
+    _filter_kwargs_for_callable, _inject_cann_cpath_env, _merge_dims_into_kwargs,
+    _merge_pass_configs_and_flags, _normalize_flag_list, _normalize_trackb_unit_source,
+    _parse_cce_res_usage_with_summary, _parse_objdump_pipe_counts, _resolve_artifact_store,
+    _resolve_bisheng_bin, _split_selector_output, _verify_object_has_instantiated_kernel,
+    ascend_compile_session, build_stage_b_driver_source,
+    compile_trackb_shared_so as _compile_trackb_shared_so_impl,
+    compute_trackb_shared_so_filename, has_unreserved_vf_stack_overflow, parse_cce_res_usage,
+    resolve_trackb_compile_flags, run_stage_b_ascendc_compile as _run_stage_b_ascendc_compile_impl,
+    run_stage_b_compile as _run_stage_b_compile_impl,
 )
+from tilefoundry_ascend.agent.specs.anchor_specs import build_anchor_var_bindings
+from tilefoundry_ascend.agent.specs.latency_algebra import StaticDynamicResidual, compute_static_dynamic_residual
 from tilefoundry_ascend.agent.specs.ops_registry import infer_module_runtime_backend
-from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
-    ArtifactStore,
-    collect_new_tl_cache_binaries,
-    compute_compile_task_key,
-    extract_reachable_closure_source,
-    is_verified_binary_file,
-    merge_tl_cache_tree,
-    resolve_unified_tl_cache_dir,
-    seed_tl_cache_tree,
-    snapshot_tl_cache_binaries,
-)
-from tilefoundry_ascend.ascend.compile_cache.cpp_closure import (
-    extract_reachable_trackb_source,
-    strip_cpp_comments_and_strings,
-)
-from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
-    BishengResourceSummary,
-    count_reachable_ub_scalar_compute_loops,
-    parse_bisheng_res_usage,
-)
-from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
-    MicroarchProfile,
-    extract_microarch_profile_from_cce,
-)
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import ArtifactStore
+from tilefoundry_ascend.ascend.compile_cache.cpp_closure import extract_reachable_trackb_source, strip_cpp_comments_and_strings
+from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary, count_reachable_ub_scalar_compute_loops
+from tilefoundry_ascend.ascend.cost_model.microarch_profile import MicroarchProfile, extract_microarch_profile_from_cce
 from tilefoundry_ascend.ascend.passes.observation_space import RooflineSummaryLike
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
-    ObjectivePhysicalLedger,
-    ScopeWaterline,
-    build_objective_physical_ledger,
-    build_scope_waterline,
+    ObjectivePhysicalLedger, ScopeWaterline, build_objective_physical_ledger, build_scope_waterline,
 )
-from tilefoundry_ascend.ascend.schedule.envelope_inspector import (
-    EnvelopeInspectionResult,
-    inspect_tilelang_primfunc,
-)
+from tilefoundry_ascend.ascend.schedule.envelope_inspector import EnvelopeInspectionResult, inspect_tilelang_primfunc
 from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
 from tilefoundry_ascend.ascend.sil.verifier import verify_tilelang_ast
-from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS, AscendTarget
-from tilefoundry_ascend.ascend.target.ast_semantic_gate import (
-    check_tilelang_semantic_contracts,
-)
+from tilefoundry_ascend.ascend.target import AscendTarget
+from tilefoundry_ascend.ascend.target.ast_semantic_gate import check_tilelang_semantic_contracts
 from tilefoundry_ascend.ascend.target.dialect_surface import CCE_CPP20_SURFACE
 
 
@@ -83,158 +63,6 @@ class StageAResult:
     fault_plane: str = ""
     fault_code: str = ""
     failed_tier: str = ""
-
-
-@dataclass(frozen=True)
-class StageBResult:
-    """Output of Stage B Conda bisheng compilation check."""
-
-    passed: bool
-    error_message: str = ""
-    elapsed_sec: float = 0.0
-    spill_bytes: int = 0
-    vloopv2_hit: bool = True
-    compiler_summary: BishengResourceSummary | None = None
-    microarch_profile: dict[str, object] | None = None
-    full_diagnostic: str = ""
-    generated_cce: str = ""
-    lowered_tir: str = ""
-    fault_plane: str = ""
-    fault_code: str = ""
-    failed_tier: str = ""
-    artifact_id: str = ""
-    binary_paths: tuple[str, ...] = ()
-
-
-def _resolve_artifact_store(artifact_store: ArtifactStore | None) -> ArtifactStore:
-    if artifact_store is not None:
-        return artifact_store
-    return ArtifactStore(resolve_unified_tl_cache_dir())
-
-
-def _classify_stage_b_overflow_fault_code(
-    combined_diag: str,
-    summary: BishengResourceSummary | None,
-    default_code: str,
-) -> str:
-    low = (combined_diag or "").lower()
-    if summary is not None and int(summary.stack_bytes) > 0:
-        return "VF_STACK_OVERFLOW"
-    if any(
-        tok in low
-        for tok in (
-            "exceeded vf stack size",
-            "vf_stack",
-            "vf stack",
-            "stack frame size",
-            "stack overflow",
-        )
-    ):
-        return "VF_STACK_OVERFLOW"
-    cap_tokens = ("overflow", "exceed", "capacity", "out of memory", "insufficient")
-    if any(
-        tok in low
-        for tok in (
-            "l0c_sram_overflow",
-            "l0c overflow",
-            "l0c_overflow",
-            "l0c capacity",
-            "exceeds l0c",
-            "exceeded l0c",
-        )
-    ) or (("l0c" in low or "__cc__" in low) and any(cap in low for cap in cap_tokens)):
-        return "L0C_SRAM_OVERFLOW"
-    if any(
-        tok in low
-        for tok in (
-            "l1_sram_overflow",
-            "l1 overflow",
-            "l1_overflow",
-            "cbuf overflow",
-            "l1 capacity",
-            "cbuf capacity",
-            "exceeds l1",
-            "exceeded l1",
-        )
-    ) or (
-        ("l1 " in low or "l1_" in low or "cbuf" in low or "__cbuf__" in low)
-        and any(cap in low for cap in cap_tokens)
-    ):
-        return "L1_SRAM_OVERFLOW"
-    if any(
-        tok in low
-        for tok in (
-            "ub_sram_overflow",
-            "ub_overflow",
-            "ubuf_overflow",
-            "ub overflow",
-            "ubuf overflow",
-            "ub capacity",
-            "ubuf capacity",
-            "exceeds ub",
-            "exceeded ub",
-            "exceeds ubuf",
-            "exceeded ubuf",
-        )
-    ) or (
-        ("ubuf" in low or "__ubuf__" in low or re.search(r"\bub\b", low) is not None)
-        and any(cap in low for cap in cap_tokens)
-    ):
-        return "UB_SRAM_OVERFLOW"
-    return default_code
-
-
-def _uses_unreserved_ubuf_flags(
-    compile_flags: Sequence[str] | str | None = None,
-    pass_configs: Mapping[str, object] | None = None,
-) -> bool:
-    flags = _normalize_flag_list(compile_flags)
-    if pass_configs and "tl.device_compile_flags" in pass_configs:
-        flags.extend(_normalize_flag_list(pass_configs["tl.device_compile_flags"]))
-    return any("--cce-disable-vf-stack-reserved-ubuf" in fl for fl in flags)
-
-
-def _has_vf_stack_overflow_signal(
-    combined_diag: str,
-    summary: BishengResourceSummary | None,
-    compile_flags: Sequence[str] | str | None = None,
-    pass_configs: Mapping[str, object] | None = None,
-) -> bool:
-    low = (combined_diag or "").lower()
-    if any(tok in low for tok in ("exceeded vf stack size", "vf_stack", "stack overflow")):
-        return True
-    if summary is not None and int(summary.stack_bytes) > 0:
-        return _uses_unreserved_ubuf_flags(compile_flags, pass_configs)
-    return False
-
-
-def _normalize_trackb_unit_source(cpp_source: str, *, regime_tag: str = "") -> str:
-    stripped = cpp_source.strip()
-    if not regime_tag or not stripped:
-        return stripped
-    masked = strip_cpp_comments_and_strings(stripped)
-    kernel_count = len(re.findall(r"\b__global__\b", masked))
-    if kernel_count > 1 and "<<<" not in masked:
-        _kname, extracted = extract_reachable_trackb_source(stripped, regime_tag=regime_tag)
-        return extracted.strip()
-    return stripped
-
-
-def _classify_ascendc_stage_a_fault(errors: Sequence[str]) -> tuple[str, str, str]:
-    joined = "; ".join(errors).lower()
-    if "cce_forbidden_tokens" in joined:
-        return "STAGE_A_STATIC", "CCE_FORBIDDEN_TOKENS", "stage_a"
-    if "max_overflow_bytes" in joined:
-        return "STAGE_A_STATIC", "UB_OVERFLOW", "stage_a"
-    if "missing_cube_engine_primitives" in joined:
-        return "STAGE_A_STATIC", "MISSING_CUBE_ENGINE", "stage_a"
-    if "missing_hardware_dma_staging" in joined:
-        return "STAGE_A_STATIC", "MISSING_HARDWARE_DMA", "stage_a"
-    if "degenerated_single_lane_simt" in joined:
-        return "STAGE_A_STATIC", "DEGENERATED_SINGLE_LANE_SIMT", "stage_a"
-    if "redline" in joined:
-        return "STAGE_A_STATIC", "CUSTOM_KERNEL_REDLINE", "stage_a"
-    return "STAGE_A_STATIC", "STAGE_A_ASCENDC_STATIC_FAILED", "stage_a"
 
 
 @dataclass(frozen=True)
@@ -263,416 +91,162 @@ class FunnelEvaluation:
     error_message: str = ""
 
 
-_HIR_TO_BUILDER_DIM_MAP: dict[str, str] = {
-    "N": "n_depth",
-    "B": "b_dim",
-    "S": "s_dim",
-    "S1": "s1_dim",
-    "S2": "s2_dim",
-    "S_kv": "s_kv",
-    "D": "d_dim",
-    "N_q": "n_q",
-    "N1": "n_q",
-    "N_kv": "n_kv",
-    "N2": "n_kv",
-    "G": "g_ratio",
-    "D_nope": "d_nope",
-    "D_rope": "d_rope",
-    "M": "m_dim",
-    "K": "k_dim",
-    "H": "num_heads",
-    "E": "num_experts",
-    "topK": "top_k",
-    "topk": "top_k",
-    "sparse_size": "top_k",
-    "T": "t_dim",
-}
-
-_PARAM_DIM_FALLBACK_ALIASES: dict[str, tuple[str, ...]] = {
-    "m": ("M", "m_dim", "m_rows"),
-    "m_dim": ("M", "m", "m_rows"),
-    "n": ("N", "n_dim", "n_depth"),
-    "n_dim": ("N", "n"),
-    "k": ("K", "k_dim"),
-    "k_dim": ("K", "k"),
-    "d": ("D", "d_dim", "hidden_dim"),
-    "d_dim": ("D", "d", "hidden_dim"),
-    "b": ("B", "b_dim", "batch"),
-    "b_dim": ("B", "b", "batch"),
-    "s": ("S", "s_dim", "seq_len"),
-    "s_dim": ("S", "s", "seq_len"),
-    "s1_dim": ("S1", "S", "s_dim"),
-    "s2_dim": ("S2", "S_kv", "s_kv"),
-    "n_q": ("N_q", "N1", "num_heads"),
-    "n_kv": ("N_kv", "N2"),
-    "top_k": ("topK", "topk", "sparse_size", "k_sparse"),
-    "t_dim": ("T", "S", "s_dim"),
-}
-
-
-def _normalize_flag_list(raw_flags: object) -> list[str]:
-    if raw_flags is None:
-        return []
-    if isinstance(raw_flags, str):
-        text = raw_flags.strip()
-        return text.split() if text else []
-    if isinstance(raw_flags, (tuple, list)) or (
-        hasattr(raw_flags, "__iter__") and not isinstance(raw_flags, (bytes, bytearray, Mapping))
-    ):
-        out: list[str] = []
-        for item in raw_flags:
-            val = str(getattr(item, "value", item)).strip()
-            if val and val not in out:
-                out.append(val)
-        return out
-    text = str(raw_flags).strip()
-    return [text] if text else []
-
-
-def resolve_trackb_compile_flags(
-    cpp_source: str,
-    selector_flags: Sequence[str] | str | None = None,
-) -> tuple[str, ...]:
-    """Resolve Track-B bisheng flags, stripping SIMD-VF UBUF flags on __simt_vf__."""
-    masked = strip_cpp_comments_and_strings(cpp_source)
-    has_simt_vf = bool(re.search(r"\b__simt_vf__\b", masked))
-    normalized = _normalize_flag_list(selector_flags)
-    if has_simt_vf:
-        simdvf_flags = frozenset(PURE_SIMDVF_UBUF_FLAGS)
-        return tuple(flag for flag in normalized if flag not in simdvf_flags)
-    flags = list(PURE_SIMDVF_UBUF_FLAGS)
-    for flag in normalized:
-        if flag not in flags:
-            flags.append(flag)
-    return tuple(flags)
-
-
-_FORBIDDEN_NPU_HOST_CALLS: frozenset[str] = frozenset(
-    {
-        "matmul",
-        "bmm",
-        "einsum",
-        "rms_norm",
-        "softmax",
-        "silu",
-        "layer_norm",
-        "scaled_dot_product_attention",
-    }
-)
-_CTYPES_LIB_RECEIVERS: frozenset[str] = frozenset(
-    {"lib", "_lib", "so_lib", "dll", "cdll", "handle"}
-)
-_POLLUTED_FLOAT_KEY_NAMES: frozenset[str] = frozenset(
-    {
-        "eps",
-        "epsilon",
-        "scale",
-        "softmax_scale",
-        "sm_scale",
-        "alpha",
-        "beta",
-        "dropout_p",
-        "inv_scale",
-        "temperature",
-    }
-)
-_POLLUTED_ADDR_ATTRS: frozenset[str] = frozenset({"data_ptr", "storage_offset"})
-_TRACKA_CORE_PRIMITIVES: frozenset[str] = frozenset(
-    {"SimdVF", "SimtVF", "gemm", "gemm_v0", "ascend_mmad", "ascend_gemm", "ascend_vec"}
-)
-_TRACKB_MONOTONICITY_BACKENDS: frozenset[str] = frozenset(
-    {"ascendc_trackb", "hybrid_trackb", "cce_trackb", "ascendc"}
-)
-_TRACKB_CORE_TOKENS: tuple[str, ...] = (
-    "simd_inst::",
-    "asc_mmad",
-    "ascend_gemm_l1",
-    "__simd_vf__",
-    "__simt_vf__",
-)
-
-
-def _is_non_npu_guard(cond_txt: str) -> bool:
-    compact = cond_txt.replace(" ", "")
-    if "device.type" in cond_txt and (
-        "!=" in cond_txt or '=="cpu"' in compact or "=='cpu'" in compact
-    ):
-        return True
-    return "is_npu" in cond_txt and (
-        "not " in cond_txt or "==False" in compact or "isFalse" in compact
+def _stage_a_fail(
+    t0: float, error_message: str, fault_code: str, *, backend_kind: str = "tilelang",
+    prim_func: object | None = None, ledger: ObjectivePhysicalLedger | None = None,
+    features: dict[str, object] | None = None, route: object | None = None,
+) -> StageAResult:
+    return StageAResult(
+        passed=False, prim_func=prim_func, ledger=ledger, features=features, route=route,
+        error_message=error_message, elapsed_ms=(time.monotonic() - t0) * 1000.0,
+        backend_kind=backend_kind, fault_plane="STAGE_A_STATIC", fault_code=fault_code, failed_tier="stage_a",
     )
 
 
-def _is_npu_positive_guard(cond_txt: str) -> bool:
-    compact = cond_txt.replace(" ", "")
-    if "device.type" in cond_txt and ('=="npu"' in compact or "=='npu'" in compact):
-        return True
-    return "is_npu" in cond_txt and not _is_non_npu_guard(cond_txt)
+def _ascend_target_context() -> contextlib.AbstractContextManager[None]:
+    return ascend_compile_session("ascend")
 
 
-def _collect_npu_reachable_nodes(
-    module_source: str,
-    stmts: Sequence[ast.stmt],
-) -> list[ast.AST]:
-    """Return AST nodes on reachable NPU execution paths, skipping non-NPU fallback branches."""
-    collected: list[ast.AST] = []
-    for stmt in stmts:
-        if isinstance(stmt, ast.If):
-            cond_txt = ast.get_source_segment(module_source, stmt.test) or ""
-            collected.append(stmt.test)
-            if _is_non_npu_guard(cond_txt):
-                collected.extend(_collect_npu_reachable_nodes(module_source, stmt.orelse))
-                continue
-            if _is_npu_positive_guard(cond_txt):
-                collected.extend(_collect_npu_reachable_nodes(module_source, stmt.body))
-                continue
-            collected.extend(_collect_npu_reachable_nodes(module_source, stmt.body))
-            collected.extend(_collect_npu_reachable_nodes(module_source, stmt.orelse))
-            continue
-        collected.append(stmt)
-    return collected
+def compile_trackb_shared_so(cpp_source: str, **kwargs: object) -> tuple[bool, Path | None, str]:
+    """Compile a Track-B C++20 TU into a content-addressed cached .so via bisheng."""
+    fn: Callable[..., tuple[bool, Path | None, str]] = _compile_trackb_shared_so_impl
+    return fn(cpp_source, subproc_run=subprocess.run, **kwargs)
+
+
+def run_stage_b_compile(dsl_source: str, **kwargs: object) -> StageBResult:
+    """Verify full TileLang + bisheng device compilation in an isolated subprocess."""
+    fn: Callable[..., StageBResult] = _run_stage_b_compile_impl
+    return fn(dsl_source, subproc_run=subprocess.run, **kwargs)
+
+
+def run_stage_b_ascendc_compile(cpp_source: str, **kwargs: object) -> StageBResult:
+    """Verify dav-3510 C++20 translation unit compilation via bisheng in an isolated tempdir."""
+    fn: Callable[..., StageBResult] = _run_stage_b_ascendc_compile_impl
+    return fn(
+        cpp_source,
+        subproc_run=subprocess.run,
+        disassembly_profile_fn=_merge_disassembly_microarch_profile,
+        bisheng_resolver=_resolve_bisheng_bin,
+        verify_instantiated_fn=_verify_object_has_instantiated_kernel,
+        disassemble_fn=_disassemble_object,
+        **kwargs,
+    )
+
+
+_ASCENDC_FAULT_TOKENS: tuple[tuple[str, str], ...] = (
+    ("cce_forbidden_tokens", "CCE_FORBIDDEN_TOKENS"), ("max_overflow_bytes", "UB_OVERFLOW"),
+    ("missing_cube_engine_primitives", "MISSING_CUBE_ENGINE"), ("missing_hardware_dma_staging", "MISSING_HARDWARE_DMA"),
+    ("degenerated_single_lane_simt", "DEGENERATED_SINGLE_LANE_SIMT"), ("redline", "CUSTOM_KERNEL_REDLINE"),
+)
+_FORBIDDEN_NPU_HOST_CALLS = frozenset({"matmul", "bmm", "einsum", "rms_norm", "softmax", "silu", "layer_norm", "scaled_dot_product_attention"})
+_CTYPES_LIB_RECEIVERS = frozenset({"lib", "_lib", "so_lib", "dll", "cdll", "handle"})
+_POLLUTED_FLOAT_KEYS = frozenset({"eps", "epsilon", "scale", "softmax_scale", "sm_scale", "alpha", "beta", "dropout_p", "inv_scale", "temperature"})
+_TRACKA_CORE_PRIMS = frozenset({"SimdVF", "SimtVF", "gemm", "gemm_v0", "ascend_mmad", "ascend_gemm", "ascend_vec"})
+_TRACKB_MONOTONICITY_BACKENDS = frozenset({"ascendc_trackb", "hybrid_trackb", "cce_trackb", "ascendc"})
+_TRACKB_CORE_TOKENS = ("simd_inst::", "asc_mmad", "ascend_gemm_l1", "__simd_vf__", "__simt_vf__")
+_SIMDVF_LOCAL_ARRAY_RE = re.compile(r"\b(?:float|half|bfloat16_t|u?int(?:8|16|32|64)_t|bool)\s+[A-Za-z_]\w*\s*\[[^\]]+\]")
+_ALIGNED_COPY_ARITIES = {
+    "asc_copy_gm2ub_align": ((3, 8, 10), "invalid_asc_copy_align_arity: expected 3/8/10 args for gm2ub_align"),
+    "asc_copy_ub2gm_align": ((3, 7, 8), "invalid_asc_copy_align_arity: expected 3/7/8 args for ub2gm_align"),
+}
+_GM_PTR_DECL_RE = re.compile(r"\b__gm__\s+(?:const\s+|volatile\s+)*[A-Za-z_]\w*(?:\s*\*+\s*(?:__restrict__\s+|restrict\s+|const\s+|volatile\s+)*|\s+)([A-Za-z_]\w*)")
+_GM_ALIAS_RE = re.compile(r"\b__gm__\s+(?:const\s+|volatile\s+)*[A-Za-z_]\w*\s*\*+\s*(?:__restrict__\s+|restrict\s+)?([A-Za-z_]\w*)\s*=\s*([^;]+);")
+_AUTO_ALIAS_RE = re.compile(r"\bauto\s*\*?\s*([A-Za-z_]\w*)\s*=\s*([^;]+);")
+_CPP_DTYPE_BYTES: dict[str, int] = {
+    "uint8_t": 1, "int8_t": 1, "char": 1, "int8": 1, "uint8": 1, "fp8": 1, "fp8_t": 1,
+    "half": 2, "__bf16": 2, "bfloat16_t": 2, "bfloat16": 2, "float16_t": 2, "uint16_t": 2, "int16_t": 2,
+    "float": 4, "int": 4, "int32_t": 4, "uint32_t": 4, "double": 8, "int64_t": 8, "uint64_t": 8,
+}
+_CPP_CAST_RE = re.compile(r"\(\s*(?:u?int(?:8|16|32|64)_t|size_t|unsigned(?:\s+(?:int|long|short))?|int|long|short|float|double|half|__bf16|bfloat16_t|bfloat16)\s*\)")
+_LAUNCH_BLOCK_DIM_RE = re.compile(r"<<<\s*([^,<>]+?)\s*(?:,|>>>)")
+_UB_STRIDED_ACCESS_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\+\s*(?:\(\s*[A-Za-z_]\w*\s*\)\s*)?[A-Za-z_]\w*\s*\*\s*([A-Za-z_]\w*|\d+)\b")
+_TRANSFER_ROUTES = ("gm_to_l1", "gm_to_ub", "l1_to_l0a", "l1_to_l0b", "l0c_to_ub", "l0c_to_l1", "l0c_to_gm", "ub_to_gm", "ub_to_l1")
+_TRANSFER_CALL_SPECS = {
+    "gm_to_l1": ("asc_copy_gm2l1", 4, 5, "elem"), "gm_to_ub": ("asc_copy_gm2ub", 2, 3, "bytes"),
+    "l1_to_l0a": ("asc_copy_l12l0a", 4, 5, "elem"), "l1_to_l0b": ("asc_copy_l12l0b", 4, 5, "elem"),
+    "l0c_to_ub": ("asc_copy_l0c2ub", 3, 2, "float"), "l0c_to_l1": ("asc_copy_l0c2l1", 3, 2, "float"),
+    "l0c_to_gm": ("asc_copy_l0c2gm", 3, 2, "float"), "ub_to_gm": ("asc_copy_ub2gm", 2, 3, "bytes"),
+}
+
+
+def _collect_npu_reachable_nodes(module_source: str, stmts: Sequence[ast.stmt]) -> list[ast.AST]:
+    out: list[ast.AST] = []
+    for st in stmts:
+        if isinstance(st, ast.If):
+            ct = ast.get_source_segment(module_source, st.test) or ""
+            cm = ct.replace(" ", "")
+            non_npu = ("device.type" in ct and ("!=" in ct or '=="cpu"' in cm or "=='cpu'" in cm)) or ("is_npu" in ct and ("not " in ct or "==False" in cm or "isFalse" in cm))
+            pos_npu = ("device.type" in ct and ('=="npu"' in cm or "=='npu'" in cm)) or ("is_npu" in ct and not non_npu)
+            out.append(st.test)
+            out.extend(_collect_npu_reachable_nodes(module_source, st.orelse) if non_npu else (_collect_npu_reachable_nodes(module_source, st.body) if pos_npu else [*_collect_npu_reachable_nodes(module_source, st.body), *_collect_npu_reachable_nodes(module_source, st.orelse)]))
+        else:
+            out.append(st)
+    return out
 
 
 def _detect_module_entrypoint(tree: ast.Module) -> str:
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for tgt in node.targets:
-                if (
-                    isinstance(tgt, ast.Name)
-                    and tgt.id == "kernel"
-                    and isinstance(node.value, ast.Name)
-                ):
-                    return node.value.id
-    return ""
+    return next((n.value.id for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Name) for t in n.targets if isinstance(t, ast.Name) and t.id == "kernel"), "")
 
 
-def _has_module_kernel_cache(tree: ast.Module) -> bool:
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and node.value is not None:
-            if any(isinstance(t, ast.Name) and t.id == "_KERNEL_CACHE" for t in node.targets):
-                return True
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            if isinstance(node.target, ast.Name) and node.target.id == "_KERNEL_CACHE":
-                return True
-    return False
-
-
-def _collect_local_var_assigns(fnode: ast.FunctionDef) -> dict[str, list[ast.expr]]:
-    assigns: dict[str, list[ast.expr]] = {}
-    for sub in ast.walk(fnode):
-        if isinstance(sub, ast.Assign) and sub.value is not None:
-            for tgt in sub.targets:
-                if isinstance(tgt, ast.Name):
-                    assigns.setdefault(tgt.id, []).append(sub.value)
-        elif isinstance(sub, ast.AnnAssign) and sub.value is not None:
-            if isinstance(sub.target, ast.Name):
-                assigns.setdefault(sub.target.id, []).append(sub.value)
-    return assigns
-
-
-def _extract_kernel_cache_key_exprs(fnode: ast.FunctionDef) -> list[ast.expr]:
-    exprs: list[ast.expr] = []
-    for sub in ast.walk(fnode):
-        if (
-            isinstance(sub, ast.Subscript)
-            and isinstance(sub.value, ast.Name)
-            and sub.value.id == "_KERNEL_CACHE"
-        ):
-            exprs.append(sub.slice)
-        elif (
-            isinstance(sub, ast.Call)
-            and isinstance(sub.func, ast.Attribute)
-            and isinstance(sub.func.value, ast.Name)
-            and sub.func.value.id == "_KERNEL_CACHE"
-            and sub.func.attr in ("get", "setdefault", "pop")
-        ):
-            if sub.args:
-                exprs.append(sub.args[0])
-            else:
-                for kw in sub.keywords:
-                    if kw.arg == "key":
-                        exprs.append(kw.value)
-        elif isinstance(sub, ast.Compare):
-            for op, comp in zip(sub.ops, sub.comparators):
-                if (
-                    isinstance(op, (ast.In, ast.NotIn))
-                    and isinstance(comp, ast.Name)
-                    and comp.id == "_KERNEL_CACHE"
-                ):
-                    exprs.append(sub.left)
-    return exprs
-
-
-def _find_polluted_cache_key_reason(
-    expr: ast.expr,
-    local_assigns: Mapping[str, list[ast.expr]],
-    seen_vars: frozenset[str] = frozenset(),
-) -> str | None:
+def _find_polluted_cache_key_reason(expr: ast.expr, local_assigns: Mapping[str, list[ast.expr]], seen: frozenset[str] = frozenset()) -> str | None:
     for node in ast.walk(expr):
         if isinstance(node, ast.Constant) and isinstance(node.value, float):
             return f"float_literal({node.value!r})"
         if isinstance(node, ast.Name):
-            if node.id.lower() in _POLLUTED_FLOAT_KEY_NAMES:
+            if node.id.lower() in _POLLUTED_FLOAT_KEYS:
                 return f"float_param({node.id})"
-            if node.id in local_assigns and node.id not in seen_vars:
-                next_seen = seen_vars | {node.id}
+            if node.id in local_assigns and node.id not in seen:
                 for rhs in local_assigns[node.id]:
-                    nested = _find_polluted_cache_key_reason(rhs, local_assigns, next_seen)
-                    if nested is not None:
-                        return nested
-        elif isinstance(node, ast.Attribute):
-            if node.attr.lower() in _POLLUTED_FLOAT_KEY_NAMES:
-                return f"float_attr({node.attr})"
-        elif isinstance(node, ast.Subscript):
-            slc = node.slice
-            if (
-                isinstance(slc, ast.Constant)
-                and isinstance(slc.value, str)
-                and slc.value.lower() in _POLLUTED_FLOAT_KEY_NAMES
-            ):
-                return f"float_key({slc.value!r})"
+                    if (res := _find_polluted_cache_key_reason(rhs, local_assigns, seen | {node.id})) is not None:
+                        return res
+        elif isinstance(node, ast.Attribute) and node.attr.lower() in _POLLUTED_FLOAT_KEYS:
+            return f"float_attr({node.attr})"
+        elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str) and node.slice.value.lower() in _POLLUTED_FLOAT_KEYS:
+            return f"float_key({node.slice.value!r})"
         elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name):
-                if node.func.id == "float":
-                    return "float_cast(float(...))"
-                if node.func.id == "id":
-                    return "object_identity(id(...))"
-                if node.func.id == "addressof":
-                    return "pointer_address(addressof(...))"
-            elif isinstance(node.func, ast.Attribute):
-                if node.func.attr in _POLLUTED_ADDR_ATTRS:
+            if isinstance(node.func, ast.Name) and node.func.id in ("float", "id", "addressof"):
+                return {"float": "float_cast(float(...))", "id": "object_identity(id(...))", "addressof": "pointer_address(addressof(...))"}[node.func.id]
+            if isinstance(node.func, ast.Attribute):
+                if node.func.attr in ("data_ptr", "storage_offset"):
                     return f"pointer_attr(.{node.func.attr}())"
                 if node.func.attr == "addressof":
                     return "pointer_address(ctypes.addressof(...))"
     return None
 
 
-def _check_kernel_cache_key_pollution(
-    funcs: Mapping[str, ast.FunctionDef],
-    cache_fns: set[str],
-) -> list[str]:
-    """Reject float hyperparameters or runtime pointer/id values in _KERNEL_CACHE keys."""
-    errors: list[str] = []
-    for fname in sorted(cache_fns):
-        if fname not in funcs:
-            continue
-        fnode = funcs[fname]
-        local_assigns = _collect_local_var_assigns(fnode)
-        for key_expr in _extract_kernel_cache_key_exprs(fnode):
-            reason = _find_polluted_cache_key_reason(key_expr, local_assigns)
-            if reason is None:
-                continue
-            msg = (
-                f"polluted_kernel_cache_key: {fname} key uses {reason} "
-                "(pass float hyperparameters as T.float32 scalar kernel params "
-                "and dynamic outer axes via T.dynamic)"
-            )
-            if msg not in errors:
-                errors.append(msg)
-    return errors
-
-
-def _has_tracka_core_primitives(tree: ast.AST) -> bool:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute):
-            val = node.value
-            if (
-                isinstance(val, ast.Name)
-                and val.id == "T"
-                and node.attr in _TRACKA_CORE_PRIMITIVES
-            ):
-                return True
-            if (
-                isinstance(val, ast.Attribute)
-                and isinstance(val.value, ast.Name)
-                and val.value.id == "T"
-                and val.attr == "simd"
-            ):
-                return True
-    return False
-
-
-def _extract_tracka_pipelined_stages(tree: ast.AST) -> list[int | None]:
-    stages: list[int | None] = []
-    for node in ast.walk(tree):
-        if not _is_t_dsl_call(node, "Pipelined"):
-            continue
-        assert isinstance(node, ast.Call)
-        stage_expr: ast.expr | None = None
-        for kw in node.keywords:
-            if kw.arg == "num_stages":
-                stage_expr = kw.value
-                break
-        if stage_expr is None and len(node.args) >= 3:
-            stage_expr = node.args[2]
-        if stage_expr is None:
-            stages.append(0)
-        elif (
-            isinstance(stage_expr, ast.Constant)
-            and isinstance(stage_expr.value, int)
-            and not isinstance(stage_expr.value, bool)
-        ):
-            stages.append(int(stage_expr.value))
-        else:
-            stages.append(None)
-    return stages
-
-
-def check_repair_monotonicity(
-    parent_source: str,
-    repaired_source: str,
-    *,
-    backend_kind: str = "tilelang_dsl",
-) -> list[str]:
+def check_repair_monotonicity(parent_source: str, repaired_source: str, *, backend_kind: str = "tilelang_dsl") -> list[str]:
     """Reject repairs that regress vector/cube primitives or drop T.Pipelined stages."""
     if backend_kind in _TRACKB_MONOTONICITY_BACKENDS:
-        masked_parent = strip_cpp_comments_and_strings(parent_source)
-        masked_repaired = strip_cpp_comments_and_strings(repaired_source)
-        had_core = any(tok in masked_parent for tok in _TRACKB_CORE_TOKENS)
-        has_core = any(tok in masked_repaired for tok in _TRACKB_CORE_TOKENS)
-        if had_core and not has_core:
-            return [
-                "monotonicity_regression_trackb_scalar_fallback: repair dropped all "
-                "Track-B vector/cube primitives"
-            ]
+        if any(t in strip_cpp_comments_and_strings(parent_source) for t in _TRACKB_CORE_TOKENS) and not any(t in strip_cpp_comments_and_strings(repaired_source) for t in _TRACKB_CORE_TOKENS):
+            return ["monotonicity_regression_trackb_scalar_fallback: repair dropped all Track-B vector/cube primitives"]
         return []
-
     try:
-        parent_tree = ast.parse(parent_source)
+        ptree = ast.parse(parent_source)
     except SyntaxError:
         return []
     try:
-        repaired_tree = ast.parse(repaired_source)
+        rtree = ast.parse(repaired_source)
     except SyntaxError as exc:
         return [f"syntax_error:{exc}"]
-
-    errors: list[str] = []
-    if _has_tracka_core_primitives(parent_tree) and not _has_tracka_core_primitives(repaired_tree):
-        errors.append(
-            "monotonicity_regression_scalar_fallback: repair dropped all "
-            "vector/matrix core primitives (T.SimdVF/T.SimtVF/T.gemm/T.simd.*)"
-        )
-    parent_stages = _extract_tracka_pipelined_stages(parent_tree)
-    if any(s is not None and s >= 1 for s in parent_stages):
-        repaired_stages = _extract_tracka_pipelined_stages(repaired_tree)
-        if not repaired_stages:
-            errors.append(
-                "monotonicity_regression_pipeline_dropped: repair removed T.Pipelined"
-            )
-        elif all(s == 0 for s in repaired_stages):
-            errors.append(
-                "monotonicity_regression_pipeline_disabled: repair set T.Pipelined num_stages=0"
-            )
+    has_core = lambda t: any(isinstance(n, ast.Attribute) and ((isinstance(n.value, ast.Name) and n.value.id == "T" and n.attr in _TRACKA_CORE_PRIMS) or (isinstance(n.value, ast.Attribute) and isinstance(n.value.value, ast.Name) and n.value.value.id == "T" and n.value.attr == "simd")) for n in ast.walk(t))
+    def _stages(t: ast.AST) -> list[int | None]:
+        out: list[int | None] = []
+        for n in ast.walk(t):
+            if isinstance(n, ast.Call) and _is_t_dsl_call(n, "Pipelined"):
+                se = next((kw.value for kw in n.keywords if kw.arg == "num_stages"), n.args[2] if len(n.args) >= 3 else None)
+                out.append(0 if se is None else (int(se.value) if isinstance(se, ast.Constant) and isinstance(se.value, int) and not isinstance(se.value, bool) else None))
+        return out
+    errors = ["monotonicity_regression_scalar_fallback: repair dropped all vector/matrix core primitives (T.SimdVF/T.SimtVF/T.gemm/T.simd.*)"] if (has_core(ptree) and not has_core(rtree)) else []
+    if any(s is not None and s >= 1 for s in _stages(ptree)):
+        rs = _stages(rtree)
+        if not rs:
+            errors.append("monotonicity_regression_pipeline_dropped: repair removed T.Pipelined")
+        elif all(s == 0 for s in rs):
+            errors.append("monotonicity_regression_pipeline_disabled: repair set T.Pipelined num_stages=0")
     return errors
 
 
-def check_npu_entrypoint_purity(
-    module_source: str,
-    entrypoint: str,
-    *,
-    track: str | None = None,
-    require_kernel_cache: bool = False,
-) -> list[str]:
+def check_npu_entrypoint_purity(module_source: str, entrypoint: str, *, track: str | None = None, require_kernel_cache: bool = False) -> list[str]:
     """Reject detached decoy @T.prim_func scaffolds and NPU-side PyTorch/golden fallbacks."""
     try:
         tree = ast.parse(module_source)
@@ -681,2880 +255,921 @@ def check_npu_entrypoint_purity(
     funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
     if entrypoint not in funcs:
         return []
-
     errors: list[str] = []
-    backend, _tb_syms = infer_module_runtime_backend(module_source, entrypoint)
-    reachable_src: list[str] = []
-    visited: set[str] = set()
-    cache_loaded = False
-    cache_stored = False
-    queue = [entrypoint]
+    backend, _ = infer_module_runtime_backend(module_source, entrypoint)
+    r_src, visited, cache_load, cache_store, queue = [], set(), False, False, [entrypoint]
     while queue:
-        fn_name = queue.pop(0)
-        if fn_name in visited or fn_name not in funcs:
+        if (fn := queue.pop(0)) in visited or fn not in funcs:
             continue
-        visited.add(fn_name)
-        fnode = funcs[fn_name]
-        reachable_src.append(ast.get_source_segment(module_source, fnode) or "")
+        visited.add(fn)
+        r_src.append(ast.get_source_segment(module_source, fnode := funcs[fn]) or "")
         for node in _collect_npu_reachable_nodes(module_source, fnode.body):
             for sub in ast.walk(node):
-                if isinstance(sub, ast.Name) and sub.id == "_KERNEL_CACHE":
-                    if isinstance(sub.ctx, ast.Load):
-                        cache_loaded = True
-                elif (
-                    isinstance(sub, ast.Subscript)
-                    and isinstance(sub.ctx, ast.Store)
-                    and isinstance(sub.value, ast.Name)
-                    and sub.value.id == "_KERNEL_CACHE"
-                ):
-                    cache_stored = True
+                if isinstance(sub, ast.Name) and sub.id == "_KERNEL_CACHE" and isinstance(sub.ctx, ast.Load):
+                    cache_load = True
+                elif isinstance(sub, ast.Subscript) and isinstance(sub.ctx, ast.Store) and isinstance(sub.value, ast.Name) and sub.value.id == "_KERNEL_CACHE":
+                    cache_store = True
                 if isinstance(sub, ast.Call):
-                    if (
-                        isinstance(sub.func, ast.Attribute)
-                        and isinstance(sub.func.value, ast.Name)
-                        and sub.func.value.id == "_KERNEL_CACHE"
-                        and sub.func.attr in ("setdefault", "update")
-                    ):
-                        cache_stored = True
-                    callee = (
-                        sub.func.id
-                        if isinstance(sub.func, ast.Name)
-                        else (sub.func.attr if isinstance(sub.func, ast.Attribute) else "")
-                    )
-                    is_local_fn = isinstance(sub.func, ast.Name) and sub.func.id in funcs
-                    is_ctypes_lib = (
-                        isinstance(sub.func, ast.Attribute)
-                        and isinstance(sub.func.value, ast.Name)
-                        and sub.func.value.id.lower() in _CTYPES_LIB_RECEIVERS
-                    )
-                    if (
-                        callee in _FORBIDDEN_NPU_HOST_CALLS
-                        and not is_local_fn
-                        and not is_ctypes_lib
-                    ):
-                        errors.append(f"npu_host_fallback_forbidden:{fn_name}->{callee}")
-                    if is_local_fn:
+                    if isinstance(sub.func, ast.Attribute) and isinstance(sub.func.value, ast.Name) and sub.func.value.id == "_KERNEL_CACHE" and sub.func.attr in ("setdefault", "update"):
+                        cache_store = True
+                    callee = sub.func.id if isinstance(sub.func, ast.Name) else (sub.func.attr if isinstance(sub.func, ast.Attribute) else "")
+                    is_loc = isinstance(sub.func, ast.Name) and sub.func.id in funcs
+                    is_ct = isinstance(sub.func, ast.Attribute) and isinstance(sub.func.value, ast.Name) and sub.func.value.id.lower() in _CTYPES_LIB_RECEIVERS
+                    if callee in _FORBIDDEN_NPU_HOST_CALLS and not is_loc and not is_ct:
+                        errors.append(f"npu_host_fallback_forbidden:{fn}->{callee}")
+                    if is_loc:
                         assert isinstance(sub.func, ast.Name)
                         queue.append(sub.func.id)
-                elif (
-                    isinstance(sub, ast.Name)
-                    and isinstance(sub.ctx, ast.Load)
-                    and sub.id in funcs
-                ):
+                elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in funcs:
                     queue.append(sub.id)
-
-    for fname, fnode in funcs.items():
-        seg = ast.get_source_segment(module_source, fnode) or ""
-        if "@T.prim_func" in seg and fname not in visited:
-            errors.append(
-                f"unreachable_decoy_primfunc:{fname} is never reachable from {entrypoint}"
-            )
-    reachable_text = "\n".join(reachable_src)
+    for fn, fnode in funcs.items():
+        if "@T.prim_func" in (ast.get_source_segment(module_source, fnode) or "") and fn not in visited:
+            errors.append(f"unreachable_decoy_primfunc:{fn} is never reachable from {entrypoint}")
+    r_txt = "\n".join(r_src)
     if track in ("cce_trackb", "ascendc_trackb", "hybrid_trackb"):
-        has_trackb_dispatch = (
-            backend != "tilelang_dsl"
-            or "compile_ascend" in reachable_text
-            or "ctypes.CDLL" in reachable_text
-            or "_render_trackb_tu" in reachable_text
-            or "_get_track_b_lib" in reachable_text
-            or "tilelang.compile(" in reachable_text
-        )
-        if not has_trackb_dispatch:
-            errors.append(
-                f"missing_trackb_dispatch:{entrypoint} exposes no reachable Track-B C++20 "
-                "translation unit or compile_ascend dispatch"
-            )
-    elif backend == "tilelang_dsl" and "tilelang.compile(" not in reachable_text:
-        errors.append(
-            f"detached_decoy_primfunc:{entrypoint} never invokes tilelang.compile"
-        )
-    has_cache_dict = _has_module_kernel_cache(tree)
-    if require_kernel_cache or has_cache_dict or cache_loaded or cache_stored:
-        cache_fns = {
-            fname
-            for fname, fnode in funcs.items()
-            if fname in visited
-            or fname in ("_get_kernel", "_get_track_b_lib")
-            or any(
-                tok in (ast.get_source_segment(module_source, fnode) or "")
-                for tok in ("tilelang.compile", "compile_ascend", "ctypes.CDLL")
-            )
+        if backend == "tilelang_dsl" and not any(t in r_txt for t in ("compile_ascend", "ctypes.CDLL", "_render_trackb_tu", "_get_track_b_lib", "tilelang.compile(")):
+            errors.append(f"missing_trackb_dispatch:{entrypoint} exposes no reachable Track-B C++20 translation unit or compile_ascend dispatch")
+    elif backend == "tilelang_dsl" and "tilelang.compile(" not in r_txt:
+        errors.append(f"detached_decoy_primfunc:{entrypoint} never invokes tilelang.compile")
+
+    has_cd = any(
+        (isinstance(n, ast.Assign) and n.value is not None and any(isinstance(t, ast.Name) and t.id == "_KERNEL_CACHE" for t in n.targets))
+        or (isinstance(n, ast.AnnAssign) and n.value is not None and isinstance(n.target, ast.Name) and n.target.id == "_KERNEL_CACHE")
+        for n in tree.body
+    )
+    if require_kernel_cache or has_cd or cache_load or cache_store:
+        cfns = {
+            fn for fn, fnode in funcs.items()
+            if fn in visited or fn in ("_get_kernel", "_get_track_b_lib")
+            or any(t in (ast.get_source_segment(module_source, fnode) or "") for t in ("tilelang.compile", "compile_ascend", "ctypes.CDLL"))
         }
-        errors.extend(_check_kernel_cache_key_pollution(funcs, cache_fns))
+        for fn in sorted(cfns):
+            if fn not in funcs:
+                continue
+            fnode = funcs[fn]
+            loc_a: dict[str, list[ast.expr]] = {}
+            for s in ast.walk(fnode):
+                if isinstance(s, ast.Assign) and s.value is not None:
+                    for t in s.targets:
+                        if isinstance(t, ast.Name):
+                            loc_a.setdefault(t.id, []).append(s.value)
+                elif isinstance(s, ast.AnnAssign) and s.value is not None and isinstance(s.target, ast.Name):
+                    loc_a.setdefault(s.target.id, []).append(s.value)
+            kexprs: list[ast.expr] = []
+            for s in ast.walk(fnode):
+                if isinstance(s, ast.Subscript) and isinstance(s.value, ast.Name) and s.value.id == "_KERNEL_CACHE":
+                    kexprs.append(s.slice)
+                elif isinstance(s, ast.Call) and isinstance(s.func, ast.Attribute) and isinstance(s.func.value, ast.Name) and s.func.value.id == "_KERNEL_CACHE" and s.func.attr in ("get", "setdefault", "pop"):
+                    kexprs.extend([s.args[0]] if s.args else [kw.value for kw in s.keywords if kw.arg == "key"])
+                elif isinstance(s, ast.Compare):
+                    kexprs.extend([s.left for op, comp in zip(s.ops, s.comparators) if isinstance(op, (ast.In, ast.NotIn)) and isinstance(comp, ast.Name) and comp.id == "_KERNEL_CACHE"])
+            for ke in kexprs:
+                if (rsn := _find_polluted_cache_key_reason(ke, loc_a)) is not None:
+                    msg = f"polluted_kernel_cache_key: {fn} key uses {rsn} (pass float hyperparameters as T.float32 scalar kernel params and dynamic outer axes via T.dynamic)"
+                    if msg not in errors:
+                        errors.append(msg)
         if require_kernel_cache:
-            cache_nodes = [
-                sub
-                for fname in cache_fns
-                if fname in funcs
-                for sub in ast.walk(funcs[fname])
-            ]
-            any_cache_loaded = cache_loaded or any(
-                isinstance(sub, ast.Name)
-                and sub.id == "_KERNEL_CACHE"
-                and isinstance(sub.ctx, ast.Load)
-                for sub in cache_nodes
+            cnodes = [s for fn in cfns if fn in funcs for s in ast.walk(funcs[fn])]
+            any_l = cache_load or any(isinstance(s, ast.Name) and s.id == "_KERNEL_CACHE" and isinstance(s.ctx, ast.Load) for s in cnodes)
+            any_s = cache_store or any(
+                (isinstance(s, ast.Subscript) and isinstance(s.ctx, ast.Store) and isinstance(s.value, ast.Name) and s.value.id == "_KERNEL_CACHE")
+                or (isinstance(s, ast.Call) and isinstance(s.func, ast.Attribute) and isinstance(s.func.value, ast.Name) and s.func.value.id == "_KERNEL_CACHE" and s.func.attr in ("setdefault", "update"))
+                for s in cnodes
             )
-            any_cache_stored = cache_stored or any(
-                (
-                    isinstance(sub, ast.Subscript)
-                    and isinstance(sub.ctx, ast.Store)
-                    and isinstance(sub.value, ast.Name)
-                    and sub.value.id == "_KERNEL_CACHE"
-                )
-                or (
-                    isinstance(sub, ast.Call)
-                    and isinstance(sub.func, ast.Attribute)
-                    and isinstance(sub.func.value, ast.Name)
-                    and sub.func.value.id == "_KERNEL_CACHE"
-                    and sub.func.attr in ("setdefault", "update")
-                )
-                for sub in cache_nodes
-            )
-            compile_path_text = "\n".join(
-                ast.get_source_segment(module_source, funcs[fname]) or ""
-                for fname in cache_fns
-                if fname in funcs
-            )
-            has_compile_call = any(
-                tok in compile_path_text
-                for tok in ("tilelang.compile", "compile_ascend", "ctypes.CDLL")
-            )
-            if not has_cache_dict:
-                errors.append(
-                    "missing_kernel_cache: module must define module-level _KERNEL_CACHE dict"
-                )
-            elif not any_cache_loaded or (has_compile_call and not any_cache_stored):
-                errors.append(
-                    "unpopulated_kernel_cache: reachable compilation path must look up "
-                    "and populate _KERNEL_CACHE"
-                )
+            ctxt = "\n".join(ast.get_source_segment(module_source, funcs[fn]) or "" for fn in cfns if fn in funcs)
+            if not has_cd:
+                errors.append("missing_kernel_cache: module must define module-level _KERNEL_CACHE dict")
+            elif not any_l or (any(t in ctxt for t in ("tilelang.compile", "compile_ascend", "ctypes.CDLL")) and not any_s):
+                errors.append("unpopulated_kernel_cache: reachable compilation path must look up and populate _KERNEL_CACHE")
     return errors
 
 
-def _filter_kwargs_for_callable(fn: object, kwargs: Mapping[str, object]) -> dict[str, object]:
-    import inspect  # noqa: PLC0415
-
-    sig = inspect.signature(fn)
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-        return dict(kwargs)
-    filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
-    lowered_kw = {str(k).lower(): v for k, v in kwargs.items()}
-    for pname in sig.parameters:
-        if pname in filtered:
-            continue
-        if pname.lower() in lowered_kw:
-            filtered[pname] = lowered_kw[pname.lower()]
-            continue
-        for alias in _PARAM_DIM_FALLBACK_ALIASES.get(pname.lower(), ()):
-            if alias in kwargs:
-                filtered[pname] = kwargs[alias]
-                break
-            if alias.lower() in lowered_kw:
-                filtered[pname] = lowered_kw[alias.lower()]
-                break
-    return filtered
-
-
-def _merge_dims_into_kwargs(
-    base_kwargs: Mapping[str, object] | None,
-    dims: Mapping[str, object] | None,
-) -> dict[str, object]:
-    merged = dict(base_kwargs or {})
-    if not dims:
-        return merged
-    for key, val in dims.items():
-        key_str = str(key)
-        merged.setdefault(key_str, val)
-        mapped = _HIR_TO_BUILDER_DIM_MAP.get(key_str, key_str)
-        merged[mapped] = val
-    return merged
-
-
-def _split_selector_output(
-    sel_out: Mapping[str, object],
-) -> tuple[dict[str, object], dict[str, object], list[str]]:
-    pc: dict[str, object] = {}
-    cf: list[str] = []
-    builder_overrides: dict[str, object] = {}
-
-    raw_pc = sel_out.get("pass_configs")
-    if isinstance(raw_pc, Mapping):
-        for k, v in raw_pc.items():
-            if str(k) == "tl.device_compile_flags":
-                for flag in _normalize_flag_list(v):
-                    if flag not in cf:
-                        cf.append(flag)
-            else:
-                pc[str(k)] = v
-    elif raw_pc is not None:
-        for flag in _normalize_flag_list(raw_pc):
-            if flag not in cf:
-                cf.append(flag)
-
-    for flag in _normalize_flag_list(sel_out.get("compile_flags")):
-        if flag not in cf:
-            cf.append(flag)
-
-    for k, v in sel_out.items():
-        if k not in ("pass_configs", "compile_flags", "builder_kwargs"):
-            builder_overrides[str(k)] = v
-    raw_bk = sel_out.get("builder_kwargs")
-    if isinstance(raw_bk, Mapping):
-        for k, v in raw_bk.items():
-            builder_overrides[str(k)] = v
-    return builder_overrides, pc, cf
-
-
-@contextlib.contextmanager
-def ascend_compile_session(
-    target: str = "ascend",
-    pass_configs: Mapping[str, object] | None = None,
-) -> Iterator[None]:
-    """Enter contiguous TVM target and optional PassContext for Ascend lowering."""
-    from tilelang import tvm  # noqa: PLC0415
-    from tilelang.backend.module import create_backend_context  # noqa: PLC0415
-
-    with contextlib.ExitStack() as stack:
-        if tvm.target.Target.current(allow_none=True) is None:
-            stack.enter_context(create_backend_context(target).target)
-        if pass_configs is not None:
-            stack.enter_context(tvm.transform.PassContext(config=dict(pass_configs)))
-        yield
-
-
-def _ascend_target_context() -> contextlib.AbstractContextManager[None]:
-    return ascend_compile_session("ascend")
-
-
-_VLOOPV2_MISS_RE = re.compile(
-    r"(?:vloop_?v2\s*(?:miss|failed|fallback|disabled|not\s+applied)|"
-    r"vloop_?v2\s*[:=]\s*(?:false|0|no|miss)|cannot\s+use\s+vloop_?v2)",
-    re.IGNORECASE,
-)
-
-_COMPILE_DIAGNOSTIC_LIMIT = 1500
-_COMPILE_ERROR_CONTEXT_LINES = 6
-_COMPILE_ERROR_RE = re.compile(
-    r"(?i)(?:\[error\]|\btvm\s*error\b|\bfatal\s*:|\bCheck\s+failed:|"
-    r"(?:^|[\s:(])(?:Assertion|Type|Value|Runtime|Internal|Key|Attribute|Name|Syntax)Error:|"
-    r"(?:^|[\s:\[(])(?:fatal\s+)?error:)"
-)
-_DEPRECATED_WARN_RE = re.compile(
-    r"(?:warning:\s+.*\[-Wdeprecated-declarations\]|"
-    r"note:\s+'[^']+'\s+has been explicitly marked deprecated here|"
-    r"note:\s+expanded from macro 'ASC_DEPRECATED')"
-)
-_NON_ERROR_DIAG_HEADER_RE = re.compile(
-    r"^(?:note:|warning:|in file included from|/\S+:\d+:\d+:\s*(?:warning|note):)",
-    re.IGNORECASE,
-)
-_TVM_BT_RE = re.compile(r"^\s*(?:\[bt\]\s*\(\d+\)|File \"<unknown>\", line 0, in )")
-
-
-def _strip_diagnostic_noise(lines: Sequence[str]) -> list[str]:
-    kept: list[str] = []
-    skip_cascade = False
-    skip_tvm_bt = False
-    for line in lines:
-        if _COMPILE_ERROR_RE.search(line):
-            skip_cascade = False
-            skip_tvm_bt = False
-            kept.append(line)
-            continue
-        if _DEPRECATED_WARN_RE.search(line):
-            skip_cascade = True
-            skip_tvm_bt = False
-            continue
-        if line.strip() == "Stack trace:":
-            skip_tvm_bt = True
-            skip_cascade = False
-            continue
-        if skip_tvm_bt:
-            if _TVM_BT_RE.search(line) or not line.strip():
-                continue
-            skip_tvm_bt = False
-        if skip_cascade:
-            stripped = line.strip()
-            if not stripped:
-                skip_cascade = False
-                continue
-            if _NON_ERROR_DIAG_HEADER_RE.match(stripped):
-                skip_cascade = False
-            else:
-                continue
-        kept.append(line)
-    return kept
-
-
-def _bounded_compile_diagnostic(
-    output_text: str,
-    *,
-    limit: int = _COMPILE_DIAGNOSTIC_LIMIT,
-) -> str:
-    """Keep primary compiler errors without deprecation cascades plus a bounded output tail."""
-    text = output_text.strip()
-    if len(text) <= limit:
-        return text
-    raw_lines = text.splitlines()
-    filtered_lines = _strip_diagnostic_noise(raw_lines)
-    use_filtered = bool(filtered_lines) and any(
-        _COMPILE_ERROR_RE.search(line) for line in filtered_lines
-    )
-    lines = filtered_lines if use_filtered else raw_lines
-    effective_text = "\n".join(lines).strip()
-    if len(effective_text) <= limit:
-        return effective_text
-    error_indices = [
-        idx for idx, line in enumerate(lines) if _COMPILE_ERROR_RE.search(line)
-    ]
-    tail = effective_text[-limit:]
-    if not error_indices:
-        return tail
-    error_idx = error_indices[0]
-    error_line = lines[error_idx].strip()
-    if error_line in tail and len(error_indices) == 1:
-        return tail
-    context_end = min(len(lines), error_idx + 1 + _COMPILE_ERROR_CONTEXT_LINES)
-    header_lines = [
-        error_line,
-        *(line.rstrip() for line in lines[error_idx + 1 : context_end]),
-    ]
-    seen_end = context_end
-    extra_blocks = 0
-    for other_idx in error_indices[1:]:
-        if other_idx < seen_end or extra_blocks >= 2:
-            continue
-        other_line = lines[other_idx].strip()
-        if other_line in tail or "clang frontend command failed" in other_line.lower():
-            continue
-        other_end = min(len(lines), other_idx + 3)
-        header_lines.append(other_line)
-        header_lines.extend(line.rstrip() for line in lines[other_idx + 1 : other_end])
-        seen_end = other_end
-        extra_blocks += 1
-    header = "\n".join(header_lines)
-    prefix = f"{header}\n[... compiler output truncated ...]\n"
-    if len(prefix) >= limit:
-        return header[:limit]
-    return prefix + effective_text[-(limit - len(prefix)) :]
-
-
-def _parse_cce_res_usage_with_summary(
-    output_text: str,
-    *,
-    asm_or_dump_text: str = "",
-) -> tuple[int, bool, BishengResourceSummary]:
-    """Parse bisheng diagnostics and lowered/disassembled code via bisheng_res_parser."""
-    summary = parse_bisheng_res_usage(
-        output_text or "",
-        asm_or_dump_text=asm_or_dump_text or "",
-    )
-    combined_vloop_text = f"{output_text or ''}\n{asm_or_dump_text or ''}"
-    vloopv2_hit = (
-        summary.vloopv2_loops > 0
-        and summary.software_loops == 0
-        and not bool(_VLOOPV2_MISS_RE.search(combined_vloop_text))
-    )
-    return int(summary.spill_bytes), vloopv2_hit, summary
-
-
-def parse_cce_res_usage(output_text: str) -> tuple[int, bool]:
-    """Parse bisheng --cce-res-usage diagnostics into (spill_bytes, vloopv2_hit)."""
-    spill_bytes, vloopv2_hit, _summary = _parse_cce_res_usage_with_summary(output_text)
-    return spill_bytes, vloopv2_hit
-
-
-def _has_prim_func_marker(dsl_source: str) -> bool:
-    return "prim_func" in dsl_source
-
-
-def _resolve_custom_kernel_callable(
-    mod: object,
-    factory_name: str | None,
-) -> Callable[..., object] | None:
-    if factory_name and hasattr(mod, factory_name):
-        obj = getattr(mod, factory_name)
-        if callable(obj):
-            return obj
-    kernel_fn = getattr(mod, "kernel", None)
-    if callable(kernel_fn):
-        return kernel_fn
-    return None
-
-
-_SIMDVF_LOCAL_ARRAY_RE = re.compile(
-    r"\b(?:float|half|bfloat16_t|u?int(?:8|16|32|64)_t|bool)\s+[A-Za-z_]\w*\s*\[[^\]]+\]"
-)
-
-
-def _simdvf_function_bodies(cpp_source: str) -> list[str]:
-    """Return brace-matched bodies of every ``__simd_vf__`` function definition."""
-    masked = strip_cpp_comments_and_strings(cpp_source)
-    bodies: list[str] = []
-    for match in re.finditer(r"__simd_vf__", masked):
-        brace = masked.find("{", match.end())
-        if brace < 0:
-            continue
-        if masked.find(";", match.end(), brace) >= 0:
-            continue
-        depth = 0
-        for idx in range(brace, len(masked)):
-            char = masked[idx]
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    bodies.append(masked[brace + 1 : idx])
-                    break
-    return bodies
-
-
-_ALIGNED_COPY_ARITIES: dict[str, tuple[tuple[int, ...], str]] = {
-    "asc_copy_gm2ub_align": (
-        (3, 8, 10),
-        "invalid_asc_copy_align_arity: expected 3/8/10 args for gm2ub_align",
-    ),
-    "asc_copy_ub2gm_align": (
-        (3, 7, 8),
-        "invalid_asc_copy_align_arity: expected 3/7/8 args for ub2gm_align",
-    ),
-}
-
-
-def _extract_balanced_paren_arg_list(text: str, open_paren_idx: int) -> str | None:
-    """Return the top-level text inside the balanced parentheses starting at *open_paren_idx*."""
-    depth = 0
-    for idx in range(open_paren_idx, len(text)):
-        ch = text[idx]
-        if ch in "([":
-            depth += 1
-        elif ch in ")]":
-            depth -= 1
-            if depth == 0:
-                return text[open_paren_idx + 1 : idx]
-    return None
-
-
-def _split_top_level_call_args(inner: str) -> list[str]:
-    """Split a function call argument string by top-level commas without mistaking '<'."""
-    parts: list[str] = []
-    depth = 0
-    start = 0
-    for idx, ch in enumerate(inner):
-        if ch in "([":
-            depth += 1
-        elif ch in ")]" and depth > 0:
-            depth -= 1
-        elif ch == "," and depth == 0:
-            parts.append(inner[start:idx].strip())
-            start = idx + 1
-    parts.append(inner[start:].strip())
-    return [part for part in parts if part]
-
-
-def _collect_global_kernel_names(masked_source: str) -> set[str]:
-    """Collect function identifiers declared with ``__global__``, directly or via macros."""
-    globals_set: set[str] = set()
-    for match in re.finditer(r"\b__global__\b", masked_source):
-        tail = masked_source[match.end() : match.end() + 512]
-        stmt_end = len(tail)
-        for sep in ("{", ";"):
-            pos = tail.find(sep)
-            if pos >= 0:
-                stmt_end = min(stmt_end, pos)
-        header = tail[:stmt_end]
-        paren_depth = 0
-        for idx, ch in enumerate(header):
-            if ch == "(":
-                if paren_depth == 0:
-                    prefix = header[:idx].rstrip()
-                    ident = re.search(r"([A-Za-z_]\w*)\s*$", prefix)
-                    if ident is not None:
-                        name = ident.group(1)
-                        if name not in ("__mix__", "__launch_bounds__", "decltype"):
-                            globals_set.add(name)
-                            break
-                paren_depth += 1
-            elif ch == ")" and paren_depth > 0:
-                paren_depth -= 1
-
-    joined = re.sub(r"\\\r?\n", " ", masked_source)
-    macro_specs: list[tuple[str, tuple[str, ...], str]] = []
-    non_define_lines: list[str] = []
-    define_re = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s+(.*)$")
-    for raw_line in joined.splitlines():
-        m_def = define_re.match(raw_line)
-        if m_def is None:
-            non_define_lines.append(raw_line)
-            continue
-        macro_name, raw_params, body = m_def.group(1), m_def.group(2), m_def.group(3)
-        global_m = re.search(r"\b__global__\b", body)
-        if global_m is None:
-            continue
-        after_global = body[global_m.end() :]
-        paren_depth = 0
-        name_expr = ""
-        for idx, ch in enumerate(after_global):
-            if ch == "(":
-                if paren_depth == 0:
-                    prefix = after_global[:idx].rstrip()
-                    expr_m = re.search(
-                        r"([A-Za-z_]\w*(?:\s*##\s*[A-Za-z_]\w*)*)\s*$",
-                        prefix,
-                    )
-                    if expr_m is not None:
-                        cand_expr = expr_m.group(1).strip()
-                        if cand_expr not in ("__mix__", "__launch_bounds__", "decltype"):
-                            name_expr = cand_expr
-                            break
-                paren_depth += 1
-            elif ch == ")" and paren_depth > 0:
-                paren_depth -= 1
-        if name_expr:
-            params = tuple(p.strip() for p in raw_params.split(",") if p.strip())
-            if params:
-                macro_specs.append((macro_name, params, name_expr))
-
-    if macro_specs:
-        non_define_src = "\n".join(non_define_lines)
-        for macro_name, params, name_expr in macro_specs:
-            expr_tokens = re.split(r"\s*##\s*", name_expr)
-            for inv_m in re.finditer(rf"\b{re.escape(macro_name)}\s*\(", non_define_src):
-                inner = _extract_balanced_paren_arg_list(non_define_src, inv_m.end() - 1)
-                if inner is None:
-                    continue
-                args = _split_top_level_call_args(inner)
-                if len(args) < len(params):
-                    continue
-                param_map = dict(zip(params, args))
-                expanded = "".join(param_map.get(tok, tok) for tok in expr_tokens)
-                if re.fullmatch(r"[A-Za-z_]\w*", expanded):
-                    globals_set.add(expanded)
-    return globals_set
-
-
-def _strip_cpp_cast_and_parens(expr: str) -> str:
-    text = expr.strip()
-    while text:
-        if text.startswith("("):
-            close_idx = -1
-            depth = 0
-            for idx, ch in enumerate(text):
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth == 0:
-                        close_idx = idx
-                        break
-            if close_idx > 0:
-                inner = text[1:close_idx].strip()
-                rest = text[close_idx + 1 :].strip()
-                if not rest:
-                    text = inner
-                    continue
-                if "*" in inner or "__gm__" in inner or re.fullmatch(
-                    r"(?:const\s+|volatile\s+)*(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*",
-                    inner,
-                ):
-                    text = rest
-                    continue
-        cast_m = re.match(r"^(?:static|reinterpret|const)_cast\s*<[^>]+>\s*\(", text)
-        if cast_m is not None:
-            inner_cast = _extract_balanced_paren_arg_list(text, cast_m.end() - 1)
-            if inner_cast is not None:
-                after = text[cast_m.end() + len(inner_cast) + 1 :].strip()
-                if not after:
-                    text = inner_cast.strip()
-                    continue
-                if after[0] in ("+", "-"):
-                    text = f"{inner_cast} {after}".strip()
-                    continue
-        break
-    return text
-
-
-def _extract_base_ptr_name(expr: str) -> str | None:
-    text = _strip_cpp_cast_and_parens(expr)
-    if not text:
+def _extract_balanced_paren_arg_list(text: str, open_idx: int) -> str | None:
+    if open_idx < 0 or open_idx >= len(text) or text[open_idx] not in "([":
         return None
     depth = 0
+    for idx in range(open_idx, len(text)):
+        depth += (text[idx] in "([") - (text[idx] in ")]")
+        if depth == 0:
+            return text[open_idx + 1 : idx]
+    return None
+
+
+def _split_cpp_args(text: str, *, include_angle: bool = True) -> list[str]:
+    parts, depth, start = [], 0, 0
+    opens, closes = ("(<[", ")>]") if include_angle else ("([", ")]")
     for idx, ch in enumerate(text):
-        if ch in "([<":
+        if ch in opens:
             depth += 1
-        elif ch in ")]>" and depth > 0:
-            depth -= 1
-        elif depth == 0 and ch in ("+", "-"):
-            text = _strip_cpp_cast_and_parens(text[:idx])
-            break
-    ident_m = re.match(r"^([A-Za-z_]\w*)\b", text)
-    return ident_m.group(1) if ident_m is not None else None
-
-
-def _extract_func_name_from_header(header: str) -> str:
-    cleaned = re.sub(r"\b(?:const|noexcept|override|final)\s*$", "", header.strip()).rstrip()
-    if not cleaned.endswith(")"):
-        return ""
-    depth = 0
-    open_idx = -1
-    for idx in range(len(cleaned) - 1, -1, -1):
-        ch = cleaned[idx]
-        if ch == ")":
-            depth += 1
-        elif ch == "(":
-            depth -= 1
-            if depth == 0:
-                open_idx = idx
-                break
-    if open_idx <= 0:
-        return ""
-    prefix = cleaned[:open_idx].rstrip()
-    ident = re.search(r"([A-Za-z_]\w*)\s*$", prefix)
-    if ident is None:
-        return ""
-    name = ident.group(1)
-    if name in ("if", "for", "while", "switch", "decltype", "__launch_bounds__", "__mix__"):
-        return ""
-    return name
-
-
-def _extract_masked_functions(masked_source: str) -> list[tuple[str, str, str]]:
-    """Return ``(fn_name, sig_head, body)`` tuples for top-level functions in *masked_source*."""
-    funcs: list[tuple[str, str, str]] = []
-    depth = 0
-    stmt_start = 0
-    i = 0
-    n = len(masked_source)
-    while i < n:
-        ch = masked_source[i]
-        if ch == ";" and depth == 0:
-            stmt_start = i + 1
-        elif ch == "{":
-            if depth == 0:
-                sig_head = masked_source[stmt_start:i].strip()
-                fn_name = _extract_func_name_from_header(sig_head)
-                brace_depth = 1
-                j = i + 1
-                while j < n and brace_depth > 0:
-                    if masked_source[j] == "{":
-                        brace_depth += 1
-                    elif masked_source[j] == "}":
-                        brace_depth -= 1
-                    j += 1
-                if fn_name:
-                    funcs.append((fn_name, sig_head, masked_source[i + 1 : max(i + 1, j - 1)]))
-                stmt_start = j
-                i = j
-                continue
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-            if depth == 0:
-                stmt_start = i + 1
-        i += 1
-    return funcs
-
-
-def _split_func_param_names(sig_head: str) -> list[str]:
-    cleaned = re.sub(r"\b(?:const|noexcept|override|final)\s*$", "", sig_head.strip()).rstrip()
-    if not cleaned.endswith(")"):
-        return []
-    depth = 0
-    open_idx = -1
-    for idx in range(len(cleaned) - 1, -1, -1):
-        if cleaned[idx] == ")":
-            depth += 1
-        elif cleaned[idx] == "(":
-            depth -= 1
-            if depth == 0:
-                open_idx = idx
-                break
-    if open_idx < 0:
-        return []
-    params: list[str] = []
-    for raw_p in _split_top_level_call_args(cleaned[open_idx + 1 : -1]):
-        part = raw_p.split("=", 1)[0].strip()
-        m = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?$", part)
-        params.append(m.group(1) if m is not None else "")
-    return params
-
-
-_GM_PTR_DECL_RE = re.compile(
-    r"\b__gm__\s+(?:const\s+|volatile\s+)*[A-Za-z_]\w*"
-    r"(?:\s*\*+\s*(?:__restrict__\s+|restrict\s+|const\s+|volatile\s+)*|\s+)([A-Za-z_]\w*)"
-)
-_GM_ALIAS_RE = re.compile(
-    r"\b__gm__\s+(?:const\s+|volatile\s+)*[A-Za-z_]\w*\s*\*+\s*"
-    r"(?:__restrict__\s+|restrict\s+)?([A-Za-z_]\w*)\s*=\s*([^;]+);"
-)
-_AUTO_ALIAS_RE = re.compile(r"\bauto\s*\*?\s*([A-Za-z_]\w*)\s*=\s*([^;]+);")
-
-
-def _analyze_function_gm_stores(
-    sig_head: str,
-    body: str,
-) -> tuple[dict[str, set[str]], set[str], set[str]]:
-    scope_text = f"{sig_head}\n{body}"
-    gm_ptrs = set(_GM_PTR_DECL_RE.findall(scope_text))
-    alias_roots: dict[str, set[str]] = {ptr: {ptr} for ptr in gm_ptrs}
-    for _ in range(3):
-        changed = False
-        for alias_re in (_GM_ALIAS_RE, _AUTO_ALIAS_RE):
-            for match in alias_re.finditer(body):
-                alias_name, rhs_expr = match.group(1), match.group(2)
-                base_name = _extract_base_ptr_name(rhs_expr)
-                if base_name is not None and base_name in alias_roots:
-                    existing = alias_roots.setdefault(alias_name, {alias_name})
-                    before_len = len(existing)
-                    existing.update(alias_roots[base_name])
-                    existing.add(alias_name)
-                    if len(existing) != before_len:
-                        changed = True
-        if not changed:
-            break
-
-    mte3_roots: set[str] = set()
-    for match in re.finditer(r"\basc_copy_ub2gm\w*\s*\(", body):
-        inner = _extract_balanced_paren_arg_list(body, match.end() - 1)
-        if inner is None:
-            continue
-        args = _split_top_level_call_args(inner)
-        if not args:
-            continue
-        base_name = _extract_base_ptr_name(args[0])
-        if base_name is not None and base_name in alias_roots:
-            mte3_roots.update(alias_roots[base_name])
-
-    scalar_roots: set[str] = set()
-    for candidate_var, roots in alias_roots.items():
-        escaped = re.escape(candidate_var)
-        idx_store = rf"\b{escaped}\s*(?:\[[^\]]+\]\s*)+=(?!=)"
-        deref_store = rf"\*\s*\(\s*{escaped}\b[^)]*\)\s*=(?!=)"
-        ptr_store = rf"(?<![A-Za-z0-9_])\*\s*{escaped}\s*=(?!=)"
-        if (
-            re.search(idx_store, body)
-            or re.search(deref_store, body)
-            or re.search(ptr_store, body)
-        ):
-            scalar_roots.update(roots)
-    return alias_roots, mte3_roots, scalar_roots
-
-
-def _has_mixed_scalar_and_mte3_gm_store(masked_source: str) -> bool:
-    """Detect un-flushed PIPE_S scalar assignments mixed with PIPE_MTE3 stores on one GM ptr."""
-    parsed_funcs = _extract_masked_functions(masked_source)
-    if not parsed_funcs:
-        if re.search(r"\bdcci\b", masked_source):
-            return False
-        _, mte3_roots, scalar_roots = _analyze_function_gm_stores("", masked_source)
-        return bool(mte3_roots & scalar_roots)
-
-    by_name: dict[str, tuple[str, str]] = {name: (sig, body) for name, sig, body in parsed_funcs}
-    param_names: dict[str, list[str]] = {
-        name: _split_func_param_names(sig) for name, sig, _ in parsed_funcs
-    }
-    analysis: dict[str, tuple[dict[str, set[str]], set[str], set[str]]] = {
-        name: _analyze_function_gm_stores(sig, body) for name, sig, body in parsed_funcs
-    }
-    direct_dcci = {name for name, _, body in parsed_funcs if re.search(r"\bdcci\b", body)}
-
-    callees: dict[str, set[str]] = {name: set() for name in by_name}
-    for name, _, body in parsed_funcs:
-        for match in re.finditer(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}()]*>)?\s*\(", body):
-            callee = match.group(1)
-            if callee in by_name and callee != name:
-                callees[name].add(callee)
-
-    for _ in range(len(parsed_funcs)):
-        changed = False
-        for name, _, body in parsed_funcs:
-            alias_roots, mte3_roots, scalar_roots = analysis[name]
-            for match in re.finditer(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}()]*>)?\s*\(", body):
-                callee = match.group(1)
-                if callee not in by_name or callee == name:
-                    continue
-                if callee in direct_dcci:
-                    continue
-                inner = _extract_balanced_paren_arg_list(body, match.end() - 1)
-                if inner is None:
-                    continue
-                call_args = _split_top_level_call_args(inner)
-                c_params = param_names[callee]
-                _, c_mte3, c_scalar = analysis[callee]
-                for idx, arg_expr in enumerate(call_args):
-                    if idx >= len(c_params):
-                        break
-                    p_name = c_params[idx]
-                    base_arg = _extract_base_ptr_name(arg_expr)
-                    if not p_name or base_arg is None or base_arg not in alias_roots:
-                        continue
-                    if p_name in c_mte3 and not (alias_roots[base_arg] <= mte3_roots):
-                        mte3_roots.update(alias_roots[base_arg])
-                        changed = True
-                    if p_name in c_scalar and not (alias_roots[base_arg] <= scalar_roots):
-                        scalar_roots.update(alias_roots[base_arg])
-                        changed = True
-        if not changed:
-            break
-
-    for name, _, _ in parsed_funcs:
-        visited: set[str] = set()
-        stack = [name]
-        has_dcci = False
-        while stack:
-            cur = stack.pop()
-            if cur in visited:
-                continue
-            visited.add(cur)
-            if cur in direct_dcci:
-                has_dcci = True
-                break
-            stack.extend(callees.get(cur, ()))
-        if has_dcci:
-            continue
-        _, mte3_roots, scalar_roots = analysis[name]
-        if mte3_roots & scalar_roots:
-            return True
-    return False
-
-
-def _check_custom_kernel_redlines(dsl_source: str) -> list[str]:
-    errors: list[str] = []
-    lower = dsl_source.lower()
-    if "l1->gm" in lower or "gm->l0a" in lower or "gm->l0b" in lower:
-        errors.append("forbidden_dav3510_dma_path")
-    if ("int4b_t" in lower or "cube_int4" in lower) and "dist_unpack4" not in lower and "aiv_unpack" not in lower:
-        errors.append("forbidden_dav3510_cube_int4_without_aiv_unpack")
-    if any(_SIMDVF_LOCAL_ARRAY_RE.search(body) for body in _simdvf_function_bodies(dsl_source)):
-        errors.append(
-            "simdvf_nonzero_stack_array: local array inside __simd_vf__ violates vf stack "
-            "size (0); allocate in __ubuf__ workspace instead"
-        )
-
-    masked = strip_cpp_comments_and_strings(dsl_source)
-    for fn_name, (valid_arities, err_msg) in _ALIGNED_COPY_ARITIES.items():
-        for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", masked):
-            inner = _extract_balanced_paren_arg_list(masked, match.end() - 1)
-            if inner is None:
-                continue
-            args = _split_top_level_call_args(inner)
-            if args and len(args) not in valid_arities:
-                if err_msg not in errors:
-                    errors.append(err_msg)
-                break
-
-    global_kernels = _collect_global_kernel_names(masked)
-    chevron_re = re.compile(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}]*?>)?\s*<<<")
-    for match in chevron_re.finditer(masked):
-        target_fn = match.group(1)
-        if target_fn not in global_kernels:
-            errors.append(
-                "non_global_chevron_launch: <<<...>>> is only valid on __global__ kernels; "
-                "use asc_vf_call<fn>(...) inside __aicore__ kernels"
-            )
-            break
-
-    if _has_mixed_scalar_and_mte3_gm_store(masked):
-        errors.append(
-            "mixed_scalar_and_mte3_gm_store: mixing un-flushed PIPE_S scalar stores "
-            "(64B DCache) with PIPE_MTE3 asc_copy_ub2gm* on the same __gm__ output corrupts "
-            "unaligned cachelines with stale NaN bits"
-        )
-    return errors
-
-
-_CPP_DTYPE_BYTES: dict[str, int] = {
-    "uint8_t": 1,
-    "int8_t": 1,
-    "char": 1,
-    "int8": 1,
-    "uint8": 1,
-    "fp8": 1,
-    "fp8_t": 1,
-    "half": 2,
-    "__bf16": 2,
-    "bfloat16_t": 2,
-    "bfloat16": 2,
-    "float16_t": 2,
-    "uint16_t": 2,
-    "int16_t": 2,
-    "float": 4,
-    "int": 4,
-    "int32_t": 4,
-    "uint32_t": 4,
-    "double": 8,
-    "int64_t": 8,
-    "uint64_t": 8,
-}
-
-
-def _rewrite_cpp_ternary(expr: str) -> str:
-    depth = 0
-    q_idx = -1
-    for i, ch in enumerate(expr):
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        elif ch == "?" and depth == 0:
-            q_idx = i
-            break
-    if q_idx < 0:
-        return expr
-    depth = 0
-    c_idx = -1
-    nested = 0
-    for i in range(q_idx + 1, len(expr)):
-        ch = expr[i]
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        elif ch == "?" and depth == 0:
-            nested += 1
-        elif ch == ":" and depth == 0:
-            if nested == 0:
-                c_idx = i
-                break
-            nested -= 1
-    if c_idx < 0:
-        return expr
-    cond = _rewrite_cpp_ternary(expr[:q_idx].strip())
-    t_arm = _rewrite_cpp_ternary(expr[q_idx + 1 : c_idx].strip())
-    f_arm = _rewrite_cpp_ternary(expr[c_idx + 1 :].strip())
-    return f"(({t_arm}) if ({cond}) else ({f_arm}))"
-
-
-def _eval_cpp_ast_node(node: ast.AST, env: Mapping[str, int]) -> int:
-    if isinstance(node, ast.Expression):
-        return _eval_cpp_ast_node(node.body, env)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, bool)):
-        return int(node.value)
-    if isinstance(node, ast.Name):
-        if node.id in env:
-            return int(env[node.id])
-        raise KeyError(node.id)
-    if isinstance(node, ast.UnaryOp):
-        val = _eval_cpp_ast_node(node.operand, env)
-        if isinstance(node.op, ast.UAdd):
-            return +val
-        if isinstance(node.op, ast.USub):
-            return -val
-        if isinstance(node.op, ast.Invert):
-            return ~val
-        raise ValueError("unsupported unary op")
-    if isinstance(node, ast.BinOp):
-        left = _eval_cpp_ast_node(node.left, env)
-        right = _eval_cpp_ast_node(node.right, env)
-        ops = {
-            ast.Add: lambda a, b: a + b,
-            ast.Sub: lambda a, b: a - b,
-            ast.Mult: lambda a, b: a * b,
-            ast.Div: lambda a, b: a // b,
-            ast.FloorDiv: lambda a, b: a // b,
-            ast.Mod: lambda a, b: a % b,
-            ast.LShift: lambda a, b: a << b,
-            ast.RShift: lambda a, b: a >> b,
-            ast.BitAnd: lambda a, b: a & b,
-            ast.BitOr: lambda a, b: a | b,
-            ast.BitXor: lambda a, b: a ^ b,
-        }
-        fn = ops.get(type(node.op))
-        if fn is None or (isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)) and right == 0):
-            raise ValueError("unsupported binary op")
-        return int(fn(left, right))
-    if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
-        left = _eval_cpp_ast_node(node.left, env)
-        right = _eval_cpp_ast_node(node.comparators[0], env)
-        cmp_ops = {
-            ast.Lt: left < right,
-            ast.LtE: left <= right,
-            ast.Gt: left > right,
-            ast.GtE: left >= right,
-            ast.Eq: left == right,
-            ast.NotEq: left != right,
-        }
-        op_type = type(node.ops[0])
-        if op_type in cmp_ops:
-            return int(cmp_ops[op_type])
-    if isinstance(node, ast.IfExp):
-        cond = _eval_cpp_ast_node(node.test, env)
-        return _eval_cpp_ast_node(node.body if cond else node.orelse, env)
-    raise ValueError("unsupported ast node")
-
-
-def _strip_outer_parens(expr: str) -> str:
-    """Remove balanced parentheses that enclose an entire C++ expression."""
-    text = expr.strip()
-    while text.startswith("(") and text.endswith(")"):
-        depth = 0
-        enclosed = True
-        for idx, ch in enumerate(text):
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            if depth == 0 and idx < len(text) - 1:
-                enclosed = False
-                break
-        if not enclosed:
-            break
-        text = text[1:-1].strip()
-    return text
-
-
-_CPP_CAST_RE = re.compile(
-    r"\(\s*(?:u?int(?:8|16|32|64)_t|size_t|unsigned(?:\s+(?:int|long|short))?|"
-    r"int|long|short|float|double|half|__bf16|bfloat16_t|bfloat16)\s*\)"
-)
-
-
-def _strip_cpp_casts(expr: str) -> str:
-    """Drop C-style scalar casts and static_cast wrappers for numeric folding."""
-    cleaned = expr
-    for _ in range(4):
-        updated = re.sub(r"\bstatic_cast\s*<[^<>]+>\s*", "", cleaned)
-        updated = _CPP_CAST_RE.sub("", updated)
-        if updated == cleaned:
-            break
-        cleaned = updated
-    return cleaned
-
-
-def _rewrite_known_sizeof(expr: str) -> str:
-    """Replace sizeof(T) for known concrete C++ scalar types with byte widths."""
-    return re.sub(
-        r"\bsizeof\s*\(\s*([A-Za-z_]\w*)\s*\)",
-        lambda m: str(_CPP_DTYPE_BYTES[m.group(1)]) if m.group(1) in _CPP_DTYPE_BYTES else m.group(0),
-        expr,
-    )
-
-
-def _safe_eval_cpp_int(expr: str, env: Mapping[str, int]) -> int | None:
-    cleaned = re.sub(r"\b(\d+)[uUlL]+\b", r"\1", str(expr or "").strip())
-    if not cleaned:
-        return None
-    cleaned = _strip_cpp_casts(_rewrite_known_sizeof(cleaned)).strip()
-    if not cleaned:
-        return None
-    py_expr = _rewrite_cpp_ternary(_strip_outer_parens(cleaned))
-    try:
-        tree = ast.parse(py_expr, mode="eval")
-        return _eval_cpp_ast_node(tree, env)
-    except Exception:
-        return None
-
-
-_LAUNCH_BLOCK_DIM_RE = re.compile(r"<<<\s*([^,<>]+?)\s*(?:,|>>>)")
-_UB_STRIDED_ACCESS_RE = re.compile(
-    r"\b([A-Za-z_]\w*)\s*\+\s*(?:\(\s*[A-Za-z_]\w*\s*\)\s*)?"
-    r"[A-Za-z_]\w*\s*\*\s*([A-Za-z_]\w*|\d+)\b"
-)
-
-
-def _resolve_launcher_var_cap(
-    cpp_source: str, var_name: str, consts: Mapping[str, int]
-) -> int | None:
-    """Resolve constant core bounds when launch block_dim is a local host integer variable."""
-    ident = re.escape(var_name)
-    for match in re.finditer(
-        rf"\b(?:(?:const|constexpr)\s+)?(?:int|int32_t|int64_t|uint32_t|uint64_t|size_t|auto)"
-        rf"(?:\s+const)?\s+{ident}\s*=\s*([^;]+);",
-        cpp_source,
-    ):
-        expr = match.group(1).strip()
-        val = _safe_eval_cpp_int(expr, consts)
-        if val is not None and val > 0:
-            return val
-        min_match = re.search(r"std::min\s*(?:<[^>]+>)?\s*\(", expr)
-        if min_match is not None:
-            inner = _extract_balanced_paren_arg_list(expr, min_match.end() - 1)
-            if inner is not None:
-                min_vals = [
-                    capped
-                    for arg in _split_top_level_call_args(inner)
-                    if (capped := _safe_eval_cpp_int(arg, consts)) is not None and capped > 0
-                ]
-                if min_vals:
-                    return min(min_vals)
-        ternary_tail = _rewrite_cpp_ternary(expr)
-        if " else " in ternary_tail:
-            tail_expr = ternary_tail.rsplit(" else ", 1)[-1].strip("() ")
-            val_tail = _safe_eval_cpp_int(tail_expr, consts)
-            if val_tail is not None and val_tail > 0:
-                return val_tail
-    return None
-
-
-def _parse_cce_launch_block_dim(cpp_source: str, consts: Mapping[str, int]) -> int | None:
-    """Resolve the first positive ``<<<block_dim, ...>>>`` launch dimension in C++ source."""
-    stripped = strip_cpp_comments_and_strings(cpp_source)
-    for match in _LAUNCH_BLOCK_DIM_RE.finditer(stripped):
-        raw_expr = match.group(1).strip()
-        block_dim = _safe_eval_cpp_int(raw_expr, consts)
-        if block_dim is not None and block_dim > 0:
-            return block_dim
-        if re.fullmatch(r"[A-Za-z_]\w*", raw_expr):
-            capped = _resolve_launcher_var_cap(stripped, raw_expr, consts)
-            if capped is not None and capped > 0:
-                return capped
-    return None
-
-
-def _estimate_ub_bank_conflict_risk(
-    cpp_source: str,
-    consts: Mapping[str, int],
-    pointer_element_bytes: Mapping[str, int],
-) -> float:
-    """Estimate the share of constant UB row strides that alias one bank group.
-
-    Only pointers with a concrete element type and a fully constant row stride are
-    weighed; template-typed or runtime-strided access stays unknown instead of being
-    counted as a conflict, so ordinary double-buffered aligned base offsets never
-    saturate the risk. Row strides landing a 512-byte multiple apart map onto the same
-    bank group, matching the TileLang envelope inspection rule.
-    """
-    strides: dict[str, int] = {}
-    for match in _UB_STRIDED_ACCESS_RE.finditer(strip_cpp_comments_and_strings(cpp_source)):
-        pointer_name = match.group(1)
-        elem_bytes = pointer_element_bytes.get(pointer_name)
-        if elem_bytes is None:
-            continue
-        stride_elems = _safe_eval_cpp_int(match.group(2), consts)
-        if stride_elems is None or stride_elems <= 0:
-            continue
-        strides[pointer_name] = max(strides.get(pointer_name, 0), stride_elems * elem_bytes)
-    if not strides:
-        return 0.0
-    conflicting = sum(
-        1 for stride_bytes in strides.values() if stride_bytes >= 512 and stride_bytes % 512 == 0
-    )
-    return conflicting / len(strides)
-
-
-def _parse_objdump_pipe_counts(objdump_text: str) -> dict[str, int]:
-    counts: dict[str, int] = {
-        "total_insns": 0,
-        "cube_mmad": 0,
-        "fixpipe": 0,
-        "mte1": 0,
-        "mte2": 0,
-        "mte3": 0,
-        "vec": 0,
-        "vloopv2": 0,
-        "dcci": 0,
-        "sync": 0,
-        "sw_back_branches": 0,
-        "vf_sw_back_branches": 0,
-        "scalar_regs": 0,
-        "vec_regs": 0,
-        "gm_to_l1_insns": 0,
-        "gm_to_ub_insns": 0,
-        "l1_to_l0a_insns": 0,
-        "l1_to_l0b_insns": 0,
-        "l0c_to_ub_insns": 0,
-        "l0c_to_l1_insns": 0,
-        "l0c_to_gm_insns": 0,
-        "ub_to_gm_insns": 0,
-        "ub_to_l1_insns": 0,
-    }
-    if not objdump_text.strip():
-        return counts
-    xregs: set[int] = set()
-    vregs: set[int] = set()
-    in_vf = False
-    for raw_ln in objdump_text.splitlines():
-        lbl_m = re.match(r"^[0-9a-f]+\s+<([^>]+)>:\s*$", raw_ln.strip())
-        if lbl_m:
-            in_vf = ".vector.thread" in lbl_m.group(1)
-            continue
-        m = re.match(r"^\s*([0-9a-f]+):\s+[0-9a-f]+\s+([A-Za-z0-9_.]+)(.*)$", raw_ln)
-        if not m:
-            continue
-        pc = int(m.group(1), 16)
-        mnem = m.group(2).upper()
-        rest = m.group(3)
-        counts["total_insns"] += 1
-        xregs.update(int(r) for r in re.findall(r"\bX(\d+)\b", rest))
-        vregs.update(int(r) for r in re.findall(r"\bV(\d+)\b", rest))
-        if mnem.startswith("VLOOP"):
-            if "VLOOPV2" in mnem or "VLOOP_V2" in mnem:
-                counts["vloopv2"] += 1
-        elif mnem.startswith("MMAD"):
-            counts["cube_mmad"] += 1
-        elif mnem.startswith("FIX_"):
-            counts["fixpipe"] += 1
-            if "L1" in mnem or "CBUF" in mnem:
-                counts["l0c_to_l1_insns"] += 1
-            elif "UB" in mnem:
-                counts["l0c_to_ub_insns"] += 1
-            elif "GM" in mnem:
-                counts["l0c_to_gm_insns"] += 1
-        elif mnem.startswith("LOAD_L1_TO_L0"):
-            counts["mte1"] += 1
-            if "L0B" in mnem:
-                counts["l1_to_l0b_insns"] += 1
-            else:
-                counts["l1_to_l0a_insns"] += 1
-        elif mnem.startswith("MOV_OUT_TO_"):
-            counts["mte2"] += 1
-            if "L1" in mnem or "CBUF" in mnem:
-                counts["gm_to_l1_insns"] += 1
-            elif "UB" in mnem:
-                counts["gm_to_ub_insns"] += 1
-        elif mnem.startswith("MOV_UB_TO_"):
-            counts["mte3"] += 1
-            if "L1" in mnem or "CBUF" in mnem:
-                counts["ub_to_l1_insns"] += 1
-            else:
-                counts["ub_to_gm_insns"] += 1
-        elif mnem.startswith("DCCI"):
-            counts["dcci"] += 1
-        elif mnem.startswith(("SET_FLAG", "WAIT_FLAG", "SET_INTRA", "WAIT_INTRA", "BAR.")):
-            counts["sync"] += 1
-        elif mnem.startswith("V") and not mnem.startswith("VF"):
-            counts["vec"] += 1
-        if mnem.startswith(("JUMP", "B.", "CBNZ", "CBZ", "TBNZ", "TBZ")) or mnem == "B":
-            tgt_m = re.search(r"\+0x([0-9a-f]+)>", rest, re.IGNORECASE)
-            hash_m = re.search(r"#(-?\d+)", rest)
-            is_back = False
-            if tgt_m:
-                is_back = int(tgt_m.group(1), 16) <= pc
-            elif hash_m:
-                is_back = int(hash_m.group(1)) <= pc
-            if is_back:
-                counts["sw_back_branches"] += 1
-                if in_vf:
-                    counts["vf_sw_back_branches"] += 1
-    counts["scalar_regs"] = len(xregs)
-    counts["vec_regs"] = len(vregs)
-    return counts
-
-
-_STAGE_KEYS: tuple[str, ...] = (
-    "STAGES",
-    "NUM_STAGES",
-    "N_STAGES",
-    "NSTAGES",
-)
-
-
-def _rewrite_sizeof(expr: str, type_bytes: Mapping[str, int]) -> str:
-    """Replace sizeof(T) with the byte width of a resolved dtype or template parameter."""
-    return re.sub(
-        r"\bsizeof\s*\(\s*([A-Za-z_]\w*)\s*\)",
-        lambda m: str(type_bytes.get(m.group(1), _CPP_DTYPE_BYTES.get(m.group(1), 2))),
-        expr,
-    )
-
-
-def _split_cpp_args(text: str) -> list[str]:
-    """Split a C++ template or call argument list at top-level commas."""
-    parts: list[str] = []
-    depth = 0
-    start = 0
-    for idx, ch in enumerate(text):
-        if ch in "(<[":
-            depth += 1
-        elif ch in ")>]" and depth > 0:
+        elif ch in closes and depth > 0:
             depth -= 1
         elif ch == "," and depth == 0:
             parts.append(text[start:idx].strip())
             start = idx + 1
     parts.append(text[start:].strip())
-    return [part for part in parts if part]
+    return [p for p in parts if p]
 
 
-def _template_bindings(
-    cpp_source: str,
-    consts: Mapping[str, int],
-) -> tuple[dict[str, int], dict[str, int]]:
-    """Resolve integral template arguments and typename dtype widths from concrete calls."""
-    values: dict[str, int] = {}
-    types: dict[str, int] = {}
-    blocks = re.finditer(
-        r"template\s*<([^<>]*)>\s*"
-        r"(?:__\w+\s*(?:\([^()]*\))?\s*)*"
-        r"(?:(?:inline|static|void)\s+)*"
-        r"([A-Za-z_]\w*)\s*\(",
-        cpp_source,
-    )
-    for block in blocks:
-        params = _split_cpp_args(block.group(1))
-        call = re.search(
-            rf"\b{re.escape(block.group(2))}\s*<\s*([^<>]*)\s*>\s*(?:<<<|\()",
-            cpp_source,
-        )
-        if call is None:
-            continue
-        args = _split_cpp_args(call.group(1))
-        if len(args) != len(params):
-            continue
-        for declaration, argument in zip(params, args):
-            names = re.findall(r"[A-Za-z_]\w*", declaration.split("=")[0])
-            if not names:
+def _extract_call_args_at(masked_src: str, open_idx: int) -> list[str]:
+    return _split_cpp_args(inner) if (inner := _extract_balanced_paren_arg_list(masked_src, open_idx)) is not None else []
+
+
+def _collect_global_kernel_names(masked_source: str) -> set[str]:
+    globals_set: set[str] = set()
+    def _scan_decl_name(fragment: str, macro: bool = False) -> str:
+        depth = 0
+        for idx, ch in enumerate(fragment):
+            if ch == "(":
+                if depth == 0:
+                    pat = r"([A-Za-z_]\w*(?:\s*##\s*[A-Za-z_]\w*)*)\s*$" if macro else r"([A-Za-z_]\w*)\s*$"
+                    if (m := re.search(pat, fragment[:idx].rstrip())) and m.group(1).strip() not in ("__mix__", "__launch_bounds__", "decltype"):
+                        return m.group(1).strip()
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+        return ""
+    for m in re.finditer(r"\b__global__\b", masked_source):
+        tail = masked_source[m.end() : m.end() + 512]
+        end = min((p for sep in ("{", ";") if (p := tail.find(sep)) >= 0), default=len(tail))
+        if nm := _scan_decl_name(tail[:end]):
+            globals_set.add(nm)
+    macro_specs, non_def = [], []
+    def_re = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s+(.*)$")
+    for ln in re.sub(r"\\\r?\n", " ", masked_source).splitlines():
+        if (md := def_re.match(ln)) is None:
+            non_def.append(ln)
+        elif gm := re.search(r"\b__global__\b", md.group(3)):
+            if (ne := _scan_decl_name(md.group(3)[gm.end() :], macro=True)) and (ps := tuple(p.strip() for p in md.group(2).split(",") if p.strip())):
+                macro_specs.append((md.group(1), ps, ne))
+    if macro_specs:
+        nsrc = "\n".join(non_def)
+        for mname, params, nexpr in macro_specs:
+            etoks = re.split(r"\s*##\s*", nexpr)
+            for im in re.finditer(rf"\b{re.escape(mname)}\s*\(", nsrc):
+                if (inn := _extract_balanced_paren_arg_list(nsrc, im.end() - 1)) and len(args := _split_cpp_args(inn, include_angle=False)) >= len(params):
+                    pmap = dict(zip(params, args))
+                    if re.fullmatch(r"[A-Za-z_]\w*", exp := "".join(pmap.get(t, t) for t in etoks)):
+                        globals_set.add(exp)
+    return globals_set
+
+
+def _extract_base_ptr_name(expr: str) -> str | None:
+    text = expr.strip()
+    while text:
+        if text.startswith("("):
+            close, d = -1, 0
+            for idx, ch in enumerate(text):
+                d += (ch == "(") - (ch == ")")
+                if d == 0:
+                    close = idx
+                    break
+            if close > 0:
+                inn, rest = text[1:close].strip(), text[close + 1 :].strip()
+                if not rest:
+                    text = inn
+                    continue
+                if "*" in inn or "__gm__" in inn or re.fullmatch(r"(?:const\s+|volatile\s+)*(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*", inn):
+                    text = rest
+                    continue
+        if cm := re.match(r"^(?:static|reinterpret|const)_cast\s*<[^>]+>\s*\(", text):
+            if (ic := _extract_balanced_paren_arg_list(text, cm.end() - 1)) is not None:
+                after = text[cm.end() + len(ic) + 1 :].strip()
+                if not after or after[0] in ("+", "-"):
+                    text = ic.strip() if not after else f"{ic} {after}".strip()
+                    continue
+        break
+    depth = 0
+    for idx, ch in enumerate(text):
+        depth += (ch in "([<") - (ch in ")]>" and depth > 0)
+        if depth == 0 and ch in ("+", "-"):
+            text = text[:idx].strip()
+            break
+    m = re.match(r"^([A-Za-z_]\w*)\b", text)
+    return m.group(1) if m else None
+
+
+def _extract_masked_functions(masked_source: str) -> list[tuple[str, str, str]]:
+    funcs, depth, start, i, n = [], 0, 0, 0, len(masked_source)
+    while i < n:
+        ch = masked_source[i]
+        if ch == ";" and depth == 0:
+            start = i + 1
+        elif ch == "{":
+            if depth == 0:
+                sh = masked_source[start:i].strip()
+                cl = re.sub(r"\b(?:const|noexcept|override|final)\s*$", "", sh).rstrip()
+                fn_name = ""
+                if cl.endswith(")"):
+                    d, oi = 0, -1
+                    for k in range(len(cl) - 1, -1, -1):
+                        d += (cl[k] == ")") - (cl[k] == "(")
+                        if d == 0:
+                            oi = k
+                            break
+                    if oi > 0 and (id_m := re.search(r"([A-Za-z_]\w*)\s*$", cl[:oi].rstrip())):
+                        if id_m.group(1) not in ("if", "for", "while", "switch", "decltype", "__launch_bounds__", "__mix__"):
+                            fn_name = id_m.group(1)
+                bd, j = 1, i + 1
+                while j < n and bd > 0:
+                    bd += (masked_source[j] == "{") - (masked_source[j] == "}")
+                    j += 1
+                if fn_name:
+                    funcs.append((fn_name, sh, masked_source[i + 1 : max(i + 1, j - 1)]))
+                start = i = j
                 continue
-            name = names[-1]
-            if re.match(r"(?:typename|class)\b", declaration):
-                type_name = argument.split("::")[-1].strip()
-                types[name] = _CPP_DTYPE_BYTES.get(type_name, 2)
-                continue
-            val = _safe_eval_cpp_int(argument, consts)
-            if val is not None:
-                values[name] = max(values.get(name, val), val)
-    return values, types
+            depth += 1
+        elif ch == "}":
+            depth = max(0, depth - 1)
+            if depth == 0:
+                start = i + 1
+        i += 1
+    return funcs
+
+
+def _analyze_function_gm_stores(sig_head: str, body: str) -> tuple[dict[str, set[str]], set[str], set[str]]:
+    roots_map: dict[str, set[str]] = {p: {p} for p in _GM_PTR_DECL_RE.findall(f"{sig_head}\n{body}")}
+    for _ in range(3):
+        changed = False
+        for are in (_GM_ALIAS_RE, _AUTO_ALIAS_RE):
+            for m in are.finditer(body):
+                if (base := _extract_base_ptr_name(m.group(2))) and base in roots_map:
+                    ex = roots_map.setdefault(m.group(1), {m.group(1)})
+                    before = len(ex)
+                    ex.update(roots_map[base]); ex.add(m.group(1))
+                    changed = changed or (len(ex) != before)
+        if not changed:
+            break
+    mte3 = {r for m in re.finditer(r"\basc_copy_ub2gm\w*\s*\(", body) if (args := _extract_call_args_at(body, m.end() - 1)) and (base := _extract_base_ptr_name(args[0])) in roots_map for r in roots_map[base]}
+    scalar = {
+        r for c, roots in roots_map.items()
+        if (esc := re.escape(c)) and (re.search(rf"\b{esc}\s*(?:\[[^\]]+\]\s*)+=(?!=)", body) or re.search(rf"\*\s*\(\s*{esc}\b[^)]*\)\s*=(?!=)", body) or re.search(rf"(?<![A-Za-z0-9_])\*\s*{esc}\s*=(?!=)", body))
+        for r in roots
+    }
+    return roots_map, mte3, scalar
+
+
+def _has_mixed_scalar_and_mte3_gm_store(masked_source: str) -> bool:
+    pfuncs = _extract_masked_functions(masked_source)
+    if not pfuncs:
+        return (not re.search(r"\bdcci\b", masked_source)) and bool((r := _analyze_function_gm_stores("", masked_source))[1] & r[2])
+    by_n = {n: (s, b) for n, s, b in pfuncs}
+    def _pnames(sig: str) -> list[str]:
+        cl = re.sub(r"\b(?:const|noexcept|override|final)\s*$", "", sig.strip()).rstrip()
+        d, oi = 0, -1
+        for k in range(len(cl) - 1, -1, -1):
+            d += (cl[k] == ")") - (cl[k] == "(")
+            if d == 0:
+                oi = k
+                break
+        return [m.group(1) if (m := re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?$", rp.split("=", 1)[0].strip())) else "" for rp in (_split_cpp_args(cl[oi + 1 : -1], include_angle=False) if oi > 0 else ())]
+    pnames = {n: _pnames(s) for n, s, _ in pfuncs}
+    analysis = {n: _analyze_function_gm_stores(s, b) for n, s, b in pfuncs}
+    direct_dcci = {n for n, _, b in pfuncs if re.search(r"\bdcci\b", b)}
+    callees = {n: {m.group(1) for m in re.finditer(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}()]*>)?\s*\(", b) if m.group(1) in by_n and m.group(1) != n} for n, _, b in pfuncs}
+    for _ in range(len(pfuncs)):
+        changed = False
+        for name, _, body in pfuncs:
+            aroot, mte3, scal = analysis[name]
+            for m in re.finditer(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}()]*>)?\s*\(", body):
+                if (ce := m.group(1)) not in by_n or ce == name or ce in direct_dcci or (inn := _extract_balanced_paren_arg_list(body, m.end() - 1)) is None:
+                    continue
+                _, cm3, csc = analysis[ce]
+                for idx, aexpr in enumerate(_split_cpp_args(inn, include_angle=False)):
+                    if idx < len(pnames[ce]) and (pn := pnames[ce][idx]) and (ba := _extract_base_ptr_name(aexpr)) in aroot:
+                        assert ba is not None
+                        if pn in cm3 and not (aroot[ba] <= mte3): mte3.update(aroot[ba]); changed = True
+                        if pn in csc and not (aroot[ba] <= scal): scal.update(aroot[ba]); changed = True
+        if not changed:
+            break
+    for name, _, _ in pfuncs:
+        vis, st, hdcci = set(), [name], False
+        while st:
+            if (cur := st.pop()) in vis: continue
+            vis.add(cur)
+            if cur in direct_dcci: hdcci = True; break
+            st.extend(callees.get(cur, ()))
+        if not hdcci and (analysis[name][1] & analysis[name][2]):
+            return True
+    return False
+
+
+def _check_custom_kernel_redlines(dsl_source: str) -> list[str]:
+    errors, low = [], dsl_source.lower()
+    if any(t in low for t in ("l1->gm", "gm->l0a", "gm->l0b")):
+        errors.append("forbidden_dav3510_dma_path")
+    if ("int4b_t" in low or "cube_int4" in low) and "dist_unpack4" not in low and "aiv_unpack" not in low:
+        errors.append("forbidden_dav3510_cube_int4_without_aiv_unpack")
+    masked = strip_cpp_comments_and_strings(dsl_source)
+    for m in re.finditer(r"__simd_vf__", masked):
+        if (br := masked.find("{", m.end())) >= 0 and masked.find(";", m.end(), br) < 0:
+            d = 0
+            for i in range(br, len(masked)):
+                d += (masked[i] == "{") - (masked[i] == "}")
+                if d == 0:
+                    if _SIMDVF_LOCAL_ARRAY_RE.search(masked[br + 1 : i]):
+                        errors.append("simdvf_nonzero_stack_array: local array inside __simd_vf__ violates vf stack size (0); allocate in __ubuf__ workspace instead")
+                    break
+            if any(e.startswith("simdvf_nonzero_stack_array") for e in errors):
+                break
+    for fn, (valids, msg) in _ALIGNED_COPY_ARITIES.items():
+        if any((inn := _extract_balanced_paren_arg_list(masked, m.end() - 1)) is not None and (args := _split_cpp_args(inn, include_angle=False)) and len(args) not in valids for m in re.finditer(rf"\b{re.escape(fn)}\s*\(", masked)):
+            errors.append(msg)
+    gnames = _collect_global_kernel_names(masked)
+    if any(m.group(1) not in gnames for m in re.finditer(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}]*?>)?\s*<<<", masked)):
+        errors.append("non_global_chevron_launch: <<<...>>> is only valid on __global__ kernels; use asc_vf_call<fn>(...) inside __aicore__ kernels")
+    if _has_mixed_scalar_and_mte3_gm_store(masked):
+        errors.append("mixed_scalar_and_mte3_gm_store: mixing un-flushed PIPE_S scalar stores (64B DCache) with PIPE_MTE3 asc_copy_ub2gm* on the same __gm__ output corrupts unaligned cachelines with stale NaN bits")
+    return errors
+
+
+def _rewrite_cpp_ternary(expr: str) -> str:
+    d, q_i = 0, -1
+    for i, ch in enumerate(expr):
+        d += (ch == "(") - (ch == ")")
+        if ch == "?" and d == 0: q_i = i; break
+    if q_i < 0:
+        return expr
+    d, c_i, nest = 0, -1, 0
+    for i in range(q_i + 1, len(expr)):
+        d += (expr[i] == "(") - (expr[i] == ")")
+        if expr[i] == "?" and d == 0: nest += 1
+        elif expr[i] == ":" and d == 0:
+            if nest == 0: c_i = i; break
+            nest -= 1
+    return expr if c_i < 0 else f"(({_rewrite_cpp_ternary(expr[q_i + 1 : c_i].strip())}) if ({_rewrite_cpp_ternary(expr[:q_i].strip())}) else ({_rewrite_cpp_ternary(expr[c_i + 1 :].strip())}))"
+
+
+_CPP_BIN_OPS = {
+    ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b, ast.Mult: lambda a, b: a * b,
+    ast.Div: lambda a, b: a // b, ast.FloorDiv: lambda a, b: a // b, ast.Mod: lambda a, b: a % b,
+    ast.LShift: lambda a, b: a << b, ast.RShift: lambda a, b: a >> b,
+    ast.BitAnd: lambda a, b: a & b, ast.BitOr: lambda a, b: a | b, ast.BitXor: lambda a, b: a ^ b,
+}
+
+
+def _eval_cpp_ast_node(node: ast.AST, env: Mapping[str, int]) -> int:
+    if isinstance(node, ast.Expression): return _eval_cpp_ast_node(node.body, env)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, bool)): return int(node.value)
+    if isinstance(node, ast.Name): return int(env[node.id])
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
+        v = _eval_cpp_ast_node(node.operand, env)
+        return +v if isinstance(node.op, ast.UAdd) else (-v if isinstance(node.op, ast.USub) else ~v)
+    if isinstance(node, ast.BinOp) and (fn := _CPP_BIN_OPS.get(type(node.op))) is not None:
+        l, r = _eval_cpp_ast_node(node.left, env), _eval_cpp_ast_node(node.right, env)
+        if isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)) and r == 0: raise ValueError("div0")
+        return int(fn(l, r))
+    if isinstance(node, ast.Compare) and len(node.ops) == 1:
+        l, r = _eval_cpp_ast_node(node.left, env), _eval_cpp_ast_node(node.comparators[0], env)
+        cmps = {ast.Lt: l < r, ast.LtE: l <= r, ast.Gt: l > r, ast.GtE: l >= r, ast.Eq: l == r, ast.NotEq: l != r}
+        if type(node.ops[0]) in cmps: return int(cmps[type(node.ops[0])])
+    if isinstance(node, ast.IfExp):
+        return _eval_cpp_ast_node(node.body if _eval_cpp_ast_node(node.test, env) else node.orelse, env)
+    raise ValueError("unsupported")
+
+
+def _safe_eval_cpp_int(expr: str, env: Mapping[str, int]) -> int | None:
+    cleaned = re.sub(r"\b(\d+)[uUlL]+\b", r"\1", str(expr or "").strip())
+    cleaned = re.sub(r"\bsizeof\s*\(\s*([A-Za-z_]\w*)\s*\)", lambda m: str(_CPP_DTYPE_BYTES.get(m.group(1), 2)), cleaned)
+    for _ in range(4):
+        upd = _CPP_CAST_RE.sub("", re.sub(r"\bstatic_cast\s*<[^<>]+>\s*", "", cleaned))
+        if upd == cleaned: break
+        cleaned = upd
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return None
+    while cleaned.startswith("(") and cleaned.endswith(")"):
+        d, enc = 0, True
+        for i, ch in enumerate(cleaned):
+            d += (ch == "(") - (ch == ")")
+            if d == 0 and i < len(cleaned) - 1: enc = False; break
+        if not enc: break
+        cleaned = cleaned[1:-1].strip()
+    try:
+        return _eval_cpp_ast_node(ast.parse(_rewrite_cpp_ternary(cleaned), mode="eval"), env)
+    except Exception:
+        return None
+
+
+def _parse_cce_launch_block_dim(cpp_source: str, consts: Mapping[str, int]) -> int | None:
+    stripped = strip_cpp_comments_and_strings(cpp_source)
+    for m in _LAUNCH_BLOCK_DIM_RE.finditer(stripped):
+        raw = m.group(1).strip()
+        if (bd := _safe_eval_cpp_int(raw, consts)) is not None and bd > 0:
+            return bd
+        if re.fullmatch(r"[A-Za-z_]\w*", raw):
+            for vm in re.finditer(rf"\b(?:(?:const|constexpr)\s+)?(?:int|int32_t|int64_t|uint32_t|uint64_t|size_t|auto)(?:\s+const)?\s+{re.escape(raw)}\s*=\s*([^;]+);", stripped):
+                ex = vm.group(1).strip()
+                if (v := _safe_eval_cpp_int(ex, consts)) and v > 0: return v
+                if (mm := re.search(r"std::min\s*(?:<[^>]+>)?\s*\(", ex)) and (inn := _extract_balanced_paren_arg_list(ex, mm.end() - 1)):
+                    if vs := [c for a in _split_cpp_args(inn, include_angle=False) if (c := _safe_eval_cpp_int(a, consts)) and c > 0]: return min(vs)
+                if " else " in (tt := _rewrite_cpp_ternary(ex)) and (vt := _safe_eval_cpp_int(tt.rsplit(" else ", 1)[-1].strip("() "), consts)) and vt > 0: return vt
+    return None
 
 
 def _resolve_cpp_consts_and_types(cpp_source: str) -> tuple[dict[str, int], dict[str, int]]:
-    """Fold constexpr and #define integers along with resolved template type byte widths."""
     stripped = strip_cpp_comments_and_strings(cpp_source)
-    define_source = re.sub(r"\\\r?\n", " ", stripped)
-    declarations = [
-        (m.group(1), m.group(2))
-        for m in re.finditer(
-            r"\bconstexpr\s+(?:int|int32_t|int64_t|uint32_t|uint64_t|size_t)\s+"
-            r"([A-Za-z_]\w*)\s*=\s*([^;]+);",
-            stripped,
-        )
-    ]
-    for m in re.finditer(
-        r"^\s*#\s*define\s+([A-Za-z_]\w*)(?!\()\s+([^\r\n]+)",
-        define_source,
-        re.MULTILINE,
-    ):
-        declarations.append((m.group(1), m.group(2).strip()))
-    consts: dict[str, int] = {}
-    type_bytes: dict[str, int] = {}
+    decls = [(m.group(1), m.group(2)) for m in re.finditer(r"\bconstexpr\s+(?:int|int32_t|int64_t|uint32_t|uint64_t|size_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);", stripped)]
+    decls.extend((m.group(1), m.group(2).strip()) for m in re.finditer(r"^\s*#\s*define\s+([A-Za-z_]\w*)(?!\()\s+([^\r\n]+)", re.sub(r"\\\r?\n", " ", stripped), re.MULTILINE))
+    consts, type_bytes = {}, {}
+    tblocks = list(re.finditer(r"template\s*<([^<>]*)>\s*(?:__\w+\s*(?:\([^()]*\))?\s*)*(?:(?:inline|static|void)\s+)*([A-Za-z_]\w*)\s*\(", cpp_source))
     for _ in range(4):
-        previous = dict(consts)
-        for name, expr in declarations:
-            val = _safe_eval_cpp_int(_rewrite_sizeof(expr, type_bytes), consts)
-            if val is not None:
-                consts[name] = val
-        values, types = _template_bindings(cpp_source, consts)
-        consts.update(values)
-        type_bytes.update(types)
-        if consts == previous:
+        prev = dict(consts)
+        for nm, ex in decls:
+            rw = re.sub(r"\bsizeof\s*\(\s*([A-Za-z_]\w*)\s*\)", lambda m: str(type_bytes.get(m.group(1), _CPP_DTYPE_BYTES.get(m.group(1), 2))), ex)
+            if (v := _safe_eval_cpp_int(rw, consts)) is not None:
+                consts[nm] = v
+        for blk in tblocks:
+            ps = _split_cpp_args(blk.group(1))
+            if (call := re.search(rf"\b{re.escape(blk.group(2))}\s*<\s*([^<>]*)\s*>\s*(?:<<<|\()", cpp_source)) and len(args := _split_cpp_args(call.group(1))) == len(ps):
+                for decl, arg in zip(ps, args):
+                    if names := re.findall(r"[A-Za-z_]\w*", decl.split("=")[0]):
+                        if re.match(r"(?:typename|class)\b", decl):
+                            type_bytes[names[-1]] = _CPP_DTYPE_BYTES.get(arg.split("::")[-1].strip(), 2)
+                        elif (tv := _safe_eval_cpp_int(arg, consts)) is not None:
+                            consts[names[-1]] = max(consts.get(names[-1], tv), tv)
+        if consts == prev:
             break
     return consts, type_bytes
 
 
 def _resolve_cpp_consts(cpp_source: str) -> dict[str, int]:
-    """Fold constexpr and #define integers with template args, aliases, and sizeof widths."""
     return _resolve_cpp_consts_and_types(cpp_source)[0]
 
 
-def _stage_multiplicity(
-    cpp_source: str,
-    consts: Mapping[str, int],
-    *,
-    scope: str,
-    names: Sequence[str] = (),
-    strides: Mapping[str, int] | None = None,
-) -> int:
-    """Estimate buffer stage count from constexpr/template values, slots, and sync pairs."""
-    stages = 1
-    for key in (f"{scope}_STAGES", *_STAGE_KEYS):
-        value = consts.get(key)
-        if value is not None:
-            stages = max(stages, int(value))
-    if stages > 1:
-        return min(stages, 8)
-    if strides is not None and any(name in strides for name in names):
+def _stage_multiplicity(cpp_source: str, consts: Mapping[str, int], *, scope: str, names: Sequence[str] = (), strides: Mapping[str, int] | None = None) -> int:
+    if (st := max((int(consts[k]) for k in (f"{scope}_STAGES", "STAGES", "NUM_STAGES", "N_STAGES", "NSTAGES") if k in consts), default=1)) > 1:
+        return min(st, 8)
+    if strides and any(n in strides for n in names):
         return 2
-    slot_stems: dict[str, set[str]] = {}
-    for name in names:
-        if _is_numbered_slot(name):
-            slot_stems.setdefault(re.sub(r"\d+$", "", name), set()).add(name)
-    if any(len(slots) > 1 for slots in slot_stems.values()):
+    stems: dict[str, set[str]] = {}
+    for n in names:
+        if re.search(r"\d+$", n): stems.setdefault(re.sub(r"\d+$", "", n), set()).add(n)
+    if any(len(s) > 1 for s in stems.values()):
         return 2
-    ub_pairs = {frozenset(("PIPE_MTE3", "PIPE_MTE2")), frozenset(("PIPE_V", "PIPE_MTE2"))}
-    l1_pairs = {frozenset(("PIPE_MTE1", "PIPE_MTE2")), frozenset(("PIPE_M", "PIPE_MTE2"))}
-    pairs = ub_pairs if scope == "UB" else l1_pairs
-    events: set[int] = set()
-    for m in re.finditer(
-        r"asc_sync_(?:notify|wait)\s*\(\s*(PIPE_[A-Z0-9_]+)\s*,\s*(PIPE_[A-Z0-9_]+)\s*,\s*"
-        r"(?:\(event_t\))?\s*(\d+)",
-        cpp_source,
-    ):
-        if frozenset((m.group(1), m.group(2))) in pairs:
-            events.add(int(m.group(3)))
-    return 2 if {0, 1} <= events else 1
+    pairs = {frozenset(("PIPE_MTE3", "PIPE_MTE2")), frozenset(("PIPE_V", "PIPE_MTE2"))} if scope == "UB" else {frozenset(("PIPE_MTE1", "PIPE_MTE2")), frozenset(("PIPE_M", "PIPE_MTE2"))}
+    evs = {int(m.group(3)) for m in re.finditer(r"asc_sync_(?:notify|wait)\s*\(\s*(PIPE_[A-Z0-9_]+)\s*,\s*(PIPE_[A-Z0-9_]+)\s*,\s*(?:\(event_t\))?\s*(\d+)", cpp_source) if frozenset((m.group(1), m.group(2))) in pairs}
+    return 2 if {0, 1} <= evs else 1
 
 
-def _is_numbered_slot(name: str) -> bool:
-    """Report whether a buffer name carries an attached physical slot index."""
-    return bool(re.search(r"\d+$", name))
-
-
-def _stage_storage_pointer(name: str, names: Sequence[str]) -> bool:
-    """Report whether one pointer is the sole physical slot for its buffer family."""
-    stem = re.sub(r"\d+$", "", name)
-    return not any(
-        other != name and re.sub(r"\d+$", "", other) == stem for other in names
-    )
-
-
-def _stage_stride_elems(cpp_source: str, consts: Mapping[str, int]) -> dict[str, int]:
-    """Resolve per-buffer element strides from pointer plus stage-index expressions."""
-    strides: dict[str, int] = {}
-    for m in re.finditer(
-        r"\b([A-Za-z_]\w*)\s*\+\s*(?:\(\s*)?"
-        r"(?:stg_id|stage_id|stg|stage|slot|buf)\s*\*\s*([A-Za-z_]\w*|\d+)\s*\)?",
-        cpp_source,
-    ):
-        value = _safe_eval_cpp_int(m.group(2), consts)
-        if value is not None and value > 0:
-            strides[m.group(1)] = max(strides.get(m.group(1), value), value)
-    return strides
-
-
-def _declared_stage_bytes(
-    name: str,
-    elem_bytes: int,
-    consts: Mapping[str, int],
-    *,
-    stages: int,
-    single_pointer: bool,
-) -> int:
-    """Return an explicit byte size or per-stage element count for one buffer pointer."""
-    upper = name.upper()
-    numbered = _is_numbered_slot(name)
-    bases = [upper]
-    for suffix in ("_BASE", "_BUF", "_PTR", "_0", "_1"):
-        if upper.endswith(suffix):
-            bases.append(upper[: -len(suffix)])
-    roots: list[str] = []
-    for base in bases:
-        slotless = re.sub(r"\d+$", "", base)
-        roots.extend((slotless, slotless.replace("_L1", "").replace("_UB", "")))
-    for root in dict.fromkeys(roots):
-        for suffix in ("_STAGE_BYTES", "_BYTES", "_STAGE", "_BASE", "_BUF", "_PTR"):
-            if root.endswith(suffix):
-                root = root[: -len(suffix)]
-                break
-        for key, is_bytes in (
-            (f"{root}_STAGE_BYTES", True),
-            (f"{root}_BYTES", True),
-            (f"{root}_STAGE", False),
-        ):
-            if key not in consts:
-                continue
-            if is_bytes:
-                return int(consts[key])
-            scale = stages if single_pointer and not numbered else 1
-            return int(consts[key]) * elem_bytes * scale
-    return 0
-
-
-def _extract_cpp_loop_spans(masked_src: str) -> list[tuple[int, int]]:
-    """Return character spans ``(body_start, body_end)`` of C++ for/while loop bodies."""
-    spans: list[tuple[int, int]] = []
-    n = len(masked_src)
-    for m in re.finditer(r"\b(?:for|while)\s*\(", masked_src):
-        pos = m.end() - 1
-        paren_depth = 0
-        while pos < n:
-            ch = masked_src[pos]
-            if ch == "(":
-                paren_depth += 1
-            elif ch == ")":
-                paren_depth -= 1
-                if paren_depth == 0:
-                    pos += 1
-                    break
-            pos += 1
-        while pos < n and masked_src[pos].isspace():
-            pos += 1
-        if pos >= n or masked_src[pos] != "{":
-            continue
-        body_start = pos + 1
-        brace_depth = 1
-        pos += 1
-        while pos < n and brace_depth > 0:
-            if masked_src[pos] == "{":
-                brace_depth += 1
-            elif masked_src[pos] == "}":
-                brace_depth -= 1
-            pos += 1
-        spans.append((body_start, max(body_start, pos - 1)))
-    return spans
-
-
-def _extract_call_args_at(masked_src: str, open_paren_idx: int) -> list[str]:
-    """Return top-level comma-separated arguments starting at ``open_paren_idx``."""
-    n = len(masked_src)
-    if open_paren_idx < 0 or open_paren_idx >= n or masked_src[open_paren_idx] != "(":
-        return []
-    depth = 0
-    pos = open_paren_idx
-    while pos < n:
-        ch = masked_src[pos]
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return _split_cpp_args(masked_src[open_paren_idx + 1 : pos])
-        pos += 1
-    return []
-
-
-def _resolve_dma_bound_consts(
-    masked_src: str, consts: Mapping[str, int]
-) -> dict[str, int]:
-    """Fold local tile clamp upper bounds such as `if (n_cur > BN) n_cur = BN;`."""
-    env = dict(consts)
-    for m in re.finditer(
-        r"\bif\s*\(\s*([A-Za-z_]\w*)\s*>\s*([^;{}()]+?)\s*\)\s*\1\s*=\s*([^;]+);",
-        masked_src,
-    ):
-        var_name = m.group(1)
-        if var_name in env:
-            continue
-        bound = _safe_eval_cpp_int(m.group(3), env)
-        if bound is not None and bound > 0:
-            env[var_name] = bound
-    return env
-
-
-def _resolve_l0c2gm_dst_elem_bytes(
-    fname: str,
-    args: Sequence[str],
-    masked_src: str,
-    call_pos: int,
-    consts: Mapping[str, int],
-    type_bytes: Mapping[str, int],
-) -> int:
-    """Infer destination element byte width for asc_copy_l0c2gm from type, pointer, or quant."""
-    low_fname = fname.lower()
-    if low_fname.endswith(("_s8", "_u8", "_i8", "_fp8")):
-        return 1
-    if low_fname.endswith(("_f16", "_bf16")):
-        return 2
-    if low_fname.endswith(("_f32", "_s32", "_i32")):
-        return 4
-
-    def _width_for_type_token(token: str) -> int | None:
-        if token in type_bytes:
-            return int(type_bytes[token])
-        if token in _CPP_DTYPE_BYTES:
-            return int(_CPP_DTYPE_BYTES[token])
-        low_tok = token.lower()
-        if "int8" in low_tok or "uint8" in low_tok or "fp8" in low_tok:
-            return 1
-        if "half" in low_tok or "bf16" in low_tok or "bfloat16" in low_tok or "fp16" in low_tok:
-            return 2
-        if "float" in low_tok or "int32" in low_tok or "uint32" in low_tok:
-            return 4
-        return None
-
-    dst_arg = args[0] if args else ""
-    cast_m = re.search(r"__gm__\s+(?:const\s+)?([A-Za-z_]\w*)\s*\*", dst_arg)
-    if cast_m is not None:
-        width = _width_for_type_token(cast_m.group(1))
-        if width is not None:
-            return width
-
-    stripped_dst = _strip_cpp_casts(dst_arg).strip()
-    ident_m = re.match(r"^[&(]*([A-Za-z_]\w*)\b", stripped_dst)
-    if ident_m is not None:
-        ptr_name = ident_m.group(1)
-        prefix_src = masked_src[:call_pos]
-        fn_starts = [
-            fm.start()
-            for fm in re.finditer(r"\b(?:template\s*<|__global__|__aicore__)\b", prefix_src)
-        ]
-        scope_src = prefix_src[fn_starts[-1] :] if fn_starts else prefix_src
-        decl_matches = list(
-            re.finditer(
-                rf"__gm__\s+(?:const\s+)?([A-Za-z_]\w*)\s*\*\s*{re.escape(ptr_name)}\b",
-                scope_src,
-            )
-        )
-        if not decl_matches and scope_src is not prefix_src:
-            decl_matches = list(
-                re.finditer(
-                    rf"__gm__\s+(?:const\s+)?([A-Za-z_]\w*)\s*\*\s*{re.escape(ptr_name)}\b",
-                    prefix_src,
-                )
-            )
-        if decl_matches:
-            width = _width_for_type_token(decl_matches[-1].group(1))
-            if width is not None:
-                return width
-
+def _resolve_l0c2gm_eb(fn: str, args: Sequence[str], masked: str, pos: int, consts: Mapping[str, int], tb: Mapping[str, int]) -> int:
+    lf = fn.lower()
+    for suf, w in ((("_s8", "_u8", "_i8", "_fp8"), 1), (("_f16", "_bf16"), 2), (("_f32", "_s32", "_i32"), 4)):
+        if lf.endswith(suf): return w
+    def _w(tok: str) -> int | None:
+        if tok in tb: return int(tb[tok])
+        if tok in _CPP_DTYPE_BYTES: return int(_CPP_DTYPE_BYTES[tok])
+        lt = tok.lower()
+        return 1 if any(x in lt for x in ("int8", "uint8", "fp8")) else (2 if any(x in lt for x in ("half", "bf16", "bfloat16", "fp16")) else (4 if any(x in lt for x in ("float", "int32", "uint32")) else None))
+    da = args[0] if args else ""
+    if (cm := re.search(r"__gm__\s+(?:const\s+)?([A-Za-z_]\w*)\s*\*", da)) and (w := _w(cm.group(1))) is not None: return w
+    if im := re.match(r"^[&(]*([A-Za-z_]\w*)\b", _CPP_CAST_RE.sub("", da).strip()):
+        pat = rf"__gm__\s+(?:const\s+)?([A-Za-z_]\w*)\s*\*\s*{re.escape(im.group(1))}\b"
+        pref = masked[:pos]
+        starts = [fm.start() for fm in re.finditer(r"\b(?:template\s*<|__global__|__aicore__)\b", pref)]
+        if ms := (list(re.finditer(pat, pref[starts[-1] :] if starts else pref)) or list(re.finditer(pat, pref))):
+            if (w := _w(ms[-1].group(1))) is not None: return w
     if len(args) >= 9:
-        q_arg = args[8].lower()
-        if any(tok in q_arg for tok in ("int8", "s8", "fp8", "e4m3", "e5m2")):
-            return 1
-        if any(tok in q_arg for tok in ("f16", "fp16", "bf16", "bfloat16", "half")):
-            return 2
-        q_val = _safe_eval_cpp_int(args[8], consts)
-        if q_val is not None:
-            return 4 if q_val == 0 else 2
+        qa = args[8].lower()
+        if any(t in qa for t in ("int8", "s8", "fp8", "e4m3", "e5m2")): return 1
+        if any(t in qa for t in ("f16", "fp16", "bf16", "bfloat16", "half")): return 2
+        if (qv := _safe_eval_cpp_int(args[8], consts)) is not None: return 4 if qv == 0 else 2
     return 4
 
 
-def _extract_trackb_dma_and_pipe_signals(
-    cpp_source: str,
-    consts: Mapping[str, int],
-    facts: object,
-    explicit_l1: Mapping[str, int],
-    *,
-    uses_cube: bool,
-    uses_256kb_ub: bool,
-    tile_m: int,
-    tile_n: int,
-    mte2_cnt: int,
-    mte3_cnt: int,
-    mmad_cnt: int,
-    ub_stages: int,
-    l1_stages: int,
-    case_ratios: CasePhysicsRatios | None,
-    type_bytes: Mapping[str, int] | None = None,
-) -> dict[str, object]:
-    """Extract deterministic physical ledger signals from reachable C++20 source."""
-    masked = strip_cpp_comments_and_strings(cpp_source)
-    lower = masked.lower()
-    loop_spans = _extract_cpp_loop_spans(masked)
-    dma_consts = _resolve_dma_bound_consts(masked, consts)
-    resolved_types = dict(type_bytes) if type_bytes is not None else {}
-
-    pipe_all_positions: set[int] = set()
-    for b_start, b_end in loop_spans:
-        body = masked[b_start:b_end]
-        for pm in re.finditer(r"\b(?:pipe_barrier|asc_sync_pipe)\s*\(\s*PIPE_ALL\s*\)", body):
-            pipe_all_positions.add(b_start + pm.start())
-    in_loop_pipe_all = len(pipe_all_positions)
-
-    has_dual_subcore = bool(
-        re.search(r"\b(?:get_subblockid|GetSubBlockIdx|get_subblock_idx)\s*\(", masked)
-    )
-
-    dma_bytes: list[int] = []
-    contig_candidates: list[int] = []
-    gm_dma_pat = re.compile(
-        r"\b(asc_copy_gm2ub_align|asc_copy_ub2gm_align|asc_copy_gm2ub|asc_copy_ub2gm|"
-        r"asc_copy_gm2l1(?:_nd2nz|_dn2nz)?|asc_copy_l0c2gm\w*)\s*\("
-    )
-    for dm in gm_dma_pat.finditer(masked):
-        fname = dm.group(1)
-        args = _extract_call_args_at(masked, dm.end() - 1)
-        if fname in ("asc_copy_gm2ub_align", "asc_copy_ub2gm_align"):
-            if len(args) == 3:
-                sz = _safe_eval_cpp_int(args[2], dma_consts)
-                if sz is not None and sz > 0:
-                    dma_bytes.append(sz)
-                    contig_candidates.append(sz)
-            elif len(args) >= 4:
-                nburst = _safe_eval_cpp_int(args[2], dma_consts)
-                row_b = _safe_eval_cpp_int(args[3], dma_consts)
-                if row_b is not None and row_b > 0:
-                    contig_candidates.append(row_b)
-                    total_b = row_b * nburst if (nburst is not None and nburst > 0) else row_b
-                    dma_bytes.append(total_b)
-        elif fname in ("asc_copy_gm2ub", "asc_copy_ub2gm") and len(args) >= 4:
-            nburst = _safe_eval_cpp_int(args[2], dma_consts)
-            blen = _safe_eval_cpp_int(args[3], dma_consts)
-            if blen is not None and blen > 0:
-                row_b = blen * 32
-                contig_candidates.append(row_b)
-                dma_bytes.append(row_b * nburst if (nburst is not None and nburst > 0) else row_b)
-        elif fname.startswith("asc_copy_gm2l1") and len(args) >= 6:
-            rows = _safe_eval_cpp_int(args[4], dma_consts)
-            cols = _safe_eval_cpp_int(args[5], dma_consts)
-            if cols is not None and cols > 0:
-                row_b = cols * 2
-                contig_candidates.append(row_b)
-                dma_bytes.append(row_b * rows if (rows is not None and rows > 0) else row_b)
-        elif fname.startswith("asc_copy_l0c2gm") and len(args) >= 4:
-            cols = _safe_eval_cpp_int(args[2], dma_consts)
-            rows = _safe_eval_cpp_int(args[3], dma_consts)
-            if cols is not None and cols > 0:
-                elem_b = _resolve_l0c2gm_dst_elem_bytes(
-                    fname, args, masked, dm.start(), dma_consts, resolved_types
-                )
-                row_b = cols * elem_b
-                contig_candidates.append(row_b)
-                dma_bytes.append(row_b * rows if (rows is not None and rows > 0) else row_b)
-
-    min_gm_dma_bytes = min(dma_bytes) if dma_bytes else 0
-    if dma_bytes and hasattr(facts, "dma_burst_efficiency"):
-        total_dma = float(sum(dma_bytes))
-        weighted_inv = sum(
-            float(b) / max(1e-6, float(facts.dma_burst_efficiency(int(b))))
-            for b in dma_bytes
-        )
-        dma_burst_eff = round(min(1.0, total_dma / max(1e-6, weighted_inv)), 4)
-    else:
-        dma_burst_eff = 1.0
-
-    if contig_candidates:
-        dominant_contig_bytes = max(contig_candidates)
-    elif case_ratios is not None and case_ratios.inner_contiguous_bytes > 0:
-        dominant_contig_bytes = int(case_ratios.inner_contiguous_bytes)
-    elif mte2_cnt > 0 or mte3_cnt > 0:
-        dominant_contig_bytes = tile_n * 2
-    else:
-        dominant_contig_bytes = 0
-
-    cube_m_vals: list[int] = []
-    if uses_cube or mmad_cnt > 0:
-        for gm in re.finditer(r"\bascend_gemm_l1\s*<([^;{}()]+)>\s*\(", masked):
-            t_args = _split_cpp_args(gm.group(1))
-            if t_args:
-                m_val = _safe_eval_cpp_int(t_args[0], consts)
-                if m_val is not None and m_val > 0:
-                    cube_m_vals.append(m_val)
-        for mm in re.finditer(r"\basc_mmad(?:_mx|_sparse)?\s*(?:<[^;{}()]*>)?\s*\(", masked):
-            c_args = _extract_call_args_at(masked, mm.end() - 1)
-            if len(c_args) >= 4:
-                m_val = _safe_eval_cpp_int(c_args[3], consts)
-                if m_val is not None and m_val > 0:
-                    cube_m_vals.append(m_val)
-    effective_cube_m = (
-        min(cube_m_vals)
-        if cube_m_vals
-        else (tile_m if (uses_cube or mmad_cnt > 0) else 0)
-    )
-
-    has_lowbit_quant = bool(
-        re.search(
-            r"\b(?:int4|uint4|fp4|f4e2m1|f4e1m2|int4b_t|deq_scale|quant_mode|asc_mmad_mx)\b",
-            masked,
-        )
-    )
-
-    has_online_rescale_loop = False
-    exp_re = re.compile(r"\b(?:vexp|exp2|expf|exp|Exp)\s*(?:<[^>]*>)?\s*\(")
-    rescale_re = re.compile(
-        r"\b(?:vcmax|vcadd|vcmin|vreduce|ReduceMax|ReduceSum|asc_reduce_\w+|"
-        r"vmul|vdiv|vfma|vmad|Mul|Div)\b|\*=|\+="
-    )
-    for b_start, b_end in loop_spans:
-        body = masked[b_start:b_end]
-        if exp_re.search(body) and rescale_re.search(body):
-            has_online_rescale_loop = True
-            break
-
-    l1_total = sum(explicit_l1.values())
-    l1_full = max(1, int(getattr(facts, "l1_bytes", 524288)))
-    l1_half = max(1, l1_full // 2)
-    has_l1_half_iso = "l1_half_bank_split" in lower or "half_bank" in lower
-    if l1_total <= 0 or has_l1_half_iso:
-        l1_bank_conflict_risk = 0.0
-    elif l1_total > l1_half:
-        l1_bank_conflict_risk = round(min(1.0, l1_total / float(l1_full)), 4)
-    elif len(explicit_l1) >= 2:
-        l1_bank_conflict_risk = round(min(0.5, l1_total / float(l1_half)), 4)
-    else:
-        l1_bank_conflict_risk = 0.0
-
-    mte2_inflight = 0
-    if mte2_cnt > 0:
-        cur_run = 0
-        max_run = 0
-        mte2_events: set[str] = set()
-        for tok_m in re.finditer(
-            r"\b(asc_copy_gm2(?:ub|l1)\w*)\s*\(|"
-            r"\basc_sync_(?:notify|wait)\s*\(\s*([^)]+)\)",
-            masked,
-        ):
-            if tok_m.group(1):
-                cur_run += 1
-                max_run = max(max_run, cur_run)
-            else:
-                sync_args = _split_cpp_args(tok_m.group(2) or "")
-                if any(a.strip() == "PIPE_MTE2" for a in sync_args[:2]):
-                    if len(sync_args) >= 3:
-                        mte2_events.add(sync_args[2].strip())
-                    if "wait" in tok_m.group(0):
-                        cur_run = 0
-        mte2_inflight = max(1, max_run, len(mte2_events), 2 if ub_stages > 1 else 1)
-
-    strides = _stage_stride_elems(cpp_source, consts)
-    uses_dyn_offset = bool(
-        strides
-        or re.search(r"\b(?:stg|stage|stg_id|stage_id|nstg)\b[^;\n]*[?:]", masked)
-        or (
-            (ub_stages >= 2 or l1_stages >= 2)
-            and re.search(
-                r"\b\w+\s*&\s*1\b|\b\w+\s*%\s*(?:2|STAGES|NUM_STAGES)\b",
-                masked,
-            )
-        )
-    )
-
-    return {
-        "has_dual_subcore": has_dual_subcore,
-        "uses_unreserved_ubuf": uses_256kb_ub,
-        "in_loop_pipe_all_barriers": in_loop_pipe_all,
-        "min_gm_dma_bytes": min_gm_dma_bytes,
-        "dma_burst_efficiency_ratio": dma_burst_eff,
-        "dominant_contig_bytes": dominant_contig_bytes,
-        "effective_cube_m": effective_cube_m,
-        "has_lowbit_quant": has_lowbit_quant,
-        "has_online_rescale_loop": has_online_rescale_loop,
-        "l1_bank_conflict_risk": l1_bank_conflict_risk,
-        "mte2_inflight_per_aiv": mte2_inflight,
-        "uses_dynamic_offset_pipelining": uses_dyn_offset,
-    }
-
-
 def _build_ascendc_static_ledger(
-    cpp_source: str,
-    *,
-    target: AscendTarget | None = None,
-    compiler_summary: BishengResourceSummary | None = None,
-    objdump_text: str = "",
-    microarch_profile: MicroarchProfile | Mapping[str, object] | None = None,
+    cpp_source: str, *, target: AscendTarget | None = None, compiler_summary: BishengResourceSummary | None = None,
+    objdump_text: str = "", microarch_profile: MicroarchProfile | Mapping[str, object] | None = None,
     case_ratios: CasePhysicsRatios | None = None,
 ) -> ObjectivePhysicalLedger:
     """Compute SRAM waterlines and pipe cycles from C++20 constexprs, calls, and objdump."""
-    resolved_target = target or AscendTarget("ascend.950pr")
     from tilefoundry_ascend.ascend.target.facts import ascend_space_facts  # noqa: PLC0415
 
-    facts = ascend_space_facts(resolved_target)
+    facts = ascend_space_facts(target or AscendTarget("ascend.950pr"))
     lower = cpp_source.lower()
-
     consts, type_bytes = _resolve_cpp_consts_and_types(cpp_source)
-
-    ub_offsets: list[tuple[str, int, int]] = []
-    l1_offsets: list[tuple[str, int, int]] = []
-    ptr_env: dict[str, tuple[str, int]] = {}
-    concrete_pointer_bytes: dict[str, int] = {}
-
-    cast_pat = re.compile(
-        r"__(ubuf|cbuf)__\s+([A-Za-z0-9_]+)\s*\*\s*(\w+)\s*=\s*"
-        r"\(\s*__\1__\s+[A-Za-z0-9_]+\s*\*\s*\)\s*([^;]+);"
-    )
-    plus_pat = re.compile(
-        r"__(ubuf|cbuf)__\s+([A-Za-z0-9_]+)\s*\*\s*(\w+)\s*=\s*"
-        r"([A-Za-z_]\w*)\s*\+\s*([^;]+);"
-    )
+    ub_off, l1_off, ptr_env, cpb = [], [], {}, {}
+    cast_re = re.compile(r"__(ubuf|cbuf)__\s+([A-Za-z0-9_]+)\s*\*\s*(\w+)\s*=\s*\(\s*__\1__\s+[A-Za-z0-9_]+\s*\*\s*\)\s*([^;]+);")
+    plus_re = re.compile(r"__(ubuf|cbuf)__\s+([A-Za-z0-9_]+)\s*\*\s*(\w+)\s*=\s*([A-Za-z_]\w*)\s*\+\s*([^;]+);")
     for ln in cpp_source.splitlines():
-        cm = cast_pat.search(ln)
-        if cm:
-            space, ctype, name, expr = cm.group(1), cm.group(2), cm.group(3), cm.group(4)
-            if ctype in _CPP_DTYPE_BYTES:
-                concrete_pointer_bytes[name] = _CPP_DTYPE_BYTES[ctype]
-            off = _safe_eval_cpp_int(expr, consts)
-            if off is not None and off >= 0:
-                eb = _CPP_DTYPE_BYTES.get(ctype, 2)
-                ptr_env[name] = (space, off)
-                (ub_offsets if space == "ubuf" else l1_offsets).append((name, off, eb))
-            continue
-        pm = plus_pat.search(ln)
-        if pm:
-            space, ctype, name, base, expr = (
-                pm.group(1),
-                pm.group(2),
-                pm.group(3),
-                pm.group(4),
-                pm.group(5),
-            )
-            if ctype in _CPP_DTYPE_BYTES:
-                concrete_pointer_bytes[name] = _CPP_DTYPE_BYTES[ctype]
-            base_entry = ptr_env.get(base)
-            delta = _safe_eval_cpp_int(expr, consts)
-            if delta is not None:
-                eb = _CPP_DTYPE_BYTES.get(ctype, 2)
-                base_off = base_entry[1] if base_entry and base_entry[0] == space else 0
-                off = max(0, base_off + delta * eb)
-                ptr_env[name] = (space, off)
-                (ub_offsets if space == "ubuf" else l1_offsets).append((name, off, eb))
+        if cm := cast_re.search(ln):
+            sp, ct, nm, ex = cm.groups()
+            if ct in _CPP_DTYPE_BYTES: cpb[nm] = _CPP_DTYPE_BYTES[ct]
+            if (off := _safe_eval_cpp_int(ex, consts)) is not None and off >= 0:
+                ptr_env[nm] = (sp, off); (ub_off if sp == "ubuf" else l1_off).append((nm, off, _CPP_DTYPE_BYTES.get(ct, 2)))
+        elif pm := plus_re.search(ln):
+            sp, ct, nm, base, ex = pm.groups()
+            if ct in _CPP_DTYPE_BYTES: cpb[nm] = _CPP_DTYPE_BYTES[ct]
+            if (delta := _safe_eval_cpp_int(ex, consts)) is not None:
+                eb = _CPP_DTYPE_BYTES.get(ct, 2)
+                bo = ptr_env[base][1] if (base in ptr_env and ptr_env[base][0] == sp) else 0
+                off = max(0, bo + delta * eb)
+                ptr_env[nm] = (sp, off); (ub_off if sp == "ubuf" else l1_off).append((nm, off, eb))
 
-    tile_m = max(1, consts.get("CUBE_TILE_M", consts.get("BM", consts.get("TILE_M", 64))))
-    tile_n = max(1, consts.get("CUBE_TILE_N", consts.get("BN", consts.get("TILE_N", 64))))
-    tile_k = max(1, consts.get("CUBE_TILE_K", consts.get("BK", consts.get("TILE_K", 64))))
-    uses_cube = any(
-        tok in lower for tok in ("asc_mmad", "ascend_gemm_l1", "mmad", "l0c", "cube_tile", "__cbuf__")
-    )
+    tm = max(1, consts.get("CUBE_TILE_M", consts.get("BM", consts.get("TILE_M", 64))))
+    tn = max(1, consts.get("CUBE_TILE_N", consts.get("BN", consts.get("TILE_N", 64))))
+    tk = max(1, consts.get("CUBE_TILE_K", consts.get("BK", consts.get("TILE_K", 64))))
+    uses_cube = any(t in lower for t in ("asc_mmad", "ascend_gemm_l1", "mmad", "l0c", "cube_tile", "__cbuf__"))
     uses_simt = "__simt_vf__" in cpp_source or "Simt::" in cpp_source
-    uses_256kb_ub = (
-        "ub_256kb_unlock" in lower
-        or "__simd_vf__" in cpp_source
-        or "262144" in cpp_source
-    ) and not uses_simt
+    uses_256 = ("ub_256kb_unlock" in lower or "__simd_vf__" in cpp_source or "262144" in cpp_source) and not uses_simt
+    bd = _parse_cce_launch_block_dim(cpp_source, consts)
+    pc = int(facts.num_aic_cores) if uses_cube else int(facts.num_aiv_cores)
+    grid_b, wave_occ = (bd, bd / max(1, pc)) if bd is not None else ((max(1, int(round(case_ratios.wave_occupancy_ratio * pc))), float(case_ratios.wave_occupancy_ratio)) if case_ratios else (1, 0.0))
 
-    block_dim = _parse_cce_launch_block_dim(cpp_source, consts)
-    physical_cores = int(facts.num_aic_cores) if uses_cube else int(facts.num_aiv_cores)
-    if block_dim is not None:
-        grid_blocks = block_dim
-        wave_occupancy = block_dim / max(1, physical_cores)
-    elif case_ratios is not None:
-        wave_occupancy = float(case_ratios.wave_occupancy_ratio)
-        grid_blocks = max(1, int(round(wave_occupancy * physical_cores)))
-    else:
-        grid_blocks = 1
-        wave_occupancy = 0.0
-    ub_bank_conflict_risk = _estimate_ub_bank_conflict_risk(
-        cpp_source,
-        consts,
-        concrete_pointer_bytes,
-    )
+    strides_m = {}
+    for sm in re.finditer(r"\b([A-Za-z_]\w*)\s*\+\s*(?:\(\s*)?(?:stg_id|stage_id|stg|stage|slot|buf)\s*\*\s*([A-Za-z_]\w*|\d+)\s*\)?", cpp_source):
+        if (sv := _safe_eval_cpp_int(sm.group(2), consts)) and sv > 0:
+            strides_m[sm.group(1)] = max(strides_m.get(sm.group(1), sv), sv)
+    ub_stg = _stage_multiplicity(cpp_source, consts, scope="UB", names=[n for n, _, _ in ub_off])
+    l1_stg = _stage_multiplicity(cpp_source, consts, scope="L1", names=[n for n, _, _ in l1_off], strides=strides_m)
 
-    def _span_from_offsets(
-        entries: list[tuple[str, int, int]],
-        *,
-        scope: str,
-        stages: int,
-        strides: Mapping[str, int],
-    ) -> dict[str, int]:
-        if not entries:
-            return {}
-        ordered = sorted(entries, key=lambda item: item[1])
-        names = [item[0] for item in ordered]
-        bufs: dict[str, int] = {}
-        for idx, (name, off, eb) in enumerate(ordered):
-            stride = strides.get(name)
-            if stride is not None:
-                size = stride * eb * stages
-            elif idx + 1 < len(ordered):
-                size = max(0, ordered[idx + 1][1] - off)
-            elif idx > 0:
-                prev_gap = max(0, off - ordered[idx - 1][1])
-                size = prev_gap if prev_gap > 0 else max(eb * 64, tile_n * eb)
+    def _spans(entries: list[tuple[str, int, int]], scope: str, stg: int) -> dict[str, int]:
+        if not entries: return {}
+        ord_e = sorted(entries, key=lambda it: it[1])
+        names, bufs = [it[0] for it in ord_e], {}
+        for i, (nm, off, eb) in enumerate(ord_e):
+            sp = not any(o != nm and re.sub(r"\d+$", "", o) == re.sub(r"\d+$", "", nm) for o in names)
+            if (sd := strides_m.get(nm)) is not None: sz = sd * eb * stg
+            elif i + 1 < len(ord_e): sz = max(0, ord_e[i + 1][1] - off)
+            elif i > 0: sz = g if (g := max(0, off - ord_e[i - 1][1])) > 0 else max(eb * 64, tn * eb)
             else:
-                stage_bytes = consts.get(f"{scope}_STAGE_BYTES", consts.get("STAGE_BYTES"))
-                if _stage_storage_pointer(name, names) and stages > 1 and stage_bytes:
-                    size = int(stage_bytes) * stages
-                else:
-                    size = max(eb * 64, tile_m * tile_n * eb)
-            if idx + 1 == len(ordered):
-                size = max(
-                    size,
-                    _declared_stage_bytes(
-                        name,
-                        eb,
-                        consts,
-                        stages=stages,
-                        single_pointer=_stage_storage_pointer(name, names),
-                    ),
-                )
-            if size > 0:
-                bufs[name] = size
+                sb = consts.get(f"{scope}_STAGE_BYTES", consts.get("STAGE_BYTES"))
+                sz = int(sb) * stg if (sp and stg > 1 and sb) else max(eb * 64, tm * tn * eb)
+            if i + 1 == len(ord_e):
+                up = nm.upper()
+                roots = [s for b in [up, *(up[: -len(x)] for x in ("_BASE", "_BUF", "_PTR", "_0", "_1") if up.endswith(x))] for sl in (re.sub(r"\d+$", "", b),) for s in (sl, sl.replace("_L1", "").replace("_UB", ""))]
+                for rt in dict.fromkeys(roots):
+                    for suf in ("_STAGE_BYTES", "_BYTES", "_STAGE", "_BASE", "_BUF", "_PTR"):
+                        if rt.endswith(suf): rt = rt[: -len(suf)]; break
+                    for k, ib in ((f"{rt}_STAGE_BYTES", True), (f"{rt}_BYTES", True), (f"{rt}_STAGE", False)):
+                        if k in consts:
+                            sz = max(sz, int(consts[k]) if ib else int(consts[k]) * eb * (stg if sp and not re.search(r"\d+$", nm) else 1))
+                            break
+            if sz > 0: bufs[nm] = sz
         return bufs
 
-    ub_stages = _stage_multiplicity(
-        cpp_source,
-        consts,
-        scope="UB",
-        names=[name for name, _, _ in ub_offsets],
-    )
-    strides = _stage_stride_elems(cpp_source, consts)
-    l1_stages = _stage_multiplicity(
-        cpp_source,
-        consts,
-        scope="L1",
-        names=[name for name, _, _ in l1_offsets],
-        strides=strides,
-    )
-    explicit_ub = _span_from_offsets(ub_offsets, scope="UB", stages=ub_stages, strides=strides)
-    explicit_l1 = _span_from_offsets(l1_offsets, scope="L1", stages=l1_stages, strides=strides)
+    ex_ub, ex_l1 = _spans(ub_off, "UB", ub_stg), _spans(l1_off, "L1", l1_stg)
+    if um := re.search(r"\bub_bytes\s*=\s*(\d+)", cpp_source, re.IGNORECASE): ex_ub = {"ub_declared": int(um.group(1))}
+    if lm := re.search(r"\bl1_bytes\s*=\s*(\d+)", cpp_source, re.IGNORECASE): ex_l1 = {"l1_declared": int(lm.group(1))}
+    if not ex_l1 and uses_cube: ex_l1["l1_AB"] = (tm * tk + tk * tn) * 2 * max(2, l1_stg)
+    if not ex_ub: ex_ub["ub_work"] = consts.get("ROWS", tm) * consts.get("BLK", tn) * 2 if uses_cube else max(1024, consts.get("ROWS", tm) * consts.get("BLK", tn) * 2)
+    imp_ub = {**({"register_spill": int(compiler_summary.spill_bytes)} if compiler_summary and compiler_summary.spill_bytes > 0 else {}), **({"stack_frame": int(compiler_summary.stack_bytes)} if compiler_summary and compiler_summary.stack_bytes > 0 else {})}
+    ub_cap = int(facts.ub_simtvf_usable_bytes) if uses_simt else (int(facts.ub_nominal_bytes) if uses_256 else int(facts.ub_simdvf_usable_bytes))
+    wls = {"UB": build_scope_waterline(scope="UB", capacity_bytes=ub_cap, explicit_buffers=ex_ub, implicit_buffers=imp_ub)}
+    if ex_l1 or uses_cube:
+        wls["L1"] = build_scope_waterline(scope="L1", capacity_bytes=int(facts.l1_bytes), explicit_buffers=ex_l1, implicit_buffers={})
 
-    ub_match = re.search(r"\bub_bytes\s*=\s*(\d+)", cpp_source, re.IGNORECASE)
-    l1_match = re.search(r"\bl1_bytes\s*=\s*(\d+)", cpp_source, re.IGNORECASE)
-    if ub_match:
-        explicit_ub = {"ub_declared": int(ub_match.group(1))}
-    if l1_match:
-        explicit_l1 = {"l1_declared": int(l1_match.group(1))}
+    dis = _parse_objdump_pipe_counts(objdump_text)
+    mte2_c = max(len(re.findall(r"\basc_copy_gm2(?:ub|l1)\w*\s*\(", cpp_source)), dis["mte2"])
+    mte3_c = max(len(re.findall(r"\basc_copy_ub2gm\w*\s*\(", cpp_source)), dis["mte3"])
+    fix_c = max(len(re.findall(r"\basc_copy_l0c2\w*\s*\(", cpp_source)), dis["fixpipe"])
+    mmad_c = max(len(re.findall(r"\b(?:asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\s*(?:<[^;{}()]*>)?\s*\(", cpp_source)), dis["cube_mmad"])
+    vf_c = max(len(re.findall(r"\b(?:simd_inst|Reg)::\w+\s*(?:<[^>]*>)?\s*\(", cpp_source)), dis["vec"])
 
-    if not explicit_l1 and uses_cube:
-        stages = max(2, l1_stages)
-        explicit_l1["l1_AB"] = (tile_m * tile_k + tile_k * tile_n) * 2 * stages
-    if not explicit_ub:
-        ub_rows = consts.get("ROWS", tile_m)
-        ub_blk = consts.get("BLK", tile_n)
-        explicit_ub["ub_work"] = (
-            ub_rows * ub_blk * 2 if uses_cube else max(1024, ub_rows * ub_blk * 2)
-        )
+    masked = strip_cpp_comments_and_strings(cpp_source)
+    lspans, n_m = [], len(masked)
+    for lm in re.finditer(r"\b(?:for|while)\s*\(", masked):
+        p, pd = lm.end() - 1, 0
+        while p < n_m:
+            pd += (masked[p] == "(") - (masked[p] == ")"); p += 1
+            if pd == 0: break
+        while p < n_m and masked[p].isspace(): p += 1
+        if p < n_m and masked[p] == "{":
+            bs, bd_l, p = p + 1, 1, p + 1
+            while p < n_m and bd_l > 0:
+                bd_l += (masked[p] == "{") - (masked[p] == "}"); p += 1
+            lspans.append((bs, max(bs, p - 1)))
+    dconsts = dict(consts)
+    for bm in re.finditer(r"\bif\s*\(\s*([A-Za-z_]\w*)\s*>\s*([^;{}()]+?)\s*\)\s*\1\s*=\s*([^;]+);", masked):
+        if bm.group(1) not in dconsts and (bv := _safe_eval_cpp_int(bm.group(3), dconsts)) and bv > 0: dconsts[bm.group(1)] = bv
+    dma_b, cands_b = [], []
+    for dm in re.finditer(r"\b(asc_copy_gm2ub_align|asc_copy_ub2gm_align|asc_copy_gm2ub|asc_copy_ub2gm|asc_copy_gm2l1(?:_nd2nz|_dn2nz)?|asc_copy_l0c2gm\w*)\s*\(", masked):
+        fn, args = dm.group(1), _extract_call_args_at(masked, dm.end() - 1)
+        if fn in ("asc_copy_gm2ub_align", "asc_copy_ub2gm_align"):
+            if len(args) == 3 and (sz := _safe_eval_cpp_int(args[2], dconsts)) and sz > 0: dma_b.append(sz); cands_b.append(sz)
+            elif len(args) >= 4 and (rb := _safe_eval_cpp_int(args[3], dconsts)) and rb > 0: nb = _safe_eval_cpp_int(args[2], dconsts); cands_b.append(rb); dma_b.append(rb * nb if nb and nb > 0 else rb)
+        elif fn in ("asc_copy_gm2ub", "asc_copy_ub2gm") and len(args) >= 4 and (bl := _safe_eval_cpp_int(args[3], dconsts)) and bl > 0:
+            rb, nb = bl * 32, _safe_eval_cpp_int(args[2], dconsts); cands_b.append(rb); dma_b.append(rb * nb if nb and nb > 0 else rb)
+        elif fn.startswith("asc_copy_gm2l1") and len(args) >= 6 and (cs := _safe_eval_cpp_int(args[5], dconsts)) and cs > 0:
+            rb, rs = cs * 2, _safe_eval_cpp_int(args[4], dconsts); cands_b.append(rb); dma_b.append(rb * rs if rs and rs > 0 else rb)
+        elif fn.startswith("asc_copy_l0c2gm") and len(args) >= 4 and (cs := _safe_eval_cpp_int(args[2], dconsts)) and cs > 0:
+            rb, rs = cs * _resolve_l0c2gm_eb(fn, args, masked, dm.start(), dconsts, type_bytes), _safe_eval_cpp_int(args[3], dconsts); cands_b.append(rb); dma_b.append(rb * rs if rs and rs > 0 else rb)
+    dma_eff = round(min(1.0, sum(dma_b) / max(1e-6, sum(b / max(1e-6, float(facts.dma_burst_efficiency(int(b)))) for b in dma_b))), 4) if (dma_b and hasattr(facts, "dma_burst_efficiency")) else 1.0
+    dom_cb = max(cands_b) if cands_b else (int(case_ratios.inner_contiguous_bytes) if case_ratios and case_ratios.inner_contiguous_bytes > 0 else (tn * 2 if (mte2_c or mte3_c) else 0))
+    cm_vals = [mv for gm in re.finditer(r"\bascend_gemm_l1\s*<([^;{}()]+)>\s*\(", masked) if (ta := _split_cpp_args(gm.group(1))) and (mv := _safe_eval_cpp_int(ta[0], consts)) and mv > 0] if (uses_cube or mmad_c) else []
+    cm_vals.extend(mv for mm in re.finditer(r"\basc_mmad(?:_mx|_sparse)?\s*(?:<[^;{}()]*>)?\s*\(", masked) if len(ca := _extract_call_args_at(masked, mm.end() - 1)) >= 4 and (mv := _safe_eval_cpp_int(ca[3], consts)) and mv > 0)
+    eff_cm = min(cm_vals) if cm_vals else (tm if (uses_cube or mmad_c) else 0)
+    l1_tot, l1_full = sum(ex_l1.values()), max(1, int(getattr(facts, "l1_bytes", 524288)))
+    l1_risk = 0.0 if (l1_tot <= 0 or "l1_half_bank_split" in lower or "half_bank" in lower) else round(min(1.0 if l1_tot > l1_full // 2 else 0.5, l1_tot / float(l1_full if l1_tot > l1_full // 2 else max(1, l1_full // 2))), 4) if (l1_tot > l1_full // 2 or len(ex_l1) >= 2) else 0.0
+    ub_str: dict[str, int] = {}
+    for um2 in _UB_STRIDED_ACCESS_RE.finditer(masked):
+        if (eb := cpb.get(um2.group(1))) and (se := _safe_eval_cpp_int(um2.group(2), consts)) and se > 0: ub_str[um2.group(1)] = max(ub_str.get(um2.group(1), 0), se * eb)
+    ub_risk = (sum(1 for sb in ub_str.values() if sb >= 512 and sb % 512 == 0) / len(ub_str)) if ub_str else 0.0
+    mte2_inf = 0
+    if mte2_c > 0:
+        cr, mr, mevs = 0, 0, set()
+        for tm2 in re.finditer(r"\b(asc_copy_gm2(?:ub|l1)\w*)\s*\(|\basc_sync_(?:notify|wait)\s*\(\s*([^)]+)\)", masked):
+            if tm2.group(1): cr += 1; mr = max(mr, cr)
+            else:
+                sa = _split_cpp_args(tm2.group(2) or "", include_angle=False)
+                if any(a.strip() == "PIPE_MTE2" for a in sa[:2]):
+                    if len(sa) >= 3: mevs.add(sa[2].strip())
+                    if "wait" in tm2.group(0): cr = 0
+        mte2_inf = max(1, mr, len(mevs), 2 if ub_stg > 1 else 1)
 
-    implicit_ub: dict[str, int] = {}
-    if compiler_summary is not None:
-        if compiler_summary.spill_bytes > 0:
-            implicit_ub["register_spill"] = int(compiler_summary.spill_bytes)
-        if compiler_summary.stack_bytes > 0:
-            implicit_ub["stack_frame"] = int(compiler_summary.stack_bytes)
+    has_dual = bool(re.search(r"\b(?:get_subblockid|GetSubBlockIdx|get_subblock_idx)\s*\(", masked))
+    pipes: dict[str, int] = {}
+    if mte2_c > 0: pipes["AIV0.PIPE_MTE2"] = mte2_c * max(16, (tm * tn * 2) // 64)
+    if mte3_c > 0: pipes["AIV0.PIPE_MTE3"] = mte3_c * max(16, (tm * tn * 2) // 64)
+    if vf_c > 0:
+        tv = vf_c * max(8, (tm * tn) // 64) * (2 if (compiler_summary and not compiler_summary.vloopv2_hit) else 1) + (int(compiler_summary.spill_bytes) * 2 if compiler_summary else 0)
+        if has_dual: pipes["AIV0.PIPE_V"] = max(1, tv // 2); pipes["AIV1.PIPE_V"] = max(1, tv - pipes["AIV0.PIPE_V"])
+        else: pipes["AIV0.PIPE_V"] = tv
+    if mmad_c > 0: pipes["AIC.PIPE_M"] = mmad_c * max(16, (tm * tn * tk) // 4096)
+    if fix_c > 0: pipes["AIC.PIPE_FIX"] = fix_c * max(12, (tm * tn * 2) // 256)
+    if dis["mte1"] > 0: pipes["AIC.PIPE_MTE1"] = dis["mte1"] * max(8, (tm * tk) // 128)
+    ma_dict = microarch_profile.to_dict() if isinstance(microarch_profile, MicroarchProfile) else (dict(microarch_profile) if isinstance(microarch_profile, Mapping) else extract_microarch_profile_from_cce(cpp_source).to_dict())
 
-    ub_cap = (
-        int(facts.ub_simtvf_usable_bytes)
-        if uses_simt
-        else (int(facts.ub_nominal_bytes) if uses_256kb_ub else int(facts.ub_simdvf_usable_bytes))
-    )
-    waterlines: dict[str, ScopeWaterline] = {
-        "UB": build_scope_waterline(
-            scope="UB",
-            capacity_bytes=ub_cap,
-            explicit_buffers=explicit_ub,
-            implicit_buffers=implicit_ub,
-        )
-    }
-    if explicit_l1 or uses_cube:
-        waterlines["L1"] = build_scope_waterline(
-            scope="L1",
-            capacity_bytes=int(facts.l1_bytes),
-            explicit_buffers=explicit_l1,
-            implicit_buffers={},
-        )
-
-    dis_counts = _parse_objdump_pipe_counts(objdump_text)
-    mte2_src_cnt = len(re.findall(r"\basc_copy_gm2(?:ub|l1)\w*\s*\(", cpp_source))
-    mte3_src_cnt = len(re.findall(r"\basc_copy_ub2gm\w*\s*\(", cpp_source))
-    fix_src_cnt = len(re.findall(r"\basc_copy_l0c2\w*\s*\(", cpp_source))
-    mmad_src_cnt = len(
-        re.findall(
-            r"\b(?:asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\s*(?:<[^;{}()]*>)?\s*\(",
-            cpp_source,
-        )
-    )
-    vf_src_cnt = len(re.findall(r"\b(?:simd_inst|Reg)::\w+\s*(?:<[^>]*>)?\s*\(", cpp_source))
-
-    mte2_cnt = max(mte2_src_cnt, dis_counts["mte2"])
-    mte3_cnt = max(mte3_src_cnt, dis_counts["mte3"])
-    fix_cnt = max(fix_src_cnt, dis_counts["fixpipe"])
-    mmad_cnt = max(mmad_src_cnt, dis_counts["cube_mmad"])
-    vf_cnt = max(vf_src_cnt, dis_counts["vec"])
-
-    spill_penalty = int(compiler_summary.spill_bytes) * 2 if compiler_summary else 0
-    sw_loop_mult = 2 if (compiler_summary and not compiler_summary.vloopv2_hit) else 1
-
-    signals = _extract_trackb_dma_and_pipe_signals(
-        cpp_source,
-        consts,
-        facts,
-        explicit_l1,
-        uses_cube=uses_cube,
-        uses_256kb_ub=uses_256kb_ub,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        mte2_cnt=mte2_cnt,
-        mte3_cnt=mte3_cnt,
-        mmad_cnt=mmad_cnt,
-        ub_stages=ub_stages,
-        l1_stages=l1_stages,
-        case_ratios=case_ratios,
-        type_bytes=type_bytes,
-    )
-
-    pipe_cycles: dict[str, int] = {}
-    if mte2_cnt > 0:
-        pipe_cycles["AIV0.PIPE_MTE2"] = mte2_cnt * max(16, (tile_m * tile_n * 2) // 64)
-    if mte3_cnt > 0:
-        pipe_cycles["AIV0.PIPE_MTE3"] = mte3_cnt * max(16, (tile_m * tile_n * 2) // 64)
-    if vf_cnt > 0:
-        total_vec = vf_cnt * max(8, (tile_m * tile_n) // 64) * sw_loop_mult + spill_penalty
-        if bool(signals["has_dual_subcore"]):
-            aiv0_vec = max(1, total_vec // 2)
-            aiv1_vec = max(1, total_vec - aiv0_vec)
-            pipe_cycles["AIV0.PIPE_V"] = aiv0_vec
-            pipe_cycles["AIV1.PIPE_V"] = aiv1_vec
-        else:
-            pipe_cycles["AIV0.PIPE_V"] = total_vec
-    if mmad_cnt > 0:
-        pipe_cycles["AIC.PIPE_M"] = mmad_cnt * max(16, (tile_m * tile_n * tile_k) // 4096)
-    if fix_cnt > 0:
-        pipe_cycles["AIC.PIPE_FIX"] = fix_cnt * max(12, (tile_m * tile_n * 2) // 256)
-    if dis_counts["mte1"] > 0:
-        pipe_cycles["AIC.PIPE_MTE1"] = dis_counts["mte1"] * max(8, (tile_m * tile_k) // 128)
-
-    if isinstance(microarch_profile, MicroarchProfile):
-        ma_dict = microarch_profile.to_dict()
-    elif isinstance(microarch_profile, Mapping):
-        ma_dict = dict(microarch_profile)
-    else:
-        ma_dict = extract_microarch_profile_from_cce(cpp_source).to_dict()
-
-    is_legal = all(wl.overflow_bytes == 0 for wl in waterlines.values())
-    steady_ii = max(pipe_cycles.values()) if pipe_cycles else None
-    ub_scalar_loops = count_reachable_ub_scalar_compute_loops(cpp_source)
     return build_objective_physical_ledger(
-        analysis_mode="readonly_envelope",
-        is_legal=is_legal,
-        steady_state_ii=steady_ii,
-        pipe_cycles=pipe_cycles,
-        waterlines=waterlines,
-        mte2_inflight_per_aiv=int(signals["mte2_inflight_per_aiv"]),
-        grid_blocks=grid_blocks,
-        wave_occupancy=wave_occupancy,
-        dominant_contig_bytes=int(signals["dominant_contig_bytes"]),
-        effective_cube_m=int(signals["effective_cube_m"]),
-        has_indirect_gather=uses_simt,
-        has_lowbit_quant=bool(signals["has_lowbit_quant"]),
-        has_online_rescale_loop=bool(signals["has_online_rescale_loop"]),
-        uses_unreserved_ubuf=bool(signals["uses_unreserved_ubuf"]),
-        min_gm_dma_bytes=int(signals["min_gm_dma_bytes"]),
-        dma_burst_efficiency_ratio=float(signals["dma_burst_efficiency_ratio"]),
-        uses_dynamic_offset_pipelining=bool(signals["uses_dynamic_offset_pipelining"]),
-        in_loop_pipe_all_barriers=int(signals["in_loop_pipe_all_barriers"]),
-        ub_bank_conflict_risk=ub_bank_conflict_risk,
-        l1_bank_conflict_risk=float(signals["l1_bank_conflict_risk"]),
-        ub_scalar_compute_loops=ub_scalar_loops,
-        microarch_profile=ma_dict,
+        analysis_mode="readonly_envelope", is_legal=all(wl.overflow_bytes == 0 for wl in wls.values()),
+        steady_state_ii=max(pipes.values()) if pipes else None, pipe_cycles=pipes, waterlines=wls,
+        mte2_inflight_per_aiv=mte2_inf, grid_blocks=grid_b, wave_occupancy=wave_occ, dominant_contig_bytes=dom_cb,
+        effective_cube_m=eff_cm, has_indirect_gather=uses_simt,
+        has_lowbit_quant=bool(re.search(r"\b(?:int4|uint4|fp4|f4e2m1|f4e1m2|int4b_t|deq_scale|quant_mode|asc_mmad_mx)\b", masked)),
+        has_online_rescale_loop=any(re.search(r"\b(?:vexp|exp2|expf|exp|Exp)\s*(?:<[^>]*>)?\s*\(", masked[bs:be]) and re.search(r"\b(?:vcmax|vcadd|vcmin|vreduce|ReduceMax|ReduceSum|asc_reduce_\w+|vmul|vdiv|vfma|vmad|Mul|Div)\b|\*=|\+=", masked[bs:be]) for bs, be in lspans),
+        uses_unreserved_ubuf=uses_256, min_gm_dma_bytes=min(dma_b) if dma_b else 0, dma_burst_efficiency_ratio=dma_eff,
+        uses_dynamic_offset_pipelining=bool(strides_m or re.search(r"\b(?:stg|stage|stg_id|stage_id|nstg)\b[^;\n]*[?:]", masked) or ((ub_stg >= 2 or l1_stg >= 2) and re.search(r"\b\w+\s*&\s*1\b|\b\w+\s*%\s*(?:2|STAGES|NUM_STAGES)\b", masked))),
+        in_loop_pipe_all_barriers=sum(len(re.findall(r"\b(?:pipe_barrier|asc_sync_pipe)\s*\(\s*PIPE_ALL\s*\)", masked[bs:be])) for bs, be in lspans),
+        ub_bank_conflict_risk=ub_risk, l1_bank_conflict_risk=l1_risk,
+        ub_scalar_compute_loops=count_reachable_ub_scalar_compute_loops(cpp_source), microarch_profile=ma_dict,
     )
+
+
+def _merge_disassembly_microarch_profile(cpp_source: str, objdump_text: str) -> dict[str, object] | None:
+    if not cpp_source.strip() and not objdump_text.strip():
+        return None
+    base = extract_microarch_profile_from_cce(cpp_source)
+    dis = _parse_objdump_pipe_counts(objdump_text)
+    if dis["total_insns"] == 0:
+        return base.to_dict()
+    consts, _ = _resolve_cpp_consts_and_types(cpp_source)
+    gran: dict[str, int] = {}
+    shape_src = re.sub(r"\bconstexpr\s+[^;]+;", "", cpp_source)
+    eb_of = lambda txt: next((w for tn, w in _CPP_DTYPE_BYTES.items() if re.search(rf"\b{re.escape(tn)}\b", txt)), 2)
+    for route in _TRANSFER_ROUTES:
+        payloads = []
+        if spec := _TRANSFER_CALL_SPECS.get(route):
+            pfx, ri, ci, kind = spec
+            for call in re.finditer(rf"\b{pfx}\w*\s*\(([^;]*)\)\s*;", cpp_source, re.S):
+                if len(args := _split_cpp_args(call.group(1))) > max(ri, ci):
+                    eb = eb_of(call.group(0))
+                    r = _safe_eval_cpp_int(args[ri], {**consts, "T_ELEM_BYTES": eb})
+                    c = _safe_eval_cpp_int(args[ci], {**consts, "T_ELEM_BYTES": eb})
+                    if r and c and r > 0 and c > 0:
+                        payloads.append(r * c * (1 if kind == "bytes" else (4 if kind == "float" else eb)))
+        if payloads:
+            gran[route] = sorted(payloads)[len(payloads) // 2]
+        elif any(k in consts for k in ("CUBE_TILE_M", "CUBE_TILE_N", "CUBE_TILE_K", "BM", "BN", "BK", "TILE_M", "TILE_N", "TILE_K")):
+            tm, tn, tk, eb = max(1, consts.get("CUBE_TILE_M", consts.get("BM", consts.get("TILE_M", 64)))), max(1, consts.get("CUBE_TILE_N", consts.get("BN", consts.get("TILE_N", 64)))), max(1, consts.get("CUBE_TILE_K", consts.get("BK", consts.get("TILE_K", 64)))), eb_of(shape_src)
+            gran[route] = max(tm * tk, tk * tn) * eb if route == "gm_to_l1" else (tm * tn * eb if route in ("gm_to_ub", "ub_to_gm", "ub_to_l1") else (tm * tk * eb if route == "l1_to_l0a" else (tk * tn * eb if route == "l1_to_l0b" else tm * tn * 4)))
+    upd: dict[str, object] = {"fp_alu_ops": max(base.fp_alu_ops, dis["vec"]), "cube_mmad_count": max(base.cube_mmad_count, dis["cube_mmad"]), "cv_sync_barriers": max(base.cv_sync_barriers, dis["sync"])}
+    for ck, bf in (("gm_to_l1_insns", "gm_to_l1_bytes"), ("gm_to_ub_insns", "gm_to_ub_bytes"), ("l1_to_l0a_insns", "l1_to_l0a_bytes"), ("l1_to_l0b_insns", "l1_to_l0b_bytes"), ("l0c_to_ub_insns", "l0c_to_ub_bytes"), ("l0c_to_l1_insns", "l0c_to_l1_bytes"), ("l0c_to_gm_insns", "l0c_to_gm_bytes"), ("ub_to_gm_insns", "ub_to_gm_bytes"), ("ub_to_l1_insns", "ub_to_l1_bytes")):
+        rt = bf.removesuffix("_bytes")
+        upd[bf] = dis[ck] * gran[rt] if (dis[ck] > 0 and rt in gran) else getattr(base, bf)
+    return replace(base, **upd).to_dict()
 
 
 def evaluate_ascendc_candidate(
-    cpp_source: str,
-    *,
-    freedom_mask: object | None = None,
-    verifier: object | None = None,
-    target: AscendTarget | None = None,
-    max_flag_depth: int = 15,
-    enable_track_router: bool = False,
-    case_ratios: CasePhysicsRatios | None = None,
-    baseline_cpp_source: str | None = None,
-    require_hardware_dma: bool = False,
-    require_cube_engine: bool = False,
-    module_source: str | None = None,
-    regime_tag: str | None = None,
+    cpp_source: str, *, freedom_mask: object | None = None, verifier: object | None = None,
+    target: AscendTarget | None = None, enable_track_router: bool = False,
+    case_ratios: CasePhysicsRatios | None = None, require_hardware_dma: bool = False,
+    require_cube_engine: bool = False, baseline_cpp_source: str | None = None, max_flag_depth: int = 8,
+    module_source: str = "", regime_tag: str = "",
 ) -> StageAResult:
     """Validate a Track-B AscendC C++ candidate via 7-facet checks and static ledger."""
     t0 = time.monotonic()
     if not isinstance(cpp_source, str) or not cpp_source.strip():
-        return StageAResult(
-            passed=False,
-            prim_func=None,
-            ledger=None,
-            error_message="ascendc_empty_source",
-            elapsed_ms=(time.monotonic() - t0) * 1000.0,
-            backend_kind="ascendc",
-            fault_plane="STAGE_A_STATIC",
-            fault_code="ASCENDC_EMPTY_SOURCE",
-            failed_tier="stage_a",
-        )
-
+        return _stage_a_fail(t0, "ascendc_empty_source", "ASCENDC_EMPTY_SOURCE", backend_kind="ascendc")
     from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask  # noqa: PLC0415
     from tilefoundry_ascend.ascend.sil.verifier import (  # noqa: PLC0415
         SILVerifier,
         verify_source_against_facets,
     )
 
-    _, reachable_cpp = extract_reachable_trackb_source(
-        cpp_source,
-        module_source=module_source,
-        regime_tag=regime_tag,
-    )
+    _, rcpp = extract_reachable_trackb_source(cpp_source, module_source=module_source, regime_tag=regime_tag)
+    amask = freedom_mask if freedom_mask is not None else ConstraintRelaxationMask.bottom()
+    aver = verifier if verifier is not None else SILVerifier()
+    frep = aver.verify_source_against_facets(cpp_source, amask, max_flag_depth=max_flag_depth) if hasattr(aver, "verify_source_against_facets") else verify_source_against_facets(cpp_source, amask, max_flag_depth=max_flag_depth)
+    ledger = _build_ascendc_static_ledger(rcpp, target=target, case_ratios=case_ratios)
+    ftoks = CCE_CPP20_SURFACE.introduced_forbidden_tokens(baseline_cpp_source, cpp_source) if baseline_cpp_source is not None else tuple(t for t, c in CCE_CPP20_SURFACE.count_forbidden_tokens(cpp_source).items() if c > 0)
+    errors = [*_check_custom_kernel_redlines(cpp_source), *frep.errors]
+    msrc = strip_cpp_comments_and_strings(rcpp)
+    if require_cube_engine and len(re.findall(r"\b(?:asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\s*(?:<[^;{}()]*>)?\s*\(", msrc)) == 0 and int(ledger.pipe_cycles.get("AIC.PIPE_M", 0)) == 0:
+        errors.append("missing_cube_engine_primitives: matmul/attention kernel contains zero Cube MMAD instructions (scalar fallback trap)")
+    if require_hardware_dma and len(re.findall(r"\basc_copy_gm2(?:ub|l1)\w*\s*\(", msrc)) == 0 and not any(k.endswith(".PIPE_MTE2") and int(v) > 0 for k, v in ledger.pipe_cycles.items()):
+        errors.append("missing_hardware_dma_staging: Track-B kernel performs raw scalar __gm__ loops with zero GM->UB/L1 DMA transfers")
+    if (case_ratios is None or not getattr(case_ratios, "has_empty_group", False)) and re.search(r"\b__simt_vf__\b", msrc) and (re.search(r"__launch_bounds__\s*\(\s*1\s*\)", msrc) or re.search(r"\basc_vf_call\s*<[^>]+>\s*\(\s*dim3\s*\(\s*1\s*,\s*1\s*,\s*1\s*\)", msrc)):
+        errors.append("degenerated_single_lane_simt: __simt_vf__ launched with 1 thread wastes 127/128 SIMT lanes; parallelize across >=32 threads via Simt::GetThreadIdx<0>() or use __simd_vf__")
+    if ftoks: errors.append(f"cce_forbidden_tokens: {', '.join(ftoks)}")
+    if ledger.max_overflow_bytes > 0: errors.append(f"max_overflow_bytes={ledger.max_overflow_bytes}")
 
-    active_mask = freedom_mask if freedom_mask is not None else ConstraintRelaxationMask.bottom()
-    active_verifier = verifier if verifier is not None else SILVerifier()
-    if hasattr(active_verifier, "verify_source_against_facets"):
-        facet_report = active_verifier.verify_source_against_facets(
-            cpp_source, active_mask, max_flag_depth=max_flag_depth
-        )
-    else:
-        facet_report = verify_source_against_facets(
-            cpp_source, active_mask, max_flag_depth=max_flag_depth
-        )
-
-    redline_errs = _check_custom_kernel_redlines(cpp_source)
-    ledger = _build_ascendc_static_ledger(reachable_cpp, target=target, case_ratios=case_ratios)
-
-    if baseline_cpp_source is not None:
-        forbidden_tokens = CCE_CPP20_SURFACE.introduced_forbidden_tokens(
-            baseline_cpp_source, cpp_source
-        )
-    else:
-        forbidden_tokens = tuple(
-            token
-            for token, count in CCE_CPP20_SURFACE.count_forbidden_tokens(cpp_source).items()
-            if count > 0
-        )
-    errors = [*redline_errs, *facet_report.errors]
-    masked_src = strip_cpp_comments_and_strings(reachable_cpp)
-    if require_cube_engine:
-        mmad_hits = len(
-            re.findall(
-                r"\b(?:asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\s*(?:<[^;{}()]*>)?\s*\(",
-                masked_src,
-            )
-        )
-        if mmad_hits == 0 and int(ledger.pipe_cycles.get("AIC.PIPE_M", 0)) == 0:
-            errors.append(
-                "missing_cube_engine_primitives: matmul/attention kernel contains zero "
-                "Cube MMAD instructions (scalar fallback trap)"
-            )
-    if require_hardware_dma:
-        mte2_hits = len(re.findall(r"\basc_copy_gm2(?:ub|l1)\w*\s*\(", masked_src))
-        has_mte2_pipe = any(
-            k.endswith(".PIPE_MTE2") and int(v) > 0 for k, v in ledger.pipe_cycles.items()
-        )
-        if mte2_hits == 0 and not has_mte2_pipe:
-            errors.append(
-                "missing_hardware_dma_staging: Track-B kernel performs raw scalar __gm__ "
-                "loops with zero GM->UB/L1 DMA transfers"
-            )
-    if case_ratios is None or not getattr(case_ratios, "has_empty_group", False):
-        if re.search(r"\b__simt_vf__\b", masked_src) and (
-            re.search(r"__launch_bounds__\s*\(\s*1\s*\)", masked_src)
-            or re.search(
-                r"\basc_vf_call\s*<[^>]+>\s*\(\s*dim3\s*\(\s*1\s*,\s*1\s*,\s*1\s*\)",
-                masked_src,
-            )
-        ):
-            errors.append(
-                "degenerated_single_lane_simt: __simt_vf__ launched with 1 thread wastes "
-                "127/128 SIMT lanes; parallelize across >=32 threads via "
-                "Simt::GetThreadIdx<0>() or use __simd_vf__"
-            )
-    if forbidden_tokens:
-        errors.append(f"cce_forbidden_tokens: {', '.join(forbidden_tokens)}")
-    if ledger.max_overflow_bytes > 0:
-        errors.append(f"max_overflow_bytes={ledger.max_overflow_bytes}")
-
-    features: dict[str, object] | None = None
-    route: object | None = None
+    features, route = None, None
     if enable_track_router:
         from tilefoundry_ascend.agent.router.capability_gate import (  # noqa: PLC0415
             route_execution_track,
         )
 
-        lower = reachable_cpp.lower()
-        uses_cube = "mmad" in lower or "l0c" in lower or "ascend_gemm_l1" in lower
-        uses_simt = "__simt_vf__" in reachable_cpp or "Simt::" in reachable_cpp
-        uses_ssbuf = "ssbuf" in lower or "crosscore" in lower
-        static_affine_bounds = not uses_simt
-        cube_to_vector_ratio = 1.0 if uses_cube else 0.0
-        quant_granularity = "per_token_or_block" if "deq_scale" in lower else "none"
-        semantic_features: dict[str, object] = {
-            "static_affine_bounds": static_affine_bounds,
-            "cube_to_vector_ratio": cube_to_vector_ratio,
-            "quant_granularity": quant_granularity,
-            "indirect_sparse_gather": uses_simt,
-            "cross_iter_recurrence": "none",
-            "dynamic_cross_core_handoff": uses_ssbuf,
-            "inner_contiguous_bytes": (
-                case_ratios.inner_contiguous_bytes if case_ratios is not None else 0
-            ),
-            "persistent_wave_occupancy": (
-                case_ratios.wave_occupancy_ratio if case_ratios is not None else 0.0
-            ),
-            "uses_cube": uses_cube,
-        }
-        route = route_execution_track(
-            semantic_features,
-            ledger=ledger,
-            target=target,
-            case_ratios=case_ratios,
-            simt_dominant=uses_simt,
-        )
-        features = dict(route.features) if route.features is not None else semantic_features
-
-    if errors:
-        fault_plane, fault_code, failed_tier = _classify_ascendc_stage_a_fault(errors)
-        return StageAResult(
-            passed=False,
-            prim_func=None,
-            ledger=ledger,
-            features=features,
-            route=route,
-            error_message="; ".join(errors),
-            elapsed_ms=(time.monotonic() - t0) * 1000.0,
-            backend_kind="ascendc",
-            fault_plane=fault_plane,
-            fault_code=fault_code,
-            failed_tier=failed_tier,
-        )
-    return StageAResult(
-        passed=True,
-        prim_func=None,
-        ledger=ledger,
-        features=features,
-        route=route,
-        elapsed_ms=(time.monotonic() - t0) * 1000.0,
-        backend_kind="ascendc",
-    )
+        low = rcpp.lower()
+        route = route_execution_track(None, ledger=ledger, semantic_features={"static_affine_bounds": not ("__simt_vf__" in rcpp or "Simt::" in rcpp), "cube_to_vector_ratio": 1.0 if any(t in low for t in ("mmad", "l0c", "ascend_gemm_l1")) else 0.0, "quant_granularity": "per_token_or_block" if "deq_scale" in low else "none"}, target=target, case_ratios=case_ratios)
+        features = dict(route.features) if route.features is not None else None
+    if not ledger.is_legal or errors:
+        fc = next((c for tok, c in _ASCENDC_FAULT_TOKENS if tok in "; ".join(errors).lower()), "STAGE_A_ASCENDC_STATIC_FAILED")
+        return _stage_a_fail(t0, "; ".join(dict.fromkeys(errors)) or "ascendc_static_ledger_illegal", fc, backend_kind="ascendc", ledger=ledger, features=features, route=route)
+    return StageAResult(passed=True, prim_func=None, ledger=ledger, features=features, route=route, elapsed_ms=(time.monotonic() - t0) * 1000.0, backend_kind="ascendc")
 
 
 def _is_tvm_ir_node(obj: object) -> bool:
-    try:
-        import tilelang  # noqa: F401, PLC0415
-        from tvm import IRModule, tirx  # noqa: PLC0415
+    from tvm import IRModule, tirx  # noqa: PLC0415
 
-        return isinstance(obj, (tirx.PrimFunc, IRModule))
-    except Exception:
-        return False
+    return isinstance(obj, (tirx.PrimFunc, IRModule))
 
 
 def _resolve_prim_func_and_configs_from_dsl(
-    dsl_source: str,
-    *,
-    factory_name: str | None = None,
-    factory_kwargs: Mapping[str, object] | None = None,
-    config_selector_name: str | None = None,
-    dims: Mapping[str, object] | None = None,
+    dsl_source: str, *, factory_name: str | None = None, factory_kwargs: Mapping[str, object] | None = None,
+    config_selector_name: str | None = None, dims: Mapping[str, object] | None = None,
 ) -> tuple[object, dict[str, object], list[str]]:
-    """Load DSL source via a temp module, invoke selector if present, and build PrimFunc."""
-    import importlib.util  # noqa: PLC0415
-
     ast.parse(dsl_source)
-    sel_pass_configs: dict[str, object] = {}
-    sel_compile_flags: list[str] = []
-    effective_kwargs = _merge_dims_into_kwargs(factory_kwargs, dims)
-
+    sel_pc, sel_cf, eff_kw = {}, [], _merge_dims_into_kwargs(factory_kwargs, dims)
     with tempfile.TemporaryDirectory(prefix="tf_stage_a_") as tmp_dir:
-        mod_path = Path(tmp_dir) / "candidate_dsl.py"
-        mod_path.write_text(dsl_source, encoding="utf-8")
-        spec = importlib.util.spec_from_file_location("_tf_stage_a_cand", str(mod_path))
-        if spec is None or spec.loader is None:
+        (mod_p := Path(tmp_dir) / "candidate_dsl.py").write_text(dsl_source, encoding="utf-8")
+        if (spec := importlib.util.spec_from_file_location("_tf_stage_a_cand", str(mod_p))) is None or spec.loader is None:
             raise RuntimeError("failed to create module spec for candidate DSL")
         mod = importlib.util.module_from_spec(spec)
         with ascend_compile_session("ascend"):
             spec.loader.exec_module(mod)
-
-            if config_selector_name and hasattr(mod, config_selector_name):
-                selector_obj = getattr(mod, config_selector_name)
-                if callable(selector_obj):
-                    sel_args = _filter_kwargs_for_callable(selector_obj, effective_kwargs)
-                    sel_raw = selector_obj(**sel_args)
-                    if isinstance(sel_raw, Mapping):
-                        overrides, sel_pass_configs, sel_compile_flags = _split_selector_output(
-                            sel_raw
-                        )
-                        effective_kwargs.update(overrides)
-
+            if config_selector_name and callable(so := getattr(mod, config_selector_name, None)) and isinstance(sr := so(**_filter_kwargs_for_callable(so, eff_kw)), Mapping):
+                ov, sel_pc, sel_cf = _split_selector_output(sr)
+                eff_kw.update(ov)
             if factory_name and hasattr(mod, factory_name):
-                target_obj = getattr(mod, factory_name)
-                if callable(target_obj):
-                    if factory_name == "kernel" and not _has_prim_func_marker(dsl_source):
-                        return target_obj, sel_pass_configs, sel_compile_flags
-                    call_kw = _filter_kwargs_for_callable(target_obj, effective_kwargs)
-                    built = target_obj(**call_kw)
-                    return built, sel_pass_configs, sel_compile_flags
-                return target_obj, sel_pass_configs, sel_compile_flags
-
-            for val in vars(mod).values():
-                if _is_tvm_ir_node(val):
-                    return val, sel_pass_configs, sel_compile_flags
-
-            kernel_obj = getattr(mod, "kernel", None)
-            if callable(kernel_obj) and not _has_prim_func_marker(dsl_source):
-                return kernel_obj, sel_pass_configs, sel_compile_flags
-
-            for name, val in vars(mod).items():
-                if (
-                    not name.startswith("_")
-                    and callable(val)
-                    and getattr(val, "__module__", None) == mod.__name__
-                ):
-                    call_kw = _filter_kwargs_for_callable(val, effective_kwargs)
-                    return val(**call_kw), sel_pass_configs, sel_compile_flags
+                tgt = getattr(mod, factory_name)
+                return (tgt if (not callable(tgt) or (factory_name == "kernel" and "prim_func" not in dsl_source)) else tgt(**_filter_kwargs_for_callable(tgt, eff_kw))), sel_pc, sel_cf
+            if (ir_v := next((v for v in vars(mod).values() if _is_tvm_ir_node(v)), None)) is not None:
+                return ir_v, sel_pc, sel_cf
+            if callable(ko := getattr(mod, "kernel", None)) and "prim_func" not in dsl_source:
+                return ko, sel_pc, sel_cf
+            for nm, v in vars(mod).items():
+                if not nm.startswith("_") and callable(v) and getattr(v, "__module__", None) == mod.__name__:
+                    return v(**_filter_kwargs_for_callable(v, eff_kw)), sel_pc, sel_cf
     raise ValueError("DSL source defined no callable factory or PrimFunc")
 
 
-def _resolve_prim_func_from_dsl(
-    dsl_source: str,
-    *,
-    factory_name: str | None = None,
-    factory_kwargs: Mapping[str, object] | None = None,
-):
-    """Load DSL source via a temporary module so @T.prim_func sees file lines cleanly."""
-    prim_func, _pc, _cf = _resolve_prim_func_and_configs_from_dsl(
-        dsl_source,
-        factory_name=factory_name,
-        factory_kwargs=factory_kwargs,
-    )
-    return prim_func
-
-
-def _merge_pass_configs_and_flags(
-    sel_pc: Mapping[str, object] | None,
-    sel_cf: Sequence[str] | str | None,
-    ext_pc: Mapping[str, object] | None,
-    ext_cf: Sequence[str] | str | None,
-) -> tuple[dict[str, object], list[str]]:
-    merged_pc: dict[str, object] = {}
-    merged_cf: list[str] = []
-
-    def _absorb(pc_map: Mapping[str, object] | None, cf_seq: Sequence[str] | str | None) -> None:
-        if pc_map:
-            for k, v in pc_map.items():
-                if str(k) == "tl.device_compile_flags":
-                    for flag in _normalize_flag_list(v):
-                        if flag not in merged_cf:
-                            merged_cf.append(flag)
-                else:
-                    merged_pc[str(k)] = v
-        for flag in _normalize_flag_list(cf_seq):
-            if flag not in merged_cf:
-                merged_cf.append(flag)
-
-    _absorb(sel_pc, sel_cf)
-    _absorb(ext_pc, ext_cf)
-    return merged_pc, merged_cf
-
-
-_PARALLEL_FORBIDDEN_MATH = ("Cast", "exp", "log", "tanh", "sigmoid", "rsqrt")
+def _resolve_prim_func_from_dsl(dsl_source: str, *, factory_name: str | None = None, factory_kwargs: Mapping[str, object] | None = None):
+    return _resolve_prim_func_and_configs_from_dsl(dsl_source, factory_name=factory_name, factory_kwargs=factory_kwargs)[0]
 
 
 def _is_t_dsl_call(node: ast.AST, attr: str) -> bool:
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == attr
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "T"
-    )
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == attr and isinstance(node.func.value, ast.Name) and node.func.value.id == "T"
 
 
 def _parallel_forbidden_math_calls(tree: ast.AST) -> list[str]:
-    """Return sorted ``T.<op>`` scalar-math calls in ``T.Parallel`` bodies outside SimtVF."""
     found: set[str] = set()
-
-    def _visit(node: ast.AST, in_simt_vf: bool) -> None:
-        if isinstance(node, ast.For) and _is_t_dsl_call(node.iter, "Parallel") and not in_simt_vf:
-            for body_node in node.body:
-                for inner in ast.walk(body_node):
-                    if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
-                        attr = inner.func.attr
-                        if attr in _PARALLEL_FORBIDDEN_MATH and _is_t_dsl_call(inner, attr):
-                            found.add(attr)
-        nested_simt_vf = in_simt_vf or (
-            isinstance(node, ast.With)
-            and any(_is_t_dsl_call(item.context_expr, "SimtVF") for item in node.items)
-        )
-        for child in ast.iter_child_nodes(node):
-            _visit(child, nested_simt_vf)
-
-    _visit(tree, False)
+    def _v(node: ast.AST, in_simt: bool) -> None:
+        if isinstance(node, ast.For) and _is_t_dsl_call(node.iter, "Parallel") and not in_simt:
+            for bn in node.body:
+                for inner in ast.walk(bn):
+                    if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) and inner.func.attr in ("Cast", "exp", "log", "tanh", "sigmoid", "rsqrt") and _is_t_dsl_call(inner, inner.func.attr):
+                        found.add(inner.func.attr)
+        nested = in_simt or (isinstance(node, ast.With) and any(_is_t_dsl_call(it.context_expr, "SimtVF") for it in node.items))
+        for ch in ast.iter_child_nodes(node): _v(ch, nested)
+    _v(tree, False)
     return sorted(found)
 
 
-def _kernel_threads_kwarg_calls(tree: ast.AST) -> list[int]:
-    """Return line numbers of T.Kernel/Kernel calls passing forbidden threads= kwargs."""
-    lines: list[int] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        is_kernel = (
-            isinstance(node.func, ast.Attribute) and node.func.attr == "Kernel"
-        ) or (isinstance(node.func, ast.Name) and node.func.id == "Kernel")
-        if is_kernel and any(kw.arg == "threads" for kw in node.keywords):
-            lines.append(node.lineno)
-    return sorted(set(lines))
-
-
-def _ast_has_dsl_call(tree: ast.AST, *attrs: str) -> bool:
-    for node in ast.walk(tree):
-        if any(_is_t_dsl_call(node, attr) for attr in attrs):
-            return True
-    return False
-
-
-_SRAM_ALLOC_ATTRS = frozenset(
-    {"alloc_shared", "alloc_l1", "alloc_l0a", "alloc_l0b", "alloc_l0c", "alloc_ss"}
-)
-
-
-def _expr_base_name(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Subscript):
-        return _expr_base_name(node.value)
-    return None
-
-
-def _expr_names(node: ast.AST) -> set[str]:
-    return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
-
-
-def _is_sid_partition_guard(test: ast.AST, sid_var: str) -> bool:
-    for sub in ast.walk(test):
-        if isinstance(sub, ast.Compare) and isinstance(sub.left, ast.Name) and sub.left.id == sid_var:
-            if any(isinstance(op, (ast.Eq, ast.NotEq)) for op in sub.ops):
-                return True
-        if isinstance(sub, ast.Compare) and any(
-            isinstance(comp, ast.Name) and comp.id == sid_var for comp in sub.comparators
-        ):
-            if any(isinstance(op, (ast.Eq, ast.NotEq)) for op in sub.ops):
-                return True
-    return False
-
-
-def _extract_mixed_kernel_sids2(node: ast.AST) -> tuple[ast.With, str] | None:
-    if not isinstance(node, ast.With):
-        return None
-    for item in node.items:
-        call = item.context_expr
-        if not _is_t_dsl_call(call, "MixedKernel"):
-            continue
-        assert isinstance(call, ast.Call)
-        sids_val: object = None
-        for kw in call.keywords:
-            if kw.arg == "sids" and isinstance(kw.value, ast.Constant):
-                sids_val = kw.value.value
-                break
-        if sids_val != 2:
-            continue
-        if isinstance(item.optional_vars, (ast.Tuple, ast.List)) and len(item.optional_vars.elts) >= 2:
-            sid_node = item.optional_vars.elts[1]
-            if isinstance(sid_node, ast.Name) and sid_node.id != "_":
-                return node, sid_node.id
-    return None
-
-
 def _uncovered_1c2v_subcore_mte3_writes(tree: ast.AST) -> list[int]:
-    """Return line numbers of UB->GM T.copy writes lacking sid partitioning in sids=2."""
-    bad_lines: list[int] = []
-    for fn_node in ast.walk(tree):
-        if not isinstance(fn_node, ast.FunctionDef):
-            continue
-        param_names = {arg.arg for arg in fn_node.args.args}
-        for sub_node in ast.walk(fn_node):
-            extracted = _extract_mixed_kernel_sids2(sub_node)
-            if extracted is None:
-                continue
-            with_node, sid_var = extracted
-            ub_buffers: set[str] = set()
-            sram_buffers: set[str] = set()
-            for stmt in ast.walk(with_node):
-                if (
-                    isinstance(stmt, ast.Assign)
-                    and len(stmt.targets) == 1
-                    and isinstance(stmt.targets[0], ast.Name)
-                    and isinstance(stmt.value, ast.Call)
-                ):
-                    for attr in _SRAM_ALLOC_ATTRS:
-                        if _is_t_dsl_call(stmt.value, attr):
-                            name = stmt.targets[0].id
-                            sram_buffers.add(name)
-                            if attr == "alloc_shared":
-                                ub_buffers.add(name)
+    bad: list[int] = []
+    bn_of = lambda n: n.id if isinstance(n, ast.Name) else (bn_of(n.value) if isinstance(n, ast.Subscript) else None)
+    names_of = lambda n: {c.id for c in ast.walk(n) if isinstance(c, ast.Name)}
+    sram_attrs = frozenset({"alloc_shared", "alloc_l1", "alloc_l0a", "alloc_l0b", "alloc_l0c", "alloc_ss"})
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef): continue
+        pnames = {a.arg for a in fn.args.args}
+        for sub in ast.walk(fn):
+            if not isinstance(sub, ast.With): continue
+            sid = next(
+                (it.optional_vars.elts[1].id for it in sub.items if isinstance(it.context_expr, ast.Call) and _is_t_dsl_call(it.context_expr, "MixedKernel") and any(kw.arg == "sids" and isinstance(kw.value, ast.Constant) and kw.value.value == 2 for kw in it.context_expr.keywords) and isinstance(it.optional_vars, (ast.Tuple, ast.List)) and len(it.optional_vars.elts) >= 2 and isinstance(it.optional_vars.elts[1], ast.Name) and it.optional_vars.elts[1].id != "_"),
+                "",
+            )
+            if not sid: continue
+            ub_b, sram_b, tainted = set(), set(), {sid}
+            for st in ast.walk(sub):
+                if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and isinstance(st.value, ast.Call):
+                    for a in sram_attrs:
+                        if _is_t_dsl_call(st.value, a):
+                            sram_b.add(st.targets[0].id)
+                            if a == "alloc_shared": ub_b.add(st.targets[0].id)
                             break
-
-            sid_tainted: set[str] = {sid_var}
             for _ in range(6):
-                changed = False
-                for stmt in ast.walk(with_node):
-                    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
-                        tgt = stmt.targets[0]
-                        if isinstance(tgt, ast.Name) and (_expr_names(stmt.value) & sid_tainted):
-                            if tgt.id not in sid_tainted:
-                                sid_tainted.add(tgt.id)
-                                changed = True
-                    elif (
-                        isinstance(stmt, ast.AnnAssign)
-                        and stmt.value is not None
-                        and isinstance(stmt.target, ast.Name)
-                        and (_expr_names(stmt.value) & sid_tainted)
-                    ):
-                        if stmt.target.id not in sid_tainted:
-                            sid_tainted.add(stmt.target.id)
-                            changed = True
-                    elif isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name):
-                        if (
-                            isinstance(stmt.iter, ast.Call)
-                            and len(stmt.iter.args) >= 2
-                            and (_expr_names(stmt.iter) & sid_tainted)
-                            and stmt.target.id not in sid_tainted
-                        ):
-                            sid_tainted.add(stmt.target.id)
-                            changed = True
-                if not changed:
-                    break
-
-            def _scan_stmts(stmts: Sequence[ast.stmt], *, sid_guarded: bool) -> None:
+                added = False
+                for st in ast.walk(sub):
+                    t, e = (st.targets[0], st.value) if isinstance(st, ast.Assign) and len(st.targets) == 1 else ((st.target, st.value) if isinstance(st, ast.AnnAssign) and st.value is not None else ((st.target, st.iter) if isinstance(st, ast.For) and isinstance(st.iter, ast.Call) and len(st.iter.args) >= 2 else (None, None)))
+                    if isinstance(t, ast.Name) and e is not None and (names_of(e) & tainted) and t.id not in tainted:
+                        tainted.add(t.id); added = True
+                if not added: break
+            def _scan(stmts: Sequence[ast.stmt], g: bool) -> None:
                 for st in stmts:
                     if isinstance(st, ast.If):
-                        guarded = sid_guarded or _is_sid_partition_guard(st.test, sid_var)
-                        _scan_stmts(st.body, sid_guarded=guarded)
-                        _scan_stmts(st.orelse, sid_guarded=guarded)
-                        continue
-                    if isinstance(st, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
-                        _scan_stmts(st.body, sid_guarded=sid_guarded)
-                        if hasattr(st, "orelse"):
-                            _scan_stmts(st.orelse, sid_guarded=sid_guarded)
-                        continue
-                    if sid_guarded:
-                        continue
-                    for inner in ast.walk(st):
-                        if not _is_t_dsl_call(inner, "copy"):
-                            continue
-                        assert isinstance(inner, ast.Call)
-                        if len(inner.args) < 2:
-                            continue
-                        src_name = _expr_base_name(inner.args[0])
-                        dst_arg = inner.args[1]
-                        dst_name = _expr_base_name(dst_arg)
-                        if src_name not in ub_buffers or dst_name is None:
-                            continue
-                        is_gm_target = (dst_name in param_names) or (dst_name not in sram_buffers)
-                        if not is_gm_target:
-                            continue
-                        if isinstance(dst_arg, ast.Subscript):
-                            if not (_expr_names(dst_arg.slice) & sid_tainted):
-                                bad_lines.append(inner.lineno)
-                        else:
-                            bad_lines.append(inner.lineno)
-
-            _scan_stmts(with_node.body, sid_guarded=False)
-    return sorted(set(bad_lines))
+                        ig = g or any(isinstance(s, ast.Compare) and any(isinstance(o, (ast.Eq, ast.NotEq)) for o in s.ops) and ((isinstance(s.left, ast.Name) and s.left.id == sid) or any(isinstance(c, ast.Name) and c.id == sid for c in s.comparators)) for s in ast.walk(st.test))
+                        _scan(st.body, ig); _scan(st.orelse, ig)
+                    elif isinstance(st, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
+                        _scan(st.body, g)
+                    elif isinstance(st, ast.Try):
+                        _scan(st.body, g); hasattr(st, "orelse") and _scan(st.orelse, g)
+                    elif not g:
+                        for inner in ast.walk(st):
+                            if isinstance(inner, ast.Call) and _is_t_dsl_call(inner, "copy") and len(inner.args) >= 2:
+                                sn, da = bn_of(inner.args[0]), inner.args[1]
+                                if sn in ub_b and (dn := bn_of(da)) is not None and (dn in pnames or dn not in sram_b) and (not isinstance(da, ast.Subscript) or not (names_of(da.slice) & tainted)):
+                                    bad.append(inner.lineno)
+            _scan(sub.body, False)
+    return sorted(set(bad))
 
 
-def _resolve_stage_a_var_bindings(
-    dims: Mapping[str, object] | None,
-    var_bindings: Mapping[str, int] | None,
-) -> dict[str, int] | None:
-    resolved: dict[str, int] = {}
+def _resolve_stage_a_var_bindings(dims: Mapping[str, object] | None, var_bindings: Mapping[str, int] | None) -> dict[str, int] | None:
+    resolved = build_anchor_var_bindings(dims)
     if dims:
-        for key, val in dims.items():
-            if isinstance(val, int) and not isinstance(val, bool):
-                key_str = str(key)
-                iv = int(val)
-                resolved[key_str] = iv
-                mapped = _HIR_TO_BUILDER_DIM_MAP.get(key_str)
-                if mapped:
-                    resolved.setdefault(mapped, iv)
-        b_val = resolved.get("B", resolved.get("b_dim"))
-        s_val = resolved.get("S", resolved.get("S_q", resolved.get("s_dim")))
-        s1_val = resolved.get("S1", resolved.get("s1_dim", s_val))
-        nq_val = resolved.get("N_q", resolved.get("n_q"))
-        nkv_val = resolved.get("N_kv", resolved.get("n_kv"))
-        n_val = resolved.get("N", resolved.get("n_depth"))
-        if b_val is not None and s_val is not None:
-            resolved.setdefault("m_rows", b_val * s_val)
-            if n_val is not None:
-                resolved.setdefault("v_rows", n_val * b_val * s_val)
-        if b_val is not None and s1_val is not None and nq_val is not None:
-            resolved.setdefault("q_total_rows", b_val * s1_val * nq_val)
-        n1_val = resolved.get("N1", nq_val)
-        n2_val = resolved.get("N2", nkv_val)
-        if n1_val is not None and n2_val is not None and n2_val > 0:
-            resolved.setdefault("g_ratio", max(1, n1_val // n2_val))
-        if s_val is not None and nq_val is not None and nkv_val is not None and nkv_val > 0:
-            resolved.setdefault("q_rows", s_val * (nq_val // nkv_val))
-    if var_bindings:
-        for key, val in var_bindings.items():
-            if isinstance(val, int) and not isinstance(val, bool):
-                resolved[str(key)] = int(val)
+        bv, s1v = resolved.get("B", resolved.get("b_dim")), resolved.get("S1", resolved.get("s1_dim", resolved.get("S", resolved.get("S_q", resolved.get("s_dim")))))
+        nqv, nkv = resolved.get("N_q", resolved.get("n_q")), resolved.get("N_kv", resolved.get("n_kv"))
+        n1v, n2v = resolved.get("N1", nqv), resolved.get("N2", nkv)
+        if bv is not None and s1v is not None and nqv is not None: resolved.setdefault("q_total_rows", bv * s1v * nqv)
+        if n1v is not None and n2v is not None and n2v > 0: resolved.setdefault("g_ratio", max(1, n1v // n2v))
+    for k, v in (var_bindings or {}).items():
+        if isinstance(v, int) and not isinstance(v, bool): resolved[str(k)] = int(v)
     return resolved or None
 
 
 def run_stage_a_static(
-    dsl_source: str,
-    *,
-    factory_name: str | None = None,
-    factory_kwargs: Mapping[str, object] | None = None,
-    target: AscendTarget | None = None,
-    pass_configs: dict[str, object] | None = None,
-    compile_flags: Sequence[str] | str | None = None,
-    config_selector_name: str | None = None,
-    dims: Mapping[str, object] | None = None,
-    var_bindings: Mapping[str, int] | None = None,
-    enable_track_router: bool = False,
-    case_ratios: CasePhysicsRatios | None = None,
-    require_hardware_dma: bool = False,
-    require_cube_engine: bool = False,
+    dsl_source: str, *, factory_name: str | None = None, factory_kwargs: Mapping[str, object] | None = None,
+    target: AscendTarget | None = None, pass_configs: dict[str, object] | None = None,
+    compile_flags: Sequence[str] | str | None = None, config_selector_name: str | None = None,
+    dims: Mapping[str, object] | None = None, var_bindings: Mapping[str, int] | None = None,
+    enable_track_router: bool = False, case_ratios: CasePhysicsRatios | None = None,
+    require_hardware_dma: bool = False, require_cube_engine: bool = False,
     ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> StageAResult:
     """Run millisecond Stage A AST, Two-Snapshot IR Diff, and optional track routing."""
     t0 = time.monotonic()
     try:
-        parsed_tree = ast.parse(dsl_source)
-        kernel_threads_lines = _kernel_threads_kwarg_calls(parsed_tree)
-        if kernel_threads_lines:
-            line_list = ", ".join(str(ln) for ln in kernel_threads_lines)
-            return StageAResult(
-                passed=False,
-                prim_func=None,
-                ledger=None,
-                error_message=(
-                    "forbidden_kernel_threads_kwarg: T.Kernel(...) does not accept "
-                    f"threads= (lines {line_list}); pass threads= only to T.SimtVF(threads=128)"
-                ),
-                elapsed_ms=(time.monotonic() - t0) * 1000.0,
-                fault_plane="STAGE_A_STATIC",
-                fault_code="FORBIDDEN_KERNEL_THREADS_KWARG",
-                failed_tier="stage_a",
-            )
-        parallel_math = _parallel_forbidden_math_calls(parsed_tree)
-        if parallel_math:
-            return StageAResult(
-                passed=False,
-                prim_func=None,
-                ledger=None,
-                error_message=(
-                    "forbidden_tracka_parallel_scalar_math: T.Parallel body calls "
-                    f"{', '.join(f'T.{op}' for op in parallel_math)}; move elementwise math "
-                    "under with T.SimdVF(): with T.simd.vcvt / T.simd.vexp, or under "
-                    "with T.SimtVF(threads=128): with T.cast"
-                ),
-                elapsed_ms=(time.monotonic() - t0) * 1000.0,
-                fault_plane="STAGE_A_STATIC",
-                fault_code="FORBIDDEN_TRACKA_PARALLEL_SCALAR_MATH",
-                failed_tier="stage_a",
-            )
-        uncovered_1c2v_lines = _uncovered_1c2v_subcore_mte3_writes(parsed_tree)
-        if uncovered_1c2v_lines:
-            return StageAResult(
-                passed=False,
-                prim_func=None,
-                ledger=None,
-                error_message=(
-                    "uncovered_1c2v_subcore_mte3_write: T.MixedKernel(sids=2) writes shared "
-                    "GM/workspace buffer without partitioning slices by 'sid' "
-                    "(causes insert_sync AIV0.MTE3->AIV1.MTE3 fatal); "
-                    "partition rows as sid * half_m : (sid + 1) * half_m"
-                ),
-                elapsed_ms=(time.monotonic() - t0) * 1000.0,
-                fault_plane="STAGE_A_STATIC",
-                fault_code="UNCOVERED_1C2V_SUBCORE_MTE3_WRITE",
-                failed_tier="stage_a",
-            )
-        semantic_violations = check_tilelang_semantic_contracts(
-            dsl_source,
-            protected_exports=frozenset(),
-        )
-        if semantic_violations:
-            return StageAResult(
-                passed=False,
-                prim_func=None,
-                ledger=None,
-                error_message="; ".join(
-                    f"{v.code}(line {v.lineno}): {v.message}"
-                    for v in semantic_violations
-                ),
-                elapsed_ms=(time.monotonic() - t0) * 1000.0,
-                fault_plane="STAGE_A_STATIC",
-                fault_code=semantic_violations[0].code,
-                failed_tier="stage_a",
-            )
-        tl_ast_report = verify_tilelang_ast(dsl_source)
-        if not tl_ast_report.passed:
-            return StageAResult(
-                passed=False,
-                prim_func=None,
-                ledger=None,
-                error_message="; ".join(tl_ast_report.errors),
-                elapsed_ms=(time.monotonic() - t0) * 1000.0,
-                fault_plane="STAGE_A_STATIC",
-                fault_code="TILELANG_AST_VIOLATION",
-                failed_tier="stage_a",
-            )
-        entry_name = _detect_module_entrypoint(parsed_tree)
-        if entry_name:
-            purity_errs = check_npu_entrypoint_purity(dsl_source, entry_name)
-            if purity_errs:
-                return StageAResult(
-                    passed=False,
-                    prim_func=None,
-                    ledger=None,
-                    error_message="; ".join(purity_errs),
-                    elapsed_ms=(time.monotonic() - t0) * 1000.0,
-                    fault_plane="STAGE_A_STATIC",
-                    fault_code="NPU_ENTRYPOINT_PURITY_VIOLATION",
-                    failed_tier="stage_a",
-                )
+        ptree = ast.parse(dsl_source)
+        if kl := sorted({n.lineno for n in ast.walk(ptree) if isinstance(n, ast.Call) and ((isinstance(n.func, ast.Attribute) and n.func.attr == "Kernel") or (isinstance(n.func, ast.Name) and n.func.id == "Kernel")) and any(kw.arg == "threads" for kw in n.keywords)}):
+            return _stage_a_fail(t0, f"forbidden_kernel_threads_kwarg: T.Kernel(...) does not accept threads= (lines {', '.join(map(str, kl))}); pass threads= only to T.SimtVF(threads=128)", "FORBIDDEN_KERNEL_THREADS_KWARG")
+        if pm := _parallel_forbidden_math_calls(ptree):
+            return _stage_a_fail(t0, f"forbidden_tracka_parallel_scalar_math: T.Parallel body calls {', '.join(f'T.{o}' for o in pm)}; move elementwise math under with T.SimdVF(): with T.simd.vcvt / T.simd.vexp, or under with T.SimtVF(threads=128): with T.cast", "FORBIDDEN_TRACKA_PARALLEL_SCALAR_MATH")
+        if _uncovered_1c2v_subcore_mte3_writes(ptree):
+            return _stage_a_fail(t0, "uncovered_1c2v_subcore_mte3_write: T.MixedKernel(sids=2) writes shared GM/workspace buffer without partitioning slices by 'sid' (causes insert_sync AIV0.MTE3->AIV1.MTE3 fatal); partition rows as sid * half_m : (sid + 1) * half_m", "UNCOVERED_1C2V_SUBCORE_MTE3_WRITE")
+        if sv := check_tilelang_semantic_contracts(dsl_source, protected_exports=frozenset()):
+            return _stage_a_fail(t0, "; ".join(f"{v.code}(line {v.lineno}): {v.message}" for v in sv), sv[0].code)
+        if not (tl_rep := verify_tilelang_ast(dsl_source)).passed:
+            return _stage_a_fail(t0, "; ".join(tl_rep.errors), "TILELANG_AST_VIOLATION")
+        if (en := _detect_module_entrypoint(ptree)) and (pe := check_npu_entrypoint_purity(dsl_source, en)):
+            return _stage_a_fail(t0, "; ".join(pe), "NPU_ENTRYPOINT_PURITY_VIOLATION")
         with ascend_compile_session("ascend"):
-            prim_func, sel_pc, sel_cf = _resolve_prim_func_and_configs_from_dsl(
-                dsl_source,
-                factory_name=factory_name,
-                factory_kwargs=factory_kwargs,
-                config_selector_name=config_selector_name,
-                dims=dims,
-            )
+            prim_func, sel_pc, sel_cf = _resolve_prim_func_and_configs_from_dsl(dsl_source, factory_name=factory_name, factory_kwargs=factory_kwargs, config_selector_name=config_selector_name, dims=dims)
             if not _is_tvm_ir_node(prim_func) and callable(prim_func):
-                redline_errs = _check_custom_kernel_redlines(dsl_source)
-                err_parts = [
-                    *redline_errs,
-                    (
-                        "stage_a_non_kernel_callable: candidate is a plain Python function "
-                        "without @T.prim_func or Track-B TU"
-                    ),
-                ]
-                return StageAResult(
-                    passed=False,
-                    prim_func=None,
-                    ledger=None,
-                    features=None,
-                    route=None,
-                    error_message="; ".join(err_parts),
-                    elapsed_ms=(time.monotonic() - t0) * 1000.0,
-                    backend_kind="python_kernel",
-                    fault_plane="STAGE_A_STATIC",
-                    fault_code="STAGE_A_NON_KERNEL_CALLABLE",
-                    failed_tier="stage_a",
-                )
-            merged_pc, merged_cf = _merge_pass_configs_and_flags(
-                sel_pc,
-                sel_cf,
-                pass_configs,
-                compile_flags,
-            )
-            resolved_var_bindings = _resolve_stage_a_var_bindings(dims, var_bindings)
-            inspection: EnvelopeInspectionResult = inspect_tilelang_primfunc(
-                prim_func,
-                target=target,
-                pass_configs=merged_pc or None,
-                compile_flags=merged_cf or None,
-                var_bindings=resolved_var_bindings,
-                ordered_tensor_shapes=ordered_tensor_shapes,
-            )
+                errs = [*_check_custom_kernel_redlines(dsl_source), "stage_a_non_kernel_callable: candidate is a plain Python function without @T.prim_func or Track-B TU"]
+                return _stage_a_fail(t0, "; ".join(errs), "STAGE_A_NON_KERNEL_CALLABLE", backend_kind="python_kernel")
+            mpc, mcf = _merge_pass_configs_and_flags(sel_pc, sel_cf, pass_configs, compile_flags)
+            insp: EnvelopeInspectionResult = inspect_tilelang_primfunc(prim_func, target=target, pass_configs=mpc or None, compile_flags=mcf or None, var_bindings=_resolve_stage_a_var_bindings(dims, var_bindings), ordered_tensor_shapes=ordered_tensor_shapes)
     except Exception as exc:
-        return StageAResult(
-            passed=False,
-            prim_func=None,
-            ledger=None,
-            features=None,
-            route=None,
-            error_message=f"stage_a_parse_or_lower_error: {type(exc).__name__}: {exc}",
-            elapsed_ms=(time.monotonic() - t0) * 1000.0,
-            fault_plane="STAGE_A_STATIC",
-            fault_code="STAGE_A_PARSE_OR_LOWER_ERROR",
-            failed_tier="stage_a",
-        )
+        return _stage_a_fail(t0, f"stage_a_parse_or_lower_error: {type(exc).__name__}: {exc}", "STAGE_A_PARSE_OR_LOWER_ERROR")
 
-    ledger = inspection.ledger
-    features: dict[str, object] | None = None
-    route: object | None = None
+    ledger, features, route = insp.ledger, None, None
     if enable_track_router:
         from tilefoundry_ascend.agent.router.capability_gate import (  # noqa: PLC0415
             route_execution_track,
         )
 
-        route = route_execution_track(
-            prim_func,
-            ledger=ledger,
-            target=target,
-            case_ratios=case_ratios,
-        )
+        route = route_execution_track(prim_func, ledger=ledger, target=target, case_ratios=case_ratios)
         features = dict(route.features) if route.features is not None else None
     if not ledger.is_legal:
-        reasons: list[str] = []
-        if ledger.max_overflow_bytes > 0:
-            reasons.append(f"max_overflow_bytes={ledger.max_overflow_bytes}")
-        if inspection.lowering_error:
-            reasons.append(inspection.lowering_error)
-        if not reasons:
-            reasons.append("illegal_datapath_or_capacity")
-        return StageAResult(
-            passed=False,
-            prim_func=prim_func,
-            ledger=ledger,
-            features=features,
-            route=route,
-            error_message="; ".join(reasons),
-            elapsed_ms=(time.monotonic() - t0) * 1000.0,
-            fault_plane="STAGE_A_STATIC",
-            fault_code=(
-                "UB_OVERFLOW" if ledger.max_overflow_bytes > 0 else "ILLEGAL_DATAPATH_OR_CAPACITY"
-            ),
-            failed_tier="stage_a",
-        )
+        rs = ([f"max_overflow_bytes={ledger.max_overflow_bytes}"] if ledger.max_overflow_bytes > 0 else []) + ([insp.lowering_error] if insp.lowering_error else [])
+        return _stage_a_fail(t0, "; ".join(rs) or "stage_a_static_ledger_illegal", "STAGE_A_STATIC_ILLEGAL", prim_func=prim_func, ledger=ledger, features=features, route=route)
+    if redlines := _check_custom_kernel_redlines(dsl_source):
+        return _stage_a_fail(t0, "; ".join(redlines), "CUSTOM_KERNEL_REDLINE", prim_func=prim_func, ledger=ledger, features=features, route=route)
     engine_reasons: list[str] = []
     if require_cube_engine:
-        has_cube_pipe = int(ledger.pipe_cycles.get("AIC.PIPE_M", 0)) > 0
-        has_gemm_call = _ast_has_dsl_call(parsed_tree, "gemm", "gemm_v0")
-        if not (has_cube_pipe or has_gemm_call):
+        has_cube = int(ledger.pipe_cycles.get("AIC.PIPE_M", 0)) > 0 or any(
+            _is_t_dsl_call(n, "gemm") or _is_t_dsl_call(n, "gemm_v0")
+            for n in ast.walk(ptree)
+        )
+        if not has_cube:
             engine_reasons.append(
                 "missing_cube_engine_primitives: Track-A @T.prim_func contains zero "
                 "Cube MMAD/T.gemm operations (AIC.PIPE_M == 0)"
             )
     if require_hardware_dma:
-        uses_simt = bool(ledger.has_indirect_gather or _ast_has_dsl_call(parsed_tree, "SimtVF"))
+        uses_simt = bool(
+            ledger.has_indirect_gather
+            or any(_is_t_dsl_call(n, "SimtVF") for n in ast.walk(ptree))
+        )
         has_mte2 = any(
             k.endswith("PIPE_MTE2") and int(v) > 0 for k, v in ledger.pipe_cycles.items()
         )
@@ -3564,17 +1179,14 @@ def run_stage_a_static(
                 "GM->UB/L1 DMA transfers (PIPE_MTE2 == 0)"
             )
     if engine_reasons:
-        return StageAResult(
-            passed=False,
+        return _stage_a_fail(
+            t0,
+            "; ".join(engine_reasons),
+            "MISSING_ENGINE_PRIMITIVES",
             prim_func=prim_func,
             ledger=ledger,
             features=features,
             route=route,
-            error_message="; ".join(engine_reasons),
-            elapsed_ms=(time.monotonic() - t0) * 1000.0,
-            fault_plane="STAGE_A_STATIC",
-            fault_code="MISSING_ENGINE_PRIMITIVES",
-            failed_tier="stage_a",
         )
     return StageAResult(
         passed=True,
@@ -3586,2297 +1198,251 @@ def run_stage_a_static(
     )
 
 
-def _resolve_conda_python(explicit_python: str | None = None) -> str:
-    candidate = (explicit_python or os.environ.get("TILEFOUNDRY_NPU_PYTHON", "")).strip()
-    if candidate and Path(candidate).is_file():
-        return candidate
-    return sys.executable
-
-
-def build_stage_b_driver_source(
-    cand_path: str | Path,
-    *,
-    factory_name: str | None = None,
-    factory_kwargs: Mapping[str, object] | None = None,
-    config_selector_name: str | None = None,
-    pass_configs: Mapping[str, object] | None = None,
-    compile_flags: Sequence[str] | str | None = None,
-    dims: Mapping[str, object] | None = None,
-    enable_device_compile: bool = True,
-    kernel_dump_path: str | Path | None = None,
-    tir_dump_path: str | Path | None = None,
-    compile_for_cache: bool = False,
-    emit_cache_bins_path: Path | str | None = None,
-) -> str:
-    """Build standalone Python driver lowering and device-compiling a candidate DSL file."""
-    if not enable_device_compile:
-        raise ValueError("enable_device_compile=False bypass has been removed")
-    eff_kwargs = _merge_dims_into_kwargs(factory_kwargs, dims)
-    ext_pc, ext_cf = _merge_pass_configs_and_flags(None, None, pass_configs, compile_flags)
-    payload = json.dumps(
-        {
-            "cand_path": str(cand_path),
-            "factory_name": factory_name,
-            "factory_kwargs": eff_kwargs,
-            "config_selector_name": config_selector_name,
-            "pass_configs": ext_pc,
-            "compile_flags": ext_cf,
-            "kernel_dump_path": str(kernel_dump_path) if kernel_dump_path is not None else None,
-            "tir_dump_path": str(tir_dump_path) if tir_dump_path is not None else None,
-            "compile_for_cache": bool(compile_for_cache),
-            "emit_cache_bins_path": (
-                str(emit_cache_bins_path) if emit_cache_bins_path is not None else None
-            ),
-        }
-    )
-    common_head = (
-        "import contextlib, importlib.util, inspect, json, os, pathlib, tilelang\n"
-        "from tilelang import tvm\n"
-        "from tilelang.backend.module import create_backend_context\n"
-        "from tvm import tirx, IRModule\n"
-        "@contextlib.contextmanager\n"
-        "def _ascend_compile_session(pass_configs=None):\n"
-        "    with contextlib.ExitStack() as _stack:\n"
-        "        if tvm.target.Target.current(allow_none=True) is None:\n"
-        "            _stack.enter_context(create_backend_context('ascend').target)\n"
-        "        if pass_configs is not None:\n"
-        "            _stack.enter_context(\n"
-        "                tvm.transform.PassContext(config=dict(pass_configs))\n"
-        "            )\n"
-        "        yield\n"
-        f"_cfg = json.loads({payload!r})\n"
-        "_src_text = pathlib.Path(_cfg['cand_path']).read_text(encoding='utf-8')\n"
-        "_has_prim_marker = 'prim_func' in _src_text\n"
-        "_spec = importlib.util.spec_from_file_location('_tf_stage_b', _cfg['cand_path'])\n"
-        "_mod = importlib.util.module_from_spec(_spec)\n"
-        "def _filt(obj, kw):\n"
-        "    sig = inspect.signature(obj)\n"
-        "    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):\n"
-        "        return dict(kw)\n"
-        "    return {k: v for k, v in kw.items() if k in sig.parameters}\n"
-        "def _norm_flags(raw):\n"
-        "    if raw is None:\n"
-        "        return []\n"
-        "    if isinstance(raw, str):\n"
-        "        return raw.split()\n"
-        "    return [str(getattr(x, 'value', x)).strip() for x in raw if str(x).strip()]\n"
-        "_kw = dict(_cfg['factory_kwargs'])\n"
-        "_sel_pc, _sel_cf, _raw_bk, _raw_ck = {}, [], {}, {}\n"
-        "_fn = None\n"
-    )
-    selector_body = (
-        "with _ascend_compile_session():\n"
-        "    _spec.loader.exec_module(_mod)\n"
-        "    _sname = _cfg['config_selector_name']\n"
-        "    if _sname and callable(getattr(_mod, _sname, None)):\n"
-        "        _sfn = getattr(_mod, _sname)\n"
-        "        _sout = _sfn(**_filt(_sfn, _kw))\n"
-        "        if isinstance(_sout, dict):\n"
-        "            _raw_pc = _sout.get('pass_configs')\n"
-        "            if isinstance(_raw_pc, dict):\n"
-        "                for _k, _v in _raw_pc.items():\n"
-        "                    if _k == 'tl.device_compile_flags':\n"
-        "                        _sel_cf.extend(_norm_flags(_v))\n"
-        "                    else:\n"
-        "                        _sel_pc[str(_k)] = _v\n"
-        "            elif _raw_pc is not None:\n"
-        "                _sel_cf.extend(_norm_flags(_raw_pc))\n"
-        "            _sel_cf.extend(_norm_flags(_sout.get('compile_flags')))\n"
-        "            if isinstance(_sout.get('builder_kwargs'), dict):\n"
-        "                _raw_bk = dict(_sout.get('builder_kwargs'))\n"
-        "            if isinstance(_sout.get('combine_kwargs'), dict):\n"
-        "                _raw_ck = dict(_sout.get('combine_kwargs'))\n"
-        "            for _k, _v in _sout.items():\n"
-        "                if _k not in (\n"
-        "                    'pass_configs', 'compile_flags', 'builder_kwargs', 'combine_kwargs'\n"
-        "                ):\n"
-        "                    _kw[_k] = _v\n"
-        "    _fname = _cfg['factory_name']\n"
-    )
-    if not compile_for_cache:
-        return (
-            common_head
-            + selector_body
-            + "    _kw_build = dict(_kw)\n"
-            + "    _kw_build.update(_raw_bk)\n"
-            + "    if _fname and hasattr(_mod, _fname):\n"
-            + "        _obj = getattr(_mod, _fname)\n"
-            + "        if _fname == 'kernel' and not _has_prim_marker and callable(_obj):\n"
-            + "            _fn = _obj\n"
-            + "        else:\n"
-            + "            _fn = _obj(**_filt(_obj, _kw_build)) if callable(_obj) else _obj\n"
-            + "    if _fn is None:\n"
-            + "        for _v in vars(_mod).values():\n"
-            + "            if isinstance(_v, (tirx.PrimFunc, IRModule)):\n"
-            + "                _fn = _v; break\n"
-            + "    if _fn is None and callable(getattr(_mod, 'kernel', None)) and not _has_prim_marker:\n"
-            + "        _fn = getattr(_mod, 'kernel')\n"
-            + "    if _fn is None:\n"
-            + "        for _k, _v in vars(_mod).items():\n"
-            + "            if (not _k.startswith('_') and callable(_v)\n"
-            + "                    and getattr(_v, '__module__', None) == _mod.__name__):\n"
-            + "                _fn = _v(**_filt(_v, _kw_build)); break\n"
-            + "    assert _fn is not None\n"
-            + "    if not isinstance(_fn, (tirx.PrimFunc, IRModule)) and callable(_fn):\n"
-            + "        _compile_hook = getattr(\n"
-            + "            _mod, 'compile_kernel', getattr(_mod, 'build_kernel', None)\n"
-            + "        )\n"
-            + "        if not callable(_compile_hook):\n"
-            + "            raise RuntimeError(\n"
-            + "                'stage_b_non_kernel_callable: plain Python function lacks '\n"
-            + "                '@T.prim_func or compile_kernel'\n"
-            + "            )\n"
-            + "        _compile_hook()\n"
-            + "    else:\n"
-            + "        _merged_pc, _merged_cf = {}, []\n"
-            + "        def _absorb_flags(items):\n"
-            + "            for _f in items:\n"
-            + "                if _f and _f not in _merged_cf:\n"
-            + "                    _merged_cf.append(_f)\n"
-            + "        _attrs = getattr(_fn, 'attrs', None)\n"
-            + "        if _attrs and hasattr(_attrs, 'items'):\n"
-            + "            for _pk in ('tl.pass_configs', 'tilelang_pass_configs'):\n"
-            + "                if _pk in _attrs and hasattr(_attrs[_pk], 'items'):\n"
-            + "                    for _ak, _av in _attrs[_pk].items():\n"
-            + "                        _val = getattr(_av, 'value', _av)\n"
-            + "                        if str(_ak) == 'tl.device_compile_flags':\n"
-            + "                            _absorb_flags(_norm_flags(_val))\n"
-            + "                        else:\n"
-            + "                            _merged_pc[str(_ak)] = _val\n"
-            + "            for _ck in ('tir.cce_flags', 'tilelang_compile_flags'):\n"
-            + "                if _ck in _attrs:\n"
-            + "                    _absorb_flags(_norm_flags(_attrs[_ck]))\n"
-            + "        _merged_pc.update(_sel_pc)\n"
-            + "        _absorb_flags(_sel_cf)\n"
-            + "        _merged_pc.update(_cfg['pass_configs'])\n"
-            + "        _absorb_flags(_cfg['compile_flags'])\n"
-            + "        _absorb_flags(['--cce-res-usage'])\n"
-            + "        if _merged_cf:\n"
-            + "            _merged_pc['tl.device_compile_flags'] = list(_merged_cf)\n"
-            + "        if _cfg.get('tir_dump_path'):\n"
-            + "            pathlib.Path(_cfg['tir_dump_path']).write_text(\n"
-            + "                str(_fn), encoding='utf-8'\n"
-            + "            )\n"
-            + "        with _ascend_compile_session(_merged_pc):\n"
-            + "            try:\n"
-            + "                _art = tilelang.lower(\n"
-            + "                    _fn, target='ascend', enable_device_compile=True\n"
-            + "                )\n"
-            + "            except Exception:\n"
-            + "                try:\n"
-            + "                    _pre_art = tilelang.lower(\n"
-            + "                        _fn, target='ascend', enable_device_compile=False\n"
-            + "                    )\n"
-            + "                    if _cfg.get('tir_dump_path'):\n"
-            + "                        _tir_txt = str(getattr(_pre_art, 'device_mod', None) or _fn)\n"
-            + "                        pathlib.Path(_cfg['tir_dump_path']).write_text(\n"
-            + "                            _tir_txt, encoding='utf-8'\n"
-            + "                        )\n"
-            + "                    if _cfg.get('kernel_dump_path') and getattr(_pre_art, 'kernel_source', None):\n"
-            + "                        pathlib.Path(_cfg['kernel_dump_path']).write_text(\n"
-            + "                            str(_pre_art.kernel_source), encoding='utf-8'\n"
-            + "                        )\n"
-            + "                except Exception:\n"
-            + "                    pass\n"
-            + "                raise\n"
-            + "            if _cfg.get('tir_dump_path'):\n"
-            + "                _tir_txt = str(getattr(_art, 'device_mod', None) or _fn)\n"
-            + "                pathlib.Path(_cfg['tir_dump_path']).write_text(\n"
-            + "                    _tir_txt, encoding='utf-8'\n"
-            + "                )\n"
-            + "        assert _art.kernel_source\n"
-            + "        if _cfg.get('kernel_dump_path'):\n"
-            + "            pathlib.Path(_cfg['kernel_dump_path']).write_text(\n"
-            + "                str(_art.kernel_source), encoding='utf-8'\n"
-            + "            )\n"
-        )
-    return (
-        common_head
-        + "def _collect_compiled_bins(_obj):\n"
-        "    _found, _seen = [], set()\n"
-        "    def _add_bin(_raw):\n"
-        "        if not _raw:\n"
-        "            return\n"
-        "        try:\n"
-        "            _p = pathlib.Path(str(_raw))\n"
-        "            if not _p.is_file():\n"
-        "                return\n"
-        "            if _p.suffix not in ('.so', '.o', '.bin') and '.so' not in _p.suffixes:\n"
-        "                return\n"
-        "            if _p.stat().st_size <= 0:\n"
-        "                return\n"
-        "            _rp = str(_p.resolve())\n"
-        "        except OSError:\n"
-        "            return\n"
-        "        if _rp not in _seen:\n"
-        "            _seen.add(_rp)\n"
-        "            _found.append(_rp)\n"
-        "    _objs = [_obj]\n"
-        "    if isinstance(_obj, (tuple, list)) and _obj:\n"
-        "        _objs.append(_obj[0])\n"
-        "    for _cur in list(_objs):\n"
-        "        if _cur is None:\n"
-        "            continue\n"
-        "        for _sa in ('adapter', 'lib', 'kernel_lib', 'artifact'):\n"
-        "            _sub = getattr(_cur, _sa, None)\n"
-        "            if _sub is not None:\n"
-        "                _objs.append(_sub)\n"
-        "    _tl_cache = os.environ.get('TILELANG_CACHE_DIR', '')\n"
-        "    _tl_res = str(pathlib.Path(_tl_cache).resolve()) if _tl_cache else ''\n"
-        "    for _cur in _objs:\n"
-        "        if _cur is None:\n"
-        "            continue\n"
-        "        if isinstance(_cur, (str, pathlib.Path)):\n"
-        "            _add_bin(_cur); continue\n"
-        "        if isinstance(_cur, dict):\n"
-        "            for _v in _cur.values():\n"
-        "                if isinstance(_v, (str, pathlib.Path)):\n"
-        "                    _add_bin(_v)\n"
-        "            continue\n"
-        "        for _attr in (\n"
-        "            'kernel_path', 'libpath', 'lib_path', 'so_path',\n"
-        "            'binary_path', 'artifact_path', 'path', '_name',\n"
-        "            '_tilelang_cache_path',\n"
-        "        ):\n"
-        "            _add_bin(getattr(_cur, _attr, None))\n"
-        "        _tc_path = getattr(_cur, '_tilelang_cache_path', None)\n"
-        "        if _tc_path:\n"
-        "            try:\n"
-        "                _tp = pathlib.Path(str(_tc_path))\n"
-        "                if _tp.is_dir():\n"
-        "                    for _cand in sorted(_tp.rglob('*')):\n"
-        "                        _add_bin(_cand)\n"
-        "            except OSError:\n"
-        "                pass\n"
-        "        _ckey = (\n"
-        "            getattr(_cur, 'cache_key', None)\n"
-        "            or getattr(_cur, '_tilelang_cache_key', None)\n"
-        "        )\n"
-        "        if _ckey and _tl_res:\n"
-        "            _cdir = pathlib.Path(_tl_res)\n"
-        "            _kdir = _cdir / str(_ckey)\n"
-        "            if _kdir.is_dir():\n"
-        "                for _cand in sorted(_kdir.rglob('*')):\n"
-        "                    _add_bin(_cand)\n"
-        "            for _cand in sorted(_cdir.glob(f'*{_ckey}*')):\n"
-        "                _add_bin(_cand)\n"
-        "        try:\n"
-        "            _d = vars(_cur)\n"
-        "        except TypeError:\n"
-        "            _d = None\n"
-        "        if isinstance(_d, dict) and _tl_res:\n"
-        "            for _v in _d.values():\n"
-        "                if isinstance(_v, (str, pathlib.Path)):\n"
-        "                    try:\n"
-        "                        _vp = str(pathlib.Path(str(_v)).resolve())\n"
-        "                        if _vp.startswith(_tl_res):\n"
-        "                            _add_bin(_vp)\n"
-        "                    except OSError:\n"
-        "                        pass\n"
-        "    return _found\n"
-        "def _extract_ksrc(_obj):\n"
-        "    _tgt = _obj[0] if isinstance(_obj, (tuple, list)) and _obj else _obj\n"
-        "    for _cur in (_tgt, getattr(_tgt, 'adapter', None)):\n"
-        "        if _cur is None:\n"
-        "            continue\n"
-        "        _gks = getattr(_cur, 'get_kernel_source', None)\n"
-        "        if callable(_gks):\n"
-        "            try:\n"
-        "                _val = _gks()\n"
-        "                if isinstance(_val, str) and _val.strip():\n"
-        "                    return _val\n"
-        "            except Exception:\n"
-        "                pass\n"
-        "        _ks = getattr(_cur, 'kernel_source', None)\n"
-        "        if isinstance(_ks, str) and _ks.strip():\n"
-        "            return _ks\n"
-        "    return ''\n"
-        + selector_body
-        + "    _cache_pc, _cache_cf = {}, []\n"
-        "    def _absorb_cache_flags(_items):\n"
-        "        for _f in _items:\n"
-        "            if _f and _f not in _cache_cf:\n"
-        "                _cache_cf.append(_f)\n"
-        "    _cache_pc.update(_sel_pc)\n"
-        "    _absorb_cache_flags(_sel_cf)\n"
-        "    _cache_pc.update(_cfg['pass_configs'])\n"
-        "    _absorb_cache_flags(_cfg['compile_flags'])\n"
-        "    _compiled_cache = None\n"
-        "    _used_cache_path = False\n"
-        "    _gk_pool = dict(_kw)\n"
-        "    _gk_pool['pass_configs'] = dict(_cache_pc)\n"
-        "    _gk_pool['compile_flags'] = tuple(_cache_cf)\n"
-        "    _gk_pool['extra_builder_kwargs'] = dict(_raw_bk) if _raw_bk else None\n"
-        "    _gk_pool['extra_combine_kwargs'] = dict(_raw_ck) if _raw_ck else None\n"
-        "    _var_kinds = (\n"
-        "        inspect.Parameter.VAR_POSITIONAL,\n"
-        "        inspect.Parameter.VAR_KEYWORD,\n"
-        "    )\n"
-        "    _builder_obj = (\n"
-        "        getattr(_mod, _fname, None)\n"
-        "        if (_fname and hasattr(_mod, _fname))\n"
-        "        else None\n"
-        "    )\n"
-        "    _ep_name = _cfg.get('entrypoint')\n"
-        "    for _dsrc in (\n"
-        "        getattr(_mod, _ep_name, None) if _ep_name else None,\n"
-        "        getattr(_mod, 'kernel', None),\n"
-        "        getattr(_mod, _sname, None) if _sname else None,\n"
-        "        _builder_obj,\n"
-        "    ):\n"
-        "        if not callable(_dsrc):\n"
-        "            continue\n"
-        "        try:\n"
-        "            _dsig = inspect.signature(_dsrc)\n"
-        "        except (TypeError, ValueError):\n"
-        "            continue\n"
-        "        for _dp in _dsig.parameters.values():\n"
-        "            if (\n"
-        "                _dp.name not in _gk_pool\n"
-        "                and _dp.default is not inspect.Parameter.empty\n"
-        "                and _dp.kind not in _var_kinds\n"
-        "            ):\n"
-        "                _gk_pool[_dp.name] = _dp.default\n"
-        "    _comb_fn = getattr(_mod, '_get_combine_kernel', None)\n"
-        "    if _fname == '_get_combine_kernel' and callable(_comb_fn):\n"
-        "        _compiled_cache = _comb_fn(**_filt(_comb_fn, _gk_pool))\n"
-        "        _used_cache_path = True\n"
-        "    else:\n"
-        "        if callable(_builder_obj):\n"
-        "            _gk_pool['builder_fn'] = _builder_obj\n"
-        "        _gk_fn = getattr(_mod, '_get_kernel', None)\n"
-        "        if callable(_gk_fn):\n"
-        "            _gk_sig = inspect.signature(_gk_fn)\n"
-        "            _has_req = all(\n"
-        "                _p.name in _gk_pool\n"
-        "                for _p in _gk_sig.parameters.values()\n"
-        "                if _p.default is inspect.Parameter.empty\n"
-        "                and _p.kind not in _var_kinds\n"
-        "            )\n"
-        "            if _has_req:\n"
-        "                _compiled_cache = _gk_fn(**_filt(_gk_fn, _gk_pool))\n"
-        "                _used_cache_path = True\n"
-        "    if not _used_cache_path:\n"
-        "        _kw_build = dict(_kw)\n"
-        "        _kw_build.update(_raw_bk)\n"
-        "        if _fname and hasattr(_mod, _fname):\n"
-        "            _obj = getattr(_mod, _fname)\n"
-        "            if _fname == 'kernel' and not _has_prim_marker and callable(_obj):\n"
-        "                _fn = _obj\n"
-        "            else:\n"
-        "                _fn = _obj(**_filt(_obj, _kw_build)) if callable(_obj) else _obj\n"
-        "        if _fn is None:\n"
-        "            for _v in vars(_mod).values():\n"
-        "                if isinstance(_v, (tirx.PrimFunc, IRModule)):\n"
-        "                    _fn = _v; break\n"
-        "        if _fn is None and callable(getattr(_mod, 'kernel', None)) and not _has_prim_marker:\n"
-        "            _fn = getattr(_mod, 'kernel')\n"
-        "        if _fn is None:\n"
-        "            for _k, _v in vars(_mod).items():\n"
-        "                if (not _k.startswith('_') and callable(_v)\n"
-        "                        and getattr(_v, '__module__', None) == _mod.__name__):\n"
-        "                    _fn = _v(**_filt(_v, _kw_build)); break\n"
-        "        assert _fn is not None\n"
-        "        if not isinstance(_fn, (tirx.PrimFunc, IRModule)) and callable(_fn):\n"
-        "            _compile_hook = getattr(\n"
-        "                _mod, 'compile_kernel', getattr(_mod, 'build_kernel', None)\n"
-        "            )\n"
-        "            if not callable(_compile_hook):\n"
-        "                raise RuntimeError(\n"
-        "                    'stage_b_non_kernel_callable: plain Python function lacks '\n"
-        "                    '@T.prim_func or compile_kernel'\n"
-        "                )\n"
-        "            _compiled_cache = _compile_hook()\n"
-        "        else:\n"
-        "            _merged_pc, _merged_cf = {}, []\n"
-        "            def _absorb_flags(items):\n"
-        "                for _f in items:\n"
-        "                    if _f and _f not in _merged_cf:\n"
-        "                        _merged_cf.append(_f)\n"
-        "            _attrs = getattr(_fn, 'attrs', None)\n"
-        "            if _attrs and hasattr(_attrs, 'items'):\n"
-        "                for _pk in ('tl.pass_configs', 'tilelang_pass_configs'):\n"
-        "                    if _pk in _attrs and hasattr(_attrs[_pk], 'items'):\n"
-        "                        for _ak, _av in _attrs[_pk].items():\n"
-        "                            _val = getattr(_av, 'value', _av)\n"
-        "                            if str(_ak) == 'tl.device_compile_flags':\n"
-        "                                _absorb_flags(_norm_flags(_val))\n"
-        "                            else:\n"
-        "                                _merged_pc[str(_ak)] = _val\n"
-        "                for _ck in ('tir.cce_flags', 'tilelang_compile_flags'):\n"
-        "                    if _ck in _attrs:\n"
-        "                        _absorb_flags(_norm_flags(_attrs[_ck]))\n"
-        "            _merged_pc.update(_sel_pc)\n"
-        "            _absorb_flags(_sel_cf)\n"
-        "            _merged_pc.update(_cfg['pass_configs'])\n"
-        "            _absorb_flags(_cfg['compile_flags'])\n"
-        "            if _merged_cf:\n"
-        "                _merged_pc['tl.device_compile_flags'] = list(_merged_cf)\n"
-        "            if _cfg.get('tir_dump_path'):\n"
-        "                pathlib.Path(_cfg['tir_dump_path']).write_text(\n"
-        "                    str(_fn), encoding='utf-8'\n"
-        "                )\n"
-        "            with _ascend_compile_session(_merged_pc or None):\n"
-        "                if callable(getattr(tilelang, 'compile', None)):\n"
-        "                    _compiled_cache = tilelang.compile(\n"
-        "                        _fn,\n"
-        "                        target='ascend',\n"
-        "                        pass_configs=_merged_pc or None,\n"
-        "                        compile_flags=_merged_cf or None,\n"
-        "                    )\n"
-        "                else:\n"
-        "                    _compiled_cache = tilelang.lower(\n"
-        "                        _fn, target='ascend', enable_device_compile=True\n"
-        "                    )\n"
-        "    _ksrc = _extract_ksrc(_compiled_cache)\n"
-        "    if _cfg.get('kernel_dump_path') and _ksrc:\n"
-        "        pathlib.Path(_cfg['kernel_dump_path']).write_text(_ksrc, encoding='utf-8')\n"
-        "    if _cfg.get('emit_cache_bins_path'):\n"
-        "        _ep = pathlib.Path(_cfg['emit_cache_bins_path'])\n"
-        "        _ep.parent.mkdir(parents=True, exist_ok=True)\n"
-        "        _ep.write_text(\n"
-        "            json.dumps(_collect_compiled_bins(_compiled_cache)), encoding='utf-8'\n"
-        "        )\n"
-    )
-
-
-def run_stage_b_compile(
-    dsl_source: str,
-    *,
-    factory_name: str | None = None,
-    factory_kwargs: Mapping[str, object] | None = None,
-    config_selector_name: str | None = None,
-    pass_configs: Mapping[str, object] | None = None,
-    compile_flags: Sequence[str] | str | None = None,
-    dims: Mapping[str, object] | None = None,
-    python_bin: str | None = None,
-    timeout_sec: int = 120,
-    enable_device_compile: bool = True,
-    artifact_store: ArtifactStore | None = None,
-    artifact_id: str = "",
-    regime_tag: str = "",
-    spec_key: str = "",
-) -> StageBResult:
-    """Verify full TileLang + bisheng device compilation in an isolated subprocess."""
-    if not enable_device_compile:
-        raise ValueError("enable_device_compile=False bypass has been removed")
-    t0 = time.monotonic()
-    py_exe = _resolve_conda_python(python_bin)
-    env = dict(os.environ)
-    env.setdefault("USE_CUDA", "0")
-    _inject_cann_cpath_env(env)
-    resolved_store = _resolve_artifact_store(artifact_store)
-    resolved_store.root.mkdir(parents=True, exist_ok=True)
-    recorded_aid = ""
-    recorded_bins: tuple[str, ...] = ()
-    norm_pc, norm_cf = _merge_pass_configs_and_flags(None, None, pass_configs, compile_flags)
-    closure_src = (
-        extract_reachable_closure_source(dsl_source, regime_tag=regime_tag)
-        if regime_tag
-        else dsl_source
-    )
-    target_aid = artifact_id or compute_compile_task_key(
-        normalized_kernel_unit_src=closure_src,
-        cann_target="dav-3510",
-        pass_configs=norm_pc,
-        compile_flags=norm_cf,
-        static_spec_signature=spec_key,
-    )
-    with tempfile.TemporaryDirectory(prefix="tf_stage_b_") as tmp_dir:
-        tmp_root = Path(tmp_dir)
-        worker_cache = tmp_root / "tl_cache"
-        seed_tl_cache_tree(resolved_store.root, worker_cache)
-        pre_bins = snapshot_tl_cache_binaries(worker_cache)
-        env["TILELANG_DISABLE_CACHE"] = "0"
-        env["TILELANG_CACHE_DIR"] = str(worker_cache)
-        env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
-        cand_path = tmp_root / "candidate_dsl.py"
-        cand_path.write_text(dsl_source, encoding="utf-8")
-        kernel_dump_path = tmp_root / "lowered_kernel.cce"
-        tir_dump_path = tmp_root / "lowered_tir.tir"
-        driver = build_stage_b_driver_source(
-            cand_path,
-            factory_name=factory_name,
-            factory_kwargs=factory_kwargs,
-            config_selector_name=config_selector_name,
-            pass_configs=pass_configs,
-            compile_flags=compile_flags,
-            dims=dims,
-            kernel_dump_path=kernel_dump_path,
-            tir_dump_path=tir_dump_path,
-        )
-        try:
-            proc = subprocess.run(
-                [py_exe, "-c", driver],
-                text=True,
-                capture_output=True,
-                cwd=tmp_dir,
-                env=env,
-                timeout=timeout_sec,
-            )
-        except subprocess.TimeoutExpired:
-            lowered_dump = (
-                kernel_dump_path.read_text(encoding="utf-8", errors="ignore")
-                if kernel_dump_path.is_file()
-                else ""
-            )
-            lowered_tir_dump = (
-                tir_dump_path.read_text(encoding="utf-8", errors="ignore")
-                if tir_dump_path.is_file()
-                else ""
-            )
-            return StageBResult(
-                passed=False,
-                error_message=f"stage_b_compile_timeout:{timeout_sec}s",
-                elapsed_sec=time.monotonic() - t0,
-                generated_cce=lowered_dump,
-                lowered_tir=lowered_tir_dump,
-                fault_plane="STAGE_B_COMPILE",
-                fault_code="STAGE_B_COMPILE_TIMEOUT",
-                failed_tier="stage_b",
-            )
-        lowered_dump = (
-            kernel_dump_path.read_text(encoding="utf-8", errors="ignore")
-            if kernel_dump_path.is_file()
-            else ""
-        )
-        lowered_tir_dump = (
-            tir_dump_path.read_text(encoding="utf-8", errors="ignore")
-            if tir_dump_path.is_file()
-            else ""
-        )
-        combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
-            combined_out,
-            asm_or_dump_text=lowered_dump,
-        )
-        ma_profile = (
-            extract_microarch_profile_from_cce(lowered_dump).to_dict()
-            if lowered_dump.strip()
-            else None
-        )
-        if proc.returncode != 0:
-            raw_detail = proc.stderr or proc.stdout or ""
-            detail = _bounded_compile_diagnostic(raw_detail)
-            fault_code = _classify_stage_b_overflow_fault_code(
-                f"{raw_detail}\n{lowered_dump}",
-                summary,
-                "STAGE_B_COMPILE_FAILED",
-            )
-            return StageBResult(
-                passed=False,
-                error_message=f"stage_b_compile_failed (rc={proc.returncode}): {detail}",
-                elapsed_sec=time.monotonic() - t0,
-                spill_bytes=spill_bytes,
-                vloopv2_hit=vloopv2_hit,
-                compiler_summary=summary,
-                microarch_profile=ma_profile,
-                full_diagnostic=raw_detail,
-                generated_cce=lowered_dump,
-                lowered_tir=lowered_tir_dump,
-                fault_plane="STAGE_B_COMPILE",
-                fault_code=fault_code,
-                failed_tier="stage_b",
-            )
-        if _has_vf_stack_overflow_signal(combined_out, summary, norm_cf, norm_pc):
-            return StageBResult(
-                passed=False,
-                error_message=f"stage_b_vf_stack_overflow: stack_bytes={summary.stack_bytes}",
-                elapsed_sec=time.monotonic() - t0,
-                spill_bytes=spill_bytes,
-                vloopv2_hit=vloopv2_hit,
-                compiler_summary=summary,
-                microarch_profile=ma_profile,
-                full_diagnostic=combined_out,
-                generated_cce=lowered_dump,
-                lowered_tir=lowered_tir_dump,
-                fault_plane="STAGE_B_COMPILE",
-                fault_code="VF_STACK_OVERFLOW",
-                failed_tier="stage_b",
-            )
-        lock_path = resolved_store.root / ".prewarm_manifest_v1.lock"
-        with lock_path.open("a+", encoding="utf-8") as lock_fh:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-            try:
-                merge_tl_cache_tree(worker_cache, resolved_store.root)
-            finally:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-        existing_rec = resolved_store.get_verified_artifact(target_aid)
-        post_new_rels = [
-            rel
-            for rel in collect_new_tl_cache_binaries(worker_cache, pre_bins)
-            if rel not in pre_bins or worker_cache.joinpath(rel).stat().st_size != pre_bins[rel][0]
-            or worker_cache.joinpath(rel).stat().st_mtime_ns != pre_bins[rel][1]
-        ]
-        cache_bins = [
-            resolved_store.root / rel
-            for rel in post_new_rels
-            if is_verified_binary_file(resolved_store.root / rel)
-        ]
-        tmp_bins = [
-            p
-            for p in sorted(tmp_root.rglob("*"))
-            if not p.is_relative_to(worker_cache) and is_verified_binary_file(p)
-        ]
-        built_bins = [*cache_bins, *tmp_bins]
-        if not built_bins and existing_rec is None:
-            built_bins = [
-                resolved_store.root / rel
-                for rel in collect_new_tl_cache_binaries(worker_cache, pre_bins)
-                if is_verified_binary_file(resolved_store.root / rel)
-            ]
-        if built_bins:
-            flags_str = " ".join(norm_cf)
-            recorded_aid = target_aid
-            rec = resolved_store.record_verified_artifact(
-                recorded_aid,
-                binary_paths=built_bins,
-                backend_kind="tilelang",
-                flags=flags_str,
-                spec_key=spec_key,
-                closure_src=closure_src,
-                copy_binaries=True,
-            )
-            recorded_bins = rec.binary_paths
-        elif existing_rec is not None:
-            recorded_aid = existing_rec.artifact_id
-            recorded_bins = existing_rec.binary_paths
-    return StageBResult(
-        passed=True,
-        elapsed_sec=time.monotonic() - t0,
-        spill_bytes=spill_bytes,
-        vloopv2_hit=vloopv2_hit,
-        compiler_summary=summary,
-        microarch_profile=ma_profile,
-        generated_cce=lowered_dump,
-        lowered_tir=lowered_tir_dump,
-        artifact_id=recorded_aid,
-        binary_paths=recorded_bins,
-    )
-
-
-_CANN_INCLUDE_SUBDIRS: tuple[str, ...] = (
-    "include",
-    "x86_64-linux/asc",
-    "x86_64-linux/asc/include",
-    "x86_64-linux/include",
-    "aarch64-linux/asc",
-    "aarch64-linux/asc/include",
-    "aarch64-linux/include",
-    "runtime/include",
-    "asc",
-    "asc/include",
-    "tools/tikcpp/tikcfw",
-    "compiler/tikcpp/tikcfw",
-)
-
-
-def _resolve_cann_root(
-    cann_root: str | Path | None = None,
-    *,
-    bisheng_bin: str | Path | None = None,
-) -> Path | None:
-    if cann_root is not None and str(cann_root).strip():
-        return Path(cann_root).expanduser()
-    for env_key in ("ASCEND_TOOLKIT_HOME", "ASCEND_HOME_PATH", "BISHENG_HOME"):
-        raw = os.environ.get(env_key, "").strip()
-        if raw:
-            cand = Path(raw).expanduser()
-            if env_key == "BISHENG_HOME" and not any(
-                (cand / sub).is_dir() for sub in _CANN_INCLUDE_SUBDIRS[:4]
-            ):
-                for parent in cand.parents:
-                    if any((parent / sub).is_dir() for sub in _CANN_INCLUDE_SUBDIRS[:4]):
-                        return parent
-            return cand
-    for env_key in ("ASCEND_OPP_PATH", "ASCEND_AICPU_PATH"):
-        raw = os.environ.get(env_key, "").strip()
-        if raw:
-            parent = Path(raw).expanduser().parent
-            if any((parent / sub).is_dir() for sub in _CANN_INCLUDE_SUBDIRS[:4]):
-                return parent
-    resolved_bin = bisheng_bin or shutil.which("bisheng")
-    if resolved_bin:
-        bpath = Path(str(resolved_bin)).resolve()
-        for parent in bpath.parents:
-            if any((parent / sub).is_dir() for sub in _CANN_INCLUDE_SUBDIRS[:4]):
-                return parent
-    return None
-
-
-def _resolve_bisheng_bin(
-    bisheng_bin: str | Path | None = None,
-    cann_root: str | Path | None = None,
-) -> str | None:
-    """Resolve bisheng compiler binary from explicit arg, PATH, or CANN installation."""
-    if bisheng_bin is not None:
-        raw = str(bisheng_bin).strip()
-        if raw:
-            p = Path(raw)
-            if p.is_file():
-                return str(p)
-            which_explicit = shutil.which(raw)
-            if which_explicit:
-                return which_explicit
-        return None
-    bh = os.environ.get("BISHENG_HOME", "").strip()
-    if bh:
-        bh_cand = Path(bh).expanduser() / "bin" / "bisheng"
-        if bh_cand.is_file():
-            return str(bh_cand)
-    found = shutil.which("bisheng")
-    if found:
-        return found
-    resolved_cann = _resolve_cann_root(cann_root)
-    if resolved_cann is not None:
-        for rel in ("tools/ccec_compiler/bin/bisheng", "bin/bisheng"):
-            candidate = resolved_cann / rel
-            if candidate.is_file():
-                return str(candidate)
-    return None
-
-
-def _detect_cann_include_dirs(
-    cann_root: str | Path | None = None,
-    *,
-    bisheng_bin: str | Path | None = None,
-) -> list[str]:
-    """Auto-discover CANN C/C++ header include directories from env and toolchain."""
-    roots: list[Path] = []
-    if cann_root is not None and str(cann_root).strip():
-        roots.append(Path(cann_root).expanduser())
-    for env_key in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME"):
-        raw = os.environ.get(env_key, "").strip()
-        if raw:
-            roots.append(Path(raw).expanduser())
-    inferred = _resolve_cann_root(cann_root, bisheng_bin=bisheng_bin)
-    if inferred is not None:
-        roots.append(inferred)
-
-    found: list[str] = []
-    seen_resolved: set[str] = set()
-    for root in roots:
-        for sub in _CANN_INCLUDE_SUBDIRS:
-            inc = root / sub
-            if inc.is_dir():
-                res_key = str(inc.resolve())
-                if res_key not in seen_resolved:
-                    seen_resolved.add(res_key)
-                    found.append(str(inc))
-    return found
-
-
-def _inject_cann_cpath_env(env_map: dict[str, str] | None = None) -> list[str]:
-    """Prepend discovered CANN include directories to ``CPATH`` without duplicates."""
-    cann_incs = _detect_cann_include_dirs()
-    if cann_incs:
-        target_env = os.environ if env_map is None else env_map
-        existing = [p for p in target_env.get("CPATH", "").split(os.pathsep) if p]
-        target_env["CPATH"] = os.pathsep.join(dict.fromkeys([*cann_incs, *existing]))
-    return cann_incs
-
-
-def _resolve_toolchain_tool(
-    tool_names: Sequence[str],
-    *,
-    bisheng_bin: str | Path | None = None,
-) -> str | None:
-    """Resolve a companion binutils/LLVM tool near bisheng or on PATH."""
-    if bisheng_bin is not None:
-        bpath = Path(str(bisheng_bin))
-        if bpath.is_file():
-            for name in tool_names:
-                cand = bpath.resolve().with_name(name)
-                if cand.is_file():
-                    return str(cand)
-    for name in tool_names:
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
-
-
-def _verify_object_has_instantiated_kernel(
-    obj_path: Path,
-    *,
-    bisheng_bin: str | Path | None = None,
-) -> tuple[bool, str]:
-    """Ensure bisheng emitted at least one concrete instantiated kernel symbol in .text."""
-    if not obj_path.is_file():
-        return False, "stage_b_ascendc_missing_object: object file was not generated"
-    nm_bin = _resolve_toolchain_tool(("llvm-nm", "nm"), bisheng_bin=bisheng_bin)
-    if nm_bin:
-        proc = subprocess.run(
-            [nm_bin, "--defined-only", str(obj_path)],
-            text=True,
-            capture_output=True,
-            timeout=15,
-            check=False,
-        )
-        if proc.returncode == 0:
-            defined_text_syms = [
-                ln.strip()
-                for ln in (proc.stdout or "").splitlines()
-                if re.search(r"\b[Tt]\s+(?!\$)\S+", ln)
-            ]
-            if not defined_text_syms:
-                return False, (
-                    "stage_b_ascendc_uninstantiated_template: object file contains zero "
-                    "instantiated code symbols (.text is empty); provide concrete template "
-                    "instantiation via _render_trackb_tu"
-                )
-            return True, ""
-
-    objdump_bin = _resolve_toolchain_tool(("llvm-objdump", "objdump"), bisheng_bin=bisheng_bin)
-    if objdump_bin:
-        proc = subprocess.run(
-            [objdump_bin, "-h", str(obj_path)],
-            text=True,
-            capture_output=True,
-            timeout=15,
-            check=False,
-        )
-        if proc.returncode == 0:
-            text_sec = re.search(r"\.text(?:\.\S+)?\s+([0-9a-fA-F]+)\s", proc.stdout or "")
-            if text_sec and int(text_sec.group(1), 16) > 0:
-                return True, ""
-            return False, (
-                "stage_b_ascendc_uninstantiated_template: .text section size is 0; "
-                "provide concrete template instantiation via _render_trackb_tu"
-            )
-
-    if obj_path.stat().st_size > 2048:
-        return True, ""
-    return False, (
-        "stage_b_ascendc_uninstantiated_template: object file contains no verifiable "
-        "instantiated kernel code"
-    )
-
-
-def _disassemble_object(
-    obj_path: Path,
-    *,
-    bisheng_bin: str | Path | None = None,
-) -> str:
-    """Run llvm-objdump -d on a compiled Ascend object file."""
-    objdump_bin = _resolve_toolchain_tool(("llvm-objdump", "objdump"), bisheng_bin=bisheng_bin)
-    if not objdump_bin or not obj_path.is_file():
-        return ""
-    proc = subprocess.run(
-        [objdump_bin, "-d", str(obj_path)],
-        text=True,
-        capture_output=True,
-        timeout=30,
-        check=False,
-    )
-    return proc.stdout if proc.returncode == 0 else ""
-
-
-def _augment_bisheng_telemetry_text(
-    compiler_out: str,
-    objdump_text: str,
-) -> str:
-    """Normalize bisheng --cce-res-usage and llvm-objdump -d metrics for bisheng_res_parser."""
-    vreg_vals = [int(m) for m in re.findall(r"\bVReg\s+number\s*:\s*(\d+)", compiler_out)]
-    stack_vals = [
-        int(m)
-        for m in re.findall(
-            r"(?:^|[,\s])Stack\s+size\s*:\s*(\d+)\s*bytes",
-            compiler_out,
-            flags=re.IGNORECASE,
-        )
-    ]
-    dis = _parse_objdump_pipe_counts(objdump_text)
-    vec_regs = max([*vreg_vals, dis["vec_regs"], 0])
-    scalar_regs = dis["scalar_regs"]
-    stack_bytes = max(stack_vals, default=0)
-
-    extra_lines: list[str] = []
-    if vec_regs > 0 and not re.search(
-        r"(?:vector\s+register\s+usage|vec_reg_num)", compiler_out, re.IGNORECASE
-    ):
-        extra_lines.append(f"Vector Register Usage: {vec_regs}")
-    if scalar_regs > 0 and not re.search(
-        r"(?:scalar\s+register\s+usage|scalar_reg_num)", compiler_out, re.IGNORECASE
-    ):
-        extra_lines.append(f"Scalar Register Usage: {scalar_regs}")
-    if stack_bytes > 0 and not re.search(r"stack\s+frame\s+size", compiler_out, re.IGNORECASE):
-        extra_lines.append(f"Stack Frame Size: {stack_bytes} bytes")
-    if objdump_text.strip():
-        vloop_cnt = dis["vloopv2"]
-        sw_cnt = dis["vf_sw_back_branches"] if vloop_cnt > 0 else dis["sw_back_branches"]
-        extra_lines.append(f"vloopv2_loops: {vloop_cnt}")
-        extra_lines.append(f"software_loops: {sw_cnt}")
-    if not extra_lines:
-        return compiler_out
-    return f"{compiler_out}\n" + "\n".join(extra_lines)
-
-
-_TRANSFER_ROUTES: tuple[str, ...] = (
-    "gm_to_l1",
-    "gm_to_ub",
-    "l1_to_l0a",
-    "l1_to_l0b",
-    "l0c_to_ub",
-    "l0c_to_l1",
-    "l0c_to_gm",
-    "ub_to_gm",
-    "ub_to_l1",
-)
-
-_TRANSFER_CALL_SPECS: dict[str, tuple[str, int, int, str]] = {
-    "gm_to_l1": ("asc_copy_gm2l1", 4, 5, "elem"),
-    "gm_to_ub": ("asc_copy_gm2ub", 2, 3, "bytes"),
-    "l1_to_l0a": ("asc_copy_l12l0a", 4, 5, "elem"),
-    "l1_to_l0b": ("asc_copy_l12l0b", 4, 5, "elem"),
-    "l0c_to_ub": ("asc_copy_l0c2ub", 3, 2, "float"),
-    "l0c_to_l1": ("asc_copy_l0c2l1", 3, 2, "float"),
-    "l0c_to_gm": ("asc_copy_l0c2gm", 3, 2, "float"),
-    "ub_to_gm": ("asc_copy_ub2gm", 2, 3, "bytes"),
-}
-
-
-def _eval_call_arg(expr: str, consts: Mapping[str, int], elem_bytes: int) -> int | None:
-    """Evaluate one data-copy call argument with sizeof and template constants folded."""
-    type_bytes = {"InT": elem_bytes, "half": 2, "float": 4, "bfloat16_t": 2}
-    return _safe_eval_cpp_int(_rewrite_sizeof(_strip_cpp_casts(expr), type_bytes), consts)
-
-
-def _call_elem_bytes(call_text: str) -> int:
-    """Return the element width named in one copy call, defaulting to half precision."""
-    for type_name, width in _CPP_DTYPE_BYTES.items():
-        if re.search(rf"\b{re.escape(type_name)}\b", call_text):
-            return width
-    return 2
-
-
-def _source_call_payloads(
-    cpp_source: str,
-    route: str,
-    consts: Mapping[str, int],
-) -> list[int]:
-    """Collect copy payloads from CBE-style call arguments for one transfer route."""
-    spec = _TRANSFER_CALL_SPECS.get(route)
-    if spec is None:
-        return []
-    prefix, rows_idx, cols_idx, kind = spec
-    payloads: list[int] = []
-    for call in re.finditer(rf"\b{prefix}\w*\s*\(([^;]*)\)\s*;", cpp_source, re.S):
-        text = call.group(0)
-        args = _split_cpp_args(call.group(1))
-        if len(args) <= max(rows_idx, cols_idx):
-            continue
-        elem_bytes = _call_elem_bytes(text)
-        rows = _eval_call_arg(args[rows_idx], consts, elem_bytes)
-        cols = _eval_call_arg(args[cols_idx], consts, elem_bytes)
-        if rows is None or cols is None or rows <= 0 or cols <= 0:
-            continue
-        if kind == "bytes":
-            payloads.append(rows * cols)
-        elif kind == "float":
-            payloads.append(rows * cols * 4)
-        else:
-            payloads.append(rows * cols * elem_bytes)
-    return payloads
-
-
-def _tile_shape_payload(cpp_source: str, route: str, consts: Mapping[str, int]) -> int:
-    """Estimate one transfer payload from C++20 tile extents when a call cannot be folded."""
-    shape_keys = (
-        "CUBE_TILE_M",
-        "CUBE_TILE_N",
-        "CUBE_TILE_K",
-        "BM",
-        "BN",
-        "BK",
-        "TILE_M",
-        "TILE_N",
-        "TILE_K",
-    )
-    if not any(key in consts for key in shape_keys):
-        return 0
-    tile_m = max(1, consts.get("CUBE_TILE_M", consts.get("BM", consts.get("TILE_M", 64))))
-    tile_n = max(1, consts.get("CUBE_TILE_N", consts.get("BN", consts.get("TILE_N", 64))))
-    tile_k = max(1, consts.get("CUBE_TILE_K", consts.get("BK", consts.get("TILE_K", 64))))
-    shape_source = re.sub(r"\bconstexpr\s+[^;]+;", "", cpp_source)
-    elem_bytes = _call_elem_bytes(shape_source)
-    if route == "gm_to_l1":
-        return max(tile_m * tile_k, tile_k * tile_n) * elem_bytes
-    if route in ("gm_to_ub", "ub_to_gm", "ub_to_l1"):
-        return tile_m * tile_n * elem_bytes
-    if route == "l1_to_l0a":
-        return tile_m * tile_k * elem_bytes
-    if route == "l1_to_l0b":
-        return tile_k * tile_n * elem_bytes
-    return tile_m * tile_n * 4
-
-
-def _median_payload(values: Sequence[int]) -> int:
-    """Return the integer median of a nonempty payload sample."""
-    ordered = sorted(values)
-    return ordered[len(ordered) // 2]
-
-
-def _estimate_transfer_granularity(cpp_source: str) -> dict[str, int]:
-    """Estimate per-instruction transfer bytes from copy-call operands or tile extents."""
-    consts, type_bytes = _resolve_cpp_consts_and_types(cpp_source)
-    estimates: dict[str, int] = {}
-    for route in _TRANSFER_ROUTES:
-        source_payloads = _source_call_payloads(cpp_source, route, consts)
-        if source_payloads:
-            estimates[route] = _median_payload(source_payloads)
-            continue
-        tile_payload = _tile_shape_payload(cpp_source, route, consts)
-        if tile_payload > 0:
-            estimates[route] = tile_payload
-    return estimates
-
-
-def _merge_disassembly_microarch_profile(
-    cpp_source: str,
-    objdump_text: str,
-) -> dict[str, object] | None:
-    if not cpp_source.strip() and not objdump_text.strip():
-        return None
-    base = extract_microarch_profile_from_cce(cpp_source)
-    dis = _parse_objdump_pipe_counts(objdump_text)
-    if dis["total_insns"] == 0:
-        return base.to_dict()
-    granularity = _estimate_transfer_granularity(cpp_source)
-    updates: dict[str, object] = {
-        "fp_alu_ops": max(base.fp_alu_ops, dis["vec"]),
-        "cube_mmad_count": max(base.cube_mmad_count, dis["cube_mmad"]),
-        "cv_sync_barriers": max(base.cv_sync_barriers, dis["sync"]),
-    }
-    byte_routes = (
-        ("gm_to_l1_insns", "gm_to_l1_bytes"),
-        ("gm_to_ub_insns", "gm_to_ub_bytes"),
-        ("l1_to_l0a_insns", "l1_to_l0a_bytes"),
-        ("l1_to_l0b_insns", "l1_to_l0b_bytes"),
-        ("l0c_to_ub_insns", "l0c_to_ub_bytes"),
-        ("l0c_to_l1_insns", "l0c_to_l1_bytes"),
-        ("l0c_to_gm_insns", "l0c_to_gm_bytes"),
-        ("ub_to_gm_insns", "ub_to_gm_bytes"),
-        ("ub_to_l1_insns", "ub_to_l1_bytes"),
-    )
-    for count_key, byte_field in byte_routes:
-        route = byte_field.removesuffix("_bytes")
-        if dis[count_key] > 0 and route in granularity:
-            updates[byte_field] = dis[count_key] * granularity[route]
-        else:
-            updates[byte_field] = getattr(base, byte_field)
-    return replace(base, **updates).to_dict()
-
-
-def _detect_tilelang_include_dir() -> str | None:
-    try:
-        import tilelang  # noqa: PLC0415
-
-        src_dir = Path(tilelang.__file__).resolve().parents[1] / "src"
-        if (src_dir / "tl_templates" / "ascend").is_dir():
-            return str(src_dir)
-    except Exception:
-        pass
-    env_tl = (
-        os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE", "").strip()
-        or os.environ.get("TILEFOUNDRY_NPU_TILELANG_REPO", "").strip()
-    )
-    if env_tl:
-        src_dir = Path(env_tl).expanduser() / "src"
-        if (src_dir / "tl_templates" / "ascend").is_dir():
-            return str(src_dir)
-    sibling = Path(__file__).resolve().parents[5].parent / "tilelang" / "src"
-    if (sibling / "tl_templates" / "ascend").is_dir():
-        return str(sibling)
-    return None
-
-
-@dataclass(frozen=True)
-class _AscendcCompileContext:
-    extra_flags: list[str]
-    has_explicit_x: bool
-    std_flags: list[str]
-    include_flags: list[str]
-    env: dict[str, str]
-
-
-def _prepare_ascendc_compile_context(
-    *,
-    compile_flags: Sequence[str] | str | None,
-    cann_root: str | Path | None,
-    resolved_bisheng: str,
-    extra_include_dirs: Sequence[str | Path] | str | Path | None,
-) -> _AscendcCompileContext:
-    extra_flags = _normalize_flag_list(compile_flags)
-    has_explicit_std = any(f.startswith("-std=") for f in extra_flags)
-    has_explicit_x = "-x" in extra_flags
-    std_flags: list[str] = [] if has_explicit_std else ["-std=c++20"]
-
-    include_flags: list[str] = []
-    seen_inc_flags = set(extra_flags)
-
-    def _add_inc(inc_dir: str) -> None:
-        flag = f"-I{inc_dir}"
-        if inc_dir and Path(inc_dir).is_dir() and flag not in seen_inc_flags:
-            seen_inc_flags.add(flag)
-            include_flags.append(flag)
-
-    if extra_include_dirs is not None:
-        extra_inc_list = (
-            [extra_include_dirs]
-            if isinstance(extra_include_dirs, (str, Path))
-            else list(extra_include_dirs)
-        )
-        for inc_item in extra_inc_list:
-            _add_inc(str(inc_item).strip())
-    tl_inc = _detect_tilelang_include_dir()
-    if tl_inc:
-        _add_inc(tl_inc)
-    for cann_inc in _detect_cann_include_dirs(cann_root, bisheng_bin=resolved_bisheng):
-        _add_inc(cann_inc)
-
-    env = dict(os.environ)
-    resolved_cann = _resolve_cann_root(cann_root, bisheng_bin=resolved_bisheng)
-    cann_root_str = str(resolved_cann).strip() if resolved_cann is not None else ""
-    if cann_root_str and Path(cann_root_str).is_dir() and not env.get("ASCEND_HOME_PATH"):
-        env["ASCEND_HOME_PATH"] = cann_root_str
-
-    return _AscendcCompileContext(
-        extra_flags=extra_flags,
-        has_explicit_x=has_explicit_x,
-        std_flags=std_flags,
-        include_flags=include_flags,
-        env=env,
-    )
-
-
-def _atomic_copy_file(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{dst.name}.")
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    try:
-        shutil.copy2(src, tmp_path)
-        os.replace(tmp_path, dst)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-
-
-def _build_trackb_shared_link_cmd(
-    resolved_bisheng: str,
-    *,
-    arch: str,
-    ctx: _AscendcCompileContext,
-    src_path: Path,
-    so_path: Path,
-) -> list[str]:
-    return [
-        resolved_bisheng,
-        "-O2",
-        "-fPIC",
-        *ctx.std_flags,
-        "-mllvm",
-        "-cce-aicore-dcpreload-args=false",
-        f"--npu-arch={arch}",
-        *ctx.include_flags,
-        *ctx.extra_flags,
-        "-Wl,--no-mmap-output-file",
-        "-shared",
-        str(src_path),
-        "-o",
-        str(so_path),
-    ]
-
-
-def compute_trackb_shared_so_filename(
-    cpp_source: str,
-    compile_flags: Sequence[str] | str | None = None,
-) -> str:
-    """Compute canonical cached shared-object filename for a Track-B TU and flags."""
-    non_inc = [f for f in _normalize_flag_list(compile_flags) if not f.startswith("-I")]
-    sig = hashlib.sha256((cpp_source + "|" + " ".join(non_inc)).encode("utf-8")).hexdigest()[:16]
-    return f"trackb_{sig}.so"
-
-
-def compile_trackb_shared_so(
-    cpp_source: str,
-    *,
-    cache_dir: str | Path,
-    compile_flags: Sequence[str] | str | None = None,
-    arch: str = "dav-3510",
-    bisheng_bin: str | Path | None = None,
-    cann_root: str | Path | None = None,
-    extra_include_dirs: Sequence[str | Path] | str | Path | None = None,
-    timeout_sec: int = 120,
-) -> tuple[bool, Path | None, str]:
-    """Compile a Track-B C++20 TU into a content-addressed cached .so via bisheng."""
-    if not isinstance(cpp_source, str) or not cpp_source.strip():
-        return (False, None, "stage_b_ascendc_empty_source")
-    cache_root = Path(cache_dir).expanduser().resolve()
-    cache_root.mkdir(parents=True, exist_ok=True)
-    target_so = cache_root / compute_trackb_shared_so_filename(cpp_source, compile_flags)
-    if is_verified_binary_file(target_so):
-        return (True, target_so, "")
-
-    resolved_bisheng = _resolve_bisheng_bin(bisheng_bin, cann_root=cann_root)
-    if resolved_bisheng is None:
-        return (False, None, "stage_b_ascendc_bisheng_not_found")
-
-    ctx = _prepare_ascendc_compile_context(
-        compile_flags=compile_flags,
-        cann_root=cann_root,
-        resolved_bisheng=resolved_bisheng,
-        extra_include_dirs=extra_include_dirs,
-    )
-    with tempfile.TemporaryDirectory(prefix="tf_trackb_shared_") as tmp_dir:
-        src_name = "kernel.cpp" if ctx.has_explicit_x else "kernel.asc"
-        src_path = Path(tmp_dir) / src_name
-        tmp_so = Path(tmp_dir) / "kernel.so"
-        src_path.write_text(cpp_source, encoding="utf-8")
-        link_cmd = _build_trackb_shared_link_cmd(
-            resolved_bisheng,
-            arch=arch,
-            ctx=ctx,
-            src_path=src_path,
-            so_path=tmp_so,
-        )
-        try:
-            link_proc = subprocess.run(
-                link_cmd,
-                text=True,
-                capture_output=True,
-                cwd=tmp_dir,
-                env=ctx.env,
-                timeout=timeout_sec,
-            )
-        except subprocess.TimeoutExpired:
-            return (False, None, f"stage_b_ascendc_shared_link_timeout:{timeout_sec}s")
-        link_raw = (link_proc.stderr or "") + "\n" + (link_proc.stdout or "")
-        if link_proc.returncode != 0 or not is_verified_binary_file(tmp_so):
-            link_detail = _bounded_compile_diagnostic(link_raw)
-            return (
-                False,
-                None,
-                f"stage_b_ascendc_shared_link_failed (rc={link_proc.returncode}): {link_detail}",
-            )
-        _atomic_copy_file(tmp_so, target_so)
-        return (True, target_so, "")
-
-
-def run_stage_b_ascendc_compile(
-    cpp_source: str,
-    *,
-    arch: str = "dav-3510",
-    compile_flags: Sequence[str] | str | None = None,
-    bisheng_bin: str | Path | None = None,
-    cann_root: str | Path | None = None,
-    extra_include_dirs: Sequence[str | Path] | str | Path | None = None,
-    timeout_sec: int = 120,
-    enable_device_compile: bool = True,
-    verify_shared_link: bool = False,
-    emit_shared_so_cache_dir: str | Path | None = None,
-    artifact_store: ArtifactStore | None = None,
-    artifact_id: str = "",
-    regime_tag: str = "",
-    spec_key: str = "",
-) -> StageBResult:
-    """Verify dav-3510 C++20 translation unit compilation via bisheng in an isolated tempdir."""
-    if not enable_device_compile:
-        raise ValueError("enable_device_compile=False bypass has been removed")
-    t0 = time.monotonic()
-    if not isinstance(cpp_source, str) or not cpp_source.strip():
-        return StageBResult(
-            passed=False,
-            error_message="stage_b_ascendc_empty_source",
-            elapsed_sec=time.monotonic() - t0,
-            fault_plane="STAGE_B_COMPILE",
-            fault_code="STAGE_B_ASCENDC_EMPTY_SOURCE",
-            failed_tier="stage_b",
-        )
-
-    resolved_bisheng = _resolve_bisheng_bin(bisheng_bin, cann_root=cann_root)
-    if resolved_bisheng is None:
-        return StageBResult(
-            passed=False,
-            error_message="stage_b_ascendc_bisheng_not_found",
-            elapsed_sec=time.monotonic() - t0,
-            fault_plane="INFRA_TOOLCHAIN",
-            fault_code="BISHENG_NOT_FOUND",
-            failed_tier="stage_b",
-        )
-
-    ctx = _prepare_ascendc_compile_context(
-        compile_flags=compile_flags,
-        cann_root=cann_root,
-        resolved_bisheng=resolved_bisheng,
-        extra_include_dirs=extra_include_dirs,
-    )
-    extra_flags = ctx.extra_flags
-    std_flags = ctx.std_flags
-    include_flags = ctx.include_flags
-    env = ctx.env
-
-    resolved_store = _resolve_artifact_store(artifact_store)
-    recorded_aid = ""
-    recorded_bins: tuple[str, ...] = ()
-    with tempfile.TemporaryDirectory(prefix="tf_stage_b_ascendc_") as tmp_dir:
-        src_name = "kernel.cpp" if ctx.has_explicit_x else "kernel.asc"
-        src_path = Path(tmp_dir) / src_name
-        obj_path = Path(tmp_dir) / "kernel.o"
-        src_path.write_text(cpp_source, encoding="utf-8")
-
-        should_verify_shared = (
-            verify_shared_link
-            and 'extern "C"' in cpp_source
-            and "<<<" in cpp_source
-            and not ctx.has_explicit_x
-            and bool(env.get("ASCEND_HOME_PATH"))
-        )
-        cached_so: Path | None = (
-            Path(emit_shared_so_cache_dir).expanduser().resolve()
-            / compute_trackb_shared_so_filename(cpp_source, extra_flags)
-            if should_verify_shared and emit_shared_so_cache_dir is not None
-            else None
-        )
-        cached_so_hit = cached_so is not None and is_verified_binary_file(cached_so)
-        so_path = Path(tmp_dir) / "kernel.so"
-
-        def _invoke(*, use_legacy_cce_flags: bool) -> subprocess.CompletedProcess[str]:
-            arch_flags = (
-                ["-x", "cce", f"--cce-aicore-arch={arch}"]
-                if use_legacy_cce_flags
-                else [f"--npu-arch={arch}"]
-            )
-            dep_flags = (
-                []
-                if any("Wdeprecated-declarations" in str(flag) for flag in extra_flags)
-                else ["-Wno-deprecated-declarations"]
-            )
-            cmd = [
-                resolved_bisheng,
-                *arch_flags,
-                "--cce-aicore-only",
-                "--cce-res-usage",
-                "-O2",
-                *std_flags,
-                *include_flags,
-                *dep_flags,
-                *extra_flags,
-                "-c",
-                str(src_path),
-                "-o",
-                str(obj_path),
-            ]
-            return subprocess.run(
-                cmd,
-                text=True,
-                capture_output=True,
-                cwd=tmp_dir,
-                env=env,
-                timeout=timeout_sec,
-            )
-
-        link_executor: ThreadPoolExecutor | None = None
-        link_future = None
-        try:
-            if should_verify_shared and not cached_so_hit:
-                link_cmd = _build_trackb_shared_link_cmd(
-                    resolved_bisheng,
-                    arch=arch,
-                    ctx=ctx,
-                    src_path=src_path,
-                    so_path=so_path,
-                )
-                link_executor = ThreadPoolExecutor(max_workers=2)
-                link_future = link_executor.submit(
-                    subprocess.run,
-                    link_cmd,
-                    text=True,
-                    capture_output=True,
-                    cwd=tmp_dir,
-                    env=env,
-                    timeout=timeout_sec,
-                )
-
-            try:
-                proc = _invoke(use_legacy_cce_flags=False)
-                if proc.returncode != 0:
-                    combined_err = (proc.stderr or "") + "\n" + (proc.stdout or "")
-                    low_err = combined_err.lower()
-                    if "--npu-arch" in low_err and any(
-                        tok in low_err
-                        for tok in ("unknown", "unrecognized", "unsupported", "invalid")
-                    ):
-                        proc = _invoke(use_legacy_cce_flags=True)
-            except subprocess.TimeoutExpired:
-                return StageBResult(
-                    passed=False,
-                    error_message=f"stage_b_ascendc_compile_timeout:{timeout_sec}s",
-                    elapsed_sec=time.monotonic() - t0,
-                    fault_plane="STAGE_B_COMPILE",
-                    fault_code="STAGE_B_ASCENDC_COMPILE_TIMEOUT",
-                    failed_tier="stage_b",
-                )
-
-            combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-            if proc.returncode != 0 or not obj_path.is_file():
-                spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
-                    combined_out,
-                    asm_or_dump_text=cpp_source,
-                )
-                ma_profile = (
-                    extract_microarch_profile_from_cce(cpp_source).to_dict()
-                    if cpp_source.strip()
-                    else None
-                )
-                raw_detail = (
-                    proc.stderr or proc.stdout or "bisheng failed without diagnostics"
-                )
-                detail = _bounded_compile_diagnostic(raw_detail)
-                fault_code = _classify_stage_b_overflow_fault_code(
-                    raw_detail,
-                    summary,
-                    "STAGE_B_ASCENDC_COMPILE_FAILED",
-                )
-                return StageBResult(
-                    passed=False,
-                    error_message=(
-                        f"stage_b_ascendc_compile_failed (rc={proc.returncode}): {detail}"
-                    ),
-                    elapsed_sec=time.monotonic() - t0,
-                    generated_cce=cpp_source,
-                    spill_bytes=spill_bytes,
-                    vloopv2_hit=vloopv2_hit,
-                    compiler_summary=summary,
-                    microarch_profile=ma_profile,
-                    full_diagnostic=raw_detail,
-                    fault_plane="STAGE_B_COMPILE",
-                    fault_code=fault_code,
-                    failed_tier="stage_b",
-                )
-
-            inst_ok, inst_err = _verify_object_has_instantiated_kernel(
-                obj_path, bisheng_bin=resolved_bisheng
-            )
-            objdump_text = _disassemble_object(obj_path, bisheng_bin=resolved_bisheng)
-            telemetry_out = _augment_bisheng_telemetry_text(combined_out, objdump_text)
-            dump_text = (
-                f"{objdump_text}\n{cpp_source}" if objdump_text.strip() else cpp_source
-            )
-            spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
-                telemetry_out,
-                asm_or_dump_text=dump_text,
-            )
-            ma_profile = _merge_disassembly_microarch_profile(cpp_source, objdump_text)
-            if not inst_ok:
-                return StageBResult(
-                    passed=False,
-                    error_message=inst_err,
-                    elapsed_sec=time.monotonic() - t0,
-                    generated_cce=cpp_source,
-                    spill_bytes=spill_bytes,
-                    vloopv2_hit=vloopv2_hit,
-                    compiler_summary=summary,
-                    microarch_profile=ma_profile,
-                    fault_plane="STAGE_B_COMPILE",
-                    fault_code="STAGE_B_ASCENDC_UNINSTANTIATED_TEMPLATE",
-                    failed_tier="stage_b",
-                )
-            if _has_vf_stack_overflow_signal(telemetry_out, summary, extra_flags):
-                return StageBResult(
-                    passed=False,
-                    error_message=(
-                        f"stage_b_ascendc_vf_stack_overflow: stack_bytes={summary.stack_bytes}"
-                    ),
-                    elapsed_sec=time.monotonic() - t0,
-                    generated_cce=cpp_source,
-                    spill_bytes=spill_bytes,
-                    vloopv2_hit=vloopv2_hit,
-                    compiler_summary=summary,
-                    microarch_profile=ma_profile,
-                    full_diagnostic=telemetry_out,
-                    fault_plane="STAGE_B_COMPILE",
-                    fault_code="VF_STACK_OVERFLOW",
-                    failed_tier="stage_b",
-                )
-
-            so_path_opt: Path | None = None
-            if should_verify_shared:
-                if cached_so_hit:
-                    so_path_opt = cached_so
-                elif link_future is not None:
-                    try:
-                        link_proc = link_future.result()
-                    except subprocess.TimeoutExpired:
-                        return StageBResult(
-                            passed=False,
-                            error_message=f"stage_b_ascendc_shared_link_timeout:{timeout_sec}s",
-                            elapsed_sec=time.monotonic() - t0,
-                            spill_bytes=spill_bytes,
-                            vloopv2_hit=vloopv2_hit,
-                            compiler_summary=summary,
-                            microarch_profile=ma_profile,
-                            fault_plane="STAGE_B_COMPILE",
-                            fault_code="STAGE_B_ASCENDC_SHARED_LINK_TIMEOUT",
-                            failed_tier="stage_b",
-                        )
-                    link_raw = (link_proc.stderr or "") + "\n" + (link_proc.stdout or "")
-                    if link_proc.returncode != 0 or not so_path.is_file():
-                        link_detail = _bounded_compile_diagnostic(link_raw)
-                        link_fault_code = _classify_stage_b_overflow_fault_code(
-                            link_raw,
-                            summary,
-                            "STAGE_B_ASCENDC_SHARED_LINK_FAILED",
-                        )
-                        return StageBResult(
-                            passed=False,
-                            error_message=(
-                                f"stage_b_ascendc_shared_link_failed "
-                                f"(rc={link_proc.returncode}): {link_detail}"
-                            ),
-                            elapsed_sec=time.monotonic() - t0,
-                            spill_bytes=spill_bytes,
-                            vloopv2_hit=vloopv2_hit,
-                            compiler_summary=summary,
-                            microarch_profile=ma_profile,
-                            full_diagnostic=link_raw,
-                            fault_plane="STAGE_B_COMPILE",
-                            fault_code=link_fault_code,
-                            failed_tier="stage_b",
-                        )
-                    if cached_so is not None:
-                        _atomic_copy_file(so_path, cached_so)
-                    so_path_opt = so_path
-        finally:
-            if link_future is not None:
-                try:
-                    link_future.result()
-                except Exception:
-                    pass
-            if link_executor is not None:
-                link_executor.shutdown(wait=True)
-
-        built_bins = [
-            p
-            for p in (obj_path, so_path_opt)
-            if p is not None and p.is_file() and p.stat().st_size > 0
-        ]
-        if built_bins:
-            closure_src = _normalize_trackb_unit_source(cpp_source, regime_tag=regime_tag)
-            flags_str = " ".join(extra_flags)
-            recorded_aid = artifact_id or compute_compile_task_key(
-                normalized_kernel_unit_src=closure_src,
-                cann_target=arch,
-                pass_configs=None,
-                compile_flags=extra_flags,
-                static_spec_signature=spec_key,
-            )
-            rec = resolved_store.record_verified_artifact(
-                recorded_aid,
-                binary_paths=built_bins,
-                backend_kind="ascendc",
-                arch=arch,
-                flags=flags_str,
-                spec_key=spec_key,
-                closure_src=closure_src,
-                copy_binaries=True,
-            )
-            recorded_bins = rec.binary_paths
-
-    return StageBResult(
-        passed=True,
-        elapsed_sec=time.monotonic() - t0,
-        spill_bytes=spill_bytes,
-        vloopv2_hit=vloopv2_hit,
-        compiler_summary=summary,
-        microarch_profile=ma_profile,
-        artifact_id=recorded_aid,
-        binary_paths=recorded_bins,
-    )
-
-
 def synthesize_pybind_extension_wrapper(
-    op_name: str,
-    kernel_launch_decl: str,
-    tensor_arg_names: Sequence[str],
-    *,
-    output_arg_names: Sequence[str] | None = None,
-    scalar_params: Sequence[tuple[str, str]] | None = None,
+    op_name: str, kernel_launch_decl: str, tensor_arg_names: Sequence[str], *,
+    output_arg_names: Sequence[str] | None = None, scalar_params: Sequence[tuple[str, str]] | None = None,
 ) -> str:
     """Generate a thin torch_npu pybind11 wrapper preserving Python op_fn(*inputs) ABI."""
     safe_op = re.sub(r"[^A-Za-z0-9_]", "_", (op_name or "ascend_op").strip())
-    if not safe_op or safe_op[0].isdigit():
-        safe_op = f"op_{safe_op}"
-    wrapper_fn = f"py_{safe_op}_forward"
-
-    decl_text = str(kernel_launch_decl or "").strip()
-    m_fn = re.search(r"\b([A-Za-z_]\w*)\s*\(", decl_text)
-    if m_fn:
-        launch_fn = m_fn.group(1)
-        decl_stmt = decl_text if decl_text.endswith(";") or decl_text.endswith("}") else f"{decl_text};"
+    safe_op = f"op_{safe_op}" if (not safe_op or safe_op[0].isdigit()) else safe_op
+    decl = str(kernel_launch_decl or "").strip()
+    if m_fn := re.search(r"\b([A-Za-z_]\w*)\s*\(", decl):
+        launch_fn, dstmt = m_fn.group(1), decl if decl.endswith((";", "}")) else f"{decl};"
     else:
-        launch_fn = re.sub(r"[^A-Za-z0-9_]", "_", decl_text or f"launch_{safe_op}")
-        if not launch_fn or launch_fn[0].isdigit():
-            launch_fn = f"launch_{safe_op}"
-        arg_decls = ", ".join(
-            ["aclrtStream stream"]
-            + [f"void* {re.sub(r'[^A-Za-z0-9_]', '_', a)}" for a in tensor_arg_names]
-            + [f"{ptype} {pname}" for ptype, pname in (scalar_params or ())]
-        )
-        decl_stmt = f'extern "C" void {launch_fn}({arg_decls});'
-
-    clean_tensors = [re.sub(r"[^A-Za-z0-9_]", "_", str(a).strip()) or f"t{i}" for i, a in enumerate(tensor_arg_names)]
-    clean_scalars = [
-        (str(ptype).strip(), re.sub(r"[^A-Za-z0-9_]", "_", str(pname).strip()) or f"s{i}")
-        for i, (ptype, pname) in enumerate(scalar_params or ())
-    ]
-    cpp_params = [f"const at::Tensor& {t}" for t in clean_tensors] + [
-        f"{ptype} {pname}" for ptype, pname in clean_scalars
-    ]
-
-    checks = "\n".join(
-        f'    TORCH_CHECK({t}.is_contiguous(), "Expected contiguous NPU tensor for {t}");'
-        for t in clean_tensors
-    )
-    stream_line = (
-        f"    auto npu_stream = c10_npu::getCurrentNPUStream({clean_tensors[0]}.device().index());"
-        if clean_tensors
-        else "    auto npu_stream = c10_npu::getCurrentNPUStream();"
-    )
-    launch_args = ["npu_stream.stream()"] + [f"{t}.data_ptr()" for t in clean_tensors] + [
-        pname for _ptype, pname in clean_scalars
-    ]
-
+        launch_fn = re.sub(r"[^A-Za-z0-9_]", "_", decl or f"launch_{safe_op}")
+        launch_fn = f"launch_{safe_op}" if (not launch_fn or launch_fn[0].isdigit()) else launch_fn
+        adecls = ", ".join(["aclrtStream stream", *(f"void* {re.sub(r'[^A-Za-z0-9_]', '_', a)}" for a in tensor_arg_names), *(f"{pt} {pn}" for pt, pn in (scalar_params or ()))])
+        dstmt = f'extern "C" void {launch_fn}({adecls});'
+    ctens = [re.sub(r"[^A-Za-z0-9_]", "_", str(a).strip()) or f"t{i}" for i, a in enumerate(tensor_arg_names)]
+    cscal = [(str(pt).strip(), re.sub(r"[^A-Za-z0-9_]", "_", str(pn).strip()) or f"s{i}") for i, (pt, pn) in enumerate(scalar_params or ())]
+    cparams = ", ".join([*(f"const at::Tensor& {t}" for t in ctens), *(f"{pt} {pn}" for pt, pn in cscal)])
+    stream_ln = f"    auto npu_stream = c10_npu::getCurrentNPUStream({ctens[0]}.device().index());" if ctens else "    auto npu_stream = c10_npu::getCurrentNPUStream();"
+    largs = ", ".join(["npu_stream.stream()", *(f"{t}.data_ptr()" for t in ctens), *(pn for _, pn in cscal)])
     if output_arg_names:
         outs = [re.sub(r"[^A-Za-z0-9_]", "_", str(o).strip()) for o in output_arg_names]
-        if len(outs) == 1:
-            ret_type = "at::Tensor"
-            ret_stmt = f"    return {outs[0]};"
-        else:
-            ret_type = "std::tuple<" + ", ".join("at::Tensor" for _ in outs) + ">"
-            ret_stmt = f"    return std::make_tuple({', '.join(outs)});"
-    elif clean_tensors:
-        ret_type = "at::Tensor"
-        ret_stmt = f"    return {clean_tensors[-1]};"
+        rt = "at::Tensor" if len(outs) == 1 else f"std::tuple<{', '.join('at::Tensor' for _ in outs)}>"
+        rstmt = f"    return {outs[0]};" if len(outs) == 1 else f"    return std::make_tuple({', '.join(outs)});"
+    elif ctens:
+        rt, rstmt = "at::Tensor", f"    return {ctens[-1]};"
     else:
-        ret_type = "void"
-        ret_stmt = ""
-
-    body_lines = [
-        "#include <torch/extension.h>",
-        "#include <torch_npu/csrc/core/npu/NPUStream.h>",
-        "#include <acl/acl.h>",
-        "#include <tuple>",
-        "",
-        decl_stmt,
-        "",
-        f"{ret_type} {wrapper_fn}({', '.join(cpp_params)}) {{",
+        rt, rstmt = "void", ""
+    lines = [
+        "#include <torch/extension.h>", "#include <torch_npu/csrc/core/npu/NPUStream.h>", "#include <acl/acl.h>", "#include <tuple>", "", dstmt, "",
+        f"{rt} py_{safe_op}_forward({cparams}) {{",
+        *(f'    TORCH_CHECK({t}.is_contiguous(), "Expected contiguous NPU tensor for {t}");' for t in ctens),
+        stream_ln, f"    {launch_fn}({largs});", *(([rstmt] if rstmt else [])), "}", "",
+        "PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {", f'    m.def("{safe_op}", &py_{safe_op}_forward, "Ascend 950 torch_npu extension binding for {safe_op}");', "}", "",
     ]
-    if checks:
-        body_lines.append(checks)
-    body_lines.extend(
-        [
-            stream_line,
-            f"    {launch_fn}({', '.join(launch_args)});",
-        ]
-    )
-    if ret_stmt:
-        body_lines.append(ret_stmt)
-    body_lines.extend(
-        [
-            "}",
-            "",
-            "PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {",
-            f'    m.def("{safe_op}", &{wrapper_fn}, "Ascend 950 torch_npu extension binding for {safe_op}");',
-            "}",
-            "",
-        ]
-    )
-    return "\n".join(body_lines)
+    return "\n".join(lines)
 
 
 def _resolve_agent_gates_bin() -> str:
-    env_bin = os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip()
-    if env_bin and Path(env_bin).is_file():
-        return env_bin
-    found = shutil.which("agent-gates")
-    if found:
+    if (eb := os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip()) and Path(eb).is_file():
+        return eb
+    if found := shutil.which("agent-gates"):
         return found
-    candidates: list[Path] = []
-    env_file = os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
-    if env_file:
-        env_path = Path(env_file).expanduser().resolve()
-        for ag_root in (env_path.parent, env_path.parent.parent):
-            candidates.append(ag_root / ".venv" / "bin" / "agent-gates")
-    repo_root = Path(__file__).resolve().parents[5]
-    candidates.append(repo_root.parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
-    for cand in candidates:
-        if cand.is_file():
-            return str(cand)
-    raise FileNotFoundError(
-        "Cannot locate 'agent-gates'. Set TILEFOUNDRY_NPU_AGENT_GATES_BIN or add to PATH."
-    )
+    cands = ([Path(ef).expanduser().resolve().parent / ".venv/bin/agent-gates", Path(ef).expanduser().resolve().parent.parent / ".venv/bin/agent-gates"] if (ef := os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()) else [])
+    cands.append(Path(__file__).resolve().parents[5].parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
+    if hit := next((str(c) for c in cands if c.is_file()), None):
+        return hit
+    raise FileNotFoundError("Cannot locate 'agent-gates'. Set TILEFOUNDRY_NPU_AGENT_GATES_BIN or add to PATH.")
 
 
-def verify_agent_gates_receipt(
-    agent_gates_bin: str,
-    run_id: str,
-    *,
-    source_root: str | Path,
-    env: Mapping[str, str] | None = None,
-    timeout_sec: float = 30.0,
-) -> tuple[bool, str]:
+def verify_agent_gates_receipt(agent_gates_bin: str, run_id: str, *, source_root: str | Path, env: Mapping[str, str] | None = None, timeout_sec: float = 30.0) -> tuple[bool, str]:
     """Verify one AgentGates receipt by run ID and require an authoritative PASS."""
     try:
-        proc = subprocess.run(
-            [agent_gates_bin, "verify", "--run-id", run_id, "--json"],
-            text=True,
-            capture_output=True,
-            cwd=str(Path(source_root).resolve()),
-            env=dict(env) if env is not None else None,
-            timeout=timeout_sec,
-            check=False,
-        )
+        proc = subprocess.run([agent_gates_bin, "verify", "--run-id", run_id, "--json"], text=True, capture_output=True, cwd=str(Path(source_root).resolve()), env=dict(env) if env is not None else None, timeout=timeout_sec, check=False)
     except subprocess.TimeoutExpired:
         return False, f"agent-gates verify timed out after {timeout_sec:.0f}s"
     parsed: dict[str, object] = {}
-    brace_idx = proc.stdout.find("{")
-    if brace_idx >= 0:
+    if (bi := proc.stdout.find("{")) >= 0:
         try:
-            loaded = json.loads(proc.stdout[brace_idx:])
+            if isinstance(ld := json.loads(proc.stdout[bi:]), dict): parsed = ld
         except json.JSONDecodeError as exc:
             return False, f"agent-gates verify returned malformed JSON: {exc}"
-        if isinstance(loaded, dict):
-            parsed = loaded
-    status = str(parsed.get("status", ""))
-    verified_run_id = str(parsed.get("runId", ""))
-    valid = parsed.get("valid") is True
-    if proc.returncode == 0 and status == "PASS" and verified_run_id == run_id and valid:
+    st, vrid, val = str(parsed.get("status", "")), str(parsed.get("runId", "")), parsed.get("valid") is True
+    if proc.returncode == 0 and st == "PASS" and vrid == run_id and val:
         return True, ""
-    detail = (proc.stderr or proc.stdout or "agent-gates verify failed").strip()
-    return False, (
-        "receipt_verification_failed: "
-        f"status={status or 'MISSING'} runId={verified_run_id or 'MISSING'} "
-        f"valid={valid} {detail[-1000:]}"
-    )
+    return False, f"receipt_verification_failed: status={st or 'MISSING'} runId={vrid or 'MISSING'} valid={val} {(proc.stderr or proc.stdout or 'agent-gates verify failed').strip()[-1000:]}"
 
 
 def run_stage_c_agent_gates(
-    ledger: ObjectivePhysicalLedger,
-    *,
-    source_root: str | Path,
-    device_id: str = "1",
-    env_file: str | Path | None = None,
-    device_test_rel: str | None = None,
-    telemetry_report_path: str | Path | None = None,
-    gate: str = "tilefoundry-npu-device",
-    timeout_sec: int = 300,
+    ledger: ObjectivePhysicalLedger, *, source_root: str | Path, device_id: str = "1",
+    env_file: str | Path | None = None, device_test_rel: str | None = None,
+    telemetry_report_path: str | Path | None = None, gate: str = "tilefoundry-npu-device", timeout_sec: int = 300,
 ) -> StageCResult:
     """Execute lease-locked NPU validation and msprof collection strictly via AgentGates."""
-    ag_bin = _resolve_agent_gates_bin()
-    src_path = Path(source_root).resolve()
-    cmd = [
-        ag_bin,
-        "run",
-        "--adapter",
-        "tilefoundry-npu",
-        "--source",
-        str(src_path),
-        "--gate",
-        gate,
-        "--device-id",
-        str(device_id),
-        "--json",
-    ]
+    ag_bin, src_p = _resolve_agent_gates_bin(), Path(source_root).resolve()
+    cmd = [ag_bin, "run", "--adapter", "tilefoundry-npu", "--source", str(src_p), "--gate", gate, "--device-id", str(device_id), "--json"]
     with tempfile.TemporaryDirectory(prefix="tf_stage_c_env_") as tmp_dir:
         if device_test_rel and env_file and Path(env_file).is_file():
-            tmp_env = Path(tmp_dir) / "env.sh"
-            lines = [
-                ln
-                for ln in Path(env_file).read_text(encoding="utf-8").splitlines()
-                if not ln.startswith("TILEFOUNDRY_NPU_DEVICE_TESTS=")
-            ]
-            lines.append(f'TILEFOUNDRY_NPU_DEVICE_TESTS="{device_test_rel}"')
-            tmp_env.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            cmd.extend(["--env-file", str(tmp_env)])
+            te = Path(tmp_dir) / "env.sh"
+            lines = [ln for ln in Path(env_file).read_text(encoding="utf-8").splitlines() if not ln.startswith("TILEFOUNDRY_NPU_DEVICE_TESTS=")]
+            te.write_text("\n".join([*lines, f'TILEFOUNDRY_NPU_DEVICE_TESTS="{device_test_rel}"']) + "\n", encoding="utf-8")
+            cmd.extend(["--env-file", str(te)])
         elif env_file and Path(env_file).is_file():
             cmd.extend(["--env-file", str(env_file)])
-
-        proc = subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            cwd=str(src_path),
-            timeout=timeout_sec,
-        )
-        parsed: dict[str, object] = {}
-        brace_idx = proc.stdout.find("{")
-        if brace_idx >= 0:
-            try:
-                loaded = json.loads(proc.stdout[brace_idx:])
-            except json.JSONDecodeError:
-                loaded = {}
-            if isinstance(loaded, dict):
-                parsed = loaded
-
-        status = str(parsed.get("status", "FAIL"))
-        run_id = str(parsed.get("runId", "")).strip()
-        receipt_path = str(parsed.get("receiptPath", ""))
+        proc = subprocess.run(cmd, text=True, capture_output=True, cwd=str(src_p), timeout=timeout_sec)
+        parsed = {}
+        if (bi := proc.stdout.find("{")) >= 0:
+            with contextlib.suppress(json.JSONDecodeError):
+                if isinstance(ld := json.loads(proc.stdout[bi:]), dict): parsed = ld
+        status, run_id, rpath = str(parsed.get("status", "FAIL")), str(parsed.get("runId", "")).strip(), str(parsed.get("receiptPath", ""))
         passed = proc.returncode == 0 and status == "PASS"
-        run_error = (proc.stderr or proc.stdout or "agent-gates failed")[-1000:]
-        verify_error = ""
-        if passed and not run_id:
-            passed = False
-            run_error = "agent-gates run reported PASS without a runId"
-        elif passed:
-            passed, verify_error = verify_agent_gates_receipt(
-                ag_bin,
-                run_id,
-                source_root=src_path,
-            )
-
-    telemetry: dict[str, object] = {}
+        run_err = (proc.stderr or proc.stdout or "agent-gates failed")[-1000:]
+        ver_err = ""
+        if passed and not run_id: passed, run_err = False, "agent-gates run reported PASS without a runId"
+        elif passed: passed, ver_err = verify_agent_gates_receipt(ag_bin, run_id, source_root=src_p)
+    tel: dict[str, object] = {}
     if passed and telemetry_report_path and Path(telemetry_report_path).is_file():
-        try:
-            telemetry = json.loads(Path(telemetry_report_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            telemetry = {}
-
-    latency_us = float(telemetry.get("dur_us", telemetry.get("measured_latency_us", 0.0)))
-    residual = compute_static_dynamic_residual(ledger, telemetry)
-    err = "" if passed else (verify_error or run_error)[-1000:]
-    return StageCResult(
-        passed=passed,
-        accuracy_passed=passed,
-        measured_latency_us=latency_us,
-        residual=residual,
-        telemetry=telemetry,
-        run_id=run_id,
-        receipt_path=receipt_path,
-        error_message=err,
-    )
+        with contextlib.suppress(OSError, json.JSONDecodeError):
+            tel = json.loads(Path(telemetry_report_path).read_text(encoding="utf-8"))
+    return StageCResult(passed, passed, float(tel.get("dur_us", tel.get("measured_latency_us", 0.0))), compute_static_dynamic_residual(ledger, tel), tel, run_id, rpath, "" if passed else (ver_err or run_err)[-1000:])
 
 
 class GateFunnel:
     """Orchestrates Stage A static -> Stage B bisheng -> Stage C AgentGates NPU verification."""
 
     def __init__(
-        self,
-        *,
-        target: AscendTarget | None = None,
-        skip_stage_b: bool = False,
+        self, *, target: AscendTarget | None = None, skip_stage_b: bool = False,
         compile_runner: Callable[[str], StageBResult] | None = None,
         device_runner: Callable[[str, StageAResult], StageCResult] | None = None,
-        enable_track_router: bool = False,
-        artifact_store: ArtifactStore | None = None,
+        enable_track_router: bool = False, artifact_store: ArtifactStore | None = None,
     ) -> None:
-        self._target = target or AscendTarget("ascend.950pr")
-        self._skip_stage_b = skip_stage_b
-        self._compile_runner = compile_runner
-        self._device_runner = device_runner
-        self._enable_track_router = enable_track_router
-        self._artifact_store = artifact_store
+        self._target, self._skip_stage_b, self._compile_runner, self._device_runner, self._enable_track_router, self._artifact_store = (
+            target or AscendTarget("ascend.950pr"), skip_stage_b, compile_runner, device_runner, enable_track_router, artifact_store
+        )
 
     def evaluate(
-        self,
-        dsl_source: str,
-        *,
-        factory_name: str | None = None,
-        factory_kwargs: Mapping[str, object] | None = None,
-        config_selector_name: str | None = None,
-        pass_configs: dict[str, object] | None = None,
-        compile_flags: Sequence[str] | str | None = None,
-        dims: Mapping[str, object] | None = None,
-        var_bindings: Mapping[str, int] | None = None,
-        backend_kind: str | None = None,
-        freedom_mask: object | None = None,
-        roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
-        ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
-        regime_tag: str = "",
-        spec_key: str = "",
+        self, dsl_source: str, *, factory_name: str | None = None, factory_kwargs: Mapping[str, object] | None = None,
+        config_selector_name: str | None = None, pass_configs: dict[str, object] | None = None,
+        compile_flags: Sequence[str] | str | None = None, dims: Mapping[str, object] | None = None,
+        var_bindings: Mapping[str, int] | None = None, backend_kind: str | None = None, freedom_mask: object | None = None,
+        roofline: RooflineSummaryLike | Mapping[str, object] | None = None, ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
+        regime_tag: str = "", spec_key: str = "",
     ) -> FunnelEvaluation:
         """Run Stage A, Stage B, and Stage C sequentially with early rejection."""
-        if backend_kind in ("ascendc", "ascendc_template"):
-            stage_a = evaluate_ascendc_candidate(
-                dsl_source,
-                freedom_mask=freedom_mask,
-                target=self._target,
-                enable_track_router=self._enable_track_router,
-            )
-        else:
-            stage_a = run_stage_a_static(
-                dsl_source,
-                factory_name=factory_name,
-                factory_kwargs=factory_kwargs,
-                target=self._target,
-                pass_configs=pass_configs,
-                compile_flags=compile_flags,
-                config_selector_name=config_selector_name,
-                dims=dims,
-                var_bindings=var_bindings,
-                enable_track_router=self._enable_track_router,
-                ordered_tensor_shapes=ordered_tensor_shapes,
-            )
-        if not stage_a.passed or stage_a.ledger is None:
-            return FunnelEvaluation(
-                passed=False,
-                failed_stage="stage_a",
-                stage_a=stage_a,
-                error_message=stage_a.error_message,
-            )
-
-        if self._skip_stage_b:
-            stage_b = StageBResult(passed=True)
-        elif self._compile_runner is not None:
-            stage_b = self._compile_runner(dsl_source)
-        elif backend_kind in ("ascendc", "ascendc_template"):
-            stage_b = run_stage_b_ascendc_compile(
-                dsl_source,
-                compile_flags=compile_flags,
-                artifact_store=self._artifact_store,
-                regime_tag=regime_tag,
-                spec_key=spec_key,
-            )
-        else:
-            stage_b = run_stage_b_compile(
-                dsl_source,
-                factory_name=factory_name,
-                factory_kwargs=factory_kwargs,
-                config_selector_name=config_selector_name,
-                pass_configs=pass_configs,
-                compile_flags=compile_flags,
-                dims=dims,
-                artifact_store=self._artifact_store,
-                regime_tag=regime_tag,
-                spec_key=spec_key,
-            )
-        if not stage_b.passed:
-            return FunnelEvaluation(
-                passed=False,
-                failed_stage="stage_b",
-                stage_a=stage_a,
-                stage_b=stage_b,
-                error_message=stage_b.error_message,
-            )
-
-        comp_summary = stage_b.compiler_summary
+        sa = (
+            evaluate_ascendc_candidate(dsl_source, freedom_mask=freedom_mask, target=self._target, enable_track_router=self._enable_track_router)
+            if backend_kind in ("ascendc", "ascendc_template")
+            else run_stage_a_static(dsl_source, factory_name=factory_name, factory_kwargs=factory_kwargs, target=self._target, pass_configs=pass_configs, compile_flags=compile_flags, config_selector_name=config_selector_name, dims=dims, var_bindings=var_bindings, enable_track_router=self._enable_track_router, ordered_tensor_shapes=ordered_tensor_shapes)
+        )
+        if not sa.passed or sa.ledger is None:
+            return FunnelEvaluation(False, "stage_a", sa, error_message=sa.error_message)
+        sb = (
+            StageBResult(passed=True) if self._skip_stage_b
+            else (self._compile_runner(dsl_source) if self._compile_runner is not None
+                  else (run_stage_b_ascendc_compile(dsl_source, compile_flags=compile_flags, artifact_store=self._artifact_store, regime_tag=regime_tag, spec_key=spec_key) if backend_kind in ("ascendc", "ascendc_template")
+                        else run_stage_b_compile(dsl_source, factory_name=factory_name, factory_kwargs=factory_kwargs, config_selector_name=config_selector_name, pass_configs=pass_configs, compile_flags=compile_flags, dims=dims, artifact_store=self._artifact_store, regime_tag=regime_tag, spec_key=spec_key)))
+        )
+        if not sb.passed:
+            return FunnelEvaluation(False, "stage_b", sa, sb, error_message=sb.error_message)
+        cs = sb.compiler_summary
         if self._device_runner is None:
-            fallback_telemetry: dict[str, object] = {}
-            residual = compute_static_dynamic_residual(
-                stage_a.ledger,
-                fallback_telemetry,
-                compiler_summary=comp_summary,
-                roofline=roofline,
-            )
-            stage_c = StageCResult(
-                passed=True,
-                accuracy_passed=True,
-                measured_latency_us=0.0,
-                residual=residual,
-                telemetry=fallback_telemetry,
-            )
+            sc = StageCResult(True, True, 0.0, compute_static_dynamic_residual(sa.ledger, {}, compiler_summary=cs, roofline=roofline), {})
         else:
             _inject_cann_cpath_env()
-            stage_c = self._device_runner(dsl_source, stage_a)
-            if comp_summary is not None and stage_c.residual is not None:
-                res = stage_c.residual
-                sw_loops = comp_summary.software_loops
-                vl_loops = comp_summary.vloopv2_loops
-                comp_vloop_hit = bool(stage_b.vloopv2_hit) and vl_loops > 0 and sw_loops == 0
-                merged_res = replace(
-                    res,
-                    spill_bytes=max(res.spill_bytes, int(comp_summary.spill_bytes)),
-                    vf_fusion_breaks=max(res.vf_fusion_breaks, int(comp_summary.vf_fusion_breaks)),
-                    alias_serialized_buffers=max(
-                        res.alias_serialized_buffers, int(comp_summary.alias_serialized_buffers)
-                    ),
-                    dual_issue_ipc_collapse=max(
-                        res.dual_issue_ipc_collapse, float(comp_summary.dual_issue_ipc_collapse)
-                    ),
-                    dcache_dcci_flushes=max(
-                        res.dcache_dcci_flushes, int(comp_summary.dcache_dcci_flushes)
-                    ),
-                    has_local_membar_in_vf_call=(
-                        res.has_local_membar_in_vf_call
-                        or bool(comp_summary.has_local_membar_in_vf_call)
-                    ),
-                    vloopv2_hit=(res.vloopv2_hit and comp_vloop_hit),
-                    observation=stage_a.ledger.to_observation_5d(
-                        compiler_summary=comp_summary,
-                        telemetry=stage_c.telemetry,
-                        roofline=roofline,
-                    ),
-                )
-                stage_c = replace(stage_c, residual=merged_res)
-            elif stage_c.residual is not None and roofline is not None:
-                refreshed_res = replace(
-                    stage_c.residual,
-                    observation=stage_a.ledger.to_observation_5d(
-                        compiler_summary=comp_summary,
-                        telemetry=stage_c.telemetry,
-                        roofline=roofline,
-                    ),
-                )
-                stage_c = replace(stage_c, residual=refreshed_res)
-
-        if not stage_c.passed or not stage_c.accuracy_passed:
-            return FunnelEvaluation(
-                passed=False,
-                failed_stage="stage_c",
-                stage_a=stage_a,
-                stage_b=stage_b,
-                stage_c=stage_c,
-                error_message=stage_c.error_message,
-            )
-
-        return FunnelEvaluation(
-            passed=True,
-            failed_stage=None,
-            stage_a=stage_a,
-            stage_b=stage_b,
-            stage_c=stage_c,
-        )
+            sc = self._device_runner(dsl_source, sa)
+            if cs is not None and sc.residual is not None:
+                r = sc.residual
+                sc = replace(sc, residual=replace(
+                    r, spill_bytes=max(r.spill_bytes, int(cs.spill_bytes)), vf_fusion_breaks=max(r.vf_fusion_breaks, int(cs.vf_fusion_breaks)),
+                    alias_serialized_buffers=max(r.alias_serialized_buffers, int(cs.alias_serialized_buffers)),
+                    dual_issue_ipc_collapse=max(r.dual_issue_ipc_collapse, float(cs.dual_issue_ipc_collapse)),
+                    dcache_dcci_flushes=max(r.dcache_dcci_flushes, int(cs.dcache_dcci_flushes)),
+                    has_local_membar_in_vf_call=r.has_local_membar_in_vf_call or bool(cs.has_local_membar_in_vf_call),
+                    vloopv2_hit=r.vloopv2_hit and bool(sb.vloopv2_hit) and cs.vloopv2_loops > 0 and cs.software_loops == 0,
+                    observation=sa.ledger.to_observation_5d(compiler_summary=cs, telemetry=sc.telemetry, roofline=roofline),
+                ))
+            elif sc.residual is not None and roofline is not None:
+                sc = replace(sc, residual=replace(sc.residual, observation=sa.ledger.to_observation_5d(compiler_summary=cs, telemetry=sc.telemetry, roofline=roofline)))
+        if not sc.passed or not sc.accuracy_passed:
+            return FunnelEvaluation(False, "stage_c", sa, sb, sc, error_message=sc.error_message)
+        return FunnelEvaluation(True, None, sa, sb, sc)
 
 
 def prescreen_dsl_tile_kwargs(
-    dsl_source: str,
-    *,
-    factory_name: str,
-    candidate_kwargs_list: Sequence[Mapping[str, object]],
-    target: AscendTarget | None = None,
-    var_bindings: Mapping[str, int] | None = None,
-    config_selector_name: str | None = None,
-    pass_configs: dict[str, object] | None = None,
-    compile_flags: Sequence[str] | str | None = None,
-    dims: Mapping[str, object] | None = None,
+    dsl_source: str, *, factory_name: str, candidate_kwargs_list: Sequence[Mapping[str, object]],
+    target: AscendTarget | None = None, var_bindings: Mapping[str, int] | None = None,
+    config_selector_name: str | None = None, pass_configs: dict[str, object] | None = None,
+    compile_flags: Sequence[str] | str | None = None, dims: Mapping[str, object] | None = None,
     ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> tuple[dict[str, object], StageAResult]:
     """Run Stage A across tile kwargs and pick the lowest-cost legal configuration."""
     if not candidate_kwargs_list:
         raise ValueError("candidate_kwargs_list must not be empty")
-    legal: list[tuple[tuple[float, int, int], dict[str, object], StageAResult]] = []
-    rejections: list[str] = []
-    for idx, raw_kwargs in enumerate(candidate_kwargs_list):
-        kwargs = dict(raw_kwargs)
-        res = run_stage_a_static(
-            dsl_source,
-            factory_name=factory_name,
-            factory_kwargs=kwargs,
-            target=target,
-            pass_configs=pass_configs,
-            compile_flags=compile_flags,
-            config_selector_name=config_selector_name,
-            dims=dims,
-            var_bindings=var_bindings,
-            ordered_tensor_shapes=ordered_tensor_shapes,
-        )
-        ledger = res.ledger
-        if not res.passed or ledger is None:
-            rejections.append(f"{kwargs}: {res.error_message or 'stage_a_failed'}")
-            continue
-        if not ledger.is_legal or ledger.max_overflow_bytes > 0:
-            rejections.append(f"{kwargs}: overflow={ledger.max_overflow_bytes}")
-            continue
-        degraded = [
-            buf
-            for wl in ledger.waterlines.values()
-            for buf in wl.degraded_single_buffers
-        ]
-        if degraded:
-            rejections.append(f"{kwargs}: degraded_single_buffers={degraded}")
-            continue
-        ii_rank = (
-            float(ledger.steady_state_ii)
-            if ledger.steady_state_ii is not None and ledger.steady_state_ii > 0
-            else float("inf")
-        )
-        dom_cycles = ledger.pipe_cycles.get(
-            ledger.dominant_pipe,
-            max((v for v in ledger.pipe_cycles.values() if v > 0), default=0),
-        )
-        legal.append(((ii_rank, dom_cycles, idx), kwargs, res))
+    legal, rejs = [], []
+    for idx, rkw in enumerate(candidate_kwargs_list):
+        kw = dict(rkw)
+        res = run_stage_a_static(dsl_source, factory_name=factory_name, factory_kwargs=kw, target=target, pass_configs=pass_configs, compile_flags=compile_flags, config_selector_name=config_selector_name, dims=dims, var_bindings=var_bindings, ordered_tensor_shapes=ordered_tensor_shapes)
+        if not res.passed or (lg := res.ledger) is None: rejs.append(f"{kw}: {res.error_message or 'stage_a_failed'}")
+        elif not lg.is_legal or lg.max_overflow_bytes > 0: rejs.append(f"{kw}: overflow={lg.max_overflow_bytes}")
+        elif deg := [b for wl in lg.waterlines.values() for b in wl.degraded_single_buffers]: rejs.append(f"{kw}: degraded_single_buffers={deg}")
+        else:
+            legal.append(((float(lg.steady_state_ii) if lg.steady_state_ii and lg.steady_state_ii > 0 else float("inf"), lg.pipe_cycles.get(lg.dominant_pipe, max((v for v in lg.pipe_cycles.values() if v > 0), default=0)), idx), kw, res))
     if not legal:
-        detail = "; ".join(rejections[:5])
-        raise ValueError(f"no legal tile kwargs passed Stage A prescreen: {detail}")
+        raise ValueError(f"no legal tile kwargs passed Stage A prescreen: {'; '.join(rejs[:5])}")
     legal.sort(key=lambda item: item[0])
-    _, best_kwargs, best_stage_a = legal[0]
-    return best_kwargs, best_stage_a
+    return legal[0][1], legal[0][2]
 
 
 def ledger_to_json(ledger: ObjectivePhysicalLedger | None) -> str:
     """Serialize an optional ledger safely for worker prompts."""
-    if ledger is None:
-        return json.dumps(
-            build_objective_physical_ledger(
-                analysis_mode="readonly_envelope",
-                is_legal=False,
-                steady_state_ii=None,
-                pipe_cycles={},
-                waterlines={},
-            ).to_dict(),
-            indent=2,
-        )
-    return ledger.to_json()
+    return ledger.to_json() if ledger is not None else json.dumps(build_objective_physical_ledger(analysis_mode="readonly_envelope", is_legal=False, steady_state_ii=None, pipe_cycles={}, waterlines={}).to_dict(), indent=2)
 
 
 def _extract_concrete_shape_list(raw_shapes: object) -> list[tuple[int, ...]]:
-    """Extract concrete integer tensor shapes from single, multi, or nested payloads."""
     if not isinstance(raw_shapes, (list, tuple)) or not raw_shapes:
         return []
-    if all(isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0 for dim in raw_shapes):
-        return [tuple(int(dim) for dim in raw_shapes)]
+    if all(isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in raw_shapes):
+        return [tuple(int(d) for d in raw_shapes)]
     out: list[tuple[int, ...]] = []
-    for item in raw_shapes:
-        if item is None:
-            continue
-        if isinstance(item, (list, tuple)) and item:
-            if all(
-                isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0 for dim in item
-            ):
-                out.append(tuple(int(dim) for dim in item))
-            else:
-                out.extend(_extract_concrete_shape_list(item))
+    for it in raw_shapes:
+        if isinstance(it, (list, tuple)) and it:
+            out.extend([tuple(int(d) for d in it)] if all(isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in it) else _extract_concrete_shape_list(it))
     return out
 
 
-def _resolve_proto_output_shapes(
-    proto: Mapping[str, object] | None,
-    *,
-    dims: Mapping[str, object] | None,
-    attrs: Mapping[str, object] | None,
-) -> list[tuple[int, ...]]:
-    """Resolve concrete output shapes from proto output specs when all axes are known."""
-    if not isinstance(proto, Mapping):
-        return []
-    op_block = (
-        proto["operator"]
-        if "outputs" not in proto and isinstance(proto.get("operator"), Mapping)
-        else proto
-    )
-    raw_outputs = op_block.get("outputs") if isinstance(op_block, Mapping) else None
-    if not isinstance(raw_outputs, Sequence) or isinstance(raw_outputs, (str, bytes)):
-        return []
-    dim_lookup: dict[str, int] = {}
-    for src in (attrs, dims):
-        if not isinstance(src, Mapping):
-            continue
-        for key, val in src.items():
-            if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
-                dim_lookup[str(key).strip().lower()] = int(val)
-    raw_layout = ""
-    for src in (attrs, dims):
-        if isinstance(src, Mapping):
-            for lkey in ("inputLayout", "input_layout", "layout"):
-                if isinstance(src.get(lkey), str) and str(src[lkey]).strip():
-                    raw_layout = str(src[lkey]).strip().upper()
-                    break
-        if raw_layout:
-            break
-    resolved: list[tuple[int, ...]] = []
-    for item in raw_outputs:
-        if not isinstance(item, Mapping):
-            continue
-        shape_spec = item.get("shape")
-        if not isinstance(shape_spec, str) or "[" not in shape_spec:
-            continue
-        matches = re.findall(r"(?:([A-Za-z0-9_]+)\s*:\s*)?\[([^\]]+)\]", shape_spec)
-        chosen = ""
-        if raw_layout:
-            for tag, inner in matches:
-                if tag.strip().upper() == raw_layout:
-                    chosen = inner
-                    break
-        if not chosen and matches:
-            chosen = matches[0][1]
-        if not chosen:
-            continue
-        tokens = [tok.strip() for tok in chosen.split(",") if tok.strip()]
-        shape_vals: list[int] = []
-        ok = bool(tokens)
-        for tok in tokens:
-            if tok.isdigit():
-                shape_vals.append(int(tok))
-            else:
-                matched = dim_lookup.get(tok.lower())
-                if matched is None:
-                    ok = False
-                    break
-                shape_vals.append(matched)
-        if ok:
-            resolved.append(tuple(shape_vals))
-    return resolved
-
-
 def extract_ordered_tensor_shapes(
-    *,
-    case_entry: Mapping[str, object] | None = None,
-    dims: Mapping[str, object] | None = None,
-    proto: Mapping[str, object] | None = None,
-    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
+    *, case_entry: Mapping[str, object] | None = None, dims: Mapping[str, object] | None = None,
+    proto: Mapping[str, object] | None = None, ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> tuple[tuple[int, ...], ...] | None:
     """Extract parameter-ordered concrete tensor shapes from case, dims, or proto specs."""
     if ordered_tensor_shapes is not None:
-        explicit = _extract_concrete_shape_list(ordered_tensor_shapes)
-        return tuple(explicit) if explicit else None
-
-    for container in (case_entry, dims):
-        if isinstance(container, Mapping) and "ordered_tensor_shapes" in container:
-            explicit = _extract_concrete_shape_list(container.get("ordered_tensor_shapes"))
-            if explicit:
-                return tuple(explicit)
-
-    inputs: list[tuple[int, ...]] = []
-    outputs: list[tuple[int, ...]] = []
-    for container in (case_entry, dims):
-        if not isinstance(container, Mapping):
-            continue
-        if not inputs:
-            raw_in = (
-                container.get("input_shapes")
-                if "input_shapes" in container
-                else container.get("input_shape")
-            )
-            inputs = _extract_concrete_shape_list(raw_in)
-        if not outputs:
-            raw_out = (
-                container.get("output_shapes")
-                if "output_shapes" in container
-                else container.get("output_shape")
-            )
-            outputs = _extract_concrete_shape_list(raw_out)
-
-    if not outputs and proto is not None:
-        raw_attrs = case_entry.get("attrs") if isinstance(case_entry, Mapping) else None
-        attrs = raw_attrs if isinstance(raw_attrs, Mapping) else None
-        outputs = _resolve_proto_output_shapes(proto, dims=dims, attrs=attrs)
-
-    combined = [*inputs, *outputs]
-    return tuple(combined) if combined else None
+        return tuple(ex) if (ex := _extract_concrete_shape_list(ordered_tensor_shapes)) else None
+    for c in (case_entry, dims):
+        if isinstance(c, Mapping) and "ordered_tensor_shapes" in c and (ex := _extract_concrete_shape_list(c.get("ordered_tensor_shapes"))):
+            return tuple(ex)
+    ins, outs = [], []
+    for c in (case_entry, dims):
+        if isinstance(c, Mapping):
+            if not ins: ins = _extract_concrete_shape_list(c.get("input_shapes") if "input_shapes" in c else c.get("input_shape"))
+            if not outs: outs = _extract_concrete_shape_list(c.get("output_shapes") if "output_shapes" in c else c.get("output_shape"))
+    if not outs and isinstance(proto, Mapping):
+        attrs = case_entry.get("attrs") if isinstance(case_entry, Mapping) and isinstance(case_entry.get("attrs"), Mapping) else None
+        op_b = proto["operator"] if "outputs" not in proto and isinstance(proto.get("operator"), Mapping) else proto
+        routs = op_b.get("outputs") if isinstance(op_b, Mapping) else None
+        if isinstance(routs, Sequence) and not isinstance(routs, (str, bytes)):
+            dl = {str(k).strip().lower(): int(v) for s in (attrs, dims) if isinstance(s, Mapping) for k, v in s.items() if isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+            rlay = next((str(s[lk]).strip().upper() for s in (attrs, dims) if isinstance(s, Mapping) for lk in ("inputLayout", "input_layout", "layout") if isinstance(s.get(lk), str) and str(s[lk]).strip()), "")
+            for it in routs:
+                if isinstance(it, Mapping) and isinstance(sh_s := it.get("shape"), str) and "[" in sh_s:
+                    ms = re.findall(r"(?:([A-Za-z0-9_]+)\s*:\s*)?\[([^\]]+)\]", sh_s)
+                    ch = next((inn for tg, inn in ms if rlay and tg.strip().upper() == rlay), "") or (ms[0][1] if ms else "")
+                    if ch:
+                        sv = [int(t) if t.isdigit() else dl.get(t.lower()) for t in (x.strip() for x in ch.split(",") if x.strip())]
+                        if sv and all(x is not None for x in sv):
+                            outs.append(tuple(int(x) for x in sv if x is not None))
+    return tuple(comb) if (comb := [*ins, *outs]) else None
 
 
 __all__ = [
-    "FunnelEvaluation",
-    "GateFunnel",
-    "StageAResult",
-    "StageBResult",
-    "StageCResult",
-    "ascend_compile_session",
-    "build_stage_b_driver_source",
-    "check_npu_entrypoint_purity",
-    "check_repair_monotonicity",
-    "compile_trackb_shared_so",
-    "compute_trackb_shared_so_filename",
-    "evaluate_ascendc_candidate",
-    "extract_ordered_tensor_shapes",
-    "ledger_to_json",
-    "parse_cce_res_usage",
-    "prescreen_dsl_tile_kwargs",
-    "resolve_trackb_compile_flags",
-    "run_stage_a_static",
-    "run_stage_b_ascendc_compile",
-    "run_stage_b_compile",
-    "run_stage_c_agent_gates",
-    "synthesize_pybind_extension_wrapper",
-    "verify_agent_gates_receipt",
+    "FunnelEvaluation", "GateFunnel", "StageAResult", "StageBResult", "StageCResult",
+    "_resolve_artifact_store", "_resolve_cpp_consts", "ascend_compile_session",
+    "build_stage_b_driver_source", "check_npu_entrypoint_purity", "check_repair_monotonicity",
+    "compile_trackb_shared_so", "compute_trackb_shared_so_filename", "evaluate_ascendc_candidate",
+    "extract_ordered_tensor_shapes", "has_unreserved_vf_stack_overflow", "ledger_to_json",
+    "parse_cce_res_usage", "prescreen_dsl_tile_kwargs", "resolve_trackb_compile_flags",
+    "run_stage_a_static", "run_stage_b_ascendc_compile", "run_stage_b_compile",
+    "run_stage_c_agent_gates", "synthesize_pybind_extension_wrapper", "verify_agent_gates_receipt",
 ]
