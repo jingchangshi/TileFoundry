@@ -7,6 +7,9 @@ import importlib.util
 import inspect
 import json
 import math
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1126,3 +1129,48 @@ def test_attention_residual_stage_a_regime(regime: str) -> None:
     else:
         cfg = sel(**kw, schedule_mode="tuned")
         _assert_stage_a_legal(bld(**kw, **cfg, schedule_mode="tuned"), dict(cfg["pass_configs"]), list(cfg["compile_flags"]), regime)
+
+
+def test_late_tilelang_sys_path_pass_tap_decoration(tmp_path: Path) -> None:
+    """Verify ReadOnlyAscendPassTap lazily wraps when tilelang joins sys.path after import."""
+    import tilelang  # noqa: PLC0415
+
+    tl_root = str(Path(tilelang.__file__).resolve().parents[1])
+    script_path = tmp_path / "late_tap_check.py"
+    script_path.write_text(
+        "\n".join(
+            [
+                "import importlib.util, sys",
+                f"tl_root = {tl_root!r}",
+                "sys.path[:] = [p for p in sys.path if tl_root not in p]",
+                "assert importlib.util.find_spec('tilelang') is None",
+                "from tilefoundry_ascend.ascend.schedule import ReadOnlyAscendPassTap, inspect_tilelang_primfunc",
+                "sys.path.insert(0, tl_root)",
+                "import tilelang.ascend.language as T",
+                "@T.prim_func",
+                "def vec_copy(X: T.Tensor((16, 64), 'float32'), Y: T.Tensor((16, 64), 'float32')):",
+                "    with T.Kernel(1):",
+                "        ub = T.alloc_shared((16, 64), 'float32')",
+                "        T.copy(X[0:16, 0:64], ub)",
+                "        T.copy(ub, Y[0:16, 0:64])",
+                "r1 = inspect_tilelang_primfunc(vec_copy)",
+                "r2 = inspect_tilelang_primfunc(vec_copy)",
+                "assert r1.lowering_error is None and r2.lowering_error is None",
+                "assert 'tl.MergeUBAllocations' in r1.lowered_passes_observed",
+                "assert r1.lowered_passes_observed == r2.lowered_passes_observed",
+                "assert isinstance(ReadOnlyAscendPassTap(), object)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+    proc = subprocess.run(
+        [sys.executable, str(script_path)],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"subprocess failed: {proc.stderr or proc.stdout}"

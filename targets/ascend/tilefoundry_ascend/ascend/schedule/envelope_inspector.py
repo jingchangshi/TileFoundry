@@ -2260,6 +2260,9 @@ def _specialize_primfunc_for_anchors(
     return spec_fn, spec_mod
 
 
+_PASS_TAP_CLASS_CACHE: dict[object, type] = {}
+
+
 def _pass_instrument_if_available(cls: type) -> type:
     try:
         from tilelang import tvm as tvm_mod  # noqa: PLC0415
@@ -2267,6 +2270,24 @@ def _pass_instrument_if_available(cls: type) -> type:
         return cls
     dec = getattr(getattr(getattr(tvm_mod, "ir", None), "instrument", None), "pass_instrument", None)
     return dec(cls) if callable(dec) else cls
+
+
+def _build_pass_tap_instance(tvm_mod: object) -> ReadOnlyAscendPassTap:
+    """Instantiate ReadOnlyAscendPassTap, lazily wrapping with PassInstrument if needed."""
+    inst_mod = getattr(getattr(tvm_mod, "ir", None), "instrument", None)
+    pi_base = getattr(inst_mod, "PassInstrument", None)
+    if isinstance(pi_base, type) and issubclass(ReadOnlyAscendPassTap, pi_base):
+        return ReadOnlyAscendPassTap()
+    dec = getattr(inst_mod, "pass_instrument", None)
+    cache_key: object = pi_base if isinstance(pi_base, type) else dec
+    if cache_key is not None and (cached := _PASS_TAP_CLASS_CACHE.get(cache_key)) is not None:
+        return cached()
+    if callable(dec):
+        wrapped = dec(ReadOnlyAscendPassTap)
+        if cache_key is not None:
+            _PASS_TAP_CLASS_CACHE[cache_key] = wrapped
+        return wrapped()
+    return ReadOnlyAscendPassTap()
 
 
 @_pass_instrument_if_available
@@ -2398,7 +2419,7 @@ def inspect_tilelang_primfunc(
     entry_fn, mod_in = _entry_and_mod(prim_func, tvm, tirx)
     raw_cfg, _ = _extract_primfunc_pass_configs_and_flags(entry_fn, mod_in, pass_configs=pass_configs, compile_flags=compile_flags)
     ctx = create_backend_context("ascend", None, "auto")
-    tap, lowering_error, device_mod = ReadOnlyAscendPassTap(), None, None
+    tap, lowering_error, device_mod = _build_pass_tap_instance(tvm), None, None
 
     with _ascend_compile_session(ctx.target, pass_configs=raw_cfg, instruments=[tap]):
         entry_fn, mod_in = _specialize_primfunc_for_anchors(entry_fn, mod_in, var_bindings, tvm_mod=tvm, tirx=tirx, ordered_tensor_shapes=ordered_tensor_shapes)
