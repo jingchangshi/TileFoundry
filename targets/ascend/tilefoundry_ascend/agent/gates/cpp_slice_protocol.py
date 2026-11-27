@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import inspect
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -120,14 +121,62 @@ class _SearchReplaceHunk:
     line_window: tuple[int, int] | None = None
 
 
-def filter_callable_kwargs(fn: object, kwargs: Mapping[str, object]) -> dict[str, object]:
-    """Filter *kwargs* down to parameters accepted by *fn*."""
+@functools.lru_cache(maxsize=512)
+def cached_callable_signature_info(
+    fn: object,
+) -> tuple[inspect.Signature, bool, tuple[str, ...], tuple[tuple[str, object], ...]] | None:
+    """Inspect and cache signature metadata for an external user module callable."""
     if not callable(fn):
+        return None
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    params = tuple(sig.parameters.values())
+    has_vk = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+    pos = tuple(
+        p.name
+        for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+    defs = tuple(
+        (p.name, p.default)
+        for p in params
+        if p.default is not inspect.Parameter.empty
+        and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    )
+    return sig, has_vk, pos, defs
+
+
+def filter_callable_kwargs(
+    fn: object,
+    kwargs: Mapping[str, object],
+    *,
+    aliases: Mapping[str, tuple[str, ...]] | None = None,
+) -> dict[str, object]:
+    """Filter *kwargs* down to parameters accepted by an external *fn*."""
+    info = cached_callable_signature_info(fn)
+    if info is None:
         return {}
-    sig = inspect.signature(fn)
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+    sig, has_vk, _pos, _defs = info
+    if has_vk:
         return dict(kwargs)
-    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+    filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    if not aliases:
+        return filtered
+    low_kw = {str(k).lower(): v for k, v in kwargs.items()}
+    for pname in sig.parameters:
+        if pname in filtered:
+            continue
+        pl = pname.lower()
+        if pl in low_kw:
+            filtered[pname] = low_kw[pl]
+            continue
+        for alias in aliases.get(pl, ()):
+            if alias in kwargs or alias.lower() in low_kw:
+                filtered[pname] = kwargs[alias] if alias in kwargs else low_kw[alias.lower()]
+                break
+    return filtered
 
 
 def format_trackb_reply_contract(active_kernel: str | None = None) -> str:
@@ -1082,7 +1131,7 @@ __all__ = [
     "PatchAnchorMissError", "RepairClosureSlice", "TRACKB_REPLY_CONTRACT_PROMPT", "TopLevelSymbol",
     "_TRACKB_CPP_QUALIFIERS", "_detect_trackb_prologue_line_offset", "_find_python_cpp_literal_spans",
     "_looks_like_python_primfunc_slice", "apply_scoped_trackb_patch", "build_trackb_context_view",
-    "classify_stage_failure_for_repair", "collect_referenced_helper_names",
+    "cached_callable_signature_info", "classify_stage_failure_for_repair", "collect_referenced_helper_names",
     "collect_top_level_ast_nodes", "collect_top_level_symbols", "compact_creative_source_slice",
     "escalate_primfunc_to_trackb_tu", "extract_cpp_diagnostic_lines", "extract_reachable_trackb_source",
     "extract_repair_closure_slice", "extract_scoped_trackb_kernel_view",

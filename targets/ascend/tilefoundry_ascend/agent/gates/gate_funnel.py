@@ -29,6 +29,7 @@ from tilefoundry_ascend.agent.gates.stage_b_gate import (
     resolve_trackb_compile_flags, run_stage_b_ascendc_compile as _run_stage_b_ascendc_compile_impl,
     run_stage_b_compile as _run_stage_b_compile_impl,
 )
+from tilefoundry_ascend.agent.router.capability_gate import route_execution_track
 from tilefoundry_ascend.agent.specs.anchor_specs import build_anchor_var_bindings
 from tilefoundry_ascend.agent.specs.latency_algebra import StaticDynamicResidual, compute_static_dynamic_residual
 from tilefoundry_ascend.agent.specs.ops_registry import infer_module_runtime_backend
@@ -41,11 +42,12 @@ from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger, ScopeWaterline, build_objective_physical_ledger, build_scope_waterline,
 )
 from tilefoundry_ascend.ascend.schedule.envelope_inspector import EnvelopeInspectionResult, inspect_tilelang_primfunc
-from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
-from tilefoundry_ascend.ascend.sil.verifier import verify_tilelang_ast
+from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios, ConstraintRelaxationMask
+from tilefoundry_ascend.ascend.sil.verifier import SILVerifier, verify_source_against_facets, verify_tilelang_ast
 from tilefoundry_ascend.ascend.target import AscendTarget
 from tilefoundry_ascend.ascend.target.ast_semantic_gate import check_tilelang_semantic_contracts
 from tilefoundry_ascend.ascend.target.dialect_surface import CCE_CPP20_SURFACE
+from tilefoundry_ascend.ascend.target.facts import ascend_space_facts
 
 
 @dataclass(frozen=True)
@@ -742,8 +744,6 @@ def _build_ascendc_static_ledger(
     case_ratios: CasePhysicsRatios | None = None,
 ) -> ObjectivePhysicalLedger:
     """Compute SRAM waterlines and pipe cycles from C++20 constexprs, calls, and objdump."""
-    from tilefoundry_ascend.ascend.target.facts import ascend_space_facts  # noqa: PLC0415
-
     facts = ascend_space_facts(target or AscendTarget("ascend.950pr"))
     lower = cpp_source.lower()
     consts, type_bytes = _resolve_cpp_consts_and_types(cpp_source)
@@ -949,12 +949,6 @@ def evaluate_ascendc_candidate(
     t0 = time.monotonic()
     if not isinstance(cpp_source, str) or not cpp_source.strip():
         return _stage_a_fail(t0, "ascendc_empty_source", "ASCENDC_EMPTY_SOURCE", backend_kind="ascendc")
-    from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask  # noqa: PLC0415
-    from tilefoundry_ascend.ascend.sil.verifier import (  # noqa: PLC0415
-        SILVerifier,
-        verify_source_against_facets,
-    )
-
     _, rcpp = extract_reachable_trackb_source(cpp_source, module_source=module_source, regime_tag=regime_tag)
     amask = freedom_mask if freedom_mask is not None else ConstraintRelaxationMask.bottom()
     aver = verifier if verifier is not None else SILVerifier()
@@ -974,10 +968,6 @@ def evaluate_ascendc_candidate(
 
     features, route = None, None
     if enable_track_router:
-        from tilefoundry_ascend.agent.router.capability_gate import (  # noqa: PLC0415
-            route_execution_track,
-        )
-
         low = rcpp.lower()
         route = route_execution_track(None, ledger=ledger, semantic_features={"static_affine_bounds": not ("__simt_vf__" in rcpp or "Simt::" in rcpp), "cube_to_vector_ratio": 1.0 if any(t in low for t in ("mmad", "l0c", "ascend_gemm_l1")) else 0.0, "quant_granularity": "per_token_or_block" if "deq_scale" in low else "none"}, target=target, case_ratios=case_ratios)
         features = dict(route.features) if route.features is not None else None
@@ -1143,10 +1133,6 @@ def run_stage_a_static(
 
     ledger, features, route = insp.ledger, None, None
     if enable_track_router:
-        from tilefoundry_ascend.agent.router.capability_gate import (  # noqa: PLC0415
-            route_execution_track,
-        )
-
         route = route_execution_track(prim_func, ledger=ledger, target=target, case_ratios=case_ratios)
         features = dict(route.features) if route.features is not None else None
     if not ledger.is_legal:

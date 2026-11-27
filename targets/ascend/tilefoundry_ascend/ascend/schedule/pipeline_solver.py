@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Protocol
 
 from tilefoundry.vendor.tilelang_z3 import (
     SAT, Assignment, Buffer, Capacity, Edge, Problem, Resource, Reuse, Task,
     lower_bound_ii, solve, verify_assignment,
 )
 from tilefoundry_ascend.ascend.json_record import atomic_write_text
+from tilefoundry_ascend.ascend.sil.schema import DTYPE_BYTES
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, NodeResourceMask
 
 _CORE_ALIASES = {"aic": "aic", "aic0": "aic", "aiv": "aiv0", "aiv0": "aiv0", "aiv1": "aiv1"}
@@ -358,8 +360,27 @@ def solve_pipeline_with_monotone_backoff(
     raise PipelineError("ASCEND_PIPELINE_UNSAT", "monotone backoff exhausted")
 
 
+class _DTypeLike(Protocol):
+    bits: int
+    lanes: int
+
+
+def dtype_bytes(
+    dtype_obj: object, data_type_cls: Callable[[str], _DTypeLike] | None = None
+) -> float:
+    """Return physical storage bytes per element or vector lane group for a dtype."""
+    if data_type_cls is not None:
+        dt = data_type_cls(str(dtype_obj))
+        return (dt.bits * dt.lanes) / 8.0
+    key = str(dtype_obj).strip().lower()
+    if key in ("u16", "u32", "u64"):
+        return float({"u16": 2, "u32": 4, "u64": 8}[key])
+    raw = DTYPE_BYTES.get(key)
+    return float(raw) if raw is not None else 2.0
+
+
 __all__ = [
-    "AscendPipelineResult", "PipelineError", "bitwise_conflict_pairs", "format_pipe_key",
-    "masks_conflict", "pipe_cycles_from_problem", "read_from_sil", "solve_ascend_pipeline",
-    "solve_pipeline_with_monotone_backoff", "task_resource_mask",
+    "AscendPipelineResult", "PipelineError", "bitwise_conflict_pairs", "dtype_bytes",
+    "format_pipe_key", "masks_conflict", "pipe_cycles_from_problem", "read_from_sil",
+    "solve_ascend_pipeline", "solve_pipeline_with_monotone_backoff", "task_resource_mask",
 ]

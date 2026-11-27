@@ -9,10 +9,13 @@ from typing import Protocol, runtime_checkable
 
 from tilefoundry.vendor.tilelang_z3 import Problem
 from tilefoundry_ascend.ascend.json_record import json_clone
-from tilefoundry_ascend.ascend.schedule.pipeline_solver import solve_pipeline_with_monotone_backoff
+from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
+    dtype_bytes,
+    solve_pipeline_with_monotone_backoff,
+)
+from tilefoundry_ascend.ascend.sil import PolicyEnvelope, SchedulePolicy
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
 from tilefoundry_ascend.ascend.sil.schema import (
-    DTYPE_BYTES,
     CasePhysicsRatios,
     TopologyAxes,
     WaveBand,
@@ -61,14 +64,6 @@ def _coerce_roofline_mapping(raw: RooflineSummaryLike | Mapping[str, object] | N
     if isinstance(raw, RooflineSummaryLike):
         return raw.to_dict()
     raise TypeError(f"roofline must be HirRooflineSummary, Mapping, or None, got {type(raw).__name__}")
-
-
-def _dtype_bytes(dtype_name: str) -> int:
-    key = dtype_name.strip().lower()
-    if key in ("u16", "u32", "u64"):
-        return {"u16": 2, "u32": 4, "u64": 8}[key]
-    raw = DTYPE_BYTES.get(key)
-    return max(1, math.ceil(raw)) if raw is not None else 2
 
 
 def _coerce_topology_axes(raw: object) -> TopologyAxes | None:
@@ -273,14 +268,9 @@ class RegimePlanResult:
             caliper_action=str(payload.get("caliper_action", "none")),
         )
 
-    def to_sil_policy(self) -> object:
-        """Convert to ``ascend.sil.SchedulePolicy`` if available, else return dict."""
-        try:
-            from tilefoundry_ascend.ascend.sil import SchedulePolicy  # noqa: PLC0415
-
-            return SchedulePolicy.from_dict(self.policy)
-        except ImportError:
-            return dict(self.policy)
+    def to_sil_policy(self) -> SchedulePolicy:
+        """Convert to ``ascend.sil.SchedulePolicy``."""
+        return SchedulePolicy.from_dict(self.policy)
 
 
 @dataclass(frozen=True)
@@ -301,14 +291,9 @@ class PiecewiseSchedulePlan:
             "selected_rules": list(self.selected_rules),
         }
 
-    def to_sil_policy_envelope(self) -> object:
-        """Convert to ``ascend.sil.PolicyEnvelope`` if available, else return dict."""
-        try:
-            from tilefoundry_ascend.ascend.sil import PolicyEnvelope  # noqa: PLC0415
-
-            return PolicyEnvelope.from_dict(self.to_dict())
-        except ImportError:
-            return self.to_dict()
+    def to_sil_policy_envelope(self) -> PolicyEnvelope:
+        """Convert to ``ascend.sil.PolicyEnvelope``."""
+        return PolicyEnvelope.from_dict(self.to_dict())
 
 
 def _align16(val: int, lo: int = 16, hi: int | None = None) -> int:
@@ -383,7 +368,7 @@ class RegimePiecewiseSolver:
         roofline_map = _coerce_roofline_mapping(roofline)
         merged_dims = {**_as_int_dims(roofline_map.get("anchor_dims")), **dims}
         elem_dtype = input_dtypes[0] if input_dtypes else "f16"
-        elem_bytes = _dtype_bytes(elem_dtype)
+        elem_bytes = max(1, math.ceil(dtype_bytes(elem_dtype)))
         eff_uses_cube = bool(uses_cube) if uses_cube is not None else axes.uses_cube
         eff_persistent = bool(has_persistent_state) if has_persistent_state is not None else (axes.memory_ring == "persistent_onchip_state")
         eff_dead_l1 = bool(has_dead_l1_slice)

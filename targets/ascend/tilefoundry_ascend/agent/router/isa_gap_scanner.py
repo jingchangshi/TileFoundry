@@ -7,7 +7,6 @@ import re
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
 
 VALID_HARDWARE_PIPES: tuple[str, ...] = (
     "pipe_s_scalar_spr",
@@ -48,7 +47,7 @@ class PipeGapBreakdown:
     missing_primitives: tuple[str, ...]
     coverage_ratio: float
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
 
@@ -68,7 +67,7 @@ class PipeGapReport:
             return len(self.pipes[primitive_or_pipe].missing_primitives) > 0
         return primitive_or_pipe in self.missing_primitives
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "surface_source": self.surface_source,
             "pipes": {k: v.to_dict() for k, v in self.pipes.items()},
@@ -184,7 +183,7 @@ class SdkHeaderScanResult:
     symbols: frozenset[str]
     by_category: dict[str, tuple[str, ...]]
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "source": self.source,
             "fallback_used": self.fallback_used,

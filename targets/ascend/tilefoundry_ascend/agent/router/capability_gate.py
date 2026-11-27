@@ -16,6 +16,7 @@ from tilefoundry_ascend.ascend.sil.schema import (
     TopologyAxes,
 )
 from tilefoundry_ascend.ascend.target import AscendTarget
+from tilefoundry_ascend.ascend.templates.registry import relax_facets_for_bottleneck
 
 VALID_QUANT_GRANULARITIES = ("none", "per_tensor", "per_token_or_block", "mixed_fp8_fp4")
 VALID_RECURRENCES = ("none", "associative_online_rescale", "non_associative_scan")
@@ -729,10 +730,6 @@ def _build_escalated_mask(
     sf_map: Mapping[str, object], stagnation_rounds: int, roofline_eta: float, target_eta: float,
     unlock_sram: bool = False, unlock_sync: bool = False, unlock_dma: bool = False,
 ) -> ConstraintRelaxationMask:
-    from tilefoundry_ascend.ascend.templates.registry import (  # noqa: PLC0415
-        relax_facets_for_bottleneck,
-    )
-
     mask = relax_facets_for_bottleneck(
         base_mask, dominant_bound=dominant_bound, compiler_summary=compiler_summary,
         l1_overflow=bool(sf_map.get("l1_overflow", False)), ub_overflow=bool(sf_map.get("ub_overflow", False)),

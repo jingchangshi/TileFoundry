@@ -266,30 +266,17 @@ def test_bug_sb1_real_arnq_and_ar_modules_retain_small_and_large_m_rows() -> Non
 
 
 def test_bug_sb2_compute_compile_task_key_distinguishes_static_kwargs() -> None:
-    """BUG-SB2: distinct static_kwargs, flags, or pass_configs hash distinctly."""
-    common = dict(
-        clean_unit_src="def build(tile_m: int = 1): return tile_m",
-        target="dav-3510",
-        builder_name="build",
-        pass_configs=(("tl.ascend_auto_sync", True),),
-        compile_flags=("--cce-disable-asc-reserved-ubuf",),
-    )
-    k1 = compute_compile_task_key(static_kwargs=(("d_dim", 2048), ("tile_m", 1)), **common)
-    k2 = compute_compile_task_key(static_kwargs=(("d_dim", 2048), ("tile_m", 8)), **common)
-    k1_reordered = compute_compile_task_key(
-        static_kwargs=(("tile_m", 1), ("d_dim", 2048)), **common
-    )
-    k_flag = compute_compile_task_key(
-        clean_unit_src=common["clean_unit_src"],
-        target="dav-3510",
-        builder_name="build",
-        static_kwargs=(("d_dim", 2048), ("tile_m", 1)),
-        pass_configs=common["pass_configs"],
-        compile_flags=("--cce-disable-vf-stack-reserved-ubuf",),
-    )
-    assert k1 != k2
-    assert k1 != k_flag
-    assert k1 == k1_reordered
+    """BUG-SB2: distinct static_spec_signature, flags, or pass_configs hash distinctly."""
+    common_pc = {"tl.ascend_auto_sync": True}
+    base = dict(normalized_kernel_unit_src="def build(tile_m: int = 1): return tile_m", cann_target="dav-3510", pass_configs=common_pc)
+    k1 = compute_compile_task_key(**base, compile_flags=("--cce-disable-asc-reserved-ubuf",), static_spec_signature='{"builder_name":"build","static_kwargs":[["tile_m",1]]}')
+    k2 = compute_compile_task_key(**base, compile_flags=("--cce-disable-asc-reserved-ubuf",), static_spec_signature='{"builder_name":"build","static_kwargs":[["tile_m",8]]}')
+    k_flag = compute_compile_task_key(**base, compile_flags=("--cce-disable-vf-stack-reserved-ubuf",), static_spec_signature='{"builder_name":"build","static_kwargs":[["tile_m",1]]}')
+    assert k1 != k2 and k1 != k_flag
+    ext = ModuleSelectorPlanExtractor(target="dav-3510", builder_name="_build_synth_prim_func", config_selector_name="_select_synth_config")
+    p1 = build_post_selector_regime_plan(_SYNTHETIC_SELECTOR_MODULE, "synth", {"c0": {"m_rows": 16, "d_dim": 2048, "tl_dtype": "bfloat16"}}, ext)
+    p2 = build_post_selector_regime_plan(_SYNTHETIC_SELECTOR_MODULE, "synth", {"c0": {"m_rows": 64, "d_dim": 2048, "tl_dtype": "bfloat16"}}, ext)
+    assert next(iter(p1.unique_specs_by_key)) != next(iter(p2.unique_specs_by_key))
 
 
 def test_bug_sb3_has_unreserved_vf_stack_overflow_predicate_and_gate(tmp_path: Path) -> None:

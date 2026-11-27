@@ -13,7 +13,6 @@ import json
 import linecache
 import math
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -24,49 +23,47 @@ import time
 import types
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from dataclasses import dataclass
 
 from tilefoundry_ascend.agent.contracts import (
-    CasePlanExtractor,
-    CompileTaskSpec,
-    RegimeCompilePlan,
-    StageBCompileReceipt,
+    CasePlanExtractor, CompileTaskSpec, RegimeCompilePlan, StageBCompileReceipt,
+)
+from tilefoundry_ascend.agent.gates.bisheng_toolchain import (
+    StageBResult, SubprocResultLike, _bounded_compile_diagnostic,
+    _classify_stage_b_overflow_fault_code,
+    _detect_cann_include_dirs as _detect_cann_include_dirs,
+    _detect_tilelang_include_dir as _detect_tilelang_include_dir,
+    _disassemble_object as _disassemble_object,
+    _inject_cann_cpath_env, _normalize_flag_list, _normalize_trackb_unit_source,
+    _parse_cce_res_usage_with_summary,
+    _parse_objdump_pipe_counts as _parse_objdump_pipe_counts,
+    _resolve_artifact_store,
+    _resolve_bisheng_bin as _resolve_bisheng_bin,
+    _stage_b_fail,
+    _verify_object_has_instantiated_kernel as _verify_object_has_instantiated_kernel,
+    compile_trackb_shared_so, compute_trackb_shared_so_filename,
+    has_unreserved_vf_stack_overflow, parse_cce_res_usage, resolve_trackb_compile_flags,
+    run_stage_b_ascendc_compile,
+)
+from tilefoundry_ascend.agent.gates.cpp_slice_protocol import (
+    cached_callable_signature_info, filter_callable_kwargs,
 )
 from tilefoundry_ascend.agent.specs.anchor_specs import build_anchor_var_bindings
 from tilefoundry_ascend.agent.specs.ops_registry import (
-    discover_module_trackb_symbols,
-    extract_schema_driven_case_dims,
-    extract_trackb_cpp_source,
-    infer_module_runtime_backend,
-    parse_simple_env_file,
+    discover_module_trackb_symbols, extract_schema_driven_case_dims, extract_trackb_cpp_source,
+    infer_module_runtime_backend, parse_simple_env_file,
 )
 from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
-    ArtifactStore,
-    collect_new_tl_cache_binaries,
-    compute_compile_task_key as compute_artifact_task_key,
-    extract_reachable_closure_source,
-    is_verified_binary_file,
-    merge_tl_cache_tree,
-    resolve_unified_tl_cache_dir,
-    seed_tl_cache_tree,
-    snapshot_tl_cache_binaries,
+    ArtifactStore, collect_new_tl_cache_binaries, compute_compile_task_key,
+    extract_reachable_closure_source, is_verified_binary_file, merge_tl_cache_tree,
+    resolve_unified_tl_cache_dir, seed_tl_cache_tree, snapshot_tl_cache_binaries,
 )
-from tilefoundry_ascend.ascend.compile_cache.cpp_closure import (
-    extract_reachable_trackb_source,
-    strip_cpp_comments_and_strings,
-)
-from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
-    BishengResourceSummary,
-    parse_bisheng_res_usage,
-)
+from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import extract_microarch_profile_from_cce
 from tilefoundry_ascend.ascend.json_record import atomic_write_text
-from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 
 _PREWARM_MANIFEST_FILENAME = "prewarm_manifest_v1.json"
-_COMPILE_DIAGNOSTIC_LIMIT = 1500
 _HIR_TO_BUILDER_DIM_MAP: dict[str, str] = {
     "N": "n_depth", "B": "b_dim", "S": "s_dim", "S1": "s1_dim", "S2": "s2_dim",
     "S_kv": "s_kv", "D": "d_dim", "N_q": "n_q", "N1": "n_q", "N_kv": "n_kv", "N2": "n_kv",
@@ -79,71 +76,12 @@ _PARAM_DIM_FALLBACK_ALIASES: dict[str, tuple[str, ...]] = {
     "n": ("N", "n_dim", "n_depth"), "n_dim": ("N", "n"), "k": ("K", "k_dim"),
     "k_dim": ("K", "k"), "d": ("D", "d_dim", "hidden_dim"), "d_dim": ("D", "d", "hidden_dim"),
     "b": ("B", "b_dim", "batch"), "b_dim": ("B", "b", "batch"),
-    "s": ("S", "s_dim", "seq_len"), "s_dim": ("S", "s", "seq_len"),
+    "s": ("S", "s_dim", "seq_len"), "s_dim": ("S", "s_dim", "seq_len"),
     "s1_dim": ("S1", "S", "s_dim"), "s2_dim": ("S2", "S_kv", "s_kv"),
     "n_q": ("N_q", "N1", "num_heads"), "n_kv": ("N_kv", "N2"),
     "top_k": ("topK", "topk", "sparse_size", "k_sparse"), "t_dim": ("T", "S", "s_dim"),
 }
-_CANN_INCLUDE_SUBDIRS: tuple[str, ...] = (
-    "include", "x86_64-linux/asc", "x86_64-linux/asc/include", "x86_64-linux/include",
-    "aarch64-linux/asc", "aarch64-linux/asc/include", "aarch64-linux/include",
-    "runtime/include", "asc", "asc/include", "tools/tikcpp/tikcfw", "compiler/tikcpp/tikcfw",
-)
-_VLOOPV2_MISS_RE = re.compile(
-    r"(?:vloop_?v2\s*(?:miss|failed|fallback|disabled|not\s+applied)|vloop_?v2\s*[:=]\s*(?:false|0|no|miss)|cannot\s+use\s+vloop_?v2)",
-    re.IGNORECASE,
-)
-_COMPILE_ERROR_RE = re.compile(
-    r"(?i)(?:\[error\]|\btvm\s*error\b|\bfatal\s*:|\bCheck\s+failed:|(?:^|[\s:(])(?:Assertion|Type|Value|Runtime|Internal|Key|Attribute|Name|Syntax)Error:|(?:^|[\s:\[(])(?:fatal\s+)?error:)"
-)
-_DEPRECATED_WARN_RE = re.compile(
-    r"(?:warning:\s+.*\[-Wdeprecated-declarations\]|note:\s+'[^']+'\s+has been explicitly marked deprecated here|note:\s+expanded from macro 'ASC_DEPRECATED')"
-)
-_NON_ERROR_DIAG_HEADER_RE = re.compile(r"^(?:note:|warning:|in file included from|/\S+:\d+:\d+:\s*(?:warning|note):)", re.IGNORECASE)
-_TVM_BT_RE = re.compile(r"^\s*(?:\[bt\]\s*\(\d+\)|File \"<unknown>\", line 0, in )")
-
-
-@dataclass(frozen=True)
-class StageBResult:
-    """Output of Stage B Conda bisheng compilation check."""
-
-    passed: bool
-    error_message: str = ""
-    elapsed_sec: float = 0.0
-    spill_bytes: int = 0
-    vloopv2_hit: bool = True
-    compiler_summary: BishengResourceSummary | None = None
-    microarch_profile: dict[str, object] | None = None
-    full_diagnostic: str = ""
-    generated_cce: str = ""
-    lowered_tir: str = ""
-    fault_plane: str = ""
-    fault_code: str = ""
-    failed_tier: str = ""
-    artifact_id: str = ""
-    binary_paths: tuple[str, ...] = ()
-
-
-def _stage_b_fail(
-    t0: float,
-    error_message: str,
-    fault_code: str,
-    *,
-    fault_plane: str = "STAGE_B_COMPILE",
-    spill_bytes: int = 0,
-    vloopv2_hit: bool = True,
-    summary: BishengResourceSummary | None = None,
-    ma_profile: dict[str, object] | None = None,
-    full_diag: str = "",
-    cce: str = "",
-    tir: str = "",
-) -> StageBResult:
-    return StageBResult(
-        passed=False, error_message=error_message, elapsed_sec=time.monotonic() - t0,
-        spill_bytes=spill_bytes, vloopv2_hit=vloopv2_hit, compiler_summary=summary,
-        microarch_profile=ma_profile, full_diagnostic=full_diag, generated_cce=cce,
-        lowered_tir=tir, fault_plane=fault_plane, fault_code=fault_code, failed_tier="stage_b",
-    )
+_TB_POOL_KEYS = frozenset({"bm", "d_nope", "d_dim", "tl_dtype", "m_rows", "inner_dim", "trackb_bm"})
 
 
 def _json_safe(val: object) -> object:
@@ -156,45 +94,29 @@ def _json_safe(val: object) -> object:
     return val if isinstance(val, (str, int, float, bool)) or val is None else str(val)
 
 
-def _freeze_pair_tuple(raw: Mapping[str, Any] | Sequence[tuple[str, Any]] | None) -> tuple[tuple[str, Any], ...]:
+def _freeze_pair_tuple(raw: Mapping[str, object] | Sequence[tuple[str, object]] | None) -> tuple[tuple[str, object], ...]:
     if not raw:
         return ()
     items = raw.items() if isinstance(raw, Mapping) else raw
     return tuple(sorted(((str(k), _json_safe(v)) for k, v in items), key=lambda kv: kv[0]))
 
 
-def compute_compile_task_key(
-    clean_unit_src: str, target: str, builder_name: str,
-    static_kwargs: tuple[tuple[str, Any], ...], pass_configs: tuple[tuple[str, Any], ...],
-    compile_flags: tuple[str, ...],
-) -> str:
-    """Compute canonical SHA-256 task key incorporating all 6 specialization inputs."""
-    payload = json.dumps(
-        {
-            "clean_unit_src": str(clean_unit_src),
-            "target": str(target),
-            "builder_name": str(builder_name),
-            "static_kwargs": [[str(k), _json_safe(v)] for k, v in sorted(static_kwargs, key=lambda kv: str(kv[0]))],
-            "pass_configs": [[str(k), _json_safe(v)] for k, v in sorted(pass_configs, key=lambda kv: str(kv[0]))],
-            "compile_flags": list(dict.fromkeys(str(f).strip() for f in compile_flags if str(f).strip())),
-        },
+def _static_spec_signature(builder_name: str, static_kwargs: tuple[tuple[str, object], ...]) -> str:
+    return json.dumps(
+        {"builder_name": str(builder_name), "static_kwargs": [[str(k), _json_safe(v)] for k, v in static_kwargs]},
         sort_keys=True,
         separators=(",", ":"),
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def has_unreserved_vf_stack_overflow(spec: CompileTaskSpec, stack_bytes: int, compiler_diag: str) -> bool:
-    """Decide VF stack overflow strictly against this specialization's flags."""
-    low = (compiler_diag or "").lower()
-    if "exceeded vf stack size" in low or "stack overflow" in low:
-        return True
-    return int(stack_bytes) > 0 and spec.disables_vf_stack_ubuf
 
 
 def build_post_selector_regime_plan(
-    module_source: str, regime_tag: str, cases_by_id: Mapping[Any, Mapping[str, Any]], extractor: CasePlanExtractor,
-    *, env_file: str | Path | None = None, source_root: str | Path | None = None,
+    module_source: str,
+    regime_tag: str,
+    cases_by_id: Mapping[object, Mapping[str, object]],
+    extractor: CasePlanExtractor,
+    *,
+    env_file: str | Path | None = None,
+    source_root: str | Path | None = None,
 ) -> RegimeCompilePlan:
     """Evaluate extractor over all regime cases first, then quotient by task_key."""
     tasks_by_case: dict[str, tuple[CompileTaskSpec, ...]] = {}
@@ -207,7 +129,7 @@ def build_post_selector_regime_plan(
     for case_id in sorted(cases_by_id, key=str):
         cid_str, case_spec = str(case_id), cases_by_id[case_id]
         emitted = (
-            extractor._extract_case_tasks_loaded(fast_loaded, case_spec)
+            extractor.extract_case_tasks_loaded(fast_loaded, case_spec)
             if fast_loaded is not None and isinstance(extractor, ModuleSelectorPlanExtractor)
             else tuple(extractor.extract_case_tasks(module_source, cid_str, dict(case_spec)))
         )
@@ -216,68 +138,6 @@ def build_post_selector_regime_plan(
             if spec.task_key not in unique_specs:
                 unique_specs[spec.task_key] = spec
     return RegimeCompilePlan(regime_tag=str(regime_tag), tasks_by_case_id=tasks_by_case, unique_specs_by_key=unique_specs)
-
-
-def _normalize_flag_list(raw_flags: object) -> list[str]:
-    if raw_flags is None:
-        return []
-    if isinstance(raw_flags, str):
-        return raw_flags.strip().split() if raw_flags.strip() else []
-    if isinstance(raw_flags, (tuple, list)) or (hasattr(raw_flags, "__iter__") and not isinstance(raw_flags, (bytes, bytearray, Mapping))):
-        return list(dict.fromkeys(v for item in raw_flags if (v := str(getattr(item, "value", item)).strip())))
-    return [s] if (s := str(raw_flags).strip()) else []
-
-
-def resolve_trackb_compile_flags(cpp_source: str, selector_flags: Sequence[str] | str | None = None) -> tuple[str, ...]:
-    """Resolve Track-B bisheng flags, stripping SIMD-VF UBUF flags on __simt_vf__."""
-    normalized = _normalize_flag_list(selector_flags)
-    if re.search(r"\b__simt_vf__\b", strip_cpp_comments_and_strings(cpp_source)):
-        simdvf = frozenset(PURE_SIMDVF_UBUF_FLAGS)
-        return tuple(f for f in normalized if f not in simdvf)
-    return tuple(dict.fromkeys([*PURE_SIMDVF_UBUF_FLAGS, *normalized]))
-
-
-def _normalize_trackb_unit_source(cpp_source: str, *, regime_tag: str = "") -> str:
-    stripped = cpp_source.strip()
-    if regime_tag and stripped:
-        masked = strip_cpp_comments_and_strings(stripped)
-        if len(re.findall(r"\b__global__\b", masked)) > 1 and "<<<" not in masked:
-            _, extracted = extract_reachable_trackb_source(stripped, regime_tag=regime_tag)
-            return extracted.strip()
-    return stripped
-
-
-@functools.lru_cache(maxsize=512)
-def _cached_sig_info(fn: object) -> tuple[inspect.Signature, bool, tuple[str, ...], tuple[tuple[str, Any], ...]] | None:
-    try:
-        sig = inspect.signature(fn)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
-    has_vk = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-    pos = tuple(p.name for p in sig.parameters.values() if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD))
-    defs = tuple((p.name, p.default) for p in sig.parameters.values() if p.default is not inspect.Parameter.empty and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD))
-    return sig, has_vk, pos, defs
-
-
-def _filter_kwargs_for_callable(fn: object, kwargs: Mapping[str, object]) -> dict[str, object]:
-    info = _cached_sig_info(fn)
-    if info is None or info[1]:
-        return dict(kwargs)
-    sig = info[0]
-    filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
-    low_kw = {str(k).lower(): v for k, v in kwargs.items()}
-    for pname in sig.parameters:
-        if pname in filtered:
-            continue
-        pl = pname.lower()
-        if pl in low_kw:
-            filtered[pname] = low_kw[pl]
-            continue
-        for alias in _PARAM_DIM_FALLBACK_ALIASES.get(pl, ()):
-            if alias in kwargs or alias.lower() in low_kw:
-                filtered[pname] = kwargs[alias] if alias in kwargs else low_kw[alias.lower()]
-                break
-    return filtered
 
 
 def _merge_dims_into_kwargs(base_kwargs: Mapping[str, object] | None, dims: Mapping[str, object] | None) -> dict[str, object]:
@@ -289,47 +149,52 @@ def _merge_dims_into_kwargs(base_kwargs: Mapping[str, object] | None, dims: Mapp
     return merged
 
 
+def _merge_pass_configs_and_flags(
+    sel_pc: Mapping[str, object] | None,
+    sel_cf: Sequence[str] | str | None,
+    ext_pc: Mapping[str, object] | None,
+    ext_cf: Sequence[str] | str | None,
+) -> tuple[dict[str, object], list[str]]:
+    merged_pc: dict[str, object] = {}
+    merged_cf: list[str] = []
+    for pc_map, cf_seq in ((sel_pc, sel_cf), (ext_pc, ext_cf)):
+        if isinstance(pc_map, Mapping):
+            for k, v in pc_map.items():
+                if str(k) == "tl.device_compile_flags":
+                    merged_cf.extend(f for f in _normalize_flag_list(v) if f not in merged_cf)
+                else:
+                    merged_pc[str(k)] = v
+        elif pc_map is not None:
+            merged_cf.extend(f for f in _normalize_flag_list(pc_map) if f not in merged_cf)
+        merged_cf.extend(f for f in _normalize_flag_list(cf_seq) if f not in merged_cf)
+    return merged_pc, merged_cf
+
+
 def _split_selector_output(sel_out: Mapping[str, object]) -> tuple[dict[str, object], dict[str, object], list[str]]:
-    pc, cf, overrides = {}, [], {}
-    if isinstance(raw_pc := sel_out.get("pass_configs"), Mapping):
-        for k, v in raw_pc.items():
-            if str(k) == "tl.device_compile_flags":
-                cf.extend(f for f in _normalize_flag_list(v) if f not in cf)
-            else:
-                pc[str(k)] = v
-    elif raw_pc is not None:
-        cf.extend(f for f in _normalize_flag_list(raw_pc) if f not in cf)
-    cf.extend(f for f in _normalize_flag_list(sel_out.get("compile_flags")) if f not in cf)
-    for k, v in sel_out.items():
-        if k not in ("pass_configs", "compile_flags", "builder_kwargs"):
-            overrides[str(k)] = v
+    pc, cf = _merge_pass_configs_and_flags(
+        sel_out.get("pass_configs") if isinstance(sel_out.get("pass_configs"), Mapping) else None,
+        sel_out.get("pass_configs") if not isinstance(sel_out.get("pass_configs"), Mapping) else None,
+        None,
+        sel_out.get("compile_flags") if isinstance(sel_out.get("compile_flags"), (Sequence, str)) else None,
+    )
+    overrides = {str(k): v for k, v in sel_out.items() if k not in ("pass_configs", "compile_flags", "builder_kwargs")}
     if isinstance(raw_bk := sel_out.get("builder_kwargs"), Mapping):
         overrides.update({str(k): v for k, v in raw_bk.items()})
     return overrides, pc, cf
 
 
-def _merge_pass_configs_and_flags(
-    sel_pc: Mapping[str, object] | None, sel_cf: Sequence[str] | str | None,
-    ext_pc: Mapping[str, object] | None, ext_cf: Sequence[str] | str | None,
-) -> tuple[dict[str, object], list[str]]:
-    merged_pc: dict[str, object] = {}
-    merged_cf: list[str] = []
-    for pc_map, cf_seq in ((sel_pc, sel_cf), (ext_pc, ext_cf)):
-        for k, v in (pc_map or {}).items():
-            if str(k) == "tl.device_compile_flags":
-                merged_cf.extend(f for f in _normalize_flag_list(v) if f not in merged_cf)
-            else:
-                merged_pc[str(k)] = v
-        merged_cf.extend(f for f in _normalize_flag_list(cf_seq) if f not in merged_cf)
-    return merged_pc, merged_cf
+def _filter_kwargs_for_callable(fn: object, kwargs: Mapping[str, object]) -> dict[str, object]:
+    return filter_callable_kwargs(fn, kwargs, aliases=_PARAM_DIM_FALLBACK_ALIASES)
 
 
-def _bind_callable_static_kwargs(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[tuple[str, Any], ...]:
-    info = _cached_sig_info(fn)
+def _bind_callable_static_kwargs(
+    fn: Callable[..., object], args: tuple[object, ...], kwargs: Mapping[str, object]
+) -> tuple[tuple[str, object], ...]:
+    info = cached_callable_signature_info(fn)
     if info is None:
         return _freeze_pair_tuple({k: v for k, v in kwargs.items() if not callable(v)})
     _, _, pos_names, defaults = info
-    items: dict[str, Any] = dict(defaults)
+    items: dict[str, object] = dict(defaults)
     for idx, val in enumerate(args):
         if idx < len(pos_names):
             items[pos_names[idx]] = val
@@ -399,11 +264,15 @@ class _MetaTensor:
     def size(self, axis: int | None = None) -> tuple[int, ...] | int:
         return self.shape if axis is None else self.shape[axis]
 
-    def view(self, *shape_args: Any) -> _MetaTensor:
-        raw = list(shape_args[0]) if len(shape_args) == 1 and isinstance(shape_args[0], (tuple, list)) else list(shape_args)
+    def view(self, *shape_args: object) -> _MetaTensor:
+        raw: list[object] = (
+            list(shape_args[0])
+            if len(shape_args) == 1 and isinstance(shape_args[0], (tuple, list))
+            else list(shape_args)
+        )
         neg_idx, known, out = -1, 1, []
         for idx, dim in enumerate(raw):
-            iv = int(dim)
+            iv = int(str(dim))
             if iv == -1:
                 neg_idx = idx
                 out.append(1)
@@ -425,24 +294,24 @@ class _MetaTensor:
 @dataclass(frozen=True)
 class _CapturedPrimFunc:
     builder_name: str
-    static_kwargs: tuple[tuple[str, Any], ...]
+    static_kwargs: tuple[tuple[str, object], ...]
 
 
-class _NoopCacheDict(dict[Any, Any]):
+class _NoopCacheDict(dict[object, object]):
     get = lambda self, _k, default=None: default
     __setitem__ = lambda self, _k, _v: None
 
 
 class _ModuleProxy:
-    def __init__(self, target: Any, overrides: Mapping[str, Any]) -> None:
+    def __init__(self, target: object, overrides: Mapping[str, object]) -> None:
         self._target, self._overrides = target, overrides
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> object:
         return self._overrides[name] if name in self._overrides else getattr(self._target, name)
 
 
 class _DummyCLib:
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> Callable[..., int]:
         fn = lambda *_a, **_k: 0
         setattr(self, name, fn)
         return fn
@@ -453,14 +322,14 @@ class _LoadedPlanModule:
     module_source: str
     mod_sha: str
     mod: types.ModuleType
-    records: list[tuple[str, tuple[tuple[str, Any], ...], dict[str, Any], tuple[str, ...]]]
+    records: list[tuple[str, tuple[tuple[str, object], ...], dict[str, object], tuple[str, ...]]]
     trackb_records: list[tuple[str, str, tuple[str, ...]]]
     entrypoint_name: str
     selectors: tuple[str, ...]
     builders: tuple[str, ...]
     backend_kind: str
     closure_cache: dict[tuple[str, ...], str]
-    spec_cache: dict[tuple[Any, ...], CompileTaskSpec]
+    spec_cache: dict[tuple[object, ...], CompileTaskSpec]
     trackb_tu_by_key: dict[str, str]
 
 
@@ -483,10 +352,7 @@ def _resolve_tilelang_source_dir(
     if source_root is not None:
         cands.append(Path(source_root).expanduser().resolve().parent / "tilelang")
     cands.append(Path(__file__).resolve().parents[5].parent / "tilelang")
-    for cand in cands:
-        if (cand / "tilelang").is_dir():
-            return str(cand.resolve())
-    return None
+    return next((str(c.resolve()) for c in cands if (c / "tilelang").is_dir()), None)
 
 
 def _ensure_tilelang_on_sys_path(
@@ -525,7 +391,7 @@ def _load_plan_module(
     mod = types.ModuleType(f"_tf_plan_{mod_sha[:12]}")
     exec(compile(module_source, mod_filename, "exec"), mod.__dict__)
 
-    ep, funcs, prim_builders, kernel_alias = "", [], [], ""
+    funcs, prim_builders, kernel_alias = [], [], ""
     with contextlib.suppress(SyntaxError):
         for node in ast.parse(module_source).body:
             if isinstance(node, ast.Assign):
@@ -548,24 +414,28 @@ def _load_plan_module(
         *prim_builders,
     ]))
     backend, _ = infer_module_runtime_backend(module_source, ep)
-    records: list[tuple[str, tuple[tuple[str, Any], ...], dict[str, Any], tuple[str, ...]]] = []
+    records: list[tuple[str, tuple[tuple[str, object], ...], dict[str, object], tuple[str, ...]]] = []
     tb_records: list[tuple[str, str, tuple[str, ...]]] = []
 
     for bname in builders:
         if not callable(orig_b := getattr(mod, bname, None)):
             continue
-        def _mk_spy(name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+
+        def _mk_spy(name: str, fn: Callable[..., object]) -> Callable[..., _CapturedPrimFunc]:
             @functools.wraps(fn)
-            def _spy(*a: Any, **kw: Any) -> _CapturedPrimFunc:
+            def _spy(*a: object, **kw: object) -> _CapturedPrimFunc:
                 return _CapturedPrimFunc(name, _bind_callable_static_kwargs(fn, a, kw))
-            _spy.__name__ = name
             return _spy
+
         setattr(mod, bname, _mk_spy(bname, orig_b))
 
     if isinstance(getattr(mod, "_KERNEL_CACHE", None), dict):
         setattr(mod, "_KERNEL_CACHE", _NoopCacheDict())
 
-    def _cap_compile(prog: Any, *, target: str = "ascend", out_idx: Any = None, pass_configs: Mapping[str, Any] | None = None, compile_flags: Sequence[str] | str | None = None, **_kw: Any) -> Any:
+    def _cap_compile(
+        prog: object, *, target: str = "ascend", out_idx: object = None,
+        pass_configs: Mapping[str, object] | None = None, compile_flags: Sequence[str] | str | None = None, **_kw: object,
+    ) -> Callable[..., object]:
         _ = target
         pc = dict(pass_configs) if isinstance(pass_configs, Mapping) else {}
         cf = tuple(f for f in _normalize_flag_list(compile_flags) if not f.startswith("-I"))
@@ -604,10 +474,10 @@ def _load_plan_module(
 
 
 def _extract_dim_pool(
-    case_spec: Mapping[str, Any], *, proto_inputs: Sequence[Mapping[str, Any]] = (),
-    default_builder_kwargs: Mapping[str, Any] | None = None, schedule_mode: str = "tuned",
-) -> dict[str, Any]:
-    case_pool: dict[str, Any] = {}
+    case_spec: Mapping[str, object], *, proto_inputs: Sequence[Mapping[str, object]] = (),
+    default_builder_kwargs: Mapping[str, object] | None = None, schedule_mode: str = "tuned",
+) -> dict[str, object]:
+    case_pool: dict[str, object] = {}
     if "input_shape" in case_spec:
         case_pool.update({str(k): v for k, v in extract_schema_driven_case_dims(case_spec, proto_inputs=proto_inputs).items()})
         if isinstance(attrs := case_spec.get("attrs"), Mapping):
@@ -629,8 +499,8 @@ def _extract_dim_pool(
                 if mapped := _HIR_TO_BUILDER_DIM_MAP.get(ks):
                     case_pool.setdefault(mapped, v)
         if (bv := case_pool.get("b_dim", case_pool.get("B"))) is not None and (sv := case_pool.get("s_dim", case_pool.get("S"))) is not None:
-            case_pool.setdefault("m_rows", int(bv) * int(sv))
-    pool: dict[str, Any] = dict(default_builder_kwargs) if default_builder_kwargs else {}
+            case_pool.setdefault("m_rows", int(str(bv)) * int(str(sv)))
+    pool: dict[str, object] = dict(default_builder_kwargs) if default_builder_kwargs else {}
     pool.update(case_pool)
     pool.setdefault("schedule_mode", schedule_mode)
     rtl = pool.get("tl_dtype", "bfloat16")
@@ -639,8 +509,8 @@ def _extract_dim_pool(
 
 
 @functools.lru_cache(maxsize=256)
-def _cached_ep_meta(ep_fn: Callable[..., Any]) -> tuple[tuple[tuple[str, bool], ...], int, tuple[str, ...]] | None:
-    if (info := _cached_sig_info(ep_fn)) is None:
+def _cached_ep_meta(ep_fn: Callable[..., object]) -> tuple[tuple[tuple[str, bool], ...], int, tuple[str, ...]] | None:
+    if (info := cached_callable_signature_info(ep_fn)) is None:
         return None
     req: list[tuple[str, bool]] = []
     opt: list[str] = []
@@ -657,7 +527,9 @@ def _cached_ep_meta(ep_fn: Callable[..., Any]) -> tuple[tuple[tuple[str, bool], 
     return tuple(req), n_t, tuple(opt)
 
 
-def _build_entrypoint_meta_args(ep_fn: Callable[..., Any], case_spec: Mapping[str, Any], pool: Mapping[str, Any]) -> tuple[list[Any], dict[str, Any]] | None:
+def _build_entrypoint_meta_args(
+    ep_fn: Callable[..., object], case_spec: Mapping[str, object], pool: Mapping[str, object]
+) -> tuple[list[object], dict[str, object]] | None:
     if (meta := _cached_ep_meta(ep_fn)) is None:
         return None
     req_params, n_tensors, opt_names = meta
@@ -668,11 +540,11 @@ def _build_entrypoint_meta_args(ep_fn: Callable[..., Any], case_spec: Mapping[st
             [int(d) for d in sh] for sh in raw_in if isinstance(sh, (list, tuple)) and sh and isinstance(sh[0], int)
         ]
     if len(shapes) < n_tensors and "n_depth" in pool and "d_dim" in pool and n_tensors >= 4:
-        b, s, n, d = int(pool.get("b_dim", 1)), int(pool.get("s_dim", pool.get("m_rows", 1))), int(pool["n_depth"]), int(pool["d_dim"])
+        b, s, n, d = int(str(pool.get("b_dim", 1))), int(str(pool.get("s_dim", pool.get("m_rows", 1)))), int(str(pool["n_depth"])), int(str(pool["d_dim"]))
         shapes = [[n, b, s, d], [b, s, d], [d], [d]] if n_tensors == 4 else []
     elif len(shapes) < n_tensors and "d_nope" in pool and "d_rope" in pool and n_tensors in (4, 5):
-        b, s, skv, nq, nkv = int(pool.get("b_dim", 1)), int(pool.get("s_dim", 1)), int(pool.get("s_kv", 128)), int(pool.get("n_q", 16)), int(pool.get("n_kv", 1))
-        dn, dr = int(pool["d_nope"]), int(pool["d_rope"])
+        b, s, skv, nq, nkv = int(str(pool.get("b_dim", 1))), int(str(pool.get("s_dim", 1))), int(str(pool.get("s_kv", 128))), int(str(pool.get("n_q", 16))), int(str(pool.get("n_kv", 1)))
+        dn, dr = int(str(pool["d_nope"])), int(str(pool["d_rope"]))
         if str(pool.get("input_layout", pool.get("inputLayout", "BSND"))).upper() == "BNSD":
             shapes = [[b, nq, s, dn], [b, nq, s, dr], [b, nkv, skv, dn], [b, nkv, skv, dr], [b, nkv, skv, dn]]
         else:
@@ -682,7 +554,7 @@ def _build_entrypoint_meta_args(ep_fn: Callable[..., Any], case_spec: Mapping[st
     rdt = case_spec.get("dtype")
     dt_list = [str(d).strip() for d in rdt if str(d).strip()] if isinstance(rdt, (list, tuple)) else ([rdt.strip()] if isinstance(rdt, str) and rdt.strip() else [])
     def_dt = str(pool.get("tl_dtype", "bfloat16"))
-    pos_args: list[Any] = []
+    pos_args: list[object] = []
     t_idx = 0
     for pname, is_t in req_params:
         if is_t:
@@ -690,7 +562,7 @@ def _build_entrypoint_meta_args(ep_fn: Callable[..., Any], case_spec: Mapping[st
             pos_args.append(_MetaTensor(shapes[t_idx], _resolve_torch_dtype(dt_s)))
             t_idx += 1
         else:
-            pos_args.append(float(pool.get(pname, 1.0)))
+            pos_args.append(float(str(pool.get(pname, 1.0))))
     kw_args = {on: pool[on] for on in opt_names if on in pool}
     if "numKVHeads" in opt_names and "numKVHeads" not in kw_args and "n_kv" in pool:
         kw_args["numKVHeads"] = pool["n_kv"]
@@ -699,16 +571,13 @@ def _build_entrypoint_meta_args(ep_fn: Callable[..., Any], case_spec: Mapping[st
     return pos_args, kw_args
 
 
-_TB_POOL_KEYS = frozenset({"bm", "d_nope", "d_dim", "tl_dtype", "m_rows", "inner_dim", "trackb_bm"})
-
-
 class ModuleSelectorPlanExtractor:
     """Evaluate candidate module selectors on host CPU to emit exact CompileTaskSpecs."""
 
     def __init__(
         self, *, target: str = "dav-3510", builder_name: str = "", config_selector_name: str = "",
-        default_builder_kwargs: Mapping[str, Any] | None = None, default_pass_configs: Mapping[str, Any] | None = None,
-        default_compile_flags: Sequence[str] | str | None = None, proto_inputs: Sequence[Mapping[str, Any]] = (),
+        default_builder_kwargs: Mapping[str, object] | None = None, default_pass_configs: Mapping[str, object] | None = None,
+        default_compile_flags: Sequence[str] | str | None = None, proto_inputs: Sequence[Mapping[str, object]] = (),
         schedule_mode: str = "tuned",
     ) -> None:
         self.target, self.builder_name, self.config_selector_name = str(target), str(builder_name), str(config_selector_name)
@@ -719,14 +588,14 @@ class ModuleSelectorPlanExtractor:
         self.schedule_mode = str(schedule_mode)
 
     def _spec_from_capture(
-        self, loaded: _LoadedPlanModule, builder_name: str, static_kwargs: tuple[tuple[str, Any], ...],
-        pass_configs: Mapping[str, Any], compile_flags: tuple[str, ...], *,
+        self, loaded: _LoadedPlanModule, builder_name: str, static_kwargs: tuple[tuple[str, object], ...],
+        pass_configs: Mapping[str, object], compile_flags: tuple[str, ...], *,
         selector_name: str = "", clean_unit_override: str | None = None,
     ) -> CompileTaskSpec:
         merged_pc, merged_cf = _merge_pass_configs_and_flags(pass_configs, compile_flags, self.default_pass_configs, self.default_compile_flags)
         pc_t, cf_t = _freeze_pair_tuple(merged_pc), tuple(merged_cf)
         src_sel = selector_name if clean_unit_override is None else clean_unit_override
-        ckey = json.dumps([self.target, builder_name, static_kwargs, pc_t, cf_t, src_sel], sort_keys=True)
+        ckey = (self.target, builder_name, static_kwargs, pc_t, cf_t, src_sel)
         if clean_unit_override is None and ckey in loaded.spec_cache:
             return loaded.spec_cache[ckey]
         if clean_unit_override is not None:
@@ -737,14 +606,21 @@ class ModuleSelectorPlanExtractor:
             if clean_src is None:
                 clean_src = extract_reachable_closure_source(loaded.module_source, active_symbols=sym_key) if sym_key else loaded.module_source
                 loaded.closure_cache[sym_key] = clean_src
-        spec = CompileTaskSpec(compute_compile_task_key(clean_src, self.target, builder_name, static_kwargs, pc_t, cf_t), builder_name, static_kwargs, pc_t, cf_t)
+        task_key = compute_compile_task_key(
+            normalized_kernel_unit_src=clean_src,
+            cann_target=self.target,
+            pass_configs=merged_pc,
+            compile_flags=cf_t,
+            static_spec_signature=_static_spec_signature(builder_name, static_kwargs),
+        )
+        spec = CompileTaskSpec(task_key, builder_name, static_kwargs, pc_t, cf_t)
         if clean_unit_override is not None:
             loaded.trackb_tu_by_key[spec.task_key] = clean_unit_override
         else:
             loaded.spec_cache[ckey] = spec
         return spec
 
-    def _collect_captured_specs(self, loaded: _LoadedPlanModule, pool: Mapping[str, Any], sel_name: str = "") -> list[CompileTaskSpec]:
+    def _collect_captured_specs(self, loaded: _LoadedPlanModule, pool: Mapping[str, object], sel_name: str = "") -> list[CompileTaskSpec]:
         specs = [self._spec_from_capture(loaded, bn, kw, pc, cf, selector_name=sel_name) for bn, kw, pc, cf in loaded.records]
         for tb_name, cpp_src, tb_cf in loaded.trackb_records:
             norm_tu = _normalize_trackb_unit_source(cpp_src)
@@ -753,7 +629,8 @@ class ModuleSelectorPlanExtractor:
             specs.append(self._spec_from_capture(loaded, tb_name, tb_kw, {}, eff_cf, selector_name=sel_name, clean_unit_override=norm_tu))
         return specs
 
-    def _extract_case_tasks_loaded(self, loaded: _LoadedPlanModule, case_spec: Mapping[str, Any]) -> tuple[CompileTaskSpec, ...]:
+    def extract_case_tasks_loaded(self, loaded: _LoadedPlanModule, case_spec: Mapping[str, object]) -> tuple[CompileTaskSpec, ...]:
+        """Extract ordered CompileTaskSpecs from an already-loaded sandbox plan module."""
         pool = _extract_dim_pool(case_spec, proto_inputs=self._proto_inputs, default_builder_kwargs=self.default_builder_kwargs, schedule_mode=self.schedule_mode)
         if loaded.entrypoint_name and callable(ep_fn := getattr(loaded.mod, loaded.entrypoint_name, None)):
             if (meta_args := _build_entrypoint_meta_args(ep_fn, case_spec, pool)) is not None:
@@ -767,13 +644,9 @@ class ModuleSelectorPlanExtractor:
                     pass
 
         sel_name = str(case_spec.get("config_selector_name") or self.config_selector_name or (loaded.selectors[0] if loaded.selectors else ""))
-        overrides: dict[str, Any] = {}
-        sel_pc: dict[str, Any] = {}
-        sel_cf: list[str] = []
-        raw_bk: dict[str, Any] = {}
-        raw_ck: dict[str, Any] = {}
+        overrides, sel_pc, sel_cf, raw_bk, raw_ck = {}, {}, [], {}, {}
         if sel_name and callable(sel_fn := getattr(loaded.mod, sel_name, None)):
-            if isinstance(sel_out := sel_fn(**_filter_kwargs_for_callable(sel_fn, pool)), Mapping):
+            if isinstance(sel_out := sel_fn(**filter_callable_kwargs(sel_fn, pool, aliases=_PARAM_DIM_FALLBACK_ALIASES)), Mapping):
                 overrides, sel_pc, sel_cf = _split_selector_output(sel_out)
                 if isinstance(sel_out.get("builder_kwargs"), Mapping):
                     raw_bk = dict(sel_out["builder_kwargs"])
@@ -783,7 +656,7 @@ class ModuleSelectorPlanExtractor:
 
         render_fn = getattr(loaded.mod, "_render_trackb_tu", None)
         if (bool(pool.get("use_trackb")) or (loaded.backend_kind == "ascendc_trackb" and callable(render_fn))) and callable(render_fn):
-            norm_tu = _normalize_trackb_unit_source(str(render_fn(**_filter_kwargs_for_callable(render_fn, pool))))
+            norm_tu = _normalize_trackb_unit_source(str(render_fn(**filter_callable_kwargs(render_fn, pool, aliases=_PARAM_DIM_FALLBACK_ALIASES))))
             tb_kw = _freeze_pair_tuple({k: v for k, v in pool.items() if k in _TB_POOL_KEYS})
             return (self._spec_from_capture(loaded, "_render_trackb_tu", tb_kw, sel_pc, resolve_trackb_compile_flags(norm_tu, sel_cf), selector_name=sel_name, clean_unit_override=norm_tu),)
 
@@ -794,131 +667,45 @@ class ModuleSelectorPlanExtractor:
             loaded.records.clear()
             loaded.trackb_records.clear()
             if callable(gk_fn := getattr(loaded.mod, "_get_kernel", None)):
-                pool_gk = {**pool, "builder_fn": b_fn, "pass_configs": dict(sel_pc), "compile_flags": tuple(sel_cf),
-                           "extra_builder_kwargs": ({**overrides, **raw_bk} or None)}
-                if (gk_info := _cached_sig_info(gk_fn)) and all(
+                pool_gk: dict[str, object] = {
+                    **pool, "builder_fn": b_fn, "pass_configs": dict(sel_pc),
+                    "compile_flags": tuple(sel_cf), "extra_builder_kwargs": ({**overrides, **raw_bk} or None),
+                }
+                if (gk_info := cached_callable_signature_info(gk_fn)) and all(
                     p.name in pool_gk for p in gk_info[0].parameters.values()
                     if p.default is inspect.Parameter.empty and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
                 ):
                     try:
-                        gk_fn(**_filter_kwargs_for_callable(gk_fn, pool_gk))
+                        gk_fn(**filter_callable_kwargs(gk_fn, pool_gk, aliases=_PARAM_DIM_FALLBACK_ALIASES))
                     except Exception:
                         loaded.records.clear()
             if loaded.records:
                 if raw_bk:
-                    loaded.records[:] = [
-                        (bn, _freeze_pair_tuple({**dict(kw), "extra_builder_kwargs": raw_bk}), pc, cf)
-                        for bn, kw, pc, cf in loaded.records
-                    ]
+                    loaded.records[:] = [(bn, _freeze_pair_tuple({**dict(kw), "extra_builder_kwargs": raw_bk}), pc, cf) for bn, kw, pc, cf in loaded.records]
                 specs.extend(self._collect_captured_specs(loaded, pool, sel_name=sel_name))
             else:
-                res = b_fn(**_filter_kwargs_for_callable(b_fn, pool))
-                b_kw = res.static_kwargs if isinstance(res, _CapturedPrimFunc) else _freeze_pair_tuple(_filter_kwargs_for_callable(b_fn, pool))
+                res = b_fn(**filter_callable_kwargs(b_fn, pool, aliases=_PARAM_DIM_FALLBACK_ALIASES))
+                b_kw = res.static_kwargs if isinstance(res, _CapturedPrimFunc) else _freeze_pair_tuple(filter_callable_kwargs(b_fn, pool, aliases=_PARAM_DIM_FALLBACK_ALIASES))
                 if raw_bk:
                     b_kw = _freeze_pair_tuple({**dict(b_kw), "extra_builder_kwargs": raw_bk})
                 specs.append(self._spec_from_capture(loaded, b_name, b_kw, sel_pc, tuple(sel_cf), selector_name=sel_name))
 
-        if int(pool.get("num_kv_splits", 1) or 1) > 1 and callable(comb_fn := getattr(loaded.mod, "_get_combine_kernel", None)):
+        if int(str(pool.get("num_kv_splits", 1) or 1)) > 1 and callable(comb_fn := getattr(loaded.mod, "_get_combine_kernel", None)):
             loaded.records.clear()
             loaded.trackb_records.clear()
-            comb_pool = {**pool, "pass_configs": dict(sel_pc), "compile_flags": tuple(sel_cf), "extra_combine_kwargs": raw_ck or None}
+            comb_pool: dict[str, object] = {**pool, "pass_configs": dict(sel_pc), "compile_flags": tuple(sel_cf), "extra_combine_kwargs": raw_ck or None}
             with contextlib.suppress(Exception):
-                comb_fn(**_filter_kwargs_for_callable(comb_fn, comb_pool))
+                comb_fn(**filter_callable_kwargs(comb_fn, comb_pool, aliases=_PARAM_DIM_FALLBACK_ALIASES))
             if loaded.records:
-                cb_kw = _freeze_pair_tuple(_filter_kwargs_for_callable(comb_fn, comb_pool))
-                loaded.records[:] = [
-                    ("_get_combine_kernel", cb_kw, pc, cf) if bn == "unknown_builder" else (bn, kw, pc, cf)
-                    for bn, kw, pc, cf in loaded.records
-                ]
+                cb_kw = _freeze_pair_tuple(filter_callable_kwargs(comb_fn, comb_pool, aliases=_PARAM_DIM_FALLBACK_ALIASES))
+                loaded.records[:] = [("_get_combine_kernel", cb_kw, pc, cf) if bn == "unknown_builder" else (bn, kw, pc, cf) for bn, kw, pc, cf in loaded.records]
             specs.extend(self._collect_captured_specs(loaded, pool, sel_name=sel_name))
         return tuple(specs)
 
-    def extract_case_tasks(self, module_source: str, case_id: str, case_spec: dict[str, Any]) -> tuple[CompileTaskSpec, ...]:
+    def extract_case_tasks(self, module_source: str, case_id: str, case_spec: dict[str, object]) -> tuple[CompileTaskSpec, ...]:
         """Extract ordered CompileTaskSpecs emitted by candidate selector for *case_spec*."""
         _ = case_id
-        return self._extract_case_tasks_loaded(_load_plan_module(module_source), case_spec)
-
-
-def _bounded_compile_diagnostic(output_text: str, *, limit: int = _COMPILE_DIAGNOSTIC_LIMIT) -> str:
-    """Keep primary compiler errors without deprecation cascades plus a bounded output tail."""
-    text = output_text.strip()
-    if len(text) <= limit:
-        return text
-    raw_lines = text.splitlines()
-    kept: list[str] = []
-    skip_cascade = skip_bt = False
-    for line in raw_lines:
-        if _COMPILE_ERROR_RE.search(line):
-            skip_cascade = skip_bt = False
-            kept.append(line)
-        elif _DEPRECATED_WARN_RE.search(line):
-            skip_cascade, skip_bt = True, False
-        elif line.strip() == "Stack trace:":
-            skip_bt, skip_cascade = True, False
-        elif skip_bt:
-            if not (_TVM_BT_RE.search(line) or not line.strip()):
-                skip_bt = False
-                kept.append(line)
-        elif skip_cascade:
-            st = line.strip()
-            if not st or _NON_ERROR_DIAG_HEADER_RE.match(st):
-                skip_cascade = False
-                if st:
-                    kept.append(line)
-        else:
-            kept.append(line)
-    lines = kept if (kept and any(_COMPILE_ERROR_RE.search(l) for l in kept)) else raw_lines
-    eff = "\n".join(lines).strip()
-    if len(eff) <= limit:
-        return eff
-    if not (err_idxs := [i for i, ln in enumerate(lines) if _COMPILE_ERROR_RE.search(ln)]):
-        return eff[-limit:]
-    ei = err_idxs[0]
-    tail = eff[-limit:]
-    if lines[ei].strip() in tail:
-        return tail
-    ctx = "\n".join(lines[ei : min(len(lines), ei + 7)]).strip()
-    head = ctx if len(ctx) <= limit // 2 else lines[ei].strip()[: limit // 2]
-    prefix = f"{head}\n[... compiler output truncated ...]\n"
-    return prefix[:limit] if len(prefix) >= limit else prefix + eff[-(limit - len(prefix)) :]
-
-
-_OVERFLOW_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("VF_STACK_OVERFLOW", ("exceeded vf stack size", "vf_stack", "vf stack", "stack frame size", "stack overflow")),
-    ("L0C_SRAM_OVERFLOW", ("l0c_sram_overflow", "l0c overflow", "l0c_overflow", "l0c capacity", "exceeds l0c", "exceeded l0c")),
-    ("L1_SRAM_OVERFLOW", ("l1_sram_overflow", "l1 overflow", "l1_overflow", "cbuf overflow", "l1 capacity", "cbuf capacity", "exceeds l1", "exceeded l1")),
-    ("UB_SRAM_OVERFLOW", ("ub_sram_overflow", "ub_overflow", "ubuf_overflow", "ub overflow", "ubuf overflow", "ub capacity", "ubuf capacity", "exceeds ub", "exceeded ub", "exceeds ubuf", "exceeded ubuf")),
-)
-
-
-def _classify_stage_b_overflow_fault_code(combined_diag: str, summary: BishengResourceSummary | None, default_code: str) -> str:
-    if summary is not None and int(summary.stack_bytes) > 0:
-        return "VF_STACK_OVERFLOW"
-    low = (combined_diag or "").lower()
-    for code, toks in _OVERFLOW_TABLES:
-        if any(t in low for t in toks):
-            return code
-    caps = ("overflow", "exceed", "capacity", "out of memory", "insufficient")
-    if any(c in low for c in caps):
-        if "l0c" in low or "__cc__" in low:
-            return "L0C_SRAM_OVERFLOW"
-        if any(t in low for t in ("l1 ", "l1_", "cbuf", "__cbuf__")):
-            return "L1_SRAM_OVERFLOW"
-        if "ubuf" in low or "__ubuf__" in low or re.search(r"\bub\b", low):
-            return "UB_SRAM_OVERFLOW"
-    return default_code
-
-
-def _parse_cce_res_usage_with_summary(output_text: str, *, asm_or_dump_text: str = "") -> tuple[int, bool, BishengResourceSummary]:
-    summary = parse_bisheng_res_usage(output_text or "", asm_or_dump_text=asm_or_dump_text or "")
-    vloop_hit = summary.vloopv2_loops > 0 and summary.software_loops == 0 and not _VLOOPV2_MISS_RE.search(f"{output_text}\n{asm_or_dump_text}")
-    return int(summary.spill_bytes), vloop_hit, summary
-
-
-def parse_cce_res_usage(output_text: str) -> tuple[int, bool]:
-    """Parse bisheng --cce-res-usage diagnostics into (spill_bytes, vloopv2_hit)."""
-    sp, vl, _ = _parse_cce_res_usage_with_summary(output_text)
-    return sp, vl
+        return self.extract_case_tasks_loaded(_load_plan_module(module_source), case_spec)
 
 
 @contextlib.contextmanager
@@ -933,277 +720,6 @@ def ascend_compile_session(target: str = "ascend", pass_configs: Mapping[str, ob
         if pass_configs is not None:
             stack.enter_context(tvm.transform.PassContext(config=dict(pass_configs)))
         yield
-
-
-def _resolve_cann_root(cann_root: str | Path | None = None, *, bisheng_bin: str | Path | None = None) -> Path | None:
-    if cann_root is not None and str(cann_root).strip():
-        return Path(cann_root).expanduser()
-    for ek in ("ASCEND_TOOLKIT_HOME", "ASCEND_HOME_PATH", "BISHENG_HOME"):
-        if raw := os.environ.get(ek, "").strip():
-            cand = Path(raw).expanduser()
-            if ek == "BISHENG_HOME" and not any((cand / s).is_dir() for s in _CANN_INCLUDE_SUBDIRS[:4]):
-                for p in cand.parents:
-                    if any((p / s).is_dir() for s in _CANN_INCLUDE_SUBDIRS[:4]):
-                        return p
-            return cand
-    for raw in (*(os.environ.get(k, "").strip() for k in ("ASCEND_OPP_PATH", "ASCEND_AICPU_PATH")),):
-        if raw and any(((p := Path(raw).expanduser().parent) / s).is_dir() for s in _CANN_INCLUDE_SUBDIRS[:4]):
-            return p
-    if rbin := (bisheng_bin or shutil.which("bisheng")):
-        for p in Path(str(rbin)).resolve().parents:
-            if any((p / s).is_dir() for s in _CANN_INCLUDE_SUBDIRS[:4]):
-                return p
-    return None
-
-
-def _resolve_bisheng_bin(bisheng_bin: str | Path | None = None, cann_root: str | Path | None = None) -> str | None:
-    if bisheng_bin is not None:
-        raw = str(bisheng_bin).strip()
-        return (str(Path(raw)) if Path(raw).is_file() else shutil.which(raw)) if raw else None
-    if (bh := os.environ.get("BISHENG_HOME", "").strip()) and (cand := Path(bh).expanduser() / "bin" / "bisheng").is_file():
-        return str(cand)
-    if found := shutil.which("bisheng"):
-        return found
-    if (rc := _resolve_cann_root(cann_root)) is not None:
-        return next((str(rc / rel) for rel in ("tools/ccec_compiler/bin/bisheng", "bin/bisheng") if (rc / rel).is_file()), None)
-    return None
-
-
-def _detect_cann_include_dirs(cann_root: str | Path | None = None, *, bisheng_bin: str | Path | None = None) -> list[str]:
-    roots: list[Path] = [Path(str(cann_root)).expanduser()] if (cann_root is not None and str(cann_root).strip()) else []
-    roots.extend(Path(r).expanduser() for k in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME") if (r := os.environ.get(k, "").strip()))
-    if inf := _resolve_cann_root(cann_root, bisheng_bin=bisheng_bin):
-        roots.append(inf)
-    found: list[str] = []
-    seen: set[str] = set()
-    for root in roots:
-        for sub in _CANN_INCLUDE_SUBDIRS:
-            if (inc := root / sub).is_dir() and (rk := str(inc.resolve())) not in seen:
-                seen.add(rk)
-                found.append(str(inc))
-    return found
-
-
-def _inject_cann_cpath_env(env_map: dict[str, str] | None = None) -> list[str]:
-    if incs := _detect_cann_include_dirs():
-        tgt = os.environ if env_map is None else env_map
-        tgt["CPATH"] = os.pathsep.join(dict.fromkeys([*incs, *(p for p in tgt.get("CPATH", "").split(os.pathsep) if p)]))
-    return incs
-
-
-def _resolve_toolchain_tool(tool_names: Sequence[str], *, bisheng_bin: str | Path | None = None) -> str | None:
-    if bisheng_bin is not None and (bp := Path(str(bisheng_bin))).is_file():
-        if hit := next((str(c) for n in tool_names if (c := bp.resolve().with_name(n)).is_file()), None):
-            return hit
-    return next((w for n in tool_names if (w := shutil.which(n))), None)
-
-
-def _verify_object_has_instantiated_kernel(obj_path: Path, *, bisheng_bin: str | Path | None = None, subproc_run: Callable[..., Any] | None = None) -> tuple[bool, str]:
-    if not obj_path.is_file():
-        return False, "stage_b_ascendc_missing_object: object file was not generated"
-    run_fn = subproc_run or subprocess.run
-    if nm_bin := _resolve_toolchain_tool(("llvm-nm", "nm"), bisheng_bin=bisheng_bin):
-        if (proc := run_fn([nm_bin, "--defined-only", str(obj_path)], text=True, capture_output=True, timeout=15, check=False)).returncode == 0:
-            if any(re.search(r"\b[Tt]\s+(?!\$)\S+", ln.strip()) for ln in (proc.stdout or "").splitlines()):
-                return True, ""
-            return False, "stage_b_ascendc_uninstantiated_template: object file contains zero instantiated code symbols (.text is empty); provide concrete template instantiation via _render_trackb_tu"
-    if od_bin := _resolve_toolchain_tool(("llvm-objdump", "objdump"), bisheng_bin=bisheng_bin):
-        if (proc := run_fn([od_bin, "-h", str(obj_path)], text=True, capture_output=True, timeout=15, check=False)).returncode == 0:
-            m = re.search(r"\.text(?:\.\S+)?\s+([0-9a-fA-F]+)\s", proc.stdout or "")
-            return (True, "") if (m and int(m.group(1), 16) > 0) else (False, "stage_b_ascendc_uninstantiated_template: .text section size is 0; provide concrete template instantiation via _render_trackb_tu")
-    return (True, "") if obj_path.stat().st_size > 2048 else (False, "stage_b_ascendc_uninstantiated_template: object file contains no verifiable instantiated kernel code")
-
-
-def _disassemble_object(obj_path: Path, *, bisheng_bin: str | Path | None = None, subproc_run: Callable[..., Any] | None = None) -> str:
-    od_bin = _resolve_toolchain_tool(("llvm-objdump", "objdump"), bisheng_bin=bisheng_bin)
-    if not od_bin or not obj_path.is_file():
-        return ""
-    proc = (subproc_run or subprocess.run)([od_bin, "-d", str(obj_path)], text=True, capture_output=True, timeout=30, check=False)
-    return proc.stdout if proc.returncode == 0 else ""
-
-
-_OBJDUMP_ZERO_KEYS = (
-    "total_insns", "cube_mmad", "fixpipe", "mte1", "mte2", "mte3", "vec", "vloopv2",
-    "dcci", "sync", "sw_back_branches", "vf_sw_back_branches", "scalar_regs", "vec_regs",
-    "gm_to_l1_insns", "gm_to_ub_insns", "l1_to_l0a_insns", "l1_to_l0b_insns",
-    "l0c_to_ub_insns", "l0c_to_l1_insns", "l0c_to_gm_insns", "ub_to_gm_insns", "ub_to_l1_insns",
-)
-
-
-def _parse_objdump_pipe_counts(objdump_text: str) -> dict[str, int]:
-    counts = dict.fromkeys(_OBJDUMP_ZERO_KEYS, 0)
-    if not objdump_text.strip():
-        return counts
-    xregs, vregs, in_vf = set(), set(), False
-    for raw_ln in objdump_text.splitlines():
-        if lbl := re.match(r"^[0-9a-f]+\s+<([^>]+)>:\s*$", raw_ln.strip()):
-            in_vf = ".vector.thread" in lbl.group(1)
-            continue
-        if not (m := re.match(r"^\s*([0-9a-f]+):\s+[0-9a-f]+\s+([A-Za-z0-9_.]+)(.*)$", raw_ln)):
-            continue
-        pc, mnem, rest = int(m.group(1), 16), m.group(2).upper(), m.group(3)
-        counts["total_insns"] += 1
-        xregs.update(int(r) for r in re.findall(r"\bX(\d+)\b", rest))
-        vregs.update(int(r) for r in re.findall(r"\bV(\d+)\b", rest))
-        if mnem.startswith("VLOOP"):
-            counts["vloopv2"] += int("VLOOPV2" in mnem or "VLOOP_V2" in mnem)
-        elif mnem.startswith("MMAD"):
-            counts["cube_mmad"] += 1
-        elif mnem.startswith("FIX_"):
-            counts["fixpipe"] += 1
-            for tok, key in (("L1", "l0c_to_l1_insns"), ("CBUF", "l0c_to_l1_insns"), ("UB", "l0c_to_ub_insns"), ("GM", "l0c_to_gm_insns")):
-                if tok in mnem:
-                    counts[key] += 1
-                    break
-        elif mnem.startswith("LOAD_L1_TO_L0"):
-            counts["mte1"] += 1
-            counts["l1_to_l0b_insns" if "L0B" in mnem else "l1_to_l0a_insns"] += 1
-        elif mnem.startswith("MOV_OUT_TO_"):
-            counts["mte2"] += 1
-            if "L1" in mnem or "CBUF" in mnem:
-                counts["gm_to_l1_insns"] += 1
-            elif "UB" in mnem:
-                counts["gm_to_ub_insns"] += 1
-        elif mnem.startswith("MOV_UB_TO_"):
-            counts["mte3"] += 1
-            counts["ub_to_l1_insns" if ("L1" in mnem or "CBUF" in mnem) else "ub_to_gm_insns"] += 1
-        elif mnem.startswith("DCCI"):
-            counts["dcci"] += 1
-        elif mnem.startswith(("SET_FLAG", "WAIT_FLAG", "SET_INTRA", "WAIT_INTRA", "BAR.")):
-            counts["sync"] += 1
-        elif mnem.startswith("V") and not mnem.startswith("VF"):
-            counts["vec"] += 1
-        if mnem.startswith(("JUMP", "B.", "CBNZ", "CBZ", "TBNZ", "TBZ")) or mnem == "B":
-            tm, hm = re.search(r"\+0x([0-9a-f]+)>", rest, re.IGNORECASE), re.search(r"#(-?\d+)", rest)
-            if (tm and int(tm.group(1), 16) <= pc) or (not tm and hm and int(hm.group(1)) <= pc):
-                counts["sw_back_branches"] += 1
-                counts["vf_sw_back_branches"] += int(in_vf)
-    counts["scalar_regs"], counts["vec_regs"] = len(xregs), len(vregs)
-    return counts
-
-
-def _augment_bisheng_telemetry_text(compiler_out: str, objdump_text: str) -> str:
-    dis = _parse_objdump_pipe_counts(objdump_text)
-    vec_regs = max([*(int(m) for m in re.findall(r"\bVReg\s+number\s*:\s*(\d+)", compiler_out)), dis["vec_regs"], 0])
-    stack_b = max((int(m) for m in re.findall(r"(?:^|[,\s])Stack\s+size\s*:\s*(\d+)\s*bytes", compiler_out, re.IGNORECASE)), default=0)
-    extra: list[str] = []
-    if vec_regs > 0 and not re.search(r"(?:vector\s+register\s+usage|vec_reg_num)", compiler_out, re.IGNORECASE):
-        extra.append(f"Vector Register Usage: {vec_regs}")
-    if dis["scalar_regs"] > 0 and not re.search(r"(?:scalar\s+register\s+usage|scalar_reg_num)", compiler_out, re.IGNORECASE):
-        extra.append(f"Scalar Register Usage: {dis['scalar_regs']}")
-    if stack_b > 0 and not re.search(r"stack\s+frame\s+size", compiler_out, re.IGNORECASE):
-        extra.append(f"Stack Frame Size: {stack_b} bytes")
-    if objdump_text.strip():
-        vloop_cnt = dis["vloopv2"]
-        extra.extend((f"vloopv2_loops: {vloop_cnt}", f"software_loops: {dis['vf_sw_back_branches'] if vloop_cnt > 0 else dis['sw_back_branches']}"))
-    return f"{compiler_out}\n" + "\n".join(extra) if extra else compiler_out
-
-
-def _detect_tilelang_include_dir() -> str | None:
-    try:
-        import tilelang  # noqa: PLC0415
-
-        if ((sd := Path(tilelang.__file__).resolve().parents[1] / "src") / "tl_templates" / "ascend").is_dir():
-            return str(sd)
-    except Exception:
-        pass
-    for raw in (os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE", "").strip(), os.environ.get("TILEFOUNDRY_NPU_TILELANG_REPO", "").strip()):
-        if raw and ((sd := Path(raw).expanduser() / "src") / "tl_templates" / "ascend").is_dir():
-            return str(sd)
-    sib = Path(__file__).resolve().parents[5].parent / "tilelang" / "src"
-    return str(sib) if (sib / "tl_templates" / "ascend").is_dir() else None
-
-
-@dataclass(frozen=True)
-class _AscendcCompileContext:
-    extra_flags: list[str]
-    has_explicit_x: bool
-    std_flags: list[str]
-    include_flags: list[str]
-    env: dict[str, str]
-
-
-def _prepare_ascendc_compile_context(
-    *, compile_flags: Sequence[str] | str | None, cann_root: str | Path | None,
-    resolved_bisheng: str, extra_include_dirs: Sequence[str | Path] | str | Path | None,
-) -> _AscendcCompileContext:
-    extra_flags = _normalize_flag_list(compile_flags)
-    std_flags = [] if any(f.startswith("-std=") for f in extra_flags) else ["-std=c++20"]
-    include_flags: list[str] = []
-    seen = set(extra_flags)
-    raw_incs: list[str] = ([str(extra_include_dirs)] if isinstance(extra_include_dirs, (str, Path)) else [str(i) for i in (extra_include_dirs or ())])
-    if tl_inc := _detect_tilelang_include_dir():
-        raw_incs.append(tl_inc)
-    raw_incs.extend(_detect_cann_include_dirs(cann_root, bisheng_bin=resolved_bisheng))
-    for inc in raw_incs:
-        if (s := inc.strip()) and Path(s).is_dir() and (flag := f"-I{s}") not in seen:
-            seen.add(flag)
-            include_flags.append(flag)
-    env = dict(os.environ)
-    if (rc := _resolve_cann_root(cann_root, bisheng_bin=resolved_bisheng)) is not None and rc.is_dir() and not env.get("ASCEND_HOME_PATH"):
-        env["ASCEND_HOME_PATH"] = str(rc).strip()
-    return _AscendcCompileContext(extra_flags, "-x" in extra_flags, std_flags, include_flags, env)
-
-
-def _atomic_copy_file(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{dst.name}.")
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    try:
-        shutil.copy2(src, tmp_path)
-        os.replace(tmp_path, dst)
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-
-def compute_trackb_shared_so_filename(cpp_source: str, compile_flags: Sequence[str] | str | None = None) -> str:
-    """Compute canonical cached shared-object filename for a Track-B TU and flags."""
-    non_inc = [f for f in _normalize_flag_list(compile_flags) if not f.startswith("-I")]
-    return f"trackb_{hashlib.sha256((cpp_source + '|' + ' '.join(non_inc)).encode('utf-8')).hexdigest()[:16]}.so"
-
-
-def _build_trackb_shared_link_cmd(resolved_bisheng: str, *, arch: str, ctx: _AscendcCompileContext, src_path: Path, so_path: Path) -> list[str]:
-    return [
-        resolved_bisheng, "-O2", "-fPIC", *ctx.std_flags, "-mllvm", "-cce-aicore-dcpreload-args=false",
-        f"--npu-arch={arch}", *ctx.include_flags, *ctx.extra_flags, "-Wl,--no-mmap-output-file", "-shared",
-        str(src_path), "-o", str(so_path),
-    ]
-
-
-def compile_trackb_shared_so(
-    cpp_source: str, *, cache_dir: str | Path, compile_flags: Sequence[str] | str | None = None,
-    arch: str = "dav-3510", bisheng_bin: str | Path | None = None, cann_root: str | Path | None = None,
-    extra_include_dirs: Sequence[str | Path] | str | Path | None = None, timeout_sec: int = 120,
-    subproc_run: Callable[..., Any] | None = None,
-) -> tuple[bool, Path | None, str]:
-    """Compile a Track-B C++20 TU into a content-addressed cached .so via bisheng."""
-    if not isinstance(cpp_source, str) or not cpp_source.strip():
-        return (False, None, "stage_b_ascendc_empty_source")
-    cache_root = Path(cache_dir).expanduser().resolve()
-    cache_root.mkdir(parents=True, exist_ok=True)
-    target_so = cache_root / compute_trackb_shared_so_filename(cpp_source, compile_flags)
-    if is_verified_binary_file(target_so):
-        return (True, target_so, "")
-    if (resolved_bisheng := _resolve_bisheng_bin(bisheng_bin, cann_root=cann_root)) is None:
-        return (False, None, "stage_b_ascendc_bisheng_not_found")
-    ctx = _prepare_ascendc_compile_context(compile_flags=compile_flags, cann_root=cann_root, resolved_bisheng=resolved_bisheng, extra_include_dirs=extra_include_dirs)
-    with tempfile.TemporaryDirectory(prefix="tf_trackb_shared_") as tmp_dir:
-        src_path = Path(tmp_dir) / ("kernel.cpp" if ctx.has_explicit_x else "kernel.asc")
-        tmp_so = Path(tmp_dir) / "kernel.so"
-        src_path.write_text(cpp_source, encoding="utf-8")
-        try:
-            proc = (subproc_run or subprocess.run)(
-                _build_trackb_shared_link_cmd(resolved_bisheng, arch=arch, ctx=ctx, src_path=src_path, so_path=tmp_so),
-                text=True, capture_output=True, cwd=tmp_dir, env=ctx.env, timeout=timeout_sec,
-            )
-        except subprocess.TimeoutExpired:
-            return (False, None, f"stage_b_ascendc_shared_link_timeout:{timeout_sec}s")
-        raw = (proc.stderr or "") + "\n" + (proc.stdout or "")
-        if proc.returncode != 0 or not is_verified_binary_file(tmp_so):
-            return (False, None, f"stage_b_ascendc_shared_link_failed (rc={proc.returncode}): {_bounded_compile_diagnostic(raw)}")
-        _atomic_copy_file(tmp_so, target_so)
-        return (True, target_so, "")
 
 
 def build_stage_b_driver_source(
@@ -1378,10 +894,6 @@ if _cfg.get("emit_cache_bins_path"):
     return template.lstrip().replace("__PAYLOAD__", repr(payload))
 
 
-def _resolve_artifact_store(artifact_store: ArtifactStore | None) -> ArtifactStore:
-    return artifact_store if artifact_store is not None else ArtifactStore(resolve_unified_tl_cache_dir())
-
-
 def _merge_cache_locked(worker_cache: Path, target_cache: Path) -> None:
     lock_path = target_cache / ".prewarm_manifest_v1.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1422,7 +934,7 @@ def run_stage_b_compile(
     compile_flags: Sequence[str] | str | None = None, dims: Mapping[str, object] | None = None,
     python_bin: str | None = None, timeout_sec: int = 120, enable_device_compile: bool = True,
     artifact_store: ArtifactStore | None = None, artifact_id: str = "", regime_tag: str = "",
-    spec_key: str = "", subproc_run: Callable[..., Any] | None = None,
+    spec_key: str = "", subproc_run: Callable[..., SubprocResultLike] | None = None,
 ) -> StageBResult:
     """Verify full TileLang + bisheng device compilation in an isolated subprocess."""
     if not enable_device_compile:
@@ -1436,7 +948,7 @@ def run_stage_b_compile(
     store.root.mkdir(parents=True, exist_ok=True)
     norm_pc, norm_cf = _merge_pass_configs_and_flags(None, None, pass_configs, compile_flags)
     closure_src = extract_reachable_closure_source(dsl_source, regime_tag=regime_tag) if regime_tag else dsl_source
-    target_aid = artifact_id or compute_artifact_task_key(normalized_kernel_unit_src=closure_src, cann_target="dav-3510", pass_configs=norm_pc, compile_flags=norm_cf, static_spec_signature=spec_key)
+    target_aid = artifact_id or compute_compile_task_key(normalized_kernel_unit_src=closure_src, cann_target="dav-3510", pass_configs=norm_pc, compile_flags=norm_cf, static_spec_signature=spec_key)
     spec_chk = CompileTaskSpec(target_aid, str(factory_name or ""), _freeze_pair_tuple(factory_kwargs), _freeze_pair_tuple(norm_pc), tuple(norm_cf))
 
     with tempfile.TemporaryDirectory(prefix="tf_stage_b_") as tmp_dir:
@@ -1492,115 +1004,8 @@ def run_stage_b_compile(
     )
 
 
-def run_stage_b_ascendc_compile(
-    cpp_source: str, *, arch: str = "dav-3510", compile_flags: Sequence[str] | str | None = None,
-    bisheng_bin: str | Path | None = None, cann_root: str | Path | None = None,
-    extra_include_dirs: Sequence[str | Path] | str | Path | None = None, timeout_sec: int = 120,
-    enable_device_compile: bool = True, verify_shared_link: bool = False,
-    emit_shared_so_cache_dir: str | Path | None = None, artifact_store: ArtifactStore | None = None,
-    artifact_id: str = "", regime_tag: str = "", spec_key: str = "",
-    subproc_run: Callable[..., Any] | None = None, disassembly_profile_fn: Callable[[str, str], dict[str, object] | None] | None = None,
-    bisheng_resolver: Callable[..., str | None] | None = None,
-    verify_instantiated_fn: Callable[..., tuple[bool, str]] | None = None,
-    disassemble_fn: Callable[..., str] | None = None,
-) -> StageBResult:
-    """Verify dav-3510 C++20 translation unit compilation via bisheng in an isolated tempdir."""
-    if not enable_device_compile:
-        raise ValueError("enable_device_compile=False bypass has been removed")
-    t0 = time.monotonic()
-    if not isinstance(cpp_source, str) or not cpp_source.strip():
-        return _stage_b_fail(t0, "stage_b_ascendc_empty_source", "STAGE_B_ASCENDC_EMPTY_SOURCE")
-    resolve_bs = bisheng_resolver or _resolve_bisheng_bin
-    if (resolved_bisheng := resolve_bs(bisheng_bin, cann_root=cann_root)) is None:
-        return _stage_b_fail(t0, "stage_b_ascendc_bisheng_not_found", "BISHENG_NOT_FOUND", fault_plane="INFRA_TOOLCHAIN")
-    run_fn = subproc_run or subprocess.run
-    ctx = _prepare_ascendc_compile_context(compile_flags=compile_flags, cann_root=cann_root, resolved_bisheng=resolved_bisheng, extra_include_dirs=extra_include_dirs)
-    extra_flags = ctx.extra_flags
-    store = _resolve_artifact_store(artifact_store)
-    spec_chk = CompileTaskSpec(artifact_id or "trackb", "_trackb_tu", (), (), tuple(extra_flags))
-    with tempfile.TemporaryDirectory(prefix="tf_stage_b_ascendc_") as tmp_dir:
-        src_path = Path(tmp_dir) / ("kernel.cpp" if ctx.has_explicit_x else "kernel.asc")
-        obj_path, so_path = Path(tmp_dir) / "kernel.o", Path(tmp_dir) / "kernel.so"
-        src_path.write_text(cpp_source, encoding="utf-8")
-        should_link = verify_shared_link and 'extern "C"' in cpp_source and "<<<" in cpp_source and not ctx.has_explicit_x and bool(ctx.env.get("ASCEND_HOME_PATH"))
-        cached_so = (Path(emit_shared_so_cache_dir).expanduser().resolve() / compute_trackb_shared_so_filename(cpp_source, extra_flags)) if (should_link and emit_shared_so_cache_dir is not None) else None
-        cached_hit = cached_so is not None and is_verified_binary_file(cached_so)
-
-        def _invoke(legacy: bool) -> Any:
-            af = ["-x", "cce", f"--cce-aicore-arch={arch}"] if legacy else [f"--npu-arch={arch}"]
-            df = [] if any("Wdeprecated-declarations" in str(f) for f in extra_flags) else ["-Wno-deprecated-declarations"]
-            return run_fn([resolved_bisheng, *af, "--cce-aicore-only", "--cce-res-usage", "-O2", *ctx.std_flags, *ctx.include_flags, *df, *extra_flags, "-c", str(src_path), "-o", str(obj_path)], text=True, capture_output=True, cwd=tmp_dir, env=ctx.env, timeout=timeout_sec)
-
-        link_exec, link_fut = None, None
-        try:
-            if should_link and not cached_hit:
-                link_exec = ThreadPoolExecutor(max_workers=2)
-                link_fut = link_exec.submit(run_fn, _build_trackb_shared_link_cmd(resolved_bisheng, arch=arch, ctx=ctx, src_path=src_path, so_path=so_path), text=True, capture_output=True, cwd=tmp_dir, env=ctx.env, timeout=timeout_sec)
-            try:
-                proc = _invoke(False)
-                if proc.returncode != 0:
-                    le = ((proc.stderr or "") + "\n" + (proc.stdout or "")).lower()
-                    if "--npu-arch" in le and any(t in le for t in ("unknown", "unrecognized", "unsupported", "invalid")):
-                        proc = _invoke(True)
-            except subprocess.TimeoutExpired:
-                return _stage_b_fail(t0, f"stage_b_ascendc_compile_timeout:{timeout_sec}s", "STAGE_B_ASCENDC_COMPILE_TIMEOUT")
-            comb = (proc.stdout or "") + "\n" + (proc.stderr or "")
-            if proc.returncode != 0 or not obj_path.is_file():
-                sp, vl, summary = _parse_cce_res_usage_with_summary(comb, asm_or_dump_text=cpp_source)
-                raw_d = proc.stderr or proc.stdout or "bisheng failed without diagnostics"
-                return _stage_b_fail(
-                    t0, f"stage_b_ascendc_compile_failed (rc={proc.returncode}): {_bounded_compile_diagnostic(raw_d)}",
-                    _classify_stage_b_overflow_fault_code(raw_d, summary, "STAGE_B_ASCENDC_COMPILE_FAILED"),
-                    spill_bytes=sp, vloopv2_hit=vl, summary=summary, ma_profile=(extract_microarch_profile_from_cce(cpp_source).to_dict() if cpp_source.strip() else None),
-                    full_diag=raw_d, cce=cpp_source,
-                )
-            inst_ok, inst_err = (verify_instantiated_fn or _verify_object_has_instantiated_kernel)(obj_path, bisheng_bin=resolved_bisheng, subproc_run=run_fn)
-            od_txt = (disassemble_fn or _disassemble_object)(obj_path, bisheng_bin=resolved_bisheng, subproc_run=run_fn)
-            tel_out = _augment_bisheng_telemetry_text(comb, od_txt)
-            dump_txt = f"{od_txt}\n{cpp_source}" if od_txt.strip() else cpp_source
-            sp, vl, summary = _parse_cce_res_usage_with_summary(tel_out, asm_or_dump_text=dump_txt)
-            ma_prof = disassembly_profile_fn(cpp_source, od_txt) if disassembly_profile_fn is not None else extract_microarch_profile_from_cce(cpp_source).to_dict()
-            if not inst_ok:
-                return _stage_b_fail(t0, inst_err, "STAGE_B_ASCENDC_UNINSTANTIATED_TEMPLATE", spill_bytes=sp, vloopv2_hit=vl, summary=summary, ma_profile=ma_prof, cce=cpp_source)
-            if has_unreserved_vf_stack_overflow(spec_chk, summary.stack_bytes, tel_out):
-                return _stage_b_fail(t0, f"stage_b_ascendc_vf_stack_overflow: stack_bytes={summary.stack_bytes}", "VF_STACK_OVERFLOW", spill_bytes=sp, vloopv2_hit=vl, summary=summary, ma_profile=ma_prof, full_diag=tel_out, cce=cpp_source)
-            so_opt: Path | None = None
-            if should_link:
-                if cached_hit:
-                    so_opt = cached_so
-                elif link_fut is not None:
-                    try:
-                        lp = link_fut.result()
-                    except subprocess.TimeoutExpired:
-                        return _stage_b_fail(t0, f"stage_b_ascendc_shared_link_timeout:{timeout_sec}s", "STAGE_B_ASCENDC_SHARED_LINK_TIMEOUT", spill_bytes=sp, vloopv2_hit=vl, summary=summary, ma_profile=ma_prof)
-                    lraw = (lp.stderr or "") + "\n" + (lp.stdout or "")
-                    if lp.returncode != 0 or not so_path.is_file():
-                        return _stage_b_fail(t0, f"stage_b_ascendc_shared_link_failed (rc={lp.returncode}): {_bounded_compile_diagnostic(lraw)}", _classify_stage_b_overflow_fault_code(lraw, summary, "STAGE_B_ASCENDC_SHARED_LINK_FAILED"), spill_bytes=sp, vloopv2_hit=vl, summary=summary, ma_profile=ma_prof, full_diag=lraw)
-                    if cached_so is not None:
-                        _atomic_copy_file(so_path, cached_so)
-                    so_opt = so_path
-        finally:
-            if link_fut is not None:
-                with contextlib.suppress(Exception):
-                    link_fut.result()
-            if link_exec is not None:
-                link_exec.shutdown(wait=True)
-
-        recorded_aid, recorded_bins = "", ()
-        if built := [p for p in (obj_path, so_opt) if p is not None and p.is_file() and p.stat().st_size > 0]:
-            closure_src = _normalize_trackb_unit_source(cpp_source, regime_tag=regime_tag)
-            recorded_aid = artifact_id or compute_artifact_task_key(normalized_kernel_unit_src=closure_src, cann_target=arch, pass_configs=None, compile_flags=extra_flags, static_spec_signature=spec_key)
-            rec = store.record_verified_artifact(recorded_aid, binary_paths=built, backend_kind="ascendc", arch=arch, flags=" ".join(extra_flags), spec_key=spec_key, closure_src=closure_src, metadata={"stack_bytes": int(summary.stack_bytes)}, copy_binaries=True)
-            recorded_bins = rec.binary_paths
-    return StageBResult(
-        passed=True, elapsed_sec=time.monotonic() - t0, spill_bytes=sp, vloopv2_hit=vl,
-        compiler_summary=summary, microarch_profile=ma_prof, generated_cce=cpp_source,
-        artifact_id=recorded_aid, binary_paths=recorded_bins,
-    )
-
-
-def _load_manifest_dict(manifest_path: Path) -> dict[str, Any]:
-    base: dict[str, Any] = {"version": 1, "regime_tag": "", "tasks": {}, "plan_index": {}}
+def _load_manifest_dict(manifest_path: Path) -> dict[str, object]:
+    base: dict[str, object] = {"version": 1, "regime_tag": "", "tasks": {}, "plan_index": {}}
     if not manifest_path.is_file():
         return base
     with contextlib.suppress(OSError, json.JSONDecodeError):
@@ -1613,7 +1018,7 @@ def _load_manifest_dict(manifest_path: Path) -> dict[str, Any]:
     return base
 
 
-def validate_prewarm_manifest_v1(manifest_path: str | Path, plan: RegimeCompilePlan) -> tuple[bool, dict[str, Any]]:
+def validate_prewarm_manifest_v1(manifest_path: str | Path, plan: RegimeCompilePlan) -> tuple[bool, dict[str, object]]:
     """Validate prewarm_manifest_v1.json against all CompileTaskSpecs in *plan*."""
     mpath = Path(manifest_path)
     manifest = _load_manifest_dict(mpath)
@@ -1651,7 +1056,7 @@ def _build_cpu_compile_env(env_vals: Mapping[str, str], tl_cache_dir: Path, sour
     cann_setup = (env_vals.get("TILEFOUNDRY_NPU_CANN_SETUP") or os.environ.get("TILEFOUNDRY_NPU_CANN_SETUP") or "").strip()
     tl_src = _resolve_tilelang_source_dir(env_vals=env_vals, source_root=source_root) or ""
     root = source_root or Path(__file__).resolve().parents[5]
-    pp = [*( [tl_src] if tl_src else [] ), str(root), str(root / "src"), str(root / "targets" / "ascend"), *( [os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [] )]
+    pp = [*([tl_src] if tl_src else []), str(root), str(root / "src"), str(root / "targets" / "ascend"), *([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])]
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(pp), "TILELANG_DISABLE_CACHE": "0", "TILELANG_KERNEL_CACHE_USE_LIB_STAMP": "1", "TILELANG_CACHE_DIR": str(tl_cache_dir), "TORCH_DEVICE_BACKEND_AUTOLOAD": "0", "ASCEND_RT_VISIBLE_DEVICES": ""}
     env.setdefault("USE_CUDA", "0")
     need_src = bool(cann_setup and Path(cann_setup).is_file() and shutil.which("bisheng") is None)
@@ -1720,7 +1125,7 @@ def _resolve_trackb_spec_cpp_source(
             fn = getattr(loaded.mod, "_render_trackb_tu", None)
         raw_fn = getattr(fn, "__wrapped__", fn) if callable(fn) else None
         if callable(raw_fn):
-            res = raw_fn(**_filter_kwargs_for_callable(raw_fn, dict(spec.static_kwargs)))
+            res = raw_fn(**filter_callable_kwargs(raw_fn, dict(spec.static_kwargs), aliases=_PARAM_DIM_FALLBACK_ALIASES))
             if isinstance(res, str):
                 return True, _normalize_trackb_unit_source(res)
             if not is_explicit:
@@ -1784,12 +1189,13 @@ class StageBCompileGate:
         tl_cache.mkdir(parents=True, exist_ok=True)
         manifest_path = tl_cache / _PREWARM_MANIFEST_FILENAME
         existing = _load_manifest_dict(manifest_path)
+        existing_tasks = existing["tasks"] if isinstance(existing.get("tasks"), Mapping) else {}
 
         cached_res: dict[str, tuple[bool, int, str, tuple[Path, ...], str]] = {}
         missed: list[CompileTaskSpec] = []
         for tkey, spec in active_plan.unique_specs_by_key.items():
             if (rec := self.artifact_store.get_verified_artifact(tkey)) is not None:
-                prev = existing["tasks"].get(tkey)
+                prev = existing_tasks.get(tkey)
                 sb = int(rec.metadata.get("stack_bytes", prev.get("stack_bytes", 0) if isinstance(prev, Mapping) else 0) or 0)
                 bins = tuple(Path(p) for p in rec.binary_paths if is_verified_binary_file(Path(p)))
                 cached_res[tkey] = (False, sb, f"stage_b_vf_stack_overflow: stack_bytes={sb}", bins, "VF_STACK_OVERFLOW") if has_unreserved_vf_stack_overflow(spec, sb, "") else (True, sb, "", bins, "")
@@ -1836,7 +1242,8 @@ class StageBCompileGate:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
                 try:
                     latest = _load_manifest_dict(manifest_path)
-                    mtasks, mplan = dict(latest["tasks"]), dict(latest["plan_index"])
+                    mtasks = dict(latest["tasks"]) if isinstance(latest.get("tasks"), Mapping) else {}
+                    mplan = dict(latest["plan_index"]) if isinstance(latest.get("plan_index"), Mapping) else {}
                     for tkey, spec in active_plan.unique_specs_by_key.items():
                         ok, sb, diag, bins, fc = all_res[tkey]
                         max_sb = max(max_sb, int(sb))
@@ -1893,7 +1300,7 @@ def run_l1_compile_check(
             timeout_sec=timeout_sec, artifact_store=store, artifact_id=artifact_id, regime_tag=regime_tag,
         )
 
-    cases_by_id: dict[str, dict[str, Any]] = {str(cn): dict(cd) for cn, _, cd in (anchor_case_specs or ())}
+    cases_by_id: dict[str, dict[str, object]] = {str(cn): dict(cd) for cn, _, cd in (anchor_case_specs or ())}
     if dims:
         cases_by_id.setdefault("primary", dict(dims))
     if tail_anchor_dims:
