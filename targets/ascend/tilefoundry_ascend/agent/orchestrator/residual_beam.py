@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
 
 from tilefoundry_ascend.agent.specs.latency_algebra import (
     StaticDynamicResidual,
@@ -397,38 +396,9 @@ class BeamCandidate(JsonRecordMixin):
                     f"got {type(val).__name__}"
                 )
 
-    def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serializable dictionary representation."""
-        out = super().to_dict()
-        out["case_latencies_us"] = {
-            int(k): float(v) for k, v in self.case_latencies_us.items()
-        }
-        return out
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> BeamCandidate:
-        """Reconstruct a BeamCandidate from a serialized dictionary."""
-        cleaned = dict(payload)
-        raw_lats = cleaned.get("case_latencies_us")
-        clean_lats: dict[int, float] = {}
-        if isinstance(raw_lats, Mapping):
-            for k, v in raw_lats.items():
-                if isinstance(k, bool) or isinstance(v, bool):
-                    continue
-                try:
-                    clean_lats[int(k)] = float(v)
-                except (TypeError, ValueError):
-                    continue
-        cleaned["case_latencies_us"] = clean_lats
-        if not isinstance(cleaned.get("features"), Mapping):
-            cleaned["features"] = None
-        if not isinstance(cleaned.get("policy"), Mapping):
-            cleaned["policy"] = {}
-        return super().from_dict(cleaned)
-
 
 @dataclass
-class TwoLaneBeamSearch:
+class TwoLaneBeamSearch(JsonRecordMixin):
     """Maintains greedy Exploit beam and diversity-preserving Stepping-Stone beam."""
 
     exploit_width: int = 2
@@ -502,33 +472,33 @@ class TwoLaneBeamSearch:
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable snapshot of both beam lanes and exploited signatures."""
-        return {
-            "exploit_width": self.exploit_width,
-            "stepping_stone_width": self.stepping_stone_width,
-            "exploit_beam": [c.to_dict() for c in self.exploit_beam],
-            "stepping_stone_beam": [c.to_dict() for c in self.stepping_stone_beam],
-            "exploited_signatures": [list(sig) for sig in sorted(self.exploited_signatures)],
-        }
+        out = super().to_dict()
+        out["exploited_signatures"] = [list(sig) for sig in sorted(self.exploited_signatures)]
+        return out
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> TwoLaneBeamSearch:
         """Reconstruct a TwoLaneBeamSearch instance from a serialized snapshot."""
-        raw_exploit = payload.get("exploit_beam") or ()
-        raw_stones = payload.get("stepping_stone_beam") or ()
+        if not isinstance(payload, Mapping):
+            raise TypeError(f"Expected Mapping for TwoLaneBeamSearch, got {type(payload).__name__}")
+        cleaned: dict[str, object] = dict(payload)
+        for key in ("exploit_beam", "stepping_stone_beam"):
+            raw = payload.get(key) or ()
+            if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+                raise TypeError(f"Expected sequence for {key}, got {type(raw).__name__}")
+            cleaned[key] = [
+                c if isinstance(c, BeamCandidate) else BeamCandidate.from_dict(c)
+                for c in raw
+            ]
         raw_sigs = payload.get("exploited_signatures") or ()
-        return cls(
-            exploit_width=int(payload.get("exploit_width", 2)),
-            stepping_stone_width=int(payload.get("stepping_stone_width", 2)),
-            exploit_beam=[
-                c if isinstance(c, BeamCandidate) else BeamCandidate.from_dict(c)
-                for c in raw_exploit
-            ],
-            stepping_stone_beam=[
-                c if isinstance(c, BeamCandidate) else BeamCandidate.from_dict(c)
-                for c in raw_stones
-            ],
-            exploited_signatures={tuple(str(item) for item in sig) for sig in raw_sigs},
-        )
+        if isinstance(raw_sigs, (str, bytes)) or not isinstance(raw_sigs, Iterable):
+            raise TypeError(
+                f"Expected iterable for exploited_signatures, got {type(raw_sigs).__name__}"
+            )
+        cleaned["exploited_signatures"] = {
+            tuple(str(item) for item in sig) for sig in raw_sigs
+        }
+        return super().from_dict(cleaned)
 
 
 __all__ = [

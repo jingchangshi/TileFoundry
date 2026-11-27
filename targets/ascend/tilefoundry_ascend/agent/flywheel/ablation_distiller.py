@@ -5,9 +5,10 @@ from __future__ import annotations
 import ast
 import copy
 import difflib
-import hashlib
+import importlib.util
 import math
 import re
+import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -56,23 +57,21 @@ _SUPPORTED_PROBE_KINDS = (
 def _build_allowed_schema_signal_vocabulary() -> frozenset[str]:
     """Build closed predicate identifier vocabulary from schema dataclasses and builtins."""
     vocab: set[str] = {
-        "True", "False", "None", "abs", "min", "max", "prev",
-        "PIPE_M", "PIPE_FIX", "PIPE_V", "PIPE_MTE2", "PIPE_MTE3",
-        "AIC", "AIV0", "AIV1", "UB", "L1", "L0A", "L0B", "L0C", "SSBUF",
-        "any_overflow_bytes", "degraded_buffer_count", "implicit_bloat_bytes",
-        "max_overflow_bytes", "ub_utilization_ratio", "ub_occupancy_ratio",
-        "cube_to_vector_ratio", "cube_cycles", "vec_cycles",
-        "has_dynamic_control", "has_opaque_regions", "has_simtvf",
+        "True", "False", "None", "abs", "min", "max", "prev", "PIPE_M", "PIPE_FIX", "PIPE_V",
+        "PIPE_MTE2", "PIPE_MTE3", "AIC", "AIV0", "AIV1", "UB", "L1", "L0A", "L0B", "L0C", "SSBUF",
+        "any_overflow_bytes", "degraded_buffer_count", "implicit_bloat_bytes", "max_overflow_bytes",
+        "ub_utilization_ratio", "ub_occupancy_ratio", "cube_to_vector_ratio", "cube_cycles",
+        "vec_cycles", "has_dynamic_control", "has_opaque_regions", "has_simtvf",
         "dominant_axis", "has_l1_compiler_summary", "degraded_count",
     }
     for cls in (
-        ObservationVector5D, ComputeIssueAxis, OffChipMemoryDmaAxis,
-        OnChipSramRegAxis, PipelineSyncAxis, GridIrregularityAxis,
-        AxisResidual5D, ObjectivePhysicalLedger, ScopeWaterline, CasePhysicsRatios, TopologyAxes,
+        ObservationVector5D, ComputeIssueAxis, OffChipMemoryDmaAxis, OnChipSramRegAxis,
+        PipelineSyncAxis, GridIrregularityAxis, AxisResidual5D, ObjectivePhysicalLedger,
+        ScopeWaterline, CasePhysicsRatios, TopologyAxes,
     ):
         vocab.update(f.name for f in fields(cls))
-    vocab.update(_RESIDUAL_DEFAULTS.keys())
-    vocab.update(_TELEMETRY_CONTEXT_DEFAULTS.keys())
+    vocab.update(_RESIDUAL_DEFAULTS)
+    vocab.update(_TELEMETRY_CONTEXT_DEFAULTS)
     return frozenset(vocab)
 
 
@@ -88,7 +87,6 @@ def _validate_schema_closed_identifiers(expr: str) -> list[str]:
     except SyntaxError:
         return ["<syntax_error>"]
     unknown: list[str] = []
-    seen: set[str] = set()
     for node in ast.walk(tree):
         ident: str | None = None
         if isinstance(node, ast.Name) and node.id not in ALLOWED_SCHEMA_SIGNAL_VOCABULARY:
@@ -98,8 +96,7 @@ def _validate_schema_closed_identifiers(expr: str) -> list[str]:
             and node.value.id == "prev" and node.attr not in ALLOWED_SCHEMA_SIGNAL_VOCABULARY
         ):
             ident = node.attr
-        if ident is not None and ident not in seen:
-            seen.add(ident)
+        if ident is not None and ident not in unknown:
             unknown.append(ident)
     return unknown
 
@@ -184,7 +181,7 @@ def should_trigger_flywheel_checkpoint(
 
 
 @dataclass(frozen=True)
-class AstEditChunk:
+class AstEditChunk(JsonRecordMixin):
     """Single atomic structural delta extracted from baseline and winner DSL ASTs."""
 
     chunk_id: str
@@ -194,17 +191,9 @@ class AstEditChunk:
     after_src: str
     ablated_dsl: str
 
-    def to_dict(self) -> dict[str, object]:
-        """Serialize atomic AST delta to JSON-compatible dictionary."""
-        return {
-            "chunk_id": self.chunk_id, "edit_kind": self.edit_kind, "target_path": self.target_path,
-            "before_src": self.before_src, "after_src": self.after_src,
-            "dsl_sha256": hashlib.sha256(self.ablated_dsl.encode("utf-8")).hexdigest()[:16],
-        }
-
 
 @dataclass(frozen=True)
-class AblationMeasurement:
+class AblationMeasurement(JsonRecordMixin):
     """Funnel and latency outcome for one counterfactual single-variable ablation."""
 
     chunk: AstEditChunk
@@ -216,19 +205,9 @@ class AblationMeasurement:
     stage_a_result: StageAResult | None = None
     diagnostic: str = ""
 
-    def to_dict(self) -> dict[str, object]:
-        """Serialize ablation measurement to JSON-compatible dictionary."""
-        return {
-            "chunk": self.chunk.to_dict(), "funnel_passed": self.funnel_passed,
-            "baseline_latency_us": round(self.baseline_latency_us, 6),
-            "variant_latency_us": round(self.variant_latency_us, 6),
-            "relative_gain": round(self.relative_gain, 6),
-            "positive_gain": self.positive_gain, "diagnostic": self.diagnostic,
-        }
-
 
 @dataclass(frozen=True)
-class MicroProbeSpec:
+class MicroProbeSpec(JsonRecordMixin):
     """Standalone 30-50 line Ascend 950 micro-probe pair isolating one causal edit."""
 
     probe_id: str
@@ -241,18 +220,9 @@ class MicroProbeSpec:
     tensor_shape: tuple[int, ...]
     tensor_dtype: str = "float32"
 
-    def to_dict(self) -> dict[str, object]:
-        """Serialize micro-probe specification without raw machine paths."""
-        return {
-            "probe_id": self.probe_id, "probe_kind": self.probe_kind,
-            "factory_name": self.factory_name, "line_count_baseline": self.line_count_baseline,
-            "line_count_optimized": self.line_count_optimized,
-            "tensor_shape": list(self.tensor_shape), "tensor_dtype": self.tensor_dtype,
-        }
-
 
 @dataclass(frozen=True)
-class DistilledRuleOutcome:
+class DistilledRuleOutcome(JsonRecordMixin):
     """Verification and KB admission outcome for one winning AST mechanism."""
 
     chunk_id: str
@@ -262,16 +232,6 @@ class DistilledRuleOutcome:
     rule: AscendCausalRule | None
     admitted: bool
     rejection_reason: str = ""
-
-    def to_dict(self) -> dict[str, object]:
-        """Serialize distilled rule verification and admission record."""
-        return {
-            "chunk_id": self.chunk_id,
-            "probe": self.probe.to_dict() if self.probe is not None else None,
-            "hardware_verified": self.hardware_verified, "probe_metrics": dict(self.probe_metrics),
-            "rule_id": self.rule.rule_id if self.rule else None,
-            "admitted": self.admitted, "rejection_reason": self.rejection_reason,
-        }
 
 
 @dataclass
@@ -285,18 +245,6 @@ class FlywheelDistillationReport(JsonRecordMixin):
     discarded_chunks: tuple[AblationMeasurement, ...]
     distilled_outcomes: tuple[DistilledRuleOutcome, ...] = field(default_factory=tuple)
     admitted_rule_ids: tuple[str, ...] = field(default_factory=tuple)
-
-    def to_dict(self) -> dict[str, object]:
-        """Serialize complete distillation report to JSON-compatible dictionary."""
-        return {
-            "baseline_latency_us": round(self.baseline_latency_us, 6),
-            "winner_latency_us": round(self.winner_latency_us, 6),
-            "total_chunks": self.total_chunks,
-            "kept_positive_chunks": [m.to_dict() for m in self.kept_positive_chunks],
-            "discarded_chunks": [m.to_dict() for m in self.discarded_chunks],
-            "distilled_outcomes": [o.to_dict() for o in self.distilled_outcomes],
-            "admitted_rule_ids": list(self.admitted_rule_ids),
-        }
 
 
 def _node_key(node: ast.AST) -> str:
@@ -354,35 +302,27 @@ def _extract_probe_params(chunk: AstEditChunk) -> dict[str, object]:
     """Extract and clamp concrete tile, core, stage, and dtype parameters from AST."""
     cores, stages, tile_elems, dtype = 28, 2, 2048, "float32"
     for candidate_src in (chunk.after_src, chunk.ablated_dsl):
-        if not candidate_src.strip():
-            continue
         try:
-            tree = ast.parse(candidate_src)
+            tree = ast.parse(candidate_src) if candidate_src.strip() else None
         except SyntaxError:
-            continue
-        for node in ast.walk(tree):
+            tree = None
+        for node in ast.walk(tree) if tree is not None else ():
             if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
                 continue
             attr = node.func.attr
-            if attr in ("Kernel", "MixedKernel") and node.args:
-                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, int):
-                    cores = max(2, min(56, int(node.args[0].value)))
+            if attr in ("Kernel", "MixedKernel") and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, int):
+                cores = max(2, min(56, int(node.args[0].value)))
             elif attr == "Pipelined":
                 for kw in node.keywords:
-                    if kw.arg == "num_stages" and isinstance(kw.value, ast.Constant):
-                        if isinstance(kw.value.value, int):
-                            stages = max(2, min(3, int(kw.value.value)))
+                    if kw.arg == "num_stages" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, int):
+                        stages = max(2, min(3, int(kw.value.value)))
             elif attr in ("alloc_shared", "alloc_l1") and node.args:
-                shape_arg = node.args[0]
-                if isinstance(shape_arg, (ast.Tuple, ast.List)):
-                    ints = [int(e.value) for e in shape_arg.elts
-                            if isinstance(e, ast.Constant) and isinstance(e.value, int)]
-                    if len(ints) == len(shape_arg.elts) and ints:
-                        prod = math.prod(max(1, d) for d in ints)
-                        tile_elems = max(512, min(4096, ((prod + 127) // 128) * 128))
-                if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
-                    if str(node.args[1].value) in ("float32", "float16", "bfloat16"):
-                        dtype = str(node.args[1].value)
+                if isinstance(node.args[0], (ast.Tuple, ast.List)):
+                    ints = [int(e.value) for e in node.args[0].elts if isinstance(e, ast.Constant) and isinstance(e.value, int)]
+                    if ints and len(ints) == len(node.args[0].elts):
+                        tile_elems = max(512, min(4096, ((math.prod(max(1, d) for d in ints) + 127) // 128) * 128))
+                if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and str(node.args[1].value) in ("float32", "float16", "bfloat16"):
+                    dtype = str(node.args[1].value)
     return {"cores": cores, "stages": stages, "tile_elems": tile_elems, "dtype": dtype}
 
 
@@ -390,17 +330,20 @@ def _resolve_stmt_list(tree: ast.Module, path: tuple[int, ...]) -> list[ast.stmt
     cur_list: list[ast.stmt] = tree.body
     for idx in path[:-1]:
         node = cur_list[idx]
-        if not hasattr(node, "body") or not isinstance(node.body, list):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
             return None
-        cur_list = node.body
+        cur_list = body
     return cur_list
 
 
-def _set_stmt_by_path(tree: ast.Module, path: tuple[int, ...], new_stmt: ast.stmt | None) -> bool:
-    cur_list = _resolve_stmt_list(tree, path)
-    if cur_list is None:
+def _set_stmt_by_path(tree: ast.Module, path: tuple[int, ...], new_stmt: ast.stmt | None, *, insert: bool = False) -> bool:
+    if (cur_list := _resolve_stmt_list(tree, path)) is None:
         return False
     leaf = path[-1]
+    if insert and new_stmt is not None:
+        cur_list.insert(max(0, min(leaf, len(cur_list))), copy.deepcopy(new_stmt))
+        return True
     if new_stmt is None:
         return (cur_list.pop(leaf) is not None) if 0 <= leaf < len(cur_list) else False
     if 0 <= leaf < len(cur_list):
@@ -412,19 +355,8 @@ def _set_stmt_by_path(tree: ast.Module, path: tuple[int, ...], new_stmt: ast.stm
     return False
 
 
-def _insert_stmt_by_path(tree: ast.Module, path: tuple[int, ...], new_stmt: ast.stmt) -> bool:
-    cur_list = _resolve_stmt_list(tree, path)
-    if cur_list is None:
-        return False
-    cur_list.insert(max(0, min(path[-1], len(cur_list))), copy.deepcopy(new_stmt))
-    return True
-
-
-def _replace_call_arg(
-    tree: ast.Module, stmt_path: tuple[int, ...], *, is_with_header: bool, new_expr: ast.expr
-) -> bool:
-    cur_list = _resolve_stmt_list(tree, stmt_path)
-    if cur_list is None:
+def _replace_call_arg(tree: ast.Module, stmt_path: tuple[int, ...], *, is_with_header: bool, new_expr: ast.expr) -> bool:
+    if (cur_list := _resolve_stmt_list(tree, stmt_path)) is None:
         return False
     stmt = cur_list[stmt_path[-1]]
     if is_with_header and isinstance(stmt, ast.With) and stmt.items:
@@ -540,108 +472,77 @@ def _extract_stmt_deltas(
         _extract_stmt_deltas(patch_base, b_s.body, w_s.body, cur_p, body_l, chunks, seen_dsls,
                              reverse=reverse, new_defs=new_defs, def_order=def_order)
 
+    def _emit_win_insert(ws: ast.stmt, ins_idx: int, tpath: str) -> None:
+        wt = _node_key(ws)
+        kind = "loop_fission_sfu" if (block_fission and isinstance(ws, ast.For)) else _classify_edit("", wt)
+        _try_emit(lambda t: _set_stmt_by_path(t, parent_path + (ins_idx,), ws, insert=True), kind, tpath, "", wt)
+
+    def _emit_remove(j: int, label: str) -> None:
+        wt = _node_key(win_list[j])
+        _try_emit(lambda t: _set_stmt_by_path(t, parent_path + (j,), None), _classify_edit("", wt), f"{path_label}/{label}_{j}", "", wt)
+
     matcher = difflib.SequenceMatcher(a=[_node_tag(s) for s in base_list], b=[_node_tag(s) for s in win_list], autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             for k in range(i2 - i1):
                 bs, ws = base_list[i1 + k], win_list[j1 + k]
                 bt, wt = _node_key(bs), _node_key(ws)
-                if bt == wt:
+                if bt == wt or (reverse and skip_assign_symbols and not parent_path and (
+                    (_node_tag(ws).startswith("assign:") and _node_tag(ws).removeprefix("assign:") in skip_assign_symbols)
+                    or (isinstance(ws, ast.AnnAssign) and isinstance(ws.target, ast.Name) and ws.target.id in skip_assign_symbols)
+                )):
                     continue
-                if reverse and skip_assign_symbols and not parent_path:
-                    wtag = _node_tag(ws)
-                    if (wtag.startswith("assign:") and wtag.removeprefix("assign:") in skip_assign_symbols) or (
-                        isinstance(ws, ast.AnnAssign) and isinstance(ws.target, ast.Name) and ws.target.id in skip_assign_symbols
-                    ):
-                        continue
                 idx = (j1 + k) if reverse else (i1 + k)
                 cp = parent_path + (idx,)
                 if isinstance(bs, (ast.With, ast.For)) and isinstance(ws, type(bs)):
                     sub = "with" if isinstance(bs, ast.With) else "for"
                     _handle_compound(bs, ws, cp, f"{path_label}/{sub}_{idx}", f"{path_label}/{sub}_{idx}")
                 elif isinstance(bs, ast.FunctionDef) and isinstance(ws, ast.FunctionDef):
-                    fn_name = ws.name if reverse else bs.name
-                    _extract_stmt_deltas(patch_base, bs.body, ws.body, cp, f"{path_label}/{fn_name}",
-                                         chunks, seen_dsls, reverse=reverse, new_defs=new_defs, def_order=def_order)
+                    _extract_stmt_deltas(patch_base, bs.body, ws.body, cp, f"{path_label}/{ws.name if reverse else bs.name}", chunks, seen_dsls, reverse=reverse, new_defs=new_defs, def_order=def_order)
                 else:
-                    _try_emit(lambda t: _set_stmt_by_path(t, cp, bs if reverse else ws),
-                              _classify_edit(bt, wt), f"{path_label}/stmt_{idx}", bt, wt)
+                    _try_emit(lambda t: _set_stmt_by_path(t, cp, bs if reverse else ws), _classify_edit(bt, wt), f"{path_label}/stmt_{idx}", bt, wt)
         elif tag == "replace":
             common = min(i2 - i1, j2 - j1)
             for k in range(common):
-                bs, ws = base_list[i1 + k], win_list[j1 + k]
-                idx = (j1 + k) if reverse else (i1 + k)
+                bs, ws, idx = base_list[i1 + k], win_list[j1 + k], (j1 + k) if reverse else (i1 + k)
                 cp = parent_path + (idx,)
                 if isinstance(bs, (ast.With, ast.For)) and isinstance(ws, type(bs)):
                     _handle_compound(bs, ws, cp, f"{path_label}/with_hdr_{idx}", f"{path_label}/block_{idx}")
                 else:
                     bt, wt = _node_key(bs), _node_key(ws)
-                    _try_emit(lambda t: _set_stmt_by_path(t, cp, bs if reverse else ws),
-                              _classify_edit(bt, wt), f"{path_label}/replace_{idx}", bt, wt)
+                    _try_emit(lambda t: _set_stmt_by_path(t, cp, bs if reverse else ws), _classify_edit(bt, wt), f"{path_label}/replace_{idx}", bt, wt)
             for j in range(j1 + common, j2):
-                ws = win_list[j]
-                wt = _node_key(ws)
-                if reverse:
-                    _try_emit(lambda t: _set_stmt_by_path(t, parent_path + (j,), None),
-                              _classify_edit("", wt), f"{path_label}/remove_extra_{j}", "", wt)
-                else:
-                    ins = min(i2 + (j - (j1 + common)), len(base_list))
-                    kind = "loop_fission_sfu" if (block_fission and isinstance(ws, ast.For)) else _classify_edit("", wt)
-                    _try_emit(lambda t: _insert_stmt_by_path(t, parent_path + (ins,), ws),
-                              kind, f"{path_label}/replace_ins_{j}", "", wt)
+                _emit_remove(j, "remove_extra") if reverse else _emit_win_insert(win_list[j], min(i2 + (j - (j1 + common)), len(base_list)), f"{path_label}/replace_ins_{j}")
         elif tag == "delete":
             for idx in range(i1, i2):
-                bs = base_list[idx]
-                bt = _node_key(bs)
-                _try_emit(
-                    (lambda t: _insert_stmt_by_path(t, parent_path + (min(j1, len(win_list)),), bs))
-                    if reverse else (lambda t: _set_stmt_by_path(t, parent_path + (idx,), None)),
-                    _classify_edit(bt, ""), f"{path_label}/{'reinsert' if reverse else 'delete'}_{idx}", bt, "",
-                )
+                bs, bt = base_list[idx], _node_key(base_list[idx])
+                _try_emit((lambda t: _set_stmt_by_path(t, parent_path + (min(j1, len(win_list)),), bs, insert=True)) if reverse else (lambda t: _set_stmt_by_path(t, parent_path + (idx,), None)), _classify_edit(bt, ""), f"{path_label}/{'reinsert' if reverse else 'delete'}_{idx}", bt, "")
         elif tag == "insert":
             for j in range(j1, j2):
-                ws = win_list[j]
-                wt = _node_key(ws)
-                if reverse:
-                    _try_emit(lambda t: _set_stmt_by_path(t, parent_path + (j,), None),
-                              _classify_edit("", wt), f"{path_label}/remove_ins_{j}", "", wt)
-                else:
-                    kind = "loop_fission_sfu" if (block_fission and isinstance(ws, ast.For)) else _classify_edit("", wt)
-                    _try_emit(lambda t: _insert_stmt_by_path(t, parent_path + (min(i1, len(base_list)),), ws),
-                              kind, f"{path_label}/insert_{i1}_{j}", "", wt)
+                _emit_remove(j, "remove_ins") if reverse else _emit_win_insert(win_list[j], min(i1, len(base_list)), f"{path_label}/insert_{i1}_{j}")
 
 
 def _classify_config_key_edit(key_name: str, before_src: str, after_src: str) -> str:
     kl = key_name.lower()
     for tokens, kind in (
-        (("stage", "buffer", "preload"), "pipeline_versions"),
-        (("core", "block", "split", "threads"), "core_parallelism"),
-        (("pad", "align", "datablock", "stride"), "pad_alignment"),
-        (("barrier", "sync", "unit_flag"), "barrier_prune"),
+        (("stage", "buffer", "preload"), "pipeline_versions"), (("core", "block", "split", "threads"), "core_parallelism"),
+        (("pad", "align", "datablock", "stride"), "pad_alignment"), (("barrier", "sync", "unit_flag"), "barrier_prune"),
     ):
         if any(tok in kl for tok in tokens):
             return kind
-    classified = _classify_edit(before_src, after_src)
-    return classified if classified != "stmt_rewrite" else "config_knob"
+    return c if (c := _classify_edit(before_src, after_src)) != "stmt_rewrite" else "config_knob"
 
 
 def _find_dict_literals_by_context(tree: ast.Module) -> dict[str, ast.Dict]:
     """Collect constant-key Dict literals keyed by enclosing function/assignment path."""
-    found: dict[str, ast.Dict] = {}
-    counts: dict[str, int] = {}
-
-    def _stmt_key(fn_prefix: str, idx: int, stmt: ast.stmt) -> str:
-        if isinstance(stmt, ast.Return):
-            return f"{fn_prefix}:return"
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
-            return f"{fn_prefix}:assign:{stmt.targets[0].id}"
-        return f"{fn_prefix}:{idx}"
+    found, counts = {}, {}
 
     def _visit(node: ast.AST, prefix: str) -> None:
         if isinstance(node, ast.FunctionDef):
             fn_p = f"{prefix}/{node.name}" if prefix else node.name
-            for idx, stmt in enumerate(node.body):
-                _visit(stmt, _stmt_key(fn_p, idx, stmt))
+            for idx, st in enumerate(node.body):
+                sk = f"{fn_p}:return" if isinstance(st, ast.Return) else (f"{fn_p}:assign:{st.targets[0].id}" if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) else f"{fn_p}:{idx}")
+                _visit(st, sk)
             return
         if isinstance(node, ast.Dict):
             occ = counts.get(prefix, 0)
@@ -651,21 +552,12 @@ def _find_dict_literals_by_context(tree: ast.Module) -> dict[str, ast.Dict]:
             _visit(child, prefix)
 
     for idx, stmt in enumerate(tree.body):
-        if isinstance(stmt, ast.FunctionDef):
-            _visit(stmt, "")
-        elif isinstance(stmt, ast.Assign) and stmt.targets:
-            _visit(stmt, f"global:{_node_key(stmt.targets[0])}")
-        else:
-            _visit(stmt, f"mod:{idx}")
+        _visit(stmt, "" if isinstance(stmt, ast.FunctionDef) else (f"global:{_node_key(stmt.targets[0])}" if isinstance(stmt, ast.Assign) and stmt.targets else f"mod:{idx}"))
     return found
 
 
 def _dict_key_map(dnode: ast.Dict) -> dict[str, tuple[int, ast.expr]]:
-    return {
-        k.value: (idx, v)
-        for idx, (k, v) in enumerate(zip(dnode.keys, dnode.values))
-        if isinstance(k, ast.Constant) and isinstance(k.value, str)
-    }
+    return {k.value: (idx, v) for idx, (k, v) in enumerate(zip(dnode.keys, dnode.values)) if isinstance(k, ast.Constant) and isinstance(k.value, str)}
 
 
 def _extract_config_dict_chunks(
@@ -677,22 +569,18 @@ def _extract_config_dict_chunks(
     for ctx_key, w_dict in win_dicts.items():
         if (b_dict := base_dicts.get(ctx_key)) is None:
             continue
-        b_map, w_map = _dict_key_map(b_dict), _dict_key_map(w_dict)
-        for k, (w_idx, w_val) in w_map.items():
-            w_src = _node_key(w_val)
-            patched = copy.deepcopy(patch_root)
+        b_map = _dict_key_map(b_dict)
+        for k, (w_idx, w_val) in _dict_key_map(w_dict).items():
+            w_src, patched = _node_key(w_val), copy.deepcopy(patch_root)
             if (p_dict := _find_dict_literals_by_context(patched).get(ctx_key)) is None:
                 continue
             if k in b_map:
                 b_idx, b_val = b_map[k]
-                b_src = _node_key(b_val)
-                t_idx = w_idx if reverse else b_idx
+                b_src, t_idx = _node_key(b_val), (w_idx if reverse else b_idx)
                 if b_src == w_src or t_idx >= len(p_dict.values):
                     continue
                 p_dict.values[t_idx] = copy.deepcopy(b_val if reverse else w_val)
-                _emit_chunk(chunks, seen_dsls, prefix=prefix, edit_kind=_classify_config_key_edit(k, b_src, w_src),
-                            target_path=f"{ctx_key}/dict:{k}", before_src=f"{k}: {b_src}",
-                            after_src=f"{k}: {w_src}", dsl=_render_patched(patched))
+                _emit_chunk(chunks, seen_dsls, prefix=prefix, edit_kind=_classify_config_key_edit(k, b_src, w_src), target_path=f"{ctx_key}/dict:{k}", before_src=f"{k}: {b_src}", after_src=f"{k}: {w_src}", dsl=_render_patched(patched))
             else:
                 if reverse:
                     if w_idx >= len(p_dict.values):
@@ -703,8 +591,7 @@ def _extract_config_dict_chunks(
                     p_dict.keys.append(ast.Constant(value=k))
                     p_dict.values.append(copy.deepcopy(w_val))
                     tpath = f"{ctx_key}/dict_add:{k}"
-                _emit_chunk(chunks, seen_dsls, prefix=prefix, edit_kind=_classify_config_key_edit(k, "", w_src),
-                            target_path=tpath, before_src="", after_src=f"{k}: {w_src}", dsl=_render_patched(patched))
+                _emit_chunk(chunks, seen_dsls, prefix=prefix, edit_kind=_classify_config_key_edit(k, "", w_src), target_path=tpath, before_src="", after_src=f"{k}: {w_src}", dsl=_render_patched(patched))
 
 
 def _is_trackb_render_fn(name: str) -> bool:
@@ -718,37 +605,36 @@ def _extract_func_default_loo_chunks(
     def _collect(fn: ast.FunctionDef) -> list[tuple[str, bool, int, ast.expr]]:
         pos = [*fn.args.posonlyargs, *fn.args.args]
         off = len(pos) - len(fn.args.defaults)
-        out = [(pos[off + i].arg, False, i, d) for i, d in enumerate(fn.args.defaults) if off + i >= 0]
-        out.extend((a.arg, True, ki, kd) for ki, (a, kd) in enumerate(zip(fn.args.kwonlyargs, fn.args.kw_defaults)) if kd is not None)
-        return out
+        return [(pos[off + i].arg, False, i, d) for i, d in enumerate(fn.args.defaults) if off + i >= 0] + [
+            (a.arg, True, ki, kd) for ki, (a, kd) in enumerate(zip(fn.args.kwonlyargs, fn.args.kw_defaults)) if kd is not None
+        ]
 
     base_funcs = {n.name: n for n in base_tree.body if isinstance(n, ast.FunctionDef)}
     for w_idx, w_node in enumerate(win_tree.body):
-        if not isinstance(w_node, ast.FunctionDef):
+        if not isinstance(w_node, ast.FunctionDef) or not (_is_trackb_render_fn(w_node.name) or (w_node.name.startswith("_select_") and w_node.name.endswith("_config"))) or (b_node := base_funcs.get(w_node.name)) is None:
             continue
-        fname = w_node.name
-        if not (_is_trackb_render_fn(fname) or (fname.startswith("_select_") and fname.endswith("_config"))):
-            continue
-        if (b_node := base_funcs.get(fname)) is None:
-            continue
-        prefix = "trackb_tu_" if _is_trackb_render_fn(fname) else "loo_"
+        prefix = "trackb_tu_" if _is_trackb_render_fn(w_node.name) else "loo_"
         b_defs = {(name, is_kw): expr for name, is_kw, _, expr in _collect(b_node)}
         for arg_name, is_kw, d_idx, w_def in _collect(w_node):
-            if (b_def := b_defs.get((arg_name, is_kw))) is None:
-                continue
-            b_src, w_src = _node_key(b_def), _node_key(w_def)
-            if b_src == w_src:
+            if (b_def := b_defs.get((arg_name, is_kw))) is None or (b_src := _node_key(b_def)) == (w_src := _node_key(w_def)):
                 continue
             patched = copy.deepcopy(win_tree)
             p_fn = patched.body[w_idx]
-            if isinstance(p_fn, ast.FunctionDef):
-                t_defs = p_fn.args.kw_defaults if is_kw else p_fn.args.defaults
-                if d_idx < len(t_defs):
-                    t_defs[d_idx] = copy.deepcopy(b_def)
-                    tag = "kw_default" if is_kw else "default"
-                    _emit_chunk(chunks, seen_dsls, prefix=prefix, edit_kind=_classify_config_key_edit(arg_name, b_src, w_src),
-                                target_path=f"{fname}/{tag}:{arg_name}", before_src=f"{arg_name}={b_src}",
-                                after_src=f"{arg_name}={w_src}", dsl=_render_patched(patched))
+            if isinstance(p_fn, ast.FunctionDef) and d_idx < len(t_defs := (p_fn.args.kw_defaults if is_kw else p_fn.args.defaults)):
+                t_defs[d_idx] = copy.deepcopy(b_def)
+                _emit_chunk(chunks, seen_dsls, prefix=prefix, edit_kind=_classify_config_key_edit(arg_name, b_src, w_src), target_path=f"{w_node.name}/{'kw_default' if is_kw else 'default'}:{arg_name}", before_src=f"{arg_name}={b_src}", after_src=f"{arg_name}={w_src}", dsl=_render_patched(patched))
+
+
+def _iter_line_loo_hunks(base_text: str, win_text: str) -> Iterable[tuple[int, int, int, str, str, str]]:
+    b_lines, w_lines = base_text.splitlines(keepends=True), win_text.splitlines(keepends=True)
+    ops = [op for op in difflib.SequenceMatcher(a=b_lines, b=w_lines, autojunk=False).get_opcodes() if op[0] != "equal"]
+    if len(ops) <= 1:
+        return
+    for idx, (_op, bi1, bi2, wj1, wj2) in enumerate(ops):
+        mid = list(b_lines[bi1:bi2])
+        if mid and wj2 < len(w_lines) and not mid[-1].endswith("\n"):
+            mid[-1] += "\n"
+        yield idx, wj1, wj2, "".join([*w_lines[:wj1], *mid, *w_lines[wj2:]]), "".join(b_lines[bi1:bi2]).strip(), "".join(w_lines[wj1:wj2]).strip()
 
 
 def _extract_trackb_render_template_loo_chunks(
@@ -758,9 +644,7 @@ def _extract_trackb_render_template_loo_chunks(
     """Decompose multi-line C++ template parameter blocks inside Track-B renderer functions."""
     base_funcs = {n.name: n for n in base_tree.body if isinstance(n, ast.FunctionDef)}
     for top_idx, w_fn in enumerate(win_tree.body):
-        if not isinstance(w_fn, ast.FunctionDef) or not _is_trackb_render_fn(w_fn.name):
-            continue
-        if (b_fn := base_funcs.get(w_fn.name)) is None:
+        if not isinstance(w_fn, ast.FunctionDef) or not _is_trackb_render_fn(w_fn.name) or (b_fn := base_funcs.get(w_fn.name)) is None:
             continue
         matcher = difflib.SequenceMatcher(a=[_node_tag(s) for s in b_fn.body], b=[_node_tag(s) for s in w_fn.body], autojunk=False)
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -772,40 +656,33 @@ def _extract_trackb_render_template_loo_chunks(
                     continue
                 b_seg = ast.get_source_segment(baseline_dsl, bs) or ""
                 w_seg = ast.get_source_segment(winner_dsl, ws) or ""
-                b_lines, w_lines = b_seg.splitlines(keepends=True), w_seg.splitlines(keepends=True)
-                if not b_seg.strip() or not w_seg.strip() or (len(b_lines) <= 1 and len(w_lines) <= 1):
+                if not b_seg.strip() or not w_seg.strip() or ("\n" not in b_seg and "\n" not in w_seg):
                     continue
-                ops = [op for op in difflib.SequenceMatcher(a=b_lines, b=w_lines, autojunk=False).get_opcodes() if op[0] != "equal"]
-                if len(ops) < 2:
-                    continue
-                for _op, bi1, bi2, wj1, wj2 in ops:
-                    mid = list(b_lines[bi1:bi2])
-                    if mid and wj2 < len(w_lines) and not mid[-1].endswith("\n"):
-                        mid[-1] += "\n"
+                for _idx, wj1, _wj2, ablated, bp, ap in _iter_line_loo_hunks(b_seg, w_seg):
                     try:
-                        parsed = ast.parse("".join([*w_lines[:wj1], *mid, *w_lines[wj2:]]))
+                        parsed = ast.parse(ablated)
                     except SyntaxError:
                         continue
                     if len(parsed.body) == 1 and _set_stmt_by_path(patched := copy.deepcopy(win_tree), (top_idx, j1 + k), parsed.body[0]):
-                        bp, ap = "".join(b_lines[bi1:bi2]).strip(), "".join(w_lines[wj1:wj2]).strip()
                         kind = _classify_cpp_hunk_kind(bp, ap)
-                        if kind == "cpp_hunk_edit" and "<<<" in f"{bp}{ap}":
-                            kind = "core_parallelism"
+                        kind = "core_parallelism" if (kind == "cpp_hunk_edit" and "<<<" in f"{bp}{ap}") else kind
                         _emit_chunk(chunks, seen_dsls, prefix="trackb_tu_", edit_kind=kind,
-                                    target_path=f"{w_fn.name}/template_L{wj1 + 1}", before_src=bp,
-                                    after_src=ap, dsl=_render_patched(patched))
+                                    target_path=f"{w_fn.name}/template_L{wj1 + 1}", before_src=bp, after_src=ap, dsl=_render_patched(patched))
+
+
+def _iter_top_str_constants(tree: ast.Module) -> Iterable[tuple[str, ast.Constant]]:
+    for node in tree.body:
+        name, val = None, None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name, val = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, val = node.target.id, node.value
+        if name and isinstance(val, ast.Constant) and isinstance(val.value, str):
+            yield name, val
 
 
 def _find_str_constant_node(tree: ast.Module, symbol_name: str) -> ast.Constant | None:
-    for node in tree.body:
-        val: ast.AST | None = None
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == symbol_name:
-            val = node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == symbol_name:
-            val = node.value
-        if isinstance(val, ast.Constant) and isinstance(val.value, str):
-            return val
-    return None
+    return next((val for name, val in _iter_top_str_constants(tree) if name == symbol_name), None)
 
 
 def _extract_str_constant(tree: ast.Module, symbol_name: str) -> str | None:
@@ -860,18 +737,8 @@ def _classify_cpp_hunk_kind(before_seg: str, after_seg: str) -> str:
 
 
 def _discover_trackb_cpp_symbols(tree: ast.Module) -> list[str]:
-    symbols: list[str] = []
     markers = ("tl_templates/ascend/", "__aicore__", "__global__", "__simd_vf__")
-    for node in tree.body:
-        name, val = None, None
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            name, val = node.targets[0].id, node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            name, val = node.target.id, node.value
-        if name and isinstance(val, ast.Constant) and isinstance(val.value, str):
-            if name.endswith("_TRACKB_SRC") or any(m in val.value for m in markers):
-                symbols.append(name)
-    return symbols
+    return [n for n, v in _iter_top_str_constants(tree) if n.endswith("_TRACKB_SRC") or any(m in v.value for m in markers)]
 
 
 def decompose_cpp_string_leave_one_out(
@@ -882,25 +749,15 @@ def decompose_cpp_string_leave_one_out(
     win_cpp = _extract_str_constant(ast.parse(winner_module_src), cpp_symbol_name)
     if not base_cpp or not win_cpp or base_cpp == win_cpp:
         return []
-    base_lines, win_lines = base_cpp.splitlines(keepends=True), win_cpp.splitlines(keepends=True)
-    ops = [op for op in difflib.SequenceMatcher(a=base_lines, b=win_lines, autojunk=False).get_opcodes() if op[0] != "equal"]
-    if len(ops) <= 1:
-        return []
-    chunks: list[AstEditChunk] = []
-    for idx, (_tag, i1, i2, j1, j2) in enumerate(ops):
-        mid = list(base_lines[i1:i2])
-        if mid and j2 < len(win_lines) and not mid[-1].endswith("\n"):
-            mid[-1] += "\n"
-        ablated_cpp = "".join([*win_lines[:j1], *mid, *win_lines[j2:]])
-        if ablated_cpp.count("{") != ablated_cpp.count("}"):
-            continue
-        bs, as_ = "".join(base_lines[i1:i2]).strip(), "".join(win_lines[j1:j2]).strip()
-        chunks.append(AstEditChunk(
+    return [
+        AstEditChunk(
             chunk_id=f"cpp_loo_{cpp_symbol_name}_{idx}", edit_kind=_classify_cpp_hunk_kind(bs, as_),
             target_path=f"{cpp_symbol_name}:L{j1 + 1}-L{max(j1 + 1, j2)}", before_src=bs, after_src=as_,
             ablated_dsl=_replace_str_constant_in_module(winner_module_src, cpp_symbol_name, ablated_cpp),
-        ))
-    return chunks
+        )
+        for idx, j1, j2, ablated_cpp, bs, as_ in _iter_line_loo_hunks(base_cpp, win_cpp)
+        if ablated_cpp.count("{") == ablated_cpp.count("}")
+    ]
 
 
 def decompose_leave_one_out_ablations(baseline_dsl: str, winner_dsl: str) -> tuple[AstEditChunk, ...]:
@@ -954,9 +811,9 @@ def decompose_ast_ablations(baseline_dsl: str, winner_dsl: str) -> tuple[AstEdit
 
 
 def _wrap_probe(vars_lines: Sequence[str], params_lines: Sequence[str], kernel_hdr: str, body_lines: Sequence[str]) -> str:
-    vblk = "\n".join(f"    {ln}" for ln in vars_lines)
-    pblk = "\n".join(f"        {ln}" for ln in params_lines)
-    bblk = "\n".join(f"            {ln}" for ln in body_lines)
+    vblk = "\n".join(f"    {sub}" for ln in vars_lines for sub in ln.splitlines())
+    pblk = "\n".join(f"        {sub}" for ln in params_lines for sub in ln.splitlines())
+    bblk = "\n".join(f"            {sub}" for ln in body_lines for sub in ln.splitlines())
     return (
         "import tilelang.ascend.language as T\n\ndef make_flywheel_probe():\n"
         f"{vblk}\n\n    @T.prim_func\n    def main(\n{pblk}\n    ):\n"
@@ -969,6 +826,15 @@ def _simd_vadd(a_idx: str, b_idx: str, c_idx: str, *, loop: str, count: str, pad
         f"{pad}with T.SimdVF():", f"{pad}    mask = T.simd.pset(32)", f"{pad}    for {loop} in {count}:",
         f"{pad}        va = T.simd.vld({a_idx})", f"{pad}        vb = T.simd.vld({b_idx})",
         f"{pad}        T.simd.vsts({c_idx}, T.simd.vadd(va, vb, mask), mask)",
+    ]
+
+
+def _simd_2d_vadd(rows_expr: str, cols_count: str, *, pad: str = "") -> list[str]:
+    return [
+        f"{pad}with T.SimdVF():", f"{pad}    mask = T.simd.pset(32)",
+        f"{pad}    for r in T.serial({rows_expr}):", f"{pad}        for k in {cols_count}:",
+        f"{pad}            va = T.simd.vld(a_ub[r, k * 64])", f"{pad}            vb = T.simd.vld(b_ub[r, k * 64])",
+        f"{pad}            T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)",
     ]
 
 
@@ -992,39 +858,34 @@ def _probe_templates_for_kind(
     stages = max(2, min(3, int(cfg.get("stages", 2))))
     tile = max(512, min(4096, ((int(cfg.get("tile_elems", 2048)) + 127) // 128) * 128))
     dtype = str(cfg.get("dtype", "float32"))
+    vadd_1d = _simd_vadd("a_ub[i * 64]", "b_ub[i * 64]", "c_ub[i * 64]", loop="i", count="range(tile // 64)", pad="    ")
 
     def _pipelined_vec(n_stages: int, *, with_barriers: bool) -> str:
         bar = ['    T.ascend_pipe_barrier("PIPE_ALL")'] if with_barriers else []
-        vadd = _simd_vadd("a_ub[i * 64]", "b_ub[i * 64]", "c_ub[i * 64]", loop="i", count="range(tile // 64)", pad="    ")
         return _wrap_probe(
             [f"tile = {tile}", "steps = 16", f"cores = {mix_cores}", "total = cores * steps * tile"],
             _vec_params("(total,)"), "T.Kernel(cores) as bx",
             [*_alloc_abc("(tile,)"), f"for s in T.Pipelined(steps, num_stages={n_stages}):",
              "    off = (s * cores + bx) * tile", "    T.copy(A[off : off + tile], a_ub)",
-             "    T.copy(B[off : off + tile], b_ub)", *bar, *vadd, *bar, "    T.copy(c_ub, C[off : off + tile])", *bar],
+             "    T.copy(B[off : off + tile], b_ub)", *bar, *vadd_1d, *bar, "    T.copy(c_ub, C[off : off + tile])", *bar],
         )
 
     if probe_kind == "core_parallelism":
-        vadd_in = _simd_vadd("a_ub[i * 64]", "b_ub[i * 64]", "c_ub[i * 64]", loop="i", count="range(tile // 64)", pad="    ")
         base = _wrap_probe(
             [f"tile = {tile}", f"steps = {cores}", "total = tile * steps"], _vec_params("(total,)"), "T.Kernel(1) as bx",
             [*_alloc_abc("(tile,)", stages=1), "for s in T.Pipelined(steps, num_stages=1):",
              "    off = s * tile + bx * 0", "    T.copy(A[off : off + tile], a_ub)", "    T.copy(B[off : off + tile], b_ub)",
-             *vadd_in, "    T.copy(c_ub, C[off : off + tile])", '    T.ascend_pipe_barrier("PIPE_ALL")'],
+             *vadd_1d, "    T.copy(c_ub, C[off : off + tile])", '    T.ascend_pipe_barrier("PIPE_ALL")'],
         )
         opt = _wrap_probe(
             [f"tile = {tile}", f"cores = {cores}", "total = tile * cores"], _vec_params("(total,)"), "T.Kernel(cores) as bx",
             [*_alloc_abc("(tile,)", stages=1), "off = bx * tile", "T.copy(A[off : off + tile], a_ub)",
-             "T.copy(B[off : off + tile], b_ub)",
-             *_simd_vadd("a_ub[i * 64]", "b_ub[i * 64]", "c_ub[i * 64]", loop="i", count="range(tile // 64)"),
-             "T.copy(c_ub, C[off : off + tile])"],
+             "T.copy(B[off : off + tile], b_ub)", *[ln[4:] for ln in vadd_1d], "T.copy(c_ub, C[off : off + tile])"],
         )
         return base, opt, (tile * cores,), dtype
 
     if probe_kind == "coalesced_copy":
-        v2d = ["with T.SimdVF():", "    mask = T.simd.pset(32)", "    for r in T.serial(rows):", "        for k in range(2):",
-               "            va = T.simd.vld(a_ub[r, k * 64])", "            vb = T.simd.vld(b_ub[r, k * 64])",
-               "            T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)"]
+        v2d = _simd_2d_vadd("rows", "range(2)")
         vv, vp, hdr = [f"cores = {mix_cores}", "rows = 16", "cols = 128"], _vec_params("(cores * rows, cols)"), "T.Kernel(cores) as bx"
         base = _wrap_probe(vv, vp, hdr, [
             *_alloc_abc("(rows, cols)"), "base_r = bx * rows", "for r in T.serial(rows):",
@@ -1044,100 +905,78 @@ def _probe_templates_for_kind(
             ["rounds = 64", "tile = 16"],
             ['seed: T.Tensor((tile, tile), "float16"),', 'scratch: T.Tensor((rounds, 2), "uint32"),', 'out: T.Tensor((rounds, 1), "uint64"),'],
             "T.MixedKernel(1) as (_, sid)",
-            ['cube = T.alloc_l1((tile, tile), "float16")', 'tmp_ub = T.alloc_shared((1,), "uint32")',
-             "T.copy(seed, cube)", "for i in T.Pipelined(rounds, num_stages=1):", "    with T.Stage(0):",
-             '        val = T.Cast("uint32", (i + 1) * (100 + sid))', "        tmp_ub[0] = val",
-             "        T.copy(tmp_ub, scratch[i, sid : sid + 1])", "    with T.Stage(0):",
-             '        lo = T.Cast("uint64", scratch[i, 0])', '        hi = T.Cast("uint64", scratch[i, 1]) << 32',
-             '        out[i, 0] = lo | hi', '        T.ascend_pipe_barrier("PIPE_ALL")'],
+            ['cube = T.alloc_l1((tile, tile), "float16")\ntmp_ub = T.alloc_shared((1,), "uint32")\nT.copy(seed, cube)',
+             'for i in T.Pipelined(rounds, num_stages=1):\n    with T.Stage(0):\n        val = T.Cast("uint32", (i + 1) * (100 + sid))',
+             '        tmp_ub[0] = val\n        T.copy(tmp_ub, scratch[i, sid : sid + 1])\n    with T.Stage(0):',
+             '        lo = T.Cast("uint64", scratch[i, 0])\n        hi = T.Cast("uint64", scratch[i, 1]) << 32',
+             '        out[i, 0] = lo | hi\n        T.ascend_pipe_barrier("PIPE_ALL")'],
         )
         opt = _wrap_probe(
             ["rounds = 64", "tile = 16"], ['seed: T.Tensor((tile, tile), "float16"),', 'out: T.Tensor((rounds, 1), "uint64"),'],
             "T.MixedKernel(1) as (_, sid)",
-            ['words = T.alloc_ss((2,), "uint32")', 'packed = T.view(words, shape=(1,), dtype="uint64")',
-             'T.annotate_buffer_versions({words: (3, "auto")})', 'cube = T.alloc_l1((tile, tile), "float16")',
-             "T.copy(seed, cube)", "for i in T.Pipelined(", "    rounds,", "    num_stages=3,",
-             '    annotations={"enable_offset": True},', "):", "    with T.Stage(0):",
-             "        words[sid] = T.Cast(", '            "uint32",', "            (i + 1) * (100 + sid),",
-             "        )", "    with T.Stage(2):", "        out[i, 0] = packed[0]"],
+            ['words = T.alloc_ss((2,), "uint32")\npacked = T.view(words, shape=(1,), dtype="uint64")',
+             'T.annotate_buffer_versions({words: (3, "auto")})\ncube = T.alloc_l1((tile, tile), "float16")\nT.copy(seed, cube)',
+             'for i in T.Pipelined(\n    rounds,\n    num_stages=3,\n    annotations={"enable_offset": True},\n):',
+             '    with T.Stage(0):\n        words[sid] = T.Cast(\n            "uint32",\n            (i + 1) * (100 + sid),\n        )',
+             '    with T.Stage(2):\n        out[i, 0] = packed[0]'],
         )
         return base, opt, (64, 1), "uint64"
 
     if probe_kind == "dual_copy_1c2v":
-        def _dvf(rv: str) -> list[str]:
-            return ["with T.SimdVF():", "    mask = T.simd.pset(32)", f"    for r in T.serial({rv}):",
-                    "        for k in range(cols // 64):", "            va = T.simd.vld(a_ub[r, k * 64])",
-                    "            vb = T.simd.vld(b_ub[r, k * 64])", "            T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)"]
         vp = _vec_params("(cores * rows, cols)")
         base = _wrap_probe([f"cores = {mix_cores}", "rows = 16", "cols = 128"], vp, "T.Kernel(cores) as bx", [
-            *_alloc_abc("(rows, cols)"), "base_r = bx * rows", "T.copy(A[base_r : base_r + rows, 0:cols], a_ub)",
-            "T.copy(B[base_r : base_r + rows, 0:cols], b_ub)", *_dvf("rows"), "T.copy(c_ub, C[base_r : base_r + rows, 0:cols])"])
+            *_alloc_abc("(rows, cols)"), "base_r = bx * rows\nT.copy(A[base_r : base_r + rows, 0:cols], a_ub)",
+            "T.copy(B[base_r : base_r + rows, 0:cols], b_ub)", *_simd_2d_vadd("rows", "range(cols // 64)"), "T.copy(c_ub, C[base_r : base_r + rows, 0:cols])"])
         opt = _wrap_probe([f"cores = {mix_cores}", "rows = 16", "half_rows = 8", "cols = 128"], vp, "T.MixedKernel(cores) as (bx, sid)", [
-            *_alloc_abc("(half_rows, cols)"), "row_off = bx * rows + sid * half_rows",
-            "T.copy(A[row_off : row_off + half_rows, 0:cols], a_ub)", "T.copy(B[row_off : row_off + half_rows, 0:cols], b_ub)",
-            *_dvf("half_rows"), "T.copy(c_ub, C[row_off : row_off + half_rows, 0:cols])"])
+            *_alloc_abc("(half_rows, cols)"), "row_off = bx * rows + sid * half_rows\nT.copy(A[row_off : row_off + half_rows, 0:cols], a_ub)",
+            "T.copy(B[row_off : row_off + half_rows, 0:cols], b_ub)", *_simd_2d_vadd("half_rows", "range(cols // 64)"), "T.copy(c_ub, C[row_off : row_off + half_rows, 0:cols])"])
         return base, opt, (mix_cores * 16, 128), dtype
 
     if probe_kind == "pad_alignment":
         vp = _vec_params("(cores * steps * rows, cols)")
         base = _wrap_probe([f"cores = {mix_cores}", "rows = 8", "cols = 70", "steps = 4"], vp, "T.Kernel(cores) as bx", [
-            *_alloc_abc("(rows, cols)"), "for s in T.serial(steps):", "    r0 = (bx * steps + s) * rows",
-            "    T.copy(A[r0 : r0 + rows, 0:cols], a_ub)", "    T.copy(B[r0 : r0 + rows, 0:cols], b_ub)",
-            *_simd_vadd("a_ub[r, 0]", "b_ub[r, 0]", "c_ub[r, 0]", loop="r", count="T.serial(rows)", pad="    "),
-            "    T.copy(c_ub, C[r0 : r0 + rows, 0:cols])"])
+            *_alloc_abc("(rows, cols)"), "for s in T.serial(steps):\n    r0 = (bx * steps + s) * rows\n    T.copy(A[r0 : r0 + rows, 0:cols], a_ub)",
+            "    T.copy(B[r0 : r0 + rows, 0:cols], b_ub)", *_simd_vadd("a_ub[r, 0]", "b_ub[r, 0]", "c_ub[r, 0]", loop="r", count="T.serial(rows)", pad="    "), "    T.copy(c_ub, C[r0 : r0 + rows, 0:cols])"])
         opt = _wrap_probe([f"cores = {mix_cores}", "rows = 8", "cols = 128", "steps = 4"], vp, "T.Kernel(cores) as bx", [
-            *_alloc_abc("(rows, cols)"), f"for s in T.Pipelined(steps, num_stages={stages}):", "    r0 = (bx * steps + s) * rows",
-            "    T.copy(A[r0 : r0 + rows, 0:cols], a_ub)", "    T.copy(B[r0 : r0 + rows, 0:cols], b_ub)",
-            "    with T.SimdVF():", "        mask = T.simd.pset(32)", "        for r in T.serial(rows):", "            for k in range(2):",
-            "                va = T.simd.vld(a_ub[r, k * 64])", "                vb = T.simd.vld(b_ub[r, k * 64])",
-            "                T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)",
-            "    T.copy(c_ub, C[r0 : r0 + rows, 0:cols])"])
+            *_alloc_abc("(rows, cols)"), f"for s in T.Pipelined(steps, num_stages={stages}):\n    r0 = (bx * steps + s) * rows\n    T.copy(A[r0 : r0 + rows, 0:cols], a_ub)",
+            "    T.copy(B[r0 : r0 + rows, 0:cols], b_ub)", *_simd_2d_vadd("rows", "range(2)", pad="    "), "    T.copy(c_ub, C[r0 : r0 + rows, 0:cols])"])
         return base, opt, (mix_cores * 32, 128), dtype
 
     if probe_kind == "static_pingpong_unroll":
         base = _wrap_probe(
-            [f"tile = {tile}", "steps = 16", f"cores = {mix_cores}", "total = cores * steps * tile"],
-            _vec_params("(total,)"), "T.Kernel(cores) as bx",
+            [f"tile = {tile}", "steps = 16", f"cores = {mix_cores}", "total = cores * steps * tile"], _vec_params("(total,)"), "T.Kernel(cores) as bx",
             [*_alloc_abc("(tile,)", stages=2), 'for s in T.Pipelined(steps, num_stages=2, annotations={"enable_offset": True}):',
-             "    off = (s * cores + bx) * tile", "    T.copy(A[off : off + tile], a_ub)", "    T.copy(B[off : off + tile], b_ub)",
-             *_simd_vadd("a_ub[i * 64]", "b_ub[i * 64]", "c_ub[i * 64]", loop="i", count="range(tile // 64)", pad="    "),
-             "    T.copy(c_ub, C[off : off + tile])"])
+             "    off = (s * cores + bx) * tile\n    T.copy(A[off : off + tile], a_ub)\n    T.copy(B[off : off + tile], b_ub)",
+             *vadd_1d, "    T.copy(c_ub, C[off : off + tile])"])
         opt = _wrap_probe(
-            [f"tile = {tile}", "pairs = 8", f"cores = {mix_cores}", "total = cores * pairs * 2 * tile"],
-            _vec_params("(total,)"), "T.Kernel(cores) as bx",
+            [f"tile = {tile}", "pairs = 8", f"cores = {mix_cores}", "total = cores * pairs * 2 * tile"], _vec_params("(total,)"), "T.Kernel(cores) as bx",
             [*[f'{n}{k} = T.alloc_shared((tile,), "float32")' for n in ("a", "b", "c") for k in (0, 1)],
-             "for s in T.serial(pairs):", "    off0 = (s * 2 * cores + bx) * tile", "    off1 = ((s * 2 + 1) * cores + bx) * tile",
-             "    T.copy(A[off0 : off0 + tile], a0)", "    T.copy(B[off0 : off0 + tile], b0)",
-             "    T.copy(A[off1 : off1 + tile], a1)", "    T.copy(B[off1 : off1 + tile], b1)",
-             "    with T.SimdVF():", "        mask = T.simd.pset(32)", "        for i in range(tile // 64):",
+             "for s in T.serial(pairs):\n    off0 = (s * 2 * cores + bx) * tile\n    off1 = ((s * 2 + 1) * cores + bx) * tile",
+             "    T.copy(A[off0 : off0 + tile], a0)\n    T.copy(B[off0 : off0 + tile], b0)\n    T.copy(A[off1 : off1 + tile], a1)\n    T.copy(B[off1 : off1 + tile], b1)",
+             "    with T.SimdVF():\n        mask = T.simd.pset(32)\n        for i in range(tile // 64):",
              "            T.simd.vsts(c0[i * 64], T.simd.vadd(T.simd.vld(a0[i * 64]), T.simd.vld(b0[i * 64]), mask), mask)",
              "            T.simd.vsts(c1[i * 64], T.simd.vadd(T.simd.vld(a1[i * 64]), T.simd.vld(b1[i * 64]), mask), mask)",
-             "    T.copy(c0, C[off0 : off0 + tile])", "    T.copy(c1, C[off1 : off1 + tile])"])
+             "    T.copy(c0, C[off0 : off0 + tile])\n    T.copy(c1, C[off1 : off1 + tile])"])
         return base, opt, (mix_cores * 16 * tile,), "float32"
 
     if probe_kind == "loop_fission_sfu":
-        sfu_pars = ['Q: T.Tensor((cores * rows, cols), "float32"),', 'Out: T.Tensor((cores, cols), "float32"),',
-                    'WOut: T.Tensor((cores * rows, 1), "float32"),']
+        sfu_pars = ['Q: T.Tensor((cores * rows, cols), "float32"),', 'Out: T.Tensor((cores, cols), "float32"),', 'WOut: T.Tensor((cores * rows, 1), "float32"),']
         sfu_vars = [f"cores = {mix_cores}", "rows = 4", "cols = 64"]
-        sfu_hdr = ['    with T.SimdVF():', '        m32 = T.simd.pset(32, "PAT_ALL")', "        qv = T.simd.vld(q_ub[0, 0])"]
-        exp_blk = ['        sv = T.simd.vdupv(T.simd.vcadd(qv, mask=m32), mask=m32, pos="POS_LOWEST")', "        ev = T.simd.vexp(sv, mask=m32)"]
+        sfu_hdr = '    with T.SimdVF():\n        m32 = T.simd.pset(32, "PAT_ALL")\n        qv = T.simd.vld(q_ub[0, 0])'
+        exp_blk = '        sv = T.simd.vdupv(T.simd.vcadd(qv, mask=m32), mask=m32, pos="POS_LOWEST")\n        ev = T.simd.vexp(sv, mask=m32)'
+        alloc_sfu = 'q_ub = T.alloc_shared((1, cols), "float32")\nacc_ub = T.alloc_shared((rows, cols), "float32")'
         base = _wrap_probe(sfu_vars, sfu_pars, "T.Kernel(cores) as bx", [
-            'q_ub = T.alloc_shared((1, cols), "float32")', 'acc_ub = T.alloc_shared((rows, cols), "float32")',
-            'w_ub = T.alloc_shared((rows, 1), "float32")', "for s in T.serial(rows):",
-            "    T.copy(Q[bx * rows + s : bx * rows + s + 1, :], q_ub)", *sfu_hdr, *exp_blk,
-            '        T.simd.vsts(w_ub[s, 0], ev, mask=m32, dist="ONEPT_B32")', "        av = T.simd.vld(acc_ub[s, 0])",
-            "        T.simd.vsts(acc_ub[s, 0], T.simd.vadd(av, qv, mask=m32), mask=m32)",
-            "T.copy(acc_ub[0:1, :], Out[bx : bx + 1, :])", "T.copy(w_ub, WOut[bx * rows : bx * rows + rows, :])"])
+            alloc_sfu, 'w_ub = T.alloc_shared((rows, 1), "float32")\nfor s in T.serial(rows):\n    T.copy(Q[bx * rows + s : bx * rows + s + 1, :], q_ub)',
+            sfu_hdr, exp_blk, '        T.simd.vsts(w_ub[s, 0], ev, mask=m32, dist="ONEPT_B32")\n        av = T.simd.vld(acc_ub[s, 0])',
+            "        T.simd.vsts(acc_ub[s, 0], T.simd.vadd(av, qv, mask=m32), mask=m32)\nT.copy(acc_ub[0:1, :], Out[bx : bx + 1, :])",
+            "T.copy(w_ub, WOut[bx * rows : bx * rows + rows, :])"])
         opt = _wrap_probe(sfu_vars, sfu_pars, "T.Kernel(cores) as bx", [
-            'q_ub = T.alloc_shared((1, cols), "float32")', 'acc_ub = T.alloc_shared((rows, cols), "float32")',
-            'exb = T.alloc_shared((rows, 1), "float32")', "for s in T.serial(rows):",
-            "    T.copy(Q[bx * rows + s : bx * rows + s + 1, :], q_ub)", *sfu_hdr, *exp_blk,
-            '        T.simd.vsts(exb[s, 0], ev, mask=m32, dist="ONEPT_B32")',
-            "for s2 in T.serial(rows):", "    T.copy(Q[bx * rows + s2 : bx * rows + s2 + 1, :], q_ub)", *sfu_hdr,
-            "        av = T.simd.vld(acc_ub[s2, 0])", "        T.simd.vsts(acc_ub[s2, 0], T.simd.vadd(av, qv, mask=m32), mask=m32)",
-            "T.copy(acc_ub[0:1, :], Out[bx : bx + 1, :])", "T.copy(exb, WOut[bx * rows : bx * rows + rows, :])"])
+            alloc_sfu, 'exb = T.alloc_shared((rows, 1), "float32")\nfor s in T.serial(rows):\n    T.copy(Q[bx * rows + s : bx * rows + s + 1, :], q_ub)',
+            sfu_hdr, exp_blk, '        T.simd.vsts(exb[s, 0], ev, mask=m32, dist="ONEPT_B32")\nfor s2 in T.serial(rows):',
+            "    T.copy(Q[bx * rows + s2 : bx * rows + s2 + 1, :], q_ub)", sfu_hdr,
+            "        av = T.simd.vld(acc_ub[s2, 0])\n        T.simd.vsts(acc_ub[s2, 0], T.simd.vadd(av, qv, mask=m32), mask=m32)",
+            "T.copy(acc_ub[0:1, :], Out[bx : bx + 1, :])\nT.copy(exb, WOut[bx * rows : bx * rows + rows, :])"])
         return base, opt, (mix_cores * 4, 64), "float32"
-
     return None
 
 
@@ -1151,8 +990,7 @@ def synthesize_micro_probe(chunk: AstEditChunk, *, probe_id: str | None = None) 
     return MicroProbeSpec(
         probe_id=probe_id or f"probe_{chunk.edit_kind}_{chunk.chunk_id}", probe_kind=chunk.edit_kind,
         factory_name="make_flywheel_probe", baseline_probe_source=base_src, optimized_probe_source=opt_src,
-        line_count_baseline=len(base_src.strip().splitlines()),
-        line_count_optimized=len(opt_src.strip().splitlines()),
+        line_count_baseline=len(base_src.strip().splitlines()), line_count_optimized=len(opt_src.strip().splitlines()),
         tensor_shape=shape, tensor_dtype=dtype,
     )
 
@@ -1161,6 +999,28 @@ def _check_aiv_mte2_non_regression(base_m: float, opt_m: float, b_us: float, o_u
     if base_m <= 0.0 or speedup >= 1.50:
         return True
     return not (opt_m > max(base_m * 1.15, base_m + 0.05) and opt_m * o_us > max(base_m * b_us * 1.15, base_m * b_us + 0.05 * b_us))
+
+
+def _evaluate_probe_gates(
+    b_us: float, o_us: float, *, raw: dict[str, float],
+    sigma_paired_us: float | None, paired_rel_mad: float | None,
+) -> tuple[bool, dict[str, float]]:
+    speedup = float(raw.get("speedup", (b_us / o_us) if b_us > 0.0 and o_us > 0.0 else 0.0))
+    eff_sigma = resolve_paired_sigma_us(b_us, sigma_paired_us=sigma_paired_us, paired_rel_mad=paired_rel_mad)
+    delta_us = b_us - o_us
+    raw.update({"speedup": speedup, "delta_us": delta_us, "sigma_paired_us": eff_sigma})
+    sig_ok = b_us > 0.0 and o_us > 0.0 and is_paired_gain_significant(
+        delta_us, sigma_paired_us=eff_sigma, reference_us=b_us, sigma_multiplier=3.0
+    )
+    wait_ok = True
+    if "baseline_mte2_wait_ratio" in raw and "optimized_mte2_wait_ratio" in raw:
+        bw, ow = float(raw["baseline_mte2_wait_ratio"]), float(raw["optimized_mte2_wait_ratio"])
+        wait_ok = ow <= max(bw * 1.05, bw + 0.05)
+    if "baseline_aiv_mte2" in raw and "optimized_aiv_mte2" in raw:
+        wait_ok = wait_ok and _check_aiv_mte2_non_regression(
+            float(raw["baseline_aiv_mte2"]), float(raw["optimized_aiv_mte2"]), b_us, o_us, speedup
+        )
+    return bool(raw.get("numerical_ok", True)) and sig_ok and wait_ok, raw
 
 
 def verify_micro_probe_hardware(
@@ -1172,35 +1032,15 @@ def verify_micro_probe_hardware(
     if probe_runner is not None:
         raw = dict(probe_runner(spec))
         b_us, o_us = float(raw.get("baseline_dur_us", 0.0)), float(raw.get("optimized_dur_us", 0.0))
-        speedup = float(raw.get("speedup", (b_us / o_us) if b_us > 0.0 and o_us > 0.0 else 0.0))
-        eff_sigma = resolve_paired_sigma_us(
-            b_us,
-            sigma_paired_us=float(raw["sigma_paired_us"]) if raw.get("sigma_paired_us") is not None else sigma_paired_us,
-            paired_rel_mad=float(raw["paired_rel_mad"]) if raw.get("paired_rel_mad") is not None else paired_rel_mad,
-        )
-        delta_us = b_us - o_us
-        raw.update({"speedup": speedup, "delta_us": delta_us, "sigma_paired_us": eff_sigma})
-        sig_ok = b_us > 0.0 and o_us > 0.0 and is_paired_gain_significant(
-            delta_us, sigma_paired_us=eff_sigma, reference_us=b_us, sigma_multiplier=3.0
-        )
-        wait_ok = True
-        if "baseline_mte2_wait_ratio" in raw and "optimized_mte2_wait_ratio" in raw:
-            bw, ow = float(raw["baseline_mte2_wait_ratio"]), float(raw["optimized_mte2_wait_ratio"])
-            wait_ok = ow <= max(bw * 1.05, bw + 0.05)
-        if "baseline_aiv_mte2" in raw and "optimized_aiv_mte2" in raw:
-            wait_ok = wait_ok and _check_aiv_mte2_non_regression(
-                float(raw["baseline_aiv_mte2"]), float(raw["optimized_aiv_mte2"]), b_us, o_us, speedup
-            )
-        return bool(raw.get("numerical_ok", True)) and sig_ok and wait_ok, raw
-
-    import importlib.util  # noqa: PLC0415
-    import tempfile  # noqa: PLC0415
-
-    import tilelang  # noqa: PLC0415
-    import torch  # noqa: PLC0415
+        sig = float(raw["sigma_paired_us"]) if raw.get("sigma_paired_us") is not None else sigma_paired_us
+        mad = float(raw["paired_rel_mad"]) if raw.get("paired_rel_mad") is not None else paired_rel_mad
+        return _evaluate_probe_gates(b_us, o_us, raw=raw, sigma_paired_us=sig, paired_rel_mad=mad)
 
     if probe_port is None:
         raise RuntimeError("HardwareProbePort is required for live micro-probe verification when probe_runner is None.")
+    import tilelang  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
     probe_port.ensure_cann_include_cpath()
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         raise RuntimeError("Ascend NPU device is required for live micro-probe verification.")
@@ -1219,41 +1059,28 @@ def verify_micro_probe_hardware(
             rounds = spec.tensor_shape[0]
             seed = torch.zeros((16, 16), dtype=torch.float16).npu()
             expected = torch.tensor([[(i + 1) * 100 + (((i + 1) * 101) << 32)] for i in range(rounds)], dtype=torch.uint64)
-            args = (seed, torch.zeros((rounds, 2), dtype=torch.uint32).npu()) if tag == "base" else (seed,)
-            out = kernel(*args)
-            torch.npu.synchronize()
-            torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
-            prof = probe_port.run_msprof_detail(lambda: kernel(*args), n_warmup=3, n_repeat=6)
+            args: tuple[object, ...] = (seed, torch.zeros((rounds, 2), dtype=torch.uint32).npu()) if tag == "base" else (seed,)
+            tol = {"rtol": 0, "atol": 0}
         else:
             rshape = (spec.tensor_shape[0], 70) if (kind == "pad_alignment" and tag == "base") else spec.tensor_shape
             a, b = torch.randn(rshape, dtype=torch.float32).npu(), torch.randn(rshape, dtype=torch.float32).npu()
-            out = kernel(a, b)
-            torch.npu.synchronize()
-            torch.testing.assert_close(out.cpu(), a.cpu() + b.cpu(), atol=1e-4, rtol=1e-4)
-            prof = probe_port.run_msprof_detail(lambda: kernel(a, b), n_warmup=3, n_repeat=6)
-        return float(prof.dur_us), {
-            "aiv_mte2": float(getattr(prof, "aiv_mte2", 0.0)), "aiv_vec": float(getattr(prof, "aiv_vec", 0.0)),
-            "aic_fixpipe": float(getattr(prof, "aic_fixpipe", 0.0)),
-        }
+            args, expected, tol = (a, b), a.cpu() + b.cpu(), {"atol": 1e-4, "rtol": 1e-4}
+        out = kernel(*args)
+        torch.npu.synchronize()
+        torch.testing.assert_close(out.cpu(), expected, **tol)
+        prof = probe_port.run_msprof_detail(lambda: kernel(*args), n_warmup=3, n_repeat=6)
+        return float(prof.dur_us), {k: float(getattr(prof, k, 0.0)) for k in ("aiv_mte2", "aiv_vec", "aic_fixpipe")}
 
     b_us, b_rat = _compile_and_time(spec.baseline_probe_source, "base", spec.probe_kind)
     o_us, o_rat = _compile_and_time(spec.optimized_probe_source, "opt", spec.probe_kind)
-    speedup = (b_us / o_us) if o_us > 0.0 else 0.0
-    wait_ok = _check_aiv_mte2_non_regression(b_rat["aiv_mte2"], o_rat["aiv_mte2"], b_us, o_us, speedup)
-    eff_sigma = resolve_paired_sigma_us(b_us, sigma_paired_us=sigma_paired_us, paired_rel_mad=paired_rel_mad)
-    delta_us = b_us - o_us
-    sig_ok = b_us > 0.0 and o_us > 0.0 and is_paired_gain_significant(
-        delta_us, sigma_paired_us=eff_sigma, reference_us=b_us, sigma_multiplier=3.0
-    )
-    metrics = {
-        "baseline_dur_us": round(b_us, 6), "optimized_dur_us": round(o_us, 6),
-        "delta_us": round(delta_us, 6), "sigma_paired_us": round(eff_sigma, 6),
-        "speedup": round(speedup, 6), "numerical_ok": 1.0,
+    raw = {
+        "baseline_dur_us": round(b_us, 6), "optimized_dur_us": round(o_us, 6), "numerical_ok": 1.0,
         "aiv_mte2": round(o_rat["aiv_mte2"], 6), "aiv_vec": round(o_rat["aiv_vec"], 6),
         "aic_fixpipe": round(o_rat["aic_fixpipe"], 6),
         "baseline_aiv_mte2": round(b_rat["aiv_mte2"], 6), "optimized_aiv_mte2": round(o_rat["aiv_mte2"], 6),
     }
-    return (sig_ok and wait_ok), metrics
+    ok, metrics = _evaluate_probe_gates(b_us, o_us, raw=raw, sigma_paired_us=sigma_paired_us, paired_rel_mad=paired_rel_mad)
+    return ok, {k: round(v, 6) for k, v in metrics.items()}
 
 
 _TEMPLATE_TEXT_BY_KIND: dict[str, str] = {
@@ -1327,12 +1154,15 @@ _TRACKB_TOPOLOGY_TOKENS: frozenset[str] = frozenset({
 })
 
 
+def _split_str_tokens(raw: object) -> list[str]:
+    if isinstance(raw, str):
+        return [t.strip() for t in raw.split(",") if t.strip()]
+    return [str(t).strip() for t in raw if str(t).strip()] if isinstance(raw, Iterable) else []
+
+
 def _extract_rule_facets(rule: AscendCausalRule) -> tuple[str, ...]:
-    raw_facets = getattr(rule, "recommended_facets", None)
-    if raw_facets is not None:
-        if isinstance(raw_facets, str):
-            return tuple(f.strip() for f in raw_facets.split(",") if f.strip())
-        return tuple(str(f).strip() for f in raw_facets if str(f).strip()) if isinstance(raw_facets, Iterable) else ()
+    if (raw_facets := getattr(rule, "recommended_facets", None)) is not None:
+        return tuple(_split_str_tokens(raw_facets))
     if (family_name := str(getattr(rule, "symptom_family", "") or "").strip()):
         try:
             return SYMPTOM_FAMILY_TO_FACETS.get(SymptomFamily(family_name), ())
@@ -1343,11 +1173,7 @@ def _extract_rule_facets(rule: AscendCausalRule) -> tuple[str, ...]:
 
 def _rule_covers_trackb(rule: AscendCausalRule) -> bool:
     tokens = [str(raw).strip() for raw in getattr(rule, "compatible_backends", ()) or ()]
-    app_topos = getattr(rule, "applicable_topologies", None)
-    if isinstance(app_topos, str):
-        tokens.extend(t.strip() for t in app_topos.split(",") if t.strip())
-    elif isinstance(app_topos, Iterable):
-        tokens.extend(str(t).strip() for t in app_topos if str(t).strip())
+    tokens.extend(_split_str_tokens(getattr(rule, "applicable_topologies", None)))
     return any(
         t.lower() in _TRACKB_TOPOLOGY_TOKENS or (normalize_runtime_backend(t.lower()) or t.lower()) in _TRACKB_TOPOLOGY_TOKENS
         for t in tokens
@@ -1381,11 +1207,7 @@ _IDEAL_BOOL_TRUE_NAMES = frozenset({"is_legal", "vloopv2_hit", "is_atom_aligned"
 
 def _ideal_default_for_symbol(symbol: str) -> object:
     leaf = symbol.rsplit(".", 1)[-1]
-    if leaf in _IDEAL_BOOL_TRUE_NAMES:
-        return True
-    if leaf in _IDEAL_UNIT_EFFICIENCY_NAMES:
-        return 1.0
-    return 32768 if leaf in _IDEAL_CONTIG_BYTE_NAMES else 0
+    return True if leaf in _IDEAL_BOOL_TRUE_NAMES else (1.0 if leaf in _IDEAL_UNIT_EFFICIENCY_NAMES else (32768 if leaf in _IDEAL_CONTIG_BYTE_NAMES else 0))
 
 
 def _build_zero_ideal_env(tree: ast.AST) -> dict[str, object]:
@@ -1393,8 +1215,7 @@ def _build_zero_ideal_env(tree: ast.AST) -> dict[str, object]:
     skip = frozenset({"True", "False", "None", "abs", "min", "max"})
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
-            parts: list[str] = []
-            cur: ast.AST = node
+            parts, cur = [], node
             while isinstance(cur, ast.Attribute):
                 parts.append(cur.attr)
                 cur = cur.value
@@ -1452,10 +1273,8 @@ def _validate_distilled_rule(rule: AscendCausalRule, *, operator_name: str = "")
         return False, f"invalid recommended_facets {bad_facets!r}"
     if _rule_covers_trackb(rule) and not str(rule.cpp20_transform_template or "").strip():
         return False, "Track-B applicable rule requires non-empty cpp20_transform_template"
-    if _has_tautological_ge_zero(pre_tree):
-        return False, "precondition contains tautological >= 0 comparison"
-    if safe_eval_predicate(rule.precondition, _build_zero_ideal_env(pre_tree)):
-        return False, "precondition is tautological on all-zero ideal residual vector"
+    if _has_tautological_ge_zero(pre_tree) or safe_eval_predicate(rule.precondition, _build_zero_ideal_env(pre_tree)):
+        return False, "precondition is tautological"
     post_ok, post_err = _validate_postcondition_strictness(post_tree)
     if not post_ok:
         return False, post_err
@@ -1463,9 +1282,6 @@ def _validate_distilled_rule(rule: AscendCausalRule, *, operator_name: str = "")
         if (unknown_ids := _validate_schema_closed_identifiers(expr)):
             return False, f"unknown schema identifier(s) {unknown_ids!r} in {fname}"
     return True, ""
-
-
-_is_rule_text_clean = _validate_distilled_rule
 
 
 def distill_causal_rule(
@@ -1520,98 +1336,54 @@ class FlywheelDistiller:
 
     def _allocate_rule_id(self, prefix: str, edit_kind: str) -> str:
         rule_num, suffix = len(self._tracker.rules) + 1, edit_kind.upper()
-        cand = f"{prefix}_{rule_num:02d}_{suffix}"
-        while cand in self._tracker.rules:
+        while (cand := f"{prefix}_{rule_num:02d}_{suffix}") in self._tracker.rules:
             rule_num += 1
-            cand = f"{prefix}_{rule_num:02d}_{suffix}"
         return cand
-
-    def _admit_distilled_rule(
-        self, meas: AblationMeasurement, *, rule_id_prefix: str, probe: MicroProbeSpec | None,
-        metrics: dict[str, float], rule_scope: str, operator_name: str, active_symptom_family: str,
-        topology_axes: object | None, outcomes: list[DistilledRuleOutcome], admitted_ids: list[str],
-    ) -> None:
-        rule = distill_causal_rule(
-            meas.chunk, rule_id=self._allocate_rule_id(rule_id_prefix, meas.chunk.edit_kind),
-            ledger=meas.stage_a_result.ledger if meas.stage_a_result else None,
-            probe=probe, probe_metrics=metrics, scope=rule_scope,
-            origin_operator=operator_name, active_symptom_family=active_symptom_family,
-        )
-        clean_ok, clean_err = _validate_distilled_rule(rule, operator_name=operator_name)
-        if not clean_ok:
-            outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, probe, True, metrics, rule, False, clean_err))
-            return
-        self._tracker.admit_rule(rule)
-        self._tracker.record_outcome(rule.rule_id, postcondition_realized=True,
-                                     speed_gain=max(0.0, meas.relative_gain), topology_axes=topology_axes)
-        admitted_ids.append(rule.rule_id)
-        outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, probe, True, metrics, rule, True))
 
     def _run_distill(
         self, chunks: Sequence[AstEditChunk], *, ref_dsl: str, ref_latency_us: float,
         report_base_us: float, report_win_us: float, reverse: bool, factory_name: str | None,
         factory_kwargs: Mapping[str, object] | None, config_selector_name: str | None,
-        dims: Mapping[str, object] | None, resolved_shapes: Sequence[tuple[int, ...]] | None,
+        dims: Mapping[str, object] | None, ordered_tensor_shapes: Sequence[tuple[int, ...]] | None,
         batch_latency_evaluator: Callable[[Sequence[tuple[str, str]]], Mapping[str, float]] | None,
         topology_axes: object | None, kb_output_path: str | Path | None, rule_id_prefix: str,
         operator_name: str, rule_scope: str, active_symptom_family: str,
-        eff_sigma: float | None, eff_mad: float | None,
+        sigma_paired_us: float | None, paired_rel_mad: float | None,
     ) -> FlywheelDistillationReport:
-        ref_sa = run_stage_a_static(ref_dsl, factory_name=factory_name, factory_kwargs=factory_kwargs,
-                                    config_selector_name=config_selector_name, dims=dims, ordered_tensor_shapes=resolved_shapes)
+        eff_sigma = self._sigma_paired_us if sigma_paired_us is None else sigma_paired_us
+        eff_mad = self._paired_rel_mad if paired_rel_mad is None else paired_rel_mad
+        shapes = extract_ordered_tensor_shapes(dims=dims, ordered_tensor_shapes=ordered_tensor_shapes)
+        ref_sa = run_stage_a_static(ref_dsl, factory_name=factory_name, factory_kwargs=factory_kwargs, config_selector_name=config_selector_name, dims=dims, ordered_tensor_shapes=shapes)
         ref_cost = _ledger_cost_score(ref_sa.ledger) if ref_sa.passed and ref_sa.ledger is not None else 0.0
-        funnel_results = [
-            (c, self._funnel.evaluate(c.ablated_dsl, factory_name=factory_name, factory_kwargs=factory_kwargs,
-                                      config_selector_name=config_selector_name, dims=dims, ordered_tensor_shapes=resolved_shapes))
-            for c in chunks
-        ]
+        funnel_results = [(c, self._funnel.evaluate(c.ablated_dsl, factory_name=factory_name, factory_kwargs=factory_kwargs, config_selector_name=config_selector_name, dims=dims, ordered_tensor_shapes=shapes)) for c in chunks]
         batch_latencies: dict[str, float] = {}
         if batch_latency_evaluator is not None:
-            targets: list[tuple[str, str]] = []
-            seen_b: set[str] = set()
+            targets, seen_b = [], set()
             for c, ev in funnel_results:
-                if not ev.passed or ev.stage_a is None or ev.stage_a.ledger is None:
-                    continue
-                if not reverse and (c.edit_kind not in _SUPPORTED_PROBE_KINDS or c.edit_kind in seen_b):
-                    continue
-                seen_b.add(c.edit_kind)
-                targets.append((c.chunk_id, c.ablated_dsl))
-                if not reverse and len(targets) >= 4:
-                    break
+                if ev.passed and ev.stage_a is not None and ev.stage_a.ledger is not None and (reverse or (c.edit_kind in _SUPPORTED_PROBE_KINDS and c.edit_kind not in seen_b)):
+                    seen_b.add(c.edit_kind)
+                    targets.append((c.chunk_id, c.ablated_dsl))
+                    if not reverse and len(targets) >= 4:
+                        break
             if targets:
                 batch_latencies = {str(k): float(v) for k, v in dict(batch_latency_evaluator(targets)).items() if float(v) > 0.0}
-
-        kept: list[AblationMeasurement] = []
-        discarded: list[AblationMeasurement] = []
-        ref_lat = max(ref_latency_us, 1e-6)
+        kept, discarded, ref_lat = [], [], max(ref_latency_us, 1e-6)
         base_out = ref_lat if reverse else ref_latency_us
         for c, ev in funnel_results:
             if not ev.passed or ev.stage_a is None or ev.stage_a.ledger is None:
-                discarded.append(AblationMeasurement(c, False, base_out, 0.0, -1.0, False, ev.stage_a,
-                                                     f"{ev.failed_stage}:{ev.error_message[:120]}"))
+                discarded.append(AblationMeasurement(c, False, base_out, 0.0, -1.0, False, ev.stage_a, f"{ev.failed_stage}:{ev.error_message[:120]}"))
                 continue
-            if c.chunk_id in batch_latencies:
-                var_lat = batch_latencies[c.chunk_id]
-            elif ev.stage_c and ev.stage_c.measured_latency_us > 0.0:
-                var_lat = ev.stage_c.measured_latency_us
-            elif ref_cost > 0.0:
-                var_lat = ref_lat * (_ledger_cost_score(ev.stage_a.ledger) / ref_cost)
-            else:
-                var_lat = float(max(ev.stage_a.ledger.pipe_cycles.values(), default=100)) / 20.0
+            var_lat = batch_latencies[c.chunk_id] if c.chunk_id in batch_latencies else (
+                ev.stage_c.measured_latency_us if (ev.stage_c and ev.stage_c.measured_latency_us > 0.0) else (
+                    ref_lat * (_ledger_cost_score(ev.stage_a.ledger) / ref_cost) if ref_cost > 0.0 else float(max(ev.stage_a.ledger.pipe_cycles.values(), default=100)) / 20.0
+                )
+            )
             delta_us = (var_lat - ref_lat) if reverse else (ref_lat - var_lat)
             rel_gain = delta_us / (max(var_lat, 1e-6) if reverse else ref_lat)
-            is_pos = (var_lat > ref_lat if reverse else True) and is_paired_gain_significant(
-                delta_us, sigma_paired_us=eff_sigma, paired_rel_mad=eff_mad, reference_us=ref_lat, sigma_multiplier=2.0
-            )
-            diag = ("positive_loo_gain" if is_pos else "redundant_or_harmful_edit") if reverse else (
-                "positive_gain" if is_pos else "negative_or_zero_gain"
-            )
-            meas = AblationMeasurement(c, True, base_out, var_lat, rel_gain, is_pos, ev.stage_a, diag)
-            (kept if is_pos else discarded).append(meas)
-
-        outcomes: list[DistilledRuleOutcome] = []
-        admitted_ids: list[str] = []
-        seen_keys: set[object] = set()
+            is_pos = (var_lat > ref_lat if reverse else True) and is_paired_gain_significant(delta_us, sigma_paired_us=eff_sigma, paired_rel_mad=eff_mad, reference_us=ref_lat, sigma_multiplier=2.0)
+            diag = ("positive_loo_gain" if is_pos else "redundant_or_harmful_edit") if reverse else ("positive_gain" if is_pos else "negative_or_zero_gain")
+            (kept if is_pos else discarded).append(AblationMeasurement(c, True, base_out, var_lat, rel_gain, is_pos, ev.stage_a, diag))
+        outcomes, admitted_ids, seen_keys = [], [], set()
         for meas in kept:
             dk: object = (meas.chunk.edit_kind, meas.chunk.target_path) if reverse else meas.chunk.edit_kind
             if dk in seen_keys:
@@ -1619,118 +1391,81 @@ class FlywheelDistiller:
             seen_keys.add(dk)
             if reverse:
                 speedup = meas.variant_latency_us / ref_lat if ref_lat > 0.0 else 1.0
-                probe, metrics = None, {
-                    "baseline_dur_us": round(meas.variant_latency_us, 6), "optimized_dur_us": round(ref_lat, 6),
-                    "speedup": round(speedup, 6), "numerical_ok": 1.0,
-                }
+                probe, metrics = None, {"baseline_dur_us": round(meas.variant_latency_us, 6), "optimized_dur_us": round(ref_lat, 6), "speedup": round(speedup, 6), "numerical_ok": 1.0}
             else:
                 if (probe := synthesize_micro_probe(meas.chunk)) is None:
-                    outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, None, False, {}, None, False,
-                                                         f"unverifiable_edit_kind:{meas.chunk.edit_kind}"))
+                    outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, None, False, {}, None, False, f"unverifiable_edit_kind:{meas.chunk.edit_kind}"))
                     continue
-                ok, metrics = verify_micro_probe_hardware(
-                    probe, probe_runner=self._probe_runner, probe_port=self._probe_port,
-                    sigma_paired_us=eff_sigma, paired_rel_mad=eff_mad,
-                )
+                ok, metrics = verify_micro_probe_hardware(probe, probe_runner=self._probe_runner, probe_port=self._probe_port, sigma_paired_us=eff_sigma, paired_rel_mad=eff_mad)
                 if not ok:
-                    outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, probe, False, metrics, None, False,
-                                                         "micro_probe_below_threshold_or_wait_regression"))
+                    outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, probe, False, metrics, None, False, "micro_probe_below_threshold_or_wait_regression"))
                     continue
-            self._admit_distilled_rule(
-                meas, rule_id_prefix=rule_id_prefix, probe=probe, metrics=metrics, rule_scope=rule_scope,
-                operator_name=operator_name, active_symptom_family=active_symptom_family,
-                topology_axes=topology_axes, outcomes=outcomes, admitted_ids=admitted_ids,
-            )
+            rule = distill_causal_rule(meas.chunk, rule_id=self._allocate_rule_id(rule_id_prefix, meas.chunk.edit_kind), ledger=meas.stage_a_result.ledger if meas.stage_a_result else None, probe=probe, probe_metrics=metrics, scope=rule_scope, origin_operator=operator_name, active_symptom_family=active_symptom_family)
+            clean_ok, clean_err = _validate_distilled_rule(rule, operator_name=operator_name)
+            if not clean_ok:
+                outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, probe, True, metrics, rule, False, clean_err))
+                continue
+            self._tracker.admit_rule(rule)
+            self._tracker.record_outcome(rule.rule_id, postcondition_realized=True, speed_gain=max(0.0, meas.relative_gain), topology_axes=topology_axes)
+            admitted_ids.append(rule.rule_id)
+            outcomes.append(DistilledRuleOutcome(meas.chunk.chunk_id, probe, True, metrics, rule, True))
         if kb_output_path is not None:
             save_rules_yaml(list(self._tracker.rules.values()), kb_output_path)
-        return FlywheelDistillationReport(
-            report_base_us, report_win_us, len(chunks), tuple(kept), tuple(discarded),
-            tuple(outcomes), tuple(admitted_ids),
-        )
+        return FlywheelDistillationReport(report_base_us, report_win_us, len(chunks), tuple(kept), tuple(discarded), tuple(outcomes), tuple(admitted_ids))
 
     def distill_leave_one_out(
         self, *, baseline_dsl: str, winner_dsl: str, winner_latency_us: float,
-        baseline_latency_us: float | None = None, factory_name: str | None = None,
-        factory_kwargs: Mapping[str, object] | None = None, config_selector_name: str | None = None,
-        dims: Mapping[str, object] | None = None,
-        batch_latency_evaluator: Callable[[Sequence[tuple[str, str]]], Mapping[str, float]] | None = None,
-        topology_axes: object | None = None, kb_output_path: str | Path | None = None,
-        rule_id_prefix: str = "R_FLYWHEEL_LOO", max_loo_chunks: int | None = 3,
-        operator_name: str = "", rule_scope: str = "operator_local",
-        active_symptom_family: str = "", ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
-        sigma_paired_us: float | None = None, paired_rel_mad: float | None = None,
+        baseline_latency_us: float | None = None, max_loo_chunks: int | None = 3,
+        rule_id_prefix: str = "R_FLYWHEEL_LOO", rule_scope: str = "operator_local", **kw: object,
     ) -> FlywheelDistillationReport:
         """Run Leave-One-Out AST/config ablation directly on real candidate winner_dsl."""
-        eff_sigma = self._sigma_paired_us if sigma_paired_us is None else sigma_paired_us
-        eff_mad = self._paired_rel_mad if paired_rel_mad is None else paired_rel_mad
-        resolved = extract_ordered_tensor_shapes(dims=dims, ordered_tensor_shapes=ordered_tensor_shapes)
         chunks = decompose_leave_one_out_ablations(baseline_dsl, winner_dsl)
         if max_loo_chunks is not None and int(max_loo_chunks) > 0:
             chunks = chunks[: int(max_loo_chunks)]
         win_lat = max(float(winner_latency_us), 1e-6)
         eff_base = float(baseline_latency_us) if baseline_latency_us is not None else win_lat
         return self._run_distill(
-            chunks, ref_dsl=winner_dsl, ref_latency_us=win_lat, report_base_us=eff_base, report_win_us=win_lat,
-            reverse=True, factory_name=factory_name, factory_kwargs=factory_kwargs,
-            config_selector_name=config_selector_name, dims=dims, resolved_shapes=resolved,
-            batch_latency_evaluator=batch_latency_evaluator, topology_axes=topology_axes,
-            kb_output_path=kb_output_path, rule_id_prefix=rule_id_prefix, operator_name=operator_name,
-            rule_scope=rule_scope, active_symptom_family=active_symptom_family, eff_sigma=eff_sigma, eff_mad=eff_mad,
+            chunks, ref_dsl=winner_dsl, ref_latency_us=win_lat, report_base_us=eff_base, report_win_us=win_lat, reverse=True,
+            factory_name=kw.get("factory_name"), factory_kwargs=kw.get("factory_kwargs"), config_selector_name=kw.get("config_selector_name"),
+            dims=kw.get("dims"), ordered_tensor_shapes=kw.get("ordered_tensor_shapes"), batch_latency_evaluator=kw.get("batch_latency_evaluator"),
+            topology_axes=kw.get("topology_axes"), kb_output_path=kw.get("kb_output_path"), rule_id_prefix=rule_id_prefix,
+            operator_name=str(kw.get("operator_name", "")), rule_scope=rule_scope, active_symptom_family=str(kw.get("active_symptom_family", "")),
+            sigma_paired_us=kw.get("sigma_paired_us"), paired_rel_mad=kw.get("paired_rel_mad"),
         )
 
     def distill_from_pair(
         self, *, baseline_dsl: str, winner_dsl: str, baseline_latency_us: float, winner_latency_us: float,
-        factory_name: str | None = None, factory_kwargs: Mapping[str, object] | None = None,
-        config_selector_name: str | None = None, dims: Mapping[str, object] | None = None,
-        batch_latency_evaluator: Callable[[Sequence[tuple[str, str]]], Mapping[str, float]] | None = None,
-        topology_axes: object | None = None, kb_output_path: str | Path | None = None,
-        rule_id_prefix: str = "R_FLYWHEEL", verify_on_candidate: bool = False,
-        max_loo_chunks: int | None = 3, operator_name: str = "", rule_scope: str = "cross_op",
-        active_symptom_family: str = "", ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
-        sigma_paired_us: float | None = None, paired_rel_mad: float | None = None,
+        verify_on_candidate: bool = False, max_loo_chunks: int | None = 3,
+        rule_id_prefix: str = "R_FLYWHEEL", rule_scope: str = "cross_op", **kw: object,
     ) -> FlywheelDistillationReport:
         """Run full counterfactual ablation, micro-probe or LOO check, and KB admission."""
-        eff_sigma = self._sigma_paired_us if sigma_paired_us is None else sigma_paired_us
-        eff_mad = self._paired_rel_mad if paired_rel_mad is None else paired_rel_mad
-        resolved = extract_ordered_tensor_shapes(dims=dims, ordered_tensor_shapes=ordered_tensor_shapes)
-        if not should_trigger_flywheel_checkpoint(
-            baseline_latency_us, winner_latency_us, sigma_paired_us=eff_sigma, paired_rel_mad=eff_mad
-        ):
+        eff_sigma = self._sigma_paired_us if kw.get("sigma_paired_us") is None else kw.get("sigma_paired_us")
+        eff_mad = self._paired_rel_mad if kw.get("paired_rel_mad") is None else kw.get("paired_rel_mad")
+        if not should_trigger_flywheel_checkpoint(baseline_latency_us, winner_latency_us, sigma_paired_us=eff_sigma, paired_rel_mad=eff_mad):
             return FlywheelDistillationReport(baseline_latency_us, winner_latency_us, 0, (), ())
         if verify_on_candidate:
             return self.distill_leave_one_out(
                 baseline_dsl=baseline_dsl, winner_dsl=winner_dsl, winner_latency_us=winner_latency_us,
-                baseline_latency_us=baseline_latency_us, factory_name=factory_name, factory_kwargs=factory_kwargs,
-                config_selector_name=config_selector_name, dims=dims, batch_latency_evaluator=batch_latency_evaluator,
-                topology_axes=topology_axes, kb_output_path=kb_output_path, rule_id_prefix=rule_id_prefix,
-                max_loo_chunks=max_loo_chunks, operator_name=operator_name, rule_scope=rule_scope,
-                active_symptom_family=active_symptom_family, ordered_tensor_shapes=resolved,
-                sigma_paired_us=eff_sigma, paired_rel_mad=eff_mad,
+                baseline_latency_us=baseline_latency_us, max_loo_chunks=max_loo_chunks,
+                rule_id_prefix=rule_id_prefix, rule_scope=rule_scope, **kw,
             )
         return self._run_distill(
-            decompose_ast_ablations(baseline_dsl, winner_dsl), ref_dsl=baseline_dsl,
-            ref_latency_us=baseline_latency_us, report_base_us=baseline_latency_us,
-            report_win_us=winner_latency_us, reverse=False, factory_name=factory_name,
-            factory_kwargs=factory_kwargs, config_selector_name=config_selector_name, dims=dims,
-            resolved_shapes=resolved, batch_latency_evaluator=batch_latency_evaluator,
-            topology_axes=topology_axes, kb_output_path=kb_output_path, rule_id_prefix=rule_id_prefix,
-            operator_name=operator_name, rule_scope=rule_scope,
-            active_symptom_family=active_symptom_family, eff_sigma=eff_sigma, eff_mad=eff_mad,
+            decompose_ast_ablations(baseline_dsl, winner_dsl), ref_dsl=baseline_dsl, ref_latency_us=baseline_latency_us,
+            report_base_us=baseline_latency_us, report_win_us=winner_latency_us, reverse=False,
+            factory_name=kw.get("factory_name"), factory_kwargs=kw.get("factory_kwargs"), config_selector_name=kw.get("config_selector_name"),
+            dims=kw.get("dims"), ordered_tensor_shapes=kw.get("ordered_tensor_shapes"), batch_latency_evaluator=kw.get("batch_latency_evaluator"),
+            topology_axes=kw.get("topology_axes"), kb_output_path=kw.get("kb_output_path"), rule_id_prefix=rule_id_prefix,
+            operator_name=str(kw.get("operator_name", "")), rule_scope=rule_scope, active_symptom_family=str(kw.get("active_symptom_family", "")),
+            sigma_paired_us=kw.get("sigma_paired_us"), paired_rel_mad=kw.get("paired_rel_mad"),
         )
 
     def distill_from_trajectory(
-        self, *, baseline_dsl: str, trajectory: EvolutionTrajectory, factory_name: str | None = None,
-        factory_kwargs: Mapping[str, object] | None = None, dims: Mapping[str, object] | None = None,
-        kb_output_path: str | Path | None = None, active_symptom_family: str = "",
-        ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
+        self, *, baseline_dsl: str, trajectory: EvolutionTrajectory, **kw: object,
     ) -> FlywheelDistillationReport:
         """Distill and verify causal rules directly from an EvolutionTrajectory winner."""
-        resolved = extract_ordered_tensor_shapes(dims=dims, ordered_tensor_shapes=ordered_tensor_shapes)
         return self.distill_from_pair(
             baseline_dsl=baseline_dsl, winner_dsl=trajectory.best_dsl_source,
-            baseline_latency_us=trajectory.baseline_latency_us, winner_latency_us=trajectory.best_latency_us,
-            factory_name=factory_name, factory_kwargs=factory_kwargs, dims=dims,
-            kb_output_path=kb_output_path, active_symptom_family=active_symptom_family, ordered_tensor_shapes=resolved,
+            baseline_latency_us=trajectory.baseline_latency_us, winner_latency_us=trajectory.best_latency_us, **kw,
         )
 
 

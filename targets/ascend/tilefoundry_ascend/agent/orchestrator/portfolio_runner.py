@@ -35,9 +35,11 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
 )
 from tilefoundry_ascend.agent.router.capability_gate import EscalationDecision, evaluate_track_escalation
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
+from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import evaluate_cost_gate_policy
 from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
     CostFeatures, CostPrediction, HybridAscendCostModel, build_cost_features_from_ledger,
 )
+from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
 from tilefoundry_ascend.ascend.passes.observation_space import RooflineSummaryLike
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
@@ -261,7 +263,7 @@ class PortfolioRoundReport:
 
 
 @dataclass(frozen=True)
-class RoundEscalationReport:
+class RoundEscalationReport(JsonRecordMixin):
     """Closed-loop escalation, minimal facet relaxation, and cost prediction for a round."""
 
     escalation: EscalationDecision
@@ -270,15 +272,6 @@ class RoundEscalationReport:
     roofline_eta: float
     l1_overflow: bool = False
     ub_overflow: bool = False
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "should_escalate": self.escalation.should_escalate, "from_tier": self.escalation.from_tier,
-            "to_tier": self.escalation.to_tier, "trigger_reasons": list(self.escalation.trigger_reasons),
-            "freedom_mask": self.escalation.freedom_mask.to_dict() if self.escalation.freedom_mask is not None else None,
-            "relaxed_mask": self.relaxed_mask.to_dict(), "cost_prediction": self.cost_prediction.to_dict(),
-            "roofline_eta": self.roofline_eta, "l1_overflow": self.l1_overflow, "ub_overflow": self.ub_overflow,
-        }
 
 
 def _coerce_topology_axes_opt(raw: object | None) -> TopologyAxes | None:
@@ -685,16 +678,10 @@ class PortfolioRunner:
         eff_mode = str(cost_model_mode if cost_model_mode is not None else self._cost_model_mode).strip().lower() or "off"
         eff_prescreen = self._enable_tilesize_prescreen and eff_mode != "off"
         if cost_gate_decision is None:
-            try:
-                from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (  # noqa: PLC0415
-                    evaluate_cost_gate_policy,
-                )
-                cost_gate_decision = evaluate_cost_gate_policy(
-                    mode=eff_mode, enable_prescreen_flag=eff_prescreen,
-                    bucket_clean_samples=bucket_clean_samples, out_of_sample_spearman_rho=out_of_sample_spearman_rho,
-                )
-            except ModuleNotFoundError:
-                pass
+            cost_gate_decision = evaluate_cost_gate_policy(
+                mode=eff_mode, enable_prescreen_flag=eff_prescreen,
+                bucket_clean_samples=bucket_clean_samples, out_of_sample_spearman_rho=out_of_sample_spearman_rho,
+            )
         policy_ok = (bool(getattr(cost_gate_decision, "engaged", True)) and bool(getattr(cost_gate_decision, "allow_prompt_guidance", True))) if cost_gate_decision is not None else True
         prescreen_summary = (
             build_prescreen_summary_from_kwargs(

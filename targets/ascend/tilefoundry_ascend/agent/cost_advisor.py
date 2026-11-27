@@ -5,18 +5,27 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
+from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
+    TileConfigCandidate,
+    _generate_lattice_override_grid,
+    format_prescreen_summary,
+    generate_aligned_neighborhood,
+    prescreen_tile_configs,
+)
 from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (
     CostGateDecision,
     CostModelMode,
     evaluate_cost_gate_policy,
 )
+from tilefoundry_ascend.ascend.cost_model.experience_lake import project_case_workload
+from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
+    HybridAscendCostModel,
+    build_cost_features_from_ledger,
+)
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendTarget
-
-if TYPE_CHECKING:
-    from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import HybridAscendCostModel
 
 
 def _read_field(obj: object | None, key: str, default: object = None) -> object:
@@ -161,9 +170,6 @@ class PluginCostModelAdvisor(_BaseCostAdvisor):
         resolved = mode if isinstance(mode, CostModelMode) else CostModelMode(str(mode).strip().lower())
         if resolved == CostModelMode.OFF:
             raise ValueError("PluginCostModelAdvisor does not support mode='off'; use NullCostModelAdvisor")
-        from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (  # noqa: PLC0415
-            HybridAscendCostModel,
-        )
 
         self._mode = resolved
         self._target = target or AscendTarget("ascend.950pr")
@@ -207,12 +213,6 @@ class PluginCostModelAdvisor(_BaseCostAdvisor):
         assert self._cost_model is not None
         if self._mode == CostModelMode.OFF:
             return 0.0
-        from tilefoundry_ascend.ascend.cost_model.experience_lake import (  # noqa: PLC0415
-            project_case_workload,
-        )
-        from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (  # noqa: PLC0415
-            build_cost_features_from_ledger,
-        )
 
         base_cf = build_cost_features_from_ledger(ledger, target=self._target, live_plan=live_plan, axes=_coerce_axes(axes), blueprint=blueprint, sil_advisory=sil_advisory)
         base_dict = asdict(base_cf)
@@ -245,13 +245,6 @@ class PluginCostModelAdvisor(_BaseCostAdvisor):
         assert self._cost_model is not None
         if self._mode != CostModelMode.ADVISORY or not decision.engaged or not decision.allow_prompt_guidance or not base_cfg:
             return ""
-        from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (  # noqa: PLC0415
-            TileConfigCandidate,
-            _generate_lattice_override_grid,
-            format_prescreen_summary,
-            generate_aligned_neighborhood,
-            prescreen_tile_configs,
-        )
 
         lowered = {str(k).lower(): v for k, v in base_cfg.items()}
 

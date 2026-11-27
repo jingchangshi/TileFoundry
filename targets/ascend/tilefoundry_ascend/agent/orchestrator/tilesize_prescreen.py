@@ -8,7 +8,14 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import product
 
-from tilefoundry_ascend.agent.gates.gate_funnel import StageAResult
+from tilefoundry_ascend.agent.gates import gate_funnel
+from tilefoundry_ascend.agent.gates.gate_funnel import (
+    StageAResult,
+    _filter_kwargs_for_callable,
+    _merge_dims_into_kwargs,
+    _merge_pass_configs_and_flags,
+    _resolve_prim_func_and_configs_from_dsl,
+)
 from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import is_paradigm_shift_exempt
 from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
     CostFeatures, CostPrediction, HybridAscendCostModel, build_cost_features_from_ledger,
@@ -438,10 +445,6 @@ def prescreen_live_ir_neighborhood(
         return ""
     pure_vec = count_dsl_gemm_calls(dsl_source) == 0 and any(k in params for k in ("tile_m", "tile_rows", "row_tile")) and "bm" not in params and "block_m" not in params
 
-    from tilefoundry_ascend.agent.gates.gate_funnel import (  # noqa: PLC0415
-        _merge_pass_configs_and_flags, _resolve_prim_func_and_configs_from_dsl, run_stage_a_static,
-    )
-
     sel_pc: dict[str, object] = {}
     sel_cf: list[str] = []
     if config_selector_name and pass_configs is None and compile_flags is None:
@@ -480,7 +483,7 @@ def prescreen_live_ir_neighborhood(
         if (not pure_vec) and (cand.bm % 16 != 0 or cand.bn % 16 != 0 or cand.bk % 16 != 0):
             records.append(_reject_live_ir(idx, cand, "unaligned_mmad_16x16x16_atom"))
             continue
-        res = run_stage_a_static(
+        res = gate_funnel.run_stage_a_static(
             dsl_source, factory_name=factory_name,
             factory_kwargs=_apply_tile_candidate_to_kwargs(base_kwargs, cand, params=params, has_varkw=has_varkw),
             target=target, pass_configs=merged_pc or None, compile_flags=merged_cf or None,
@@ -559,9 +562,6 @@ def _extract_selector_base_config(
     module_source: str, selector_fn_name: str, sample_builder_kwargs: Mapping[str, object], dims: Mapping[str, int] | None
 ) -> dict[str, object]:
     tree = ast.parse(module_source)
-    from tilefoundry_ascend.agent.gates.gate_funnel import (  # noqa: PLC0415
-        _filter_kwargs_for_callable, _merge_dims_into_kwargs,
-    )
     merged_kwargs = _merge_dims_into_kwargs(sample_builder_kwargs, dims)
     ns: dict[str, object] = {}
     try:
@@ -674,10 +674,6 @@ def sweep_executable_lattice_zero_llm(
     if not (override_grid := _generate_lattice_override_grid(base_cfg, eff_facts, max_points)):
         return []
 
-    from tilefoundry_ascend.agent.gates.gate_funnel import (  # noqa: PLC0415
-        run_stage_a_static,
-    )
-
     m_dim, n_dim, k_dim = _extract_problem_mnk(None, dims)
     clock_ghz, hbm_bps = float(getattr(eff_facts, "clock_ghz", 1.65) or 1.65), float(getattr(eff_facts, "hbm_peak_bandwidth_bps", 0) or 0)
     ranked: list[tuple[tuple[float, ...], LatticeSweepCandidate]] = []
@@ -688,7 +684,7 @@ def sweep_executable_lattice_zero_llm(
             patched_source = _patch_selector_source(module_source, selector_fn_name, ov)
         except (SyntaxError, ValueError):
             continue
-        stage_a = run_stage_a_static(
+        stage_a = gate_funnel.run_stage_a_static(
             patched_source, factory_name=builder_fn_name, factory_kwargs={**sample_builder_kwargs, **ov},
             target=eff_target, config_selector_name=selector_fn_name, dims=dims,
         )
