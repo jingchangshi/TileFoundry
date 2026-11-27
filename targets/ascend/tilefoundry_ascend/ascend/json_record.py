@@ -9,6 +9,7 @@ import tempfile
 import types
 from collections.abc import Mapping, Sequence
 from dataclasses import MISSING, Field, fields, is_dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self, Union, get_args, get_origin, get_type_hints
 
@@ -39,6 +40,8 @@ def atomic_write_text(path: Path | str, content: str) -> None:
 
 def json_clone(value: Any) -> Any:
     """Recursively convert records, mappings, and sequences into JSON-compatible values."""
+    if isinstance(value, Enum):
+        return value.value
     if hasattr(value, "to_dict") and callable(value.to_dict):
         return value.to_dict()
     if isinstance(value, Mapping):
@@ -92,6 +95,9 @@ def _coerce_value(hint: Any, raw: Any, *, has_default: bool = False, default_val
         if origin is dict:
             return {}
         return None
+
+    if isinstance(inner, type) and issubclass(inner, Enum):
+        return raw if isinstance(raw, inner) else inner(raw)
 
     if isinstance(inner, type) and hasattr(inner, "from_dict"):
         if isinstance(raw, inner):

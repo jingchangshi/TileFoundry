@@ -15,7 +15,10 @@ from tilefoundry.analysis.facts import (
 )
 from tilefoundry.ir.types import DType
 from tilefoundry.target.base import UnsupportedCapabilityError
-from tilefoundry_ascend.ascend.target.architecture import resolve_cube_macs_per_cycle
+from tilefoundry_ascend.ascend.target.architecture import (
+    is_dma_path_legal,
+    resolve_cube_macs_per_cycle,
+)
 from tilefoundry_ascend.ascend.target.device import detect_runtime_core_counts
 
 DEFAULT_CUBE_MACS_PER_CYCLE: tuple[tuple[str, int], ...] = (
@@ -188,10 +191,7 @@ class AscendSpaceFacts:
 
     def is_dma_path_legal(self, src: str, dst: str) -> bool:
         """Return whether direct DMA between ``src`` and ``dst`` exists on 3510."""
-        path = f"{src.strip().upper()}->{dst.strip().upper()}"
-        if path in self.forbidden_dma_paths:
-            return False
-        return path in self.valid_dma_paths
+        return is_dma_path_legal(self.valid_dma_paths, self.forbidden_dma_paths, src, dst)
 
 
 def _select_ub_bytes(target, query: object = None, *, default_simdvf: bool = False) -> int:
@@ -400,6 +400,7 @@ __all__ = [
     "ascend_space_facts",
     "cube_macs_per_cycle",
     "detect_runtime_core_counts",
+    "is_dma_path_legal",
     "memory_hierarchy",
     "performance_service",
     "resolve_cube_macs_safe",

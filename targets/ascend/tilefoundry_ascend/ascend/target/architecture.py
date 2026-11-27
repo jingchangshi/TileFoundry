@@ -24,6 +24,19 @@ def resolve_cube_macs_per_cycle(
     return mapping[key]
 
 
+def is_dma_path_legal(
+    valid_dma_paths: tuple[str, ...],
+    forbidden_dma_paths: tuple[str, ...],
+    src: str,
+    dst: str,
+) -> bool:
+    """Return whether direct DMA between ``src`` and ``dst`` exists on 3510."""
+    path = f"{src.strip().upper()}->{dst.strip().upper()}"
+    if path in forbidden_dma_paths:
+        return False
+    return path in valid_dma_paths
+
+
 @dataclass(frozen=True)
 class DaVinci950(Architecture):
     """DaVinci 950 architectural capabilities, geometry, and ownership."""
@@ -93,10 +106,7 @@ class DaVinci950(Architecture):
 
     def is_dma_path_legal(self, src: str, dst: str) -> bool:
         """Return whether direct DMA between ``src`` and ``dst`` exists on 3510."""
-        path = f"{src.strip().upper()}->{dst.strip().upper()}"
-        if path in self.forbidden_dma_paths:
-            return False
-        return path in self.valid_dma_paths
+        return is_dma_path_legal(self.valid_dma_paths, self.forbidden_dma_paths, src, dst)
 
     def topology_limit(self, name: str) -> int:
         """Return the structural limit for an Ascend topology level."""
@@ -113,4 +123,4 @@ class DaVinci950(Architecture):
             ) from None
 
 
-__all__ = ["DaVinci950", "resolve_cube_macs_per_cycle"]
+__all__ = ["DaVinci950", "is_dma_path_legal", "resolve_cube_macs_per_cycle"]

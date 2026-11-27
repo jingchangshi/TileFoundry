@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from tilefoundry_ascend.agent.kb.schema import SymptomFamily, compute_symptom_simplex
+from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
 from tilefoundry_ascend.ascend.passes.observation_space import (
     CompilerSummaryLike,
     ObservationVector5D,
@@ -288,7 +289,7 @@ def compute_adaptive_poison_pill_timeout_sec(inc_latencies_us: Sequence[float]) 
 
 
 @dataclass(frozen=True)
-class StaticDynamicResidual:
+class StaticDynamicResidual(JsonRecordMixin):
     """Gap between predicted ledger utilization and measured NPU msprof counters."""
 
     measured_latency_us: float
@@ -324,36 +325,6 @@ class StaticDynamicResidual:
     def measured_l2_fields(self) -> tuple[str, ...]:
         """Report which L2 fields were actually observed in msprof telemetry."""
         return self.observation.measured_l2_fields if self.observation is not None else ()
-
-    def to_dict(self) -> dict[str, object]:
-        """Return a JSON-serializable dictionary representation including the 5D observation."""
-        return {
-            "measured_latency_us": self.measured_latency_us,
-            "predicted_bottleneck_util": self.predicted_bottleneck_util,
-            "measured_aic_mac_ratio": self.measured_aic_mac_ratio,
-            "measured_aiv_vec_ratio": self.measured_aiv_vec_ratio,
-            "measured_mte2_wait_ratio": self.measured_mte2_wait_ratio,
-            "measured_sync_stall_ratio": self.measured_sync_stall_ratio,
-            "unexplained_gap_ratio": self.unexplained_gap_ratio,
-            "pseudo_double_buffer_serialized": self.pseudo_double_buffer_serialized,
-            "spill_bytes": self.spill_bytes,
-            "stack_bytes": self.stack_bytes,
-            "bank_conflict_ratio": self.bank_conflict_ratio,
-            "l2_hit_rate": self.l2_hit_rate,
-            "vf_fusion_breaks": self.vf_fusion_breaks,
-            "alias_serialized_buffers": self.alias_serialized_buffers,
-            "dual_issue_ipc_collapse": self.dual_issue_ipc_collapse,
-            "dcache_dcci_flushes": self.dcache_dcci_flushes,
-            "has_local_membar_in_vf_call": self.has_local_membar_in_vf_call,
-            "vloopv2_hit": self.vloopv2_hit,
-            "scalar_compute_loop_fallback": self.scalar_compute_loop_fallback,
-            "dcache_bypass_narrow_store": self.dcache_bypass_narrow_store,
-            "transfer_inflation_ratio": self.transfer_inflation_ratio,
-            "effective_compute_eta": self.effective_compute_eta,
-            "observation": (
-                self.observation.to_dict() if self.observation is not None else None
-            ),
-        }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> StaticDynamicResidual:

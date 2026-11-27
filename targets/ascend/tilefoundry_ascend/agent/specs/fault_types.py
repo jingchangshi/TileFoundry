@@ -6,6 +6,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
+from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
+
 
 class FaultPlane(str, Enum):
     """Canonical fault-plane taxonomy separating candidate errors from infra faults."""
@@ -65,7 +67,7 @@ def coerce_fault_plane(raw_plane: object) -> FaultPlane:
 
 
 @dataclass(frozen=True)
-class TypedFault:
+class TypedFault(JsonRecordMixin):
     """Structured fault record emitted directly by compiler, runtime, and gate stages."""
 
     plane: FaultPlane
@@ -74,17 +76,6 @@ class TypedFault:
     detail: str
     failed_cases: tuple[int, ...] = ()
     retriable: bool = False
-
-    def to_dict(self) -> dict[str, object]:
-        """Serialize fault record into a JSON-compatible dictionary."""
-        return {
-            "plane": self.plane.value,
-            "code": self.code,
-            "failed_tier": self.failed_tier,
-            "detail": self.detail,
-            "failed_cases": list(self.failed_cases),
-            "retriable": bool(self.retriable),
-        }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> TypedFault:

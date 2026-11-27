@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import MicroarchProfile
+from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 from tilefoundry_ascend.ascend.target.facts import resolve_cube_macs_safe
 
@@ -21,7 +22,7 @@ DIRECTION_SLOPE_MULT: dict[str, float] = {"ub_to_l1": 0.50, "l0c_to_ub": 0.877}
 
 
 @dataclass(frozen=True)
-class Ascend950PipeScheduleResult:
+class Ascend950PipeScheduleResult(JsonRecordMixin):
     """Continuous nanosecond breakdown across Ascend 950 pipes, AVE ports, and bubbles."""
 
     pipe_ns: dict[str, float]
@@ -32,16 +33,6 @@ class Ascend950PipeScheduleResult:
     loop_total_ns: float
     dominant_pipe: str
     total_ns: float
-
-    def to_dict(self) -> dict[str, object]:
-        """Serialize rounded schedule latencies to a JSON-safe dictionary."""
-        out: dict[str, object] = {
-            "pipe_ns": {k: round(v, 3) for k, v in sorted(self.pipe_ns.items())},
-            "dominant_pipe": self.dominant_pipe,
-        }
-        for key in ("ave_compute_ns", "ave_io_ns", "steady_state_ii_ns", "drain_bubble_ns", "loop_total_ns", "total_ns"):
-            out[key] = round(float(getattr(self, key)), 3)
-        return out
 
 
 def normalize_ns_to_z3_ticks(ns_values: Sequence[float], *, max_ticks: int = 12) -> list[int]:

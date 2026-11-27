@@ -54,17 +54,6 @@ class GuardrailCaseSpec(JsonRecordMixin):
         hw_us = float(self.t_hw_us) if self.t_hw_us > 0.0 else min(1.0, ref_us)
         return AnchorCaseSpec(self.task, int(self.case_num), self.regime_tag, ref_us, hw_us)
 
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> GuardrailCaseSpec:
-        """Reconstruct GuardrailCaseSpec from a JSON mapping."""
-        return cls(
-            task=str(payload["task"]),
-            case_num=int(payload["case_num"]),
-            regime_tag=str(payload["regime_tag"]),
-            incumbent_ref_us=float(payload.get("incumbent_ref_us", 0.0) or 0.0),
-            t_hw_us=float(payload.get("t_hw_us", 0.0) or 0.0),
-        )
-
 
 @dataclass(frozen=True)
 class PerfTargetSpec(JsonRecordMixin):

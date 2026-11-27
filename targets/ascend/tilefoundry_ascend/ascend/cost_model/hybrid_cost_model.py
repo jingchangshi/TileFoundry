@@ -335,7 +335,7 @@ def _sample_gate_threshold(min_samples: int, gamma: float) -> float:
 
 
 @dataclass(frozen=True)
-class CalibrationSample:
+class CalibrationSample(JsonRecordMixin):
     """Persisted calibration observation keyed by named dimensionless basis features."""
 
     named_features: dict[str, float]
@@ -352,7 +352,9 @@ class CalibrationSample:
         return ResidualBasisRegistry.vectorize(self.named_features, DEFAULT_RESIDUAL_BASIS_SPECS)
 
     def to_dict(self) -> dict[str, object]:
-        return {"named_features": dict(self.named_features), "feature_vector": list(self.feature_vector), "measured_us": self.measured_us, "analytical_us": self.analytical_us, "topology_bucket": self.topology_bucket, "basis_schema_version": int(self.basis_schema_version)}
+        out = super().to_dict()
+        out["feature_vector"] = list(self.feature_vector)
+        return out
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> CalibrationSample:
@@ -384,7 +386,7 @@ class _Tier01Result:
 
 
 @dataclass(frozen=True)
-class CostModelEvalReport:
+class CostModelEvalReport(JsonRecordMixin):
     """Empirical accuracy and intra-operator ranking evaluation summary."""
 
     sample_count: int
@@ -394,9 +396,6 @@ class CostModelEvalReport:
     mean_intra_group_spearman_rho: float
     pairwise_accuracy: float
     top1_regret_ratio: float
-
-    def to_dict(self) -> dict[str, float | int]:
-        return {"sample_count": int(self.sample_count), **{k: round(float(getattr(self, k)), 6) for k in ("mape", "median_ape", "overall_spearman_rho", "mean_intra_group_spearman_rho", "pairwise_accuracy", "top1_regret_ratio")}}
 
 
 def _average_ranks(values: Sequence[float]) -> list[float]:
