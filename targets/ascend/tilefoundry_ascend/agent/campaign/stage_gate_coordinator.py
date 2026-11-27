@@ -2441,26 +2441,82 @@ class StageGateCoordinator:
             return replace(final_b, elapsed_sec=total_elapsed)
         return final_b
 
+    def _l1_summary_reuse_key(
+        self,
+        module_source: str,
+        regime_spec: RegimeTargetSpec,
+    ) -> tuple[str, str]:
+        """Compute build-signature cache key for cross-regime Stage-B summary reuse."""
+        src_sha = self._source_sha256(module_source)
+        anchor_dims = (
+            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+        )
+        resolve_cfg_fn = self._resolve_hook("resolve_regime_config", resolve_regime_config)
+        try:
+            resolved = self._invoke_with_optional_kwargs(
+                resolve_cfg_fn,
+                module_source,
+                regime_spec,
+                dims=anchor_dims,
+            )
+            tb_hash = ""
+            if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb"):
+                tb_extracted = extract_trackb_cpp_source(
+                    module_source,
+                    regime_spec.trackb_symbols,
+                )
+                if tb_extracted is not None:
+                    tb_hash = self._source_sha256(tb_extracted[1])
+        except (
+            ValueError,
+            SyntaxError,
+            KeyError,
+            AttributeError,
+            TypeError,
+            NameError,
+            ImportError,
+            RuntimeError,
+            OSError,
+        ):
+            return (src_sha, f"regime:{regime_spec.regime_tag}")
+        sig_payload = "|".join(
+            (
+                str(resolved.builder_name),
+                repr(tuple(resolved.compile_flags)),
+                str(regime_spec.runtime_backend),
+                tb_hash,
+            )
+        )
+        sig_hash = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
+        return (src_sha, f"build:{sig_hash}")
+
     def _l1_summary_for_first_round(
         self,
         module_source: str,
         regime_spec: RegimeTargetSpec,
     ) -> BishengResourceSummary | None:
         """Compile the parent once per source when no promoted stone carries L1 data."""
-        cache_key = (self._source_sha256(module_source), regime_spec.regime_tag)
-        if cache_key not in self._l1_summary_cache:
-            run_l1_fn = self._owner_override("_run_l1") or self._run_l1
-            result = run_l1_fn(module_source, regime_spec)
-            if not result.passed:
-                logger.warning(
-                    "First-round parent L1 for regime %s failed: %s",
-                    regime_spec.regime_tag,
-                    result.error_message,
-                )
-            self._l1_summary_cache[cache_key] = (
-                result.compiler_summary if result.passed else None
+        src_sha = self._source_sha256(module_source)
+        cache_key = (src_sha, regime_spec.regime_tag)
+        if cache_key in self._l1_summary_cache:
+            return self._l1_summary_cache[cache_key]
+        reuse_key = self._l1_summary_reuse_key(module_source, regime_spec)
+        if reuse_key in self._l1_summary_cache:
+            cached = self._l1_summary_cache[reuse_key]
+            self._l1_summary_cache[cache_key] = cached
+            return cached
+        run_l1_fn = self._owner_override("_run_l1") or self._run_l1
+        result = run_l1_fn(module_source, regime_spec)
+        if not result.passed:
+            logger.warning(
+                "First-round parent L1 for regime %s failed: %s",
+                regime_spec.regime_tag,
+                result.error_message,
             )
-        return self._l1_summary_cache[cache_key]
+        summary = result.compiler_summary if result.passed else None
+        self._l1_summary_cache[cache_key] = summary
+        self._l1_summary_cache[reuse_key] = summary
+        return summary
 
     def _normalize_paired_l2_results(
         self,
@@ -3823,6 +3879,22 @@ class StageGateCoordinator:
                         pred_by_cid[chk.candidate_id] = c_pred_val
                 except (TypeError, ValueError):
                     pass
+
+        for chk in l0_l1_checks:
+            if (
+                chk.passed
+                and chk.patched_module_source
+                and chk.stage_b is not None
+                and chk.stage_b.passed
+                and chk.stage_b.compiler_summary is not None
+            ):
+                chk_src_sha = self._source_sha256(chk.patched_module_source)
+                self._l1_summary_cache[(chk_src_sha, batch.regime_spec.regime_tag)] = (
+                    chk.stage_b.compiler_summary
+                )
+                self._l1_summary_cache[
+                    self._l1_summary_reuse_key(chk.patched_module_source, batch.regime_spec)
+                ] = chk.stage_b.compiler_summary
 
         l0_l1_faults_by_cid: dict[str, TypedFault] = {}
         for chk in l0_l1_checks:

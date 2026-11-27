@@ -3961,6 +3961,36 @@ async def run_l0_l1_round_filter(
     return _finalize([results_by_idx[i] for i in range(len(candidates))])
 
 
+def _git_common_dir(path: Path) -> Path | None:
+    """Return the resolved git common directory for a checkout or worktree."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(path),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout.strip()
+    if not raw:
+        return None
+    return Path(raw).resolve()
+
+
 def _resolve_agent_gates_bin(source_root: Path | None = None) -> str:
     """Resolve the AgentGates CLI from explicit configuration, PATH, or relative sibling venv."""
     env_bin = os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip()
@@ -3973,8 +4003,8 @@ def _resolve_agent_gates_bin(source_root: Path | None = None) -> str:
     env_file_raw = os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
     if env_file_raw:
         env_path = Path(env_file_raw).expanduser().resolve()
-        ag_root = env_path.parent
-        candidates.append(ag_root / ".venv" / "bin" / "agent-gates")
+        for parent in env_path.parents:
+            candidates.append(parent / ".venv" / "bin" / "agent-gates")
         if env_path.is_file():
             cfg_bin = (
                 parse_simple_env_file(env_path)
@@ -3984,13 +4014,15 @@ def _resolve_agent_gates_bin(source_root: Path | None = None) -> str:
             if cfg_bin:
                 candidates.insert(0, Path(cfg_bin).expanduser())
     if source_root is not None:
+        resolved_src = Path(source_root).expanduser().resolve()
         candidates.append(
-            Path(source_root).expanduser().resolve().parent
-            / "AgentGates"
-            / ".venv"
-            / "bin"
-            / "agent-gates"
+            resolved_src.parent / "AgentGates" / ".venv" / "bin" / "agent-gates"
         )
+        common_dir = _git_common_dir(resolved_src)
+        if common_dir is not None:
+            candidates.append(
+                common_dir.parent.parent / "AgentGates" / ".venv" / "bin" / "agent-gates"
+            )
     repo_root = Path(__file__).resolve().parents[5]
     candidates.append(repo_root.parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
     for candidate in candidates:
@@ -7043,7 +7075,40 @@ def _agent_gates_workspace_name(source_root: Path) -> str:
         configured = entry.get("source_root")
         if isinstance(configured, str) and Path(configured).expanduser().resolve() == wanted:
             return str(name)
+    wanted_common = _git_common_dir(wanted)
+    if wanted_common is not None:
+        for name, entry in workspaces.items():
+            if not isinstance(entry, Mapping):
+                continue
+            if entry.get("allow_worktrees") is False:
+                continue
+            configured = entry.get("source_root")
+            if not isinstance(configured, str) or not configured.strip():
+                continue
+            if _git_common_dir(Path(configured).expanduser().resolve()) == wanted_common:
+                return str(name)
     raise ValueError(f"No AgentGates workspace is configured for source root {wanted}")
+
+
+def _agent_gates_source_override(workspace: str, root: Path) -> str | None:
+    """Return resolved root when caller checkout differs from workspace source_root."""
+    try:
+        raw = _agent_gates_config()
+    except (OSError, ValueError):
+        return None
+    workspaces = raw.get("workspaces")
+    if not isinstance(workspaces, Mapping):
+        return None
+    entry = workspaces.get(workspace)
+    if not isinstance(entry, Mapping):
+        return None
+    configured = entry.get("source_root")
+    if not isinstance(configured, str) or not configured.strip():
+        return None
+    resolved_root = root.resolve()
+    if Path(configured).expanduser().resolve() != resolved_root:
+        return str(resolved_root)
+    return None
 
 
 def _workspace_relative_candidate(source_root: Path, candidate_path: Path) -> str | None:
@@ -7214,6 +7279,7 @@ def _run_v2_gate(
     started = time.monotonic()
     deadline = started + max(1.0, float(timeout_sec))
     requested_device = str(device_id or "").strip()
+    source_override = _agent_gates_source_override(workspace, root)
     submit_cmd = [
         agent_gates_bin,
         "submit",
@@ -7231,6 +7297,8 @@ def _run_v2_gate(
         submit_cmd.extend(["--candidate", candidate_path])
     if requested_device:
         submit_cmd.extend(["--device-id", requested_device])
+    if source_override is not None:
+        submit_cmd.extend(["--source", source_override])
 
     def _failed(
         execution_id: str,
@@ -7472,6 +7540,8 @@ def _run_v2_gate(
     ]
     if candidate_path is not None:
         verify_cmd.extend(["--target", target, "--candidate", candidate_path])
+    if source_override is not None:
+        verify_cmd.extend(["--source", source_override])
     post_wait = min(_V2_POST_WAIT_TIMEOUT_SEC, max(1.0, deadline - time.monotonic()))
     try:
         proc, verification = _run_agent_gates_v2_cmd(verify_cmd, root=root, timeout_sec=post_wait)
