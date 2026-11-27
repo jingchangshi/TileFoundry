@@ -7,6 +7,19 @@ model: flash
 commandExecutionPolicy: eager
 inheritMcp: true
 inheritCustomizations: true
+tools:
+  - view_file
+  - write_to_file
+  - replace_file_content
+  - multi_replace_file_content
+  - list_dir
+  - find_by_name
+  - grep_search
+  - run_command
+  - manage_task
+  - read_url_content
+  - search_web
+  - send_message
 ---
 
 # Role: Isolated Worktree Implementation Worker (Hydrogen High)
