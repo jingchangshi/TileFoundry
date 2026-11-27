@@ -39,6 +39,10 @@ from tilefoundry_ascend.agent.npu import (
     build_anchor_metrics,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest, MockLLMBackend
+from tilefoundry_ascend.agent.orchestrator.residual_beam import (
+    BeamCandidate,
+    compute_static_dynamic_residual,
+)
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
@@ -708,3 +712,177 @@ def test_accept_single_point_receipt_state_advancement(tmp_path: Path, l3_passes
         assert report.rolled_back_rounds == (1,)
         assert [int(g.case_num) for g in runner.guardrail_cases] == [77]
         assert target_path.read_text(encoding="utf-8") == _BASE_SRC
+
+
+def _build_trackb_pruning_runner(tmp_path: Path) -> tuple[PerfTargetCampaignRunner, RegimeTargetSpec, RegimeTargetSpec]:
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(
+        "_TRACKB_CPP = '''\nextern \"C\" __global__ __aicore__ void k_a() {}\n'''\n"
+        "def _select_a(tile_m=16):\n    return {'tile_m': int(tile_m)}\n"
+        "def _select_b(tile_m=16):\n    return {'tile_m': int(tile_m)}\n"
+        "def _sib_only(tile_m=8):\n    return {'tile_m': int(tile_m)}\n"
+        "def kernel(x):\n    return _select_a(), _select_b(), x\n",
+        encoding="utf-8",
+    )
+    reg_a = RegimeTargetSpec(
+        regime_tag="r_a",
+        builder_candidates=("_select_a",),
+        sample_builder_kwargs={"tile_m": 16},
+        editable_symbols=("_TRACKB_CPP", "_select_a"),
+        config_selector_fn="_select_a",
+        runtime_backend="hybrid_trackb",
+        trackb_symbols=("_TRACKB_CPP",),
+    )
+    reg_b = RegimeTargetSpec(
+        regime_tag="r_b",
+        builder_candidates=("_select_b",),
+        sample_builder_kwargs={"tile_m": 16},
+        editable_symbols=("_TRACKB_CPP", "_select_b", "_sib_only"),
+        config_selector_fn="_select_b",
+        runtime_backend="hybrid_trackb",
+        trackb_symbols=("_TRACKB_CPP",),
+    )
+    ledger = _make_ledger()
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="synthetic_op", max_rounds=1, k_rule_workers=0),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("synthetic_op", 9.0, 9.0, 0.95),
+        anchors=(
+            AnchorCaseSpec("op/synthetic", 1, "r_a", 100.0, 10.0),
+            AnchorCaseSpec("op/synthetic", 2, "r_b", 100.0, 10.0),
+        ),
+        regime_specs=(reg_a, reg_b),
+        regime_blueprints={"r_a": _blueprint(), "r_b": _blueprint()},
+        llm_backend=MockLLMBackend(responses={}),
+        tracker=BayesianRuleTracker(rules={}),
+        l0_checker=lambda _s, _r: StageAResult(passed=True, prim_func=None, ledger=ledger),
+        l1_compiler=lambda _s, _r: StageBResult(passed=True),
+        l2_batch_evaluator=lambda cands, anc: L2BatchResults(
+            {cid: _make_surrogate(cid, (_make_metric(anc[0].case_num, anc[0].regime_tag, 25.0),)) for cid, _ in cands},
+            {cid: "rid" for cid, _ in cands},
+        ),
+        l3_contract_runner=lambda _p, **_kw: L3AcceptanceResult(passed=True, execution_id="ex1", run_id="r1"),
+        l4_cannbench_runner=lambda _p, **_kw: L4CannbenchResult(passed=True, execution_id="l4"),
+        msprof_collector=lambda *_a: {},
+        p2_deep_dive_collector=lambda *_a: {},
+    )
+    return runner, reg_a, reg_b
+
+
+def _make_beam_stone(cid: str, dsl_source: str) -> BeamCandidate:
+    ledger = _make_ledger()
+    return BeamCandidate(
+        candidate_id=cid,
+        round_idx=1,
+        worker_kind="creative_explore",
+        rule_id=None,
+        dsl_source=dsl_source,
+        track="unconstrained",
+        ledger=ledger,
+        residual=compute_static_dynamic_residual(ledger, {"dur_us": 25.0}),
+        latency_us=25.0,
+        accuracy_passed=True,
+        structural_signature=(cid,),
+        hypothesis="stone",
+    )
+
+
+@pytest.mark.parametrize(
+    ("snippet_kind", "promoted_snippet", "expected_touched"),
+    [
+        (
+            "sr_with_python_residual",
+            "<<<<<<< SEARCH\nextern \"C\" __global__ __aicore__ void k_a() {}\n"
+            "=======\nextern \"C\" __global__ __aicore__ void k_a() { int v = 1; }\n"
+            ">>>>>>> REPLACE\ndef _select_a(tile_m=32):\n    return {'tile_m': int(tile_m)}\n",
+            {"_TRACKB_CPP", "_select_a"},
+        ),
+        (
+            "sr_cpp_only",
+            "<<<<<<< SEARCH\nextern \"C\" __global__ __aicore__ void k_a() {}\n"
+            "=======\nextern \"C\" __global__ __aicore__ void k_a() { int v = 2; }\n"
+            ">>>>>>> REPLACE\n",
+            {"_TRACKB_CPP"},
+        ),
+        (
+            "bare_cpp",
+            "extern \"C\" __global__ __aicore__ void k_a() { int v = 3; }\n",
+            {"_TRACKB_CPP"},
+        ),
+    ],
+)
+def test_accept_trackb_snippet_prunes_stale_sibling_stepping_stones(
+    tmp_path: Path,
+    snippet_kind: str,
+    promoted_snippet: str,
+    expected_touched: set[str],
+) -> None:
+    """Accept Track-B snippets without NameError and prune stale sibling stepping stones."""
+    _ = snippet_kind
+    runner, reg_a, reg_b = _build_trackb_pruning_runner(tmp_path)
+    touched = runner._touched_symbols_for_regime_snippet(reg_a, promoted_snippet)
+    assert touched == expected_touched
+
+    shared_stone = _make_beam_stone(
+        "sib_shared",
+        "<<<<<<< SEARCH\nvoid k_a() {}\n=======\nvoid k_a() { int x = 1; }\n>>>>>>> REPLACE\n",
+    )
+    disjoint_stone = _make_beam_stone("sib_disjoint", "def _sib_only(tile_m=16):\n    return {'tile_m': int(tile_m)}\n")
+    runner.beam_for_regime(reg_b.regime_tag).stepping_stone_beam = [shared_stone, disjoint_stone]
+
+    runner._prune_stale_sibling_stepping_stones(reg_a, promoted_snippet)
+    remaining_ids = [s.candidate_id for s in runner.beam_for_regime(reg_b.regime_tag).stepping_stone_beam]
+    assert remaining_ids == ["sib_disjoint"]
+
+
+@pytest.mark.parametrize(
+    ("case_kind", "snippet", "expected_touched"),
+    [
+        (
+            "own_promoted_regime_not_pruned",
+            "<<<<<<< SEARCH\nvoid k_a() {}\n=======\nvoid k_a() { int v = 1; }\n>>>>>>> REPLACE\n",
+            {"_TRACKB_CPP"},
+        ),
+        (
+            "disjoint_symbol_not_pruned",
+            "def _select_a(tile_m=64):\n    return {'tile_m': int(tile_m)}\n",
+            {"_select_a"},
+        ),
+        (
+            "invalid_syntax_snippet",
+            "def _broken(:\n",
+            set(),
+        ),
+        (
+            "non_matching_empty_snippet",
+            "",
+            set(),
+        ),
+    ],
+)
+def test_reject_active_promoted_and_invalid_snippet_preserves_stepping_stones(
+    tmp_path: Path,
+    case_kind: str,
+    snippet: str,
+    expected_touched: set[str],
+) -> None:
+    """Reject pruning active promoted stones and preserve unrelated regimes on invalid snippets."""
+    runner, reg_a, reg_b = _build_trackb_pruning_runner(tmp_path)
+    assert runner._touched_symbols_for_regime_snippet(reg_a, snippet) == expected_touched
+
+    own_stone = _make_beam_stone(
+        "own_active",
+        "<<<<<<< SEARCH\nvoid k_a() {}\n=======\nvoid k_a() { int x = 9; }\n>>>>>>> REPLACE\n",
+    )
+    sib_dsl = (
+        "<<<<<<< SEARCH\nvoid k_a() {}\n=======\nvoid k_a() { int y = 2; }\n>>>>>>> REPLACE\n"
+        if case_kind in ("invalid_syntax_snippet", "non_matching_empty_snippet")
+        else "def _sib_only(tile_m=8):\n    return {'tile_m': int(tile_m)}\n"
+    )
+    sib_stone = _make_beam_stone("sib_unrelated", sib_dsl)
+    runner.beam_for_regime(reg_a.regime_tag).stepping_stone_beam = [own_stone]
+    runner.beam_for_regime(reg_b.regime_tag).stepping_stone_beam = [sib_stone]
+
+    runner._prune_stale_sibling_stepping_stones(reg_a, snippet)
+    assert [s.candidate_id for s in runner.beam_for_regime(reg_a.regime_tag).stepping_stone_beam] == ["own_active"]
+    assert [s.candidate_id for s in runner.beam_for_regime(reg_b.regime_tag).stepping_stone_beam] == ["sib_unrelated"]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import argparse, ast, logging, math, os, time
+import argparse, ast, json, logging, math, os, time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -52,8 +52,8 @@ from tilefoundry_ascend.agent.npu import (
 from tilefoundry_ascend.agent.orchestrator.llm_client import KernelLLMBackend
 from tilefoundry_ascend.agent.orchestrator.regime_slice_patcher import (
     ResolvedRegimeConfig, _collect_top_level_symbols, _looks_like_bare_trackb_cpp,
-    _parses_as_python, apply_ast_patch, extract_regime_snippet, patch_regime_into_module,
-    resolve_regime_config, split_readonly_host_tail,
+    _parses_as_python, _trackb_python_residual, apply_ast_patch, extract_regime_snippet,
+    patch_regime_into_module, resolve_regime_config, split_readonly_host_tail,
 )
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate, TwoLaneBeamSearch,
@@ -63,7 +63,7 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import rank_stage_
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec, GuardrailCaseSpec, PerfTargetSpec, RegimeTargetSpec,
     default_source_root, get_default_anchors, get_default_perf_target, get_default_regime_specs,
-    resolve_regime_for_case,
+    get_operator_module_relpath, resolve_regime_for_case,
 )
 from tilefoundry_ascend.agent.specs.fault_types import FaultPlane, L3Resolution, coerce_fault_plane
 from tilefoundry_ascend.agent.specs.latency_algebra import calibrate_dispatch_floor_us, geometric_speedup
@@ -480,7 +480,11 @@ class PerfTargetCampaignRunner:
                 return touched
             if not _parses_as_python(dsl_text) and _looks_like_bare_trackb_cpp(dsl_text):
                 return set(regime_spec.trackb_symbols)
-        return {s.name for s in _collect_top_level_symbols(ast.parse(dsl_text))}
+        try:
+            tree = ast.parse(dsl_text)
+        except SyntaxError:
+            return set()
+        return {s.name for s in _collect_top_level_symbols(tree)}
 
     def _prune_stale_sibling_stepping_stones(self, promoted_regime: RegimeTargetSpec, promoted_snippet: str) -> None:
         own = set(promoted_regime.editable_symbols)

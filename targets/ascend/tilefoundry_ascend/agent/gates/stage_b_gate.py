@@ -441,7 +441,12 @@ def _load_plan_module(
         cf = tuple(f for f in _normalize_flag_list(compile_flags) if not f.startswith("-I"))
         records.append((prog.builder_name, prog.static_kwargs, pc, cf) if isinstance(prog, _CapturedPrimFunc) else ("unknown_builder", (), pc, cf))
         n_out = len(out_idx) if isinstance(out_idx, (list, tuple)) and out_idx else 1
-        return lambda *a, **_k: (t := (a[0] if a and isinstance(a[0], _MetaTensor) else _MetaTensor((1,), _resolve_torch_dtype("float32")))) if n_out == 1 else tuple(t for _ in range(n_out))
+
+        def _stub_call(*a: object, **_k: object) -> object:
+            out0 = a[0] if a and isinstance(a[0], _MetaTensor) else _MetaTensor((1,), _resolve_torch_dtype("float32"))
+            return out0 if n_out == 1 else tuple(out0 for _ in range(n_out))
+
+        return _stub_call
 
     if (orig_tl := getattr(mod, "tilelang", None)) is not None:
         setattr(mod, "tilelang", _ModuleProxy(orig_tl, {"compile": _cap_compile, "lower": _cap_compile}))
