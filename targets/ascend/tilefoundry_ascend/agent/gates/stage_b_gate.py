@@ -25,6 +25,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Literal, Protocol
 
 from tilefoundry_ascend.agent.contracts import (
     CasePlanExtractor, CompileTaskSpec, RegimeCompilePlan, StageBCompileReceipt,
@@ -330,7 +331,6 @@ class _LoadedPlanModule:
     backend_kind: str
     closure_cache: dict[tuple[str, ...], str]
     spec_cache: dict[tuple[object, ...], CompileTaskSpec]
-    trackb_tu_by_key: dict[str, str]
 
 
 _PLAN_MODULE_CACHE: dict[str, _LoadedPlanModule] = {}
@@ -464,7 +464,7 @@ def _load_plan_module(
             "npu": types.SimpleNamespace(current_stream=lambda *_a, **_k: types.SimpleNamespace(npu_stream=0)),
         }))
 
-    loaded = _LoadedPlanModule(module_source, mod_sha, mod, records, tb_records, ep, selectors, builders, backend, {}, {}, {})
+    loaded = _LoadedPlanModule(module_source, mod_sha, mod, records, tb_records, ep, selectors, builders, backend, {}, {})
     with _PLAN_MODULE_LOCK:
         if len(_PLAN_MODULE_CACHE) >= 64:
             _PLAN_MODULE_CACHE.clear()
@@ -594,9 +594,10 @@ class ModuleSelectorPlanExtractor:
     ) -> CompileTaskSpec:
         merged_pc, merged_cf = _merge_pass_configs_and_flags(pass_configs, compile_flags, self.default_pass_configs, self.default_compile_flags)
         pc_t, cf_t = _freeze_pair_tuple(merged_pc), tuple(merged_cf)
+        unit_kind: Literal["tilelang_dsl", "cce_cpp20"] = "cce_cpp20" if clean_unit_override is not None else "tilelang_dsl"
         src_sel = selector_name if clean_unit_override is None else clean_unit_override
-        ckey = (self.target, builder_name, static_kwargs, pc_t, cf_t, src_sel)
-        if clean_unit_override is None and ckey in loaded.spec_cache:
+        ckey = (self.target, builder_name, static_kwargs, pc_t, cf_t, src_sel, unit_kind)
+        if ckey in loaded.spec_cache:
             return loaded.spec_cache[ckey]
         if clean_unit_override is not None:
             clean_src = clean_unit_override
@@ -613,11 +614,8 @@ class ModuleSelectorPlanExtractor:
             compile_flags=cf_t,
             static_spec_signature=_static_spec_signature(builder_name, static_kwargs),
         )
-        spec = CompileTaskSpec(task_key, builder_name, static_kwargs, pc_t, cf_t)
-        if clean_unit_override is not None:
-            loaded.trackb_tu_by_key[spec.task_key] = clean_unit_override
-        else:
-            loaded.spec_cache[ckey] = spec
+        spec = CompileTaskSpec(task_key, builder_name, static_kwargs, pc_t, cf_t, unit_kind=unit_kind, unit_source=clean_src)
+        loaded.spec_cache[ckey] = spec
         return spec
 
     def _collect_captured_specs(self, loaded: _LoadedPlanModule, pool: Mapping[str, object], sel_name: str = "") -> list[CompileTaskSpec]:
@@ -949,7 +947,7 @@ def run_stage_b_compile(
     norm_pc, norm_cf = _merge_pass_configs_and_flags(None, None, pass_configs, compile_flags)
     closure_src = extract_reachable_closure_source(dsl_source, regime_tag=regime_tag) if regime_tag else dsl_source
     target_aid = artifact_id or compute_compile_task_key(normalized_kernel_unit_src=closure_src, cann_target="dav-3510", pass_configs=norm_pc, compile_flags=norm_cf, static_spec_signature=spec_key)
-    spec_chk = CompileTaskSpec(target_aid, str(factory_name or ""), _freeze_pair_tuple(factory_kwargs), _freeze_pair_tuple(norm_pc), tuple(norm_cf))
+    spec_chk = CompileTaskSpec(target_aid, str(factory_name or ""), _freeze_pair_tuple(factory_kwargs), _freeze_pair_tuple(norm_pc), tuple(norm_cf), unit_kind="tilelang_dsl", unit_source=closure_src)
 
     with tempfile.TemporaryDirectory(prefix="tf_stage_b_") as tmp_dir:
         tmp_root = Path(tmp_dir)
@@ -1106,8 +1104,7 @@ def _run_driver_spec(
 
 
 def _is_trackb_spec(spec: CompileTaskSpec) -> bool:
-    low = str(spec.builder_name or "").strip().lower()
-    return low in ("_render_trackb_tu", "_trackb_tu") or "trackb" in low
+    return spec.unit_kind == "cce_cpp20"
 
 
 def _resolve_trackb_spec_cpp_source(
@@ -1115,11 +1112,10 @@ def _resolve_trackb_spec_cpp_source(
 ) -> tuple[bool, str]:
     if not _is_trackb_spec(spec):
         return False, ""
-    is_explicit = spec.builder_name in ("_render_trackb_tu", "_trackb_tu")
+    if spec.unit_source.strip():
+        return True, spec.unit_source
     if module_source.strip():
         loaded = _load_plan_module(module_source, env_vals=env_vals, source_root=source_root)
-        if (cached_tu := loaded.trackb_tu_by_key.get(spec.task_key)) is not None:
-            return True, cached_tu
         fn = getattr(loaded.mod, spec.builder_name, None)
         if fn is None and spec.builder_name == "_trackb_tu":
             fn = getattr(loaded.mod, "_render_trackb_tu", None)
@@ -1128,11 +1124,9 @@ def _resolve_trackb_spec_cpp_source(
             res = raw_fn(**filter_callable_kwargs(raw_fn, dict(spec.static_kwargs), aliases=_PARAM_DIM_FALLBACK_ALIASES))
             if isinstance(res, str):
                 return True, _normalize_trackb_unit_source(res)
-            if not is_explicit:
-                return False, ""
-        if is_explicit and (tb := extract_trackb_cpp_source(module_source, discover_module_trackb_symbols(module_source))):
+        if tb := extract_trackb_cpp_source(module_source, discover_module_trackb_symbols(module_source)):
             return True, _normalize_trackb_unit_source(tb[1])
-    return is_explicit, ""
+    return True, ""
 
 
 def _run_trackb_spec(
@@ -1161,12 +1155,29 @@ def _run_trackb_spec(
     return True, sb, diag, bins, ""
 
 
+class StageBCompileBackend(Protocol):
+    """Explicit backend compiler port for TileLang DSL and AscendC C++20 specs."""
+
+    def compile_tilelang(
+        self, spec: CompileTaskSpec, module_source: str, work_dir: Path,
+    ) -> tuple[bool, int, str, tuple[Path, ...], str]:
+        """Compile a TileLang DSL CompileTaskSpec."""
+        ...
+
+    def compile_ascendc(
+        self, spec: CompileTaskSpec, cpp_source: str, work_dir: Path, regime_tag: str,
+    ) -> tuple[bool, int, str, tuple[Path, ...], str]:
+        """Compile an AscendC C++20 CompileTaskSpec."""
+        ...
+
+
 class StageBCompileGate:
     """Compile cache-missed CompileTaskSpecs on CPU and emit prewarm_manifest_v1.json."""
 
     def __init__(
         self, plan_or_store: RegimeCompilePlan | ArtifactStore, artifact_store: ArtifactStore | None = None, *,
         compile_fn: Callable[[CompileTaskSpec, str, Path], tuple[bool, int, str, Sequence[Path | str]]] | None = None,
+        backend: StageBCompileBackend | None = None,
         max_workers: int | None = None, timeout_sec: int = 120, env_file: str | Path | None = None,
         source_root: str | Path | None = None,
     ) -> None:
@@ -1176,7 +1187,8 @@ class StageBCompileGate:
             if artifact_store is None:
                 raise ValueError("artifact_store is required when plan is passed first")
             self._default_plan, self.artifact_store = plan_or_store, artifact_store
-        self._compile_fn, self._max_workers, self._timeout_sec = compile_fn, max_workers, timeout_sec
+        self._compile_fn, self._backend = compile_fn, backend
+        self._max_workers, self._timeout_sec = max_workers, timeout_sec
         self._env_vals = _resolve_env_values(env_file)
         self._source_root = Path(source_root).resolve() if source_root is not None else None
 
@@ -1225,10 +1237,14 @@ class StageBCompileGate:
                     except Exception as exc:
                         return False, 0, f"stage_b_ascendc_render_failed: {type(exc).__name__}: {exc}", (), "STAGE_B_ASCENDC_RENDER_FAILED"
                     if is_tb:
+                        if self._backend is not None:
+                            return self._backend.compile_ascendc(spec, cpp_src, w_dir, active_plan.regime_tag)
                         return _run_trackb_spec(
                             spec, cpp_src, w_dir, env_vals=self._env_vals, source_root=self._source_root,
                             timeout_sec=self._timeout_sec, regime_tag=active_plan.regime_tag,
                         )
+                    if self._backend is not None:
+                        return self._backend.compile_tilelang(spec, module_source, w_dir)
                     return _run_driver_spec(spec, module_source, w_dir, resolved_tl_cache=tl_cache, env_vals=self._env_vals, source_root=self._source_root, timeout_sec=self._timeout_sec)
 
                 with ThreadPoolExecutor(max_workers=self._max_workers or min(16, os.cpu_count() or 8, max(1, len(missed)))) as pool:
@@ -1336,7 +1352,7 @@ def run_l1_compile_check(
 
 
 __all__ = [
-    "ModuleSelectorPlanExtractor", "StageBCompileGate", "StageBResult", "_resolve_artifact_store",
+    "ModuleSelectorPlanExtractor", "StageBCompileBackend", "StageBCompileGate", "StageBResult", "_resolve_artifact_store",
     "ascend_compile_session", "build_post_selector_regime_plan", "build_stage_b_driver_source",
     "compile_trackb_shared_so", "compute_compile_task_key", "compute_trackb_shared_so_filename",
     "has_unreserved_vf_stack_overflow", "parse_cce_res_usage", "resolve_trackb_compile_flags",

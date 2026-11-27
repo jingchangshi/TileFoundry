@@ -515,7 +515,7 @@ def run_stage_b_ascendc_compile(
     ctx = _prepare_ascendc_compile_context(compile_flags=compile_flags, cann_root=cann_root, resolved_bisheng=resolved_bisheng, extra_include_dirs=extra_include_dirs)
     extra_flags = ctx.extra_flags
     store = _resolve_artifact_store(artifact_store)
-    spec_chk = CompileTaskSpec(artifact_id or "trackb", "_trackb_tu", (), (), tuple(extra_flags))
+    spec_chk = CompileTaskSpec(artifact_id or "trackb", "_trackb_tu", (), (), tuple(extra_flags), unit_kind="cce_cpp20", unit_source=cpp_source)
     with tempfile.TemporaryDirectory(prefix="tf_stage_b_ascendc_") as tmp_dir:
         src_path = Path(tmp_dir) / ("kernel.cpp" if ctx.has_explicit_x else "kernel.asc")
         obj_path, so_path = Path(tmp_dir) / "kernel.o", Path(tmp_dir) / "kernel.so"

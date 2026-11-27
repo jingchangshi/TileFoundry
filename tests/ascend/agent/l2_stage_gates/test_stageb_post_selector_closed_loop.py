@@ -14,6 +14,7 @@ from tilefoundry_ascend.agent.contracts import CasePlanExtractor, CompileTaskSpe
 from tilefoundry_ascend.agent.gates import gate_funnel as gf
 from tilefoundry_ascend.agent.gates.stage_b_gate import (
     ModuleSelectorPlanExtractor,
+    StageBCompileBackend,
     StageBCompileGate,
     build_post_selector_regime_plan,
     compile_trackb_shared_so,
@@ -835,6 +836,7 @@ def test_stage_b_compile_gate_routes_render_trackb_tu_to_ascendc_compile(
         static_kwargs=(),
         pass_configs=(),
         compile_flags=("--cce-disable-vf-stack-reserved-ubuf",),
+        unit_kind="cce_cpp20",
     )
     unres_plan = build_post_selector_regime_plan(
         hybrid_src,
@@ -873,3 +875,129 @@ def test_stage_b_compile_gate_routes_render_trackb_tu_to_ascendc_compile(
     assert ovf_receipt.passed is False
     assert ovf_receipt.fault_code == "VF_STACK_OVERFLOW"
     assert ovf_receipt.max_stack_bytes == 128
+
+
+class _DirectExtractor:
+    """Protocol implementation returning a single fixed CompileTaskSpec."""
+
+    def __init__(self, spec: CompileTaskSpec) -> None:
+        self._spec = spec
+
+    def extract_case_tasks(
+        self, module_source: str, case_id: str, case_spec: dict[str, object],
+    ) -> tuple[CompileTaskSpec, ...]:
+        _ = (module_source, case_id, case_spec)
+        return (self._spec,)
+
+
+class _RecordingStageBBackend:
+    """Protocol implementation recording TileLang vs AscendC backend routing."""
+
+    def __init__(self, out_dir: Path) -> None:
+        self._out_dir = out_dir
+        self.tilelang_calls: list[CompileTaskSpec] = []
+        self.ascendc_calls: list[tuple[CompileTaskSpec, str]] = []
+
+    def compile_tilelang(
+        self, spec: CompileTaskSpec, module_source: str, work_dir: Path,
+    ) -> tuple[bool, int, str, tuple[Path, ...], str]:
+        _ = (module_source, work_dir)
+        self.tilelang_calls.append(spec)
+        obj = self._out_dir / f"{spec.task_key[:8]}_tl.so"
+        obj.parent.mkdir(parents=True, exist_ok=True)
+        obj.write_bytes(b"\x7fELF-tl")
+        return True, 0, "", (obj,), ""
+
+    def compile_ascendc(
+        self, spec: CompileTaskSpec, cpp_source: str, work_dir: Path, regime_tag: str,
+    ) -> tuple[bool, int, str, tuple[Path, ...], str]:
+        _ = (work_dir, regime_tag)
+        self.ascendc_calls.append((spec, cpp_source))
+        obj = self._out_dir / f"{spec.task_key[:8]}_ascendc.o"
+        obj.parent.mkdir(parents=True, exist_ok=True)
+        obj.write_bytes(b"\x7fELF-ascendc")
+        return True, 0, "", (obj,), ""
+
+
+_TRACKB_NAMED_PRIMFUNC_MODULE = '''
+import tilelang
+import tilelang.language as T
+
+def _build_trackb_fusion_func(d_dim: int = 64):
+    @T.prim_func
+    def trackb_fusion_kernel(x: T.Tensor((1, 64), "float32")):
+        T.nop()
+    return trackb_fusion_kernel
+
+def trackb_fusion_entry(x):
+    return tilelang.compile(_build_trackb_fusion_func(64), target="ascend")
+'''
+
+_NON_TRACKB_CPP_TU_MODULE = '''
+def compile_ascend(src: str, *, options=()):
+    return "stub.so"
+
+_CUSTOM_VEC_TU = """
+#include <tl_templates/ascend/common.h>
+extern "C" __global__ __vector__ void custom_vec_impl(__gm__ float* x) {
+    x[0] = 1.0f;
+}
+"""
+
+def custom_vector_kernel(x):
+    return compile_ascend(_CUSTOM_VEC_TU, options=["-O2"])
+'''
+
+
+@pytest.mark.parametrize(
+    ("module_source", "expected_unit_kind", "expect_ascendc", "custom_builder_name"),
+    [
+        (_TRACKB_NAMED_PRIMFUNC_MODULE, "tilelang_dsl", False, None),
+        (_NON_TRACKB_CPP_TU_MODULE, "cce_cpp20", True, "_build_custom_vector_kernel"),
+    ],
+    ids=["reject_trackb_named_primfunc", "accept_non_trackb_cpp_tu"],
+)
+def test_stageb_unit_kind_codomain_dispatch(
+    tmp_path: Path,
+    module_source: str,
+    expected_unit_kind: str,
+    expect_ascendc: bool,
+    custom_builder_name: str | None,
+) -> None:
+    """Dispatch Stage-B compilation purely on CompileTaskSpec.unit_kind."""
+    ext = ModuleSelectorPlanExtractor(target="dav-3510")
+    cases = {"c0": {"input_shape": [[1, 64]], "dtype": ["float32"]}}
+    plan = build_post_selector_regime_plan(module_source, "codomain", cases, ext)
+    assert len(plan.unique_specs_by_key) == 1
+    spec = next(iter(plan.unique_specs_by_key.values()))
+    assert spec.unit_kind == expected_unit_kind
+    assert spec.unit_source.strip()
+
+    backend: StageBCompileBackend = _RecordingStageBBackend(tmp_path / "artifacts")
+    receipt = StageBCompileGate(
+        plan, ArtifactStore(tmp_path / "cache"), backend=backend, max_workers=1,
+    ).run(module_source)
+    assert receipt.passed is True
+    assert isinstance(backend, _RecordingStageBBackend)
+    assert len(backend.ascendc_calls) == (1 if expect_ascendc else 0)
+    assert len(backend.tilelang_calls) == (0 if expect_ascendc else 1)
+
+    if custom_builder_name is not None:
+        direct_spec = CompileTaskSpec(
+            task_key="direct_custom_cpp",
+            builder_name=custom_builder_name,
+            static_kwargs=(),
+            pass_configs=(),
+            compile_flags=("-O2",),
+            unit_kind="cce_cpp20",
+            unit_source='extern "C" __global__ __vector__ void custom_vec_impl(__gm__ float* x) {}',
+        )
+        direct_ext: CasePlanExtractor = _DirectExtractor(direct_spec)
+        direct_plan = build_post_selector_regime_plan("", "direct", {"c0": {}}, direct_ext)
+        direct_backend = _RecordingStageBBackend(tmp_path / "direct_artifacts")
+        direct_rec = StageBCompileGate(
+            direct_plan, ArtifactStore(tmp_path / "direct_cache"), backend=direct_backend,
+        ).run("")
+        assert direct_rec.passed is True
+        assert len(direct_backend.ascendc_calls) == 1
+        assert len(direct_backend.tilelang_calls) == 0
