@@ -137,6 +137,41 @@ def test_zero_config_env_discovery_sanitization_and_process_env(
     assert os.environ["TILEFOUNDRY_NPU_ENV_FILE"] == str(sanitized)
 
 
+def test_ensure_marathon_env_file_preserves_occupancy_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ensure_marathon_env_file retains AgentGates occupancy policy keys."""
+    for key in list(os.environ):
+        if key.startswith("TILEFOUNDRY_NPU_"):
+            monkeypatch.delenv(key, raising=False)
+    ws = tmp_path / "ws"
+    worktree = ws / "TileFoundry"
+    worktree.mkdir(parents=True)
+    (ws / "cann-bench" / "tasks").mkdir(parents=True)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    env_path = state_dir / "env.sh"
+    env_path.write_text(
+        "TILEFOUNDRY_NPU_OCCUPANCY_POLICY=shared_quiet\n"
+        "TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS=6\n"
+        "TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB=16384\n"
+        "TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT=3\n",
+        encoding="utf-8",
+    )
+    preserved = ensure_marathon_env_file(
+        operator_name="attention_residual",
+        worktree=worktree,
+        state_dir=state_dir,
+        env_file=env_path,
+    )
+    parsed = parse_simple_env_file(preserved)
+    assert parsed["TILEFOUNDRY_NPU_OCCUPANCY_POLICY"] == "shared_quiet"
+    assert parsed["TILEFOUNDRY_NPU_SHARED_MAX_EXT_PROCS"] == "6"
+    assert parsed["TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB"] == "16384"
+    assert parsed["TILEFOUNDRY_NPU_L4_EXTERNAL_PROBE_LIMIT"] == "3"
+
+
 def test_cli_and_marathon_multi_operator_routing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
