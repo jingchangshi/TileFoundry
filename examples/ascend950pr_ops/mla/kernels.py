@@ -3587,6 +3587,7 @@ __global__ __mix__(1, 2) void mla_kv_reuse_c1c1c2(
         if (cur_n0 < BN) {
           asc_fill_value_config fc{}; fc.repeat = D_NOPE / 16; fc.blk_num = BN; fc.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)k_nope_l1_base, (uint32_t)0, fc);
           asc_fill_value_config fr{}; fr.repeat = D_ROPE / 16; fr.blk_num = BN; fr.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)k_rope_l1_base, (uint32_t)0, fr);
+          pipe_barrier(PIPE_MTE2);
         }
         asc_set_gm2l1_nz_para(1, 1, BN, 0);
         asc_copy_gm2l1_nd2nz(k_nope_l1_base, K_nope + k_batch_base_n + kv_idx0 * D_NOPE, D_NOPE * 2, static_cast<asc_load_l2_cache_mode>(0), cur_n0, D_NOPE, 0, 0);
@@ -3601,6 +3602,7 @@ __global__ __mix__(1, 2) void mla_kv_reuse_c1c1c2(
           if (cur_n1 < BN) {
             asc_fill_value_config fc1{}; fc1.repeat = D_NOPE / 16; fc1.blk_num = BN; fc1.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)(k_nope_l1_base + K_NOPE_STAGE), (uint32_t)0, fc1);
             asc_fill_value_config fr1{}; fr1.repeat = D_ROPE / 16; fr1.blk_num = BN; fr1.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)(k_rope_l1_base + K_ROPE_STAGE), (uint32_t)0, fr1);
+            pipe_barrier(PIPE_MTE2);
           }
           asc_set_gm2l1_nz_para(1, 1, BN, 0);
           asc_copy_gm2l1_nd2nz(k_nope_l1_base + K_NOPE_STAGE, K_nope + k_batch_base_n + kv_idx1 * D_NOPE, D_NOPE * 2, static_cast<asc_load_l2_cache_mode>(0), cur_n1, D_NOPE, 0, 0);
@@ -3666,6 +3668,7 @@ __global__ __mix__(1, 2) void mla_kv_reuse_c1c1c2(
               if (cur_n2 < BN) {
                 asc_fill_value_config fc2{}; fc2.repeat = D_NOPE / 16; fc2.blk_num = BN; fc2.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)(k_nope_l1_base + stg * K_NOPE_STAGE), (uint32_t)0, fc2);
                 asc_fill_value_config fr2{}; fr2.repeat = D_ROPE / 16; fr2.blk_num = BN; fr2.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)(k_rope_l1_base + stg * K_ROPE_STAGE), (uint32_t)0, fr2);
+                pipe_barrier(PIPE_MTE2);
               }
               asc_set_gm2l1_nz_para(1, 1, BN, 0);
               asc_copy_gm2l1_nd2nz(k_nope_l1_base + stg * K_NOPE_STAGE, K_nope + k_batch_base_n + kv_idx2 * D_NOPE, D_NOPE * 2, static_cast<asc_load_l2_cache_mode>(0), cur_n2, D_NOPE, 0, 0);
