@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +21,10 @@ from tilefoundry_ascend.agent.gates.stage_b_gate import (
     compile_trackb_shared_so,
     compute_compile_task_key,
     compute_trackb_shared_so_filename,
+    has_dyn_ubuf_overflow,
     has_unreserved_vf_stack_overflow,
     parse_cce_res_usage,
+    resolve_ub_nominal_bytes,
     run_stage_b_ascendc_compile,
     run_stage_b_compile,
     validate_prewarm_manifest_v1,
@@ -31,6 +34,7 @@ from tilefoundry_ascend.ascend.compile_cache import (
     compute_artifact_id,
     extract_reachable_closure_source,
 )
+from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -1001,3 +1005,106 @@ def test_stageb_unit_kind_codomain_dispatch(
         assert direct_rec.passed is True
         assert len(direct_backend.ascendc_calls) == 1
         assert len(direct_backend.tilelang_calls) == 0
+
+
+class _DynUbufStageBBackend:
+    """Protocol implementation emitting compiled TileLang output with explicit dyn_ubuf_bytes."""
+
+    def __init__(self, out_dir: Path, dyn_ubuf_bytes: int, *, static_ub_bytes: int = 9248) -> None:
+        self._out_dir = out_dir
+        self._dyn_ubuf_bytes = int(dyn_ubuf_bytes)
+        self._static_ub_bytes = int(static_ub_bytes)
+
+    def compile_tilelang(
+        self, spec: CompileTaskSpec, module_source: str, work_dir: Path,
+    ) -> tuple[bool, int, str, tuple[Path, ...], str]:
+        _ = (module_source, work_dir)
+        obj = self._out_dir / f"{spec.task_key[:8]}_tl.so"
+        obj.parent.mkdir(parents=True, exist_ok=True)
+        obj.write_bytes(b"\x7fELF-tl")
+        diag = (
+            f"ub_bytes={self._static_ub_bytes}, stack=0, spill=0\n"
+            f"dyn_ubuf_bytes: {self._dyn_ubuf_bytes}\n"
+        )
+        return True, 0, diag, (obj,), ""
+
+    def compile_ascendc(
+        self, spec: CompileTaskSpec, cpp_source: str, work_dir: Path, regime_tag: str,
+    ) -> tuple[bool, int, str, tuple[Path, ...], str]:
+        _ = (spec, cpp_source, work_dir, regime_tag)
+        raise AssertionError("TileLang dyn_ubuf_bytes test must not dispatch to compile_ascendc")
+
+
+@pytest.mark.parametrize(
+    ("dyn_ubuf_bytes", "expect_pass", "expect_fault_code"),
+    [
+        (263936, False, "UB_SRAM_OVERFLOW"),
+        (262144, True, ""),
+        (131072, True, ""),
+    ],
+    ids=[
+        "reject_dyn_ubuf_263936_over_dav3510_limit",
+        "accept_dyn_ubuf_262144_at_dav3510_limit",
+        "accept_dyn_ubuf_131072_within_dav3510_limit",
+    ],
+)
+def test_stageb_dyn_ubuf_bytes_dav3510_capacity_guard(
+    tmp_path: Path,
+    dyn_ubuf_bytes: int,
+    expect_pass: bool,
+    expect_fault_code: str,
+) -> None:
+    """Reject compiled TileLang kernels exceeding L0 dav-3510 UB nominal capacity."""
+    expected_limit = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts).ub_nominal_bytes
+    assert resolve_ub_nominal_bytes() == expected_limit == 262144
+    assert has_dyn_ubuf_overflow(dyn_ubuf_bytes) is (not expect_pass)
+
+    ext = ModuleSelectorPlanExtractor(
+        target="dav-3510",
+        builder_name="_build_synth_prim_func",
+        config_selector_name="_select_synth_config",
+    )
+    cases = {"c0": {"m_rows": 524288, "d_dim": 128, "tl_dtype": "bfloat16"}}
+    plan = build_post_selector_regime_plan(_SYNTHETIC_SELECTOR_MODULE, "dyn_ubuf", cases, ext)
+    spec = next(iter(plan.unique_specs_by_key.values()))
+
+    store = ArtifactStore(tmp_path / "cache")
+    backend: StageBCompileBackend = _DynUbufStageBBackend(tmp_path / "bins", dyn_ubuf_bytes)
+    receipt = StageBCompileGate(plan, store, backend=backend, max_workers=1).run(
+        _SYNTHETIC_SELECTOR_MODULE
+    )
+    assert receipt.passed is expect_pass
+    assert receipt.fault_code == expect_fault_code
+    manifest_ok, manifest_details = validate_prewarm_manifest_v1(receipt.manifest_path, plan)
+    assert manifest_ok is expect_pass
+    if expect_pass:
+        assert spec.task_key not in manifest_details["failed_tasks"]
+        assert store.get_verified_artifact(spec.task_key) is not None
+    else:
+        assert str(dyn_ubuf_bytes) in receipt.diagnostic
+        assert spec.task_key in manifest_details["failed_tasks"]
+        assert store.get_verified_artifact(spec.task_key) is None
+
+    def _subproc_dyn_ubuf(
+        cmd: Sequence[str], **_kw: object,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=list(cmd),
+            returncode=0,
+            stdout=(
+                "Stack Frame Size: 0 bytes\n"
+                "Register spill: 0 bytes\n"
+                "ub_bytes=9248\n"
+                f"dyn_ubuf_bytes: {dyn_ubuf_bytes}\n"
+            ),
+            stderr="",
+        )
+
+    sb_res = run_stage_b_compile(
+        "def kernel():\n    pass\n",
+        artifact_store=ArtifactStore(tmp_path / "direct_cache"),
+        subproc_run=_subproc_dyn_ubuf,
+    )
+    assert sb_res.passed is expect_pass
+    assert sb_res.fault_code == expect_fault_code
+    assert sb_res.dyn_ubuf_bytes == dyn_ubuf_bytes

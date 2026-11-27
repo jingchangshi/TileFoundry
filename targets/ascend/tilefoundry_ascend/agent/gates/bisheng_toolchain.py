@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 import re
@@ -26,7 +27,7 @@ from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     BishengResourceSummary, parse_bisheng_res_usage,
 )
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import extract_microarch_profile_from_cce
-from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
+from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS, AscendSpaceFacts, AscendTarget
 
 _COMPILE_DIAGNOSTIC_LIMIT = 1500
 _CANN_INCLUDE_SUBDIRS: tuple[str, ...] = (
@@ -46,6 +47,8 @@ _DEPRECATED_WARN_RE = re.compile(
 )
 _NON_ERROR_DIAG_HEADER_RE = re.compile(r"^(?:note:|warning:|in file included from|/\S+:\d+:\d+:\s*(?:warning|note):)", re.IGNORECASE)
 _TVM_BT_RE = re.compile(r"^\s*(?:\[bt\]\s*\(\d+\)|File \"<unknown>\", line 0, in )")
+_DYN_UBUF_BYTES_RE = re.compile(r"\bdyn_ubuf_bytes\s*[:=]\s*(\d+)\b", re.IGNORECASE)
+_TIR_DYN_SHMEM_RE = re.compile(r'dyn_shared_memory_buf["\']?\s*:\s*(?:T\.int(?:32|64)\()?(\d+)')
 _OVERFLOW_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("VF_STACK_OVERFLOW", ("exceeded vf stack size", "vf_stack", "vf stack", "stack frame size", "stack overflow")),
     ("L0C_SRAM_OVERFLOW", ("l0c_sram_overflow", "l0c overflow", "l0c_overflow", "l0c capacity", "exceeds l0c", "exceeded l0c")),
@@ -87,6 +90,7 @@ class StageBResult:
     failed_tier: str = ""
     artifact_id: str = ""
     binary_paths: tuple[str, ...] = ()
+    dyn_ubuf_bytes: int = 0
 
 
 def _stage_b_fail(
@@ -102,13 +106,38 @@ def _stage_b_fail(
     full_diag: str = "",
     cce: str = "",
     tir: str = "",
+    dyn_ubuf_bytes: int = 0,
 ) -> StageBResult:
     return StageBResult(
         passed=False, error_message=error_message, elapsed_sec=time.monotonic() - t0,
         spill_bytes=spill_bytes, vloopv2_hit=vloopv2_hit, compiler_summary=summary,
         microarch_profile=ma_profile, full_diagnostic=full_diag, generated_cce=cce,
         lowered_tir=tir, fault_plane=fault_plane, fault_code=fault_code, failed_tier="stage_b",
+        dyn_ubuf_bytes=int(dyn_ubuf_bytes),
     )
+
+
+@functools.lru_cache(maxsize=1)
+def resolve_ub_nominal_bytes() -> int:
+    """Return dav-3510 nominal hardware UB capacity in bytes from L0 target facts."""
+    return int(AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts).ub_nominal_bytes)
+
+
+def parse_dyn_ubuf_bytes(diag_text: str = "", tir_text: str = "") -> int:
+    """Extract dynamic UB allocation bytes from compiler diagnostics or lowered TIR."""
+    vals = [int(m.group(1)) for m in _DYN_UBUF_BYTES_RE.finditer(diag_text or "")]
+    vals.extend(int(m.group(1)) for m in _TIR_DYN_SHMEM_RE.finditer(tir_text or ""))
+    return max(vals, default=0)
+
+
+def resolve_dyn_ubuf_bytes(dyn_ubuf_bytes: int = 0, compiler_diag: str = "", tir_text: str = "") -> int:
+    """Resolve peak dynamic UB allocation bytes across explicit values, logs, and TIR."""
+    return max(max(0, int(dyn_ubuf_bytes or 0)), parse_dyn_ubuf_bytes(compiler_diag, tir_text))
+
+
+def has_dyn_ubuf_overflow(dyn_ubuf_bytes: int, compiler_diag: str = "", tir_text: str = "") -> bool:
+    """Return True when dynamic UB allocation exceeds dav-3510 nominal UB capacity."""
+    return resolve_dyn_ubuf_bytes(dyn_ubuf_bytes, compiler_diag, tir_text) > resolve_ub_nominal_bytes()
 
 
 def has_unreserved_vf_stack_overflow(spec: CompileTaskSpec, stack_bytes: int, compiler_diag: str) -> bool:

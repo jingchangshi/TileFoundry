@@ -44,7 +44,8 @@ from tilefoundry_ascend.agent.gates.bisheng_toolchain import (
     _stage_b_fail,
     _verify_object_has_instantiated_kernel as _verify_object_has_instantiated_kernel,
     compile_trackb_shared_so, compute_trackb_shared_so_filename,
-    has_unreserved_vf_stack_overflow, parse_cce_res_usage, resolve_trackb_compile_flags,
+    has_dyn_ubuf_overflow, has_unreserved_vf_stack_overflow, parse_cce_res_usage,
+    resolve_dyn_ubuf_bytes, resolve_trackb_compile_flags, resolve_ub_nominal_bytes,
     run_stage_b_ascendc_compile,
 )
 from tilefoundry_ascend.agent.gates.cpp_slice_protocol import (
@@ -894,6 +895,54 @@ if _compiled is not None and _cfg.get("kernel_dump_path") and not pathlib.Path(_
 if _cfg.get("emit_cache_bins_path"):
     (_ep := pathlib.Path(_cfg["emit_cache_bins_path"])).parent.mkdir(parents=True, exist_ok=True)
     _ep.write_text(json.dumps(_collect_bins(_compiled)), encoding="utf-8")
+def _extract_dyn_ubuf_bytes(obj):
+    import re as _re
+    items = list(obj) if isinstance(obj, (tuple, list)) else [obj]
+    peak = 0
+    for it in items:
+        if it is None: continue
+        dmods = [getattr(it, "device_mod", None), getattr(getattr(it, "adapter", None), "device_mod", None)]
+        found_dm = False
+        for dm in dmods:
+            if dm is None or not hasattr(dm, "functions"): continue
+            found_dm = True
+            for fn in dm.functions.values():
+                attrs = getattr(fn, "attrs", None)
+                if attrs is not None and "dyn_shared_memory_buf" in attrs:
+                    val = attrs["dyn_shared_memory_buf"]
+                    iv = getattr(val, "value", val)
+                    if isinstance(iv, int): peak = max(peak, int(iv))
+        if found_dm: continue
+        cp = getattr(it, "_tilelang_cache_path", None)
+        has_dyn = False
+        if cp:
+            ep = pathlib.Path(str(cp)) / "executable.so"
+            if ep.is_file():
+                with contextlib.suppress(OSError):
+                    has_dyn = b"tirx.use_dyn_shared_memory" in ep.read_bytes()
+        if not has_dyn:
+            ad = getattr(it, "adapter", None)
+            for c in (it, ad):
+                if c is None: continue
+                ks = c.get_kernel_source() if callable(getattr(c, "get_kernel_source", None)) else getattr(c, "kernel_source", None)
+                if isinstance(ks, str) and "buf_dyn_shmem" in ks:
+                    has_dyn = True; break
+        if not has_dyn: continue
+        hsrc = it.get_host_source() if callable(getattr(it, "get_host_source", None)) else getattr(it, "host_source", None)
+        if not isinstance(hsrc, str) or not hsrc:
+            ad = getattr(it, "adapter", None)
+            hsrc = ad.get_host_source() if ad is not None and callable(getattr(ad, "get_host_source", None)) else ""
+        if not isinstance(hsrc, str) or not hsrc: continue
+        pvars = {m.group(2) for m in _re.finditer('TVMBackendGetFuncFromEnv\\\\([^,]+,\\\\s*"([^"]+)",\\\\s*&([A-Za-z_]\\\\w*)\\\\)', hsrc) if m.group(1) not in ("__tvm_set_device", "ffi.Array") and not m.group(1).startswith("ffi.")}
+        for cm in _re.finditer('TVMFFIFunctionCall\\\\(\\\\s*([A-Za-z_]\\\\w*)\\\\s*,\\\\s*\\\\(TVMFFIAny\\\\s*\\\\*\\\\)\\\\s*stack_ffi_any\\\\s*,\\\\s*(\\\\d+)\\\\s*,', hsrc):
+            if cm.group(1) in pvars and (na := int(cm.group(2))) > 0:
+                pat = f'stack_ffi_any\\\\)\\\\s*\\\\[{na - 1}\\\\]\\\\.v_int64\\\\)\\\\s*=\\\\s*(?:\\\\(\\\\s*)?\\\\(int64_t\\\\)\\\\s*(\\\\d+)\\\\s*\\\\)?\\\\s*;'
+                matches = list(_re.finditer(pat, hsrc[max(0, cm.start() - 4096) : cm.start()]))
+                if matches:
+                    peak = max(peak, int(matches[-1].group(1)))
+    return peak
+if _compiled is not None and (_dyn_ub := _extract_dyn_ubuf_bytes(_compiled)) > 0:
+    print(f"dyn_ubuf_bytes: {_dyn_ub}")
 '''
     return template.lstrip().replace("__PAYLOAD__", repr(payload))
 
@@ -979,6 +1028,7 @@ def run_stage_b_compile(
         ltir = tir_dump.read_text(encoding="utf-8", errors="ignore") if tir_dump.is_file() else ""
         comb = (proc.stdout or "") + "\n" + (proc.stderr or "")
         sp, vl, summary = _parse_cce_res_usage_with_summary(comb, asm_or_dump_text=ldump)
+        dyn_ub = resolve_dyn_ubuf_bytes(0, comb, ltir)
         ma_prof = extract_microarch_profile_from_cce(ldump).to_dict() if ldump.strip() else None
         if proc.returncode != 0:
             raw_d = proc.stderr or proc.stdout or ""
@@ -986,18 +1036,28 @@ def run_stage_b_compile(
                 t0, f"stage_b_compile_failed (rc={proc.returncode}): {_bounded_compile_diagnostic(raw_d)}",
                 _classify_stage_b_overflow_fault_code(f"{raw_d}\n{ldump}", summary, "STAGE_B_COMPILE_FAILED"),
                 spill_bytes=sp, vloopv2_hit=vl, summary=summary, ma_profile=ma_prof, full_diag=raw_d, cce=ldump, tir=ltir,
+                dyn_ubuf_bytes=dyn_ub,
             )
         if has_unreserved_vf_stack_overflow(spec_chk, summary.stack_bytes, comb):
             return _stage_b_fail(
                 t0, f"stage_b_vf_stack_overflow: stack_bytes={summary.stack_bytes}", "VF_STACK_OVERFLOW",
                 spill_bytes=sp, vloopv2_hit=vl, summary=summary, ma_profile=ma_prof, full_diag=comb, cce=ldump, tir=ltir,
+                dyn_ubuf_bytes=dyn_ub,
+            )
+        if has_dyn_ubuf_overflow(dyn_ub, comb, ltir):
+            ub_limit = resolve_ub_nominal_bytes()
+            return _stage_b_fail(
+                t0, f"stage_b_dyn_ubuf_overflow: dyn_ubuf_bytes={dyn_ub} > ub_nominal_bytes={ub_limit}",
+                "UB_SRAM_OVERFLOW", spill_bytes=sp, vloopv2_hit=vl, summary=summary, ma_profile=ma_prof,
+                full_diag=comb, cce=ldump, tir=ltir, dyn_ubuf_bytes=dyn_ub,
             )
         _merge_cache_locked(w_cache, store.root)
         recorded_aid, recorded_bins = "", ()
         if built := _collect_built_bins(tmp_root, w_cache, store.root, pre_bins):
             rec = store.record_verified_artifact(
                 target_aid, binary_paths=built, backend_kind="tilelang", flags=" ".join(norm_cf),
-                spec_key=spec_key, closure_src=closure_src, metadata={"stack_bytes": int(summary.stack_bytes)}, copy_binaries=True,
+                spec_key=spec_key, closure_src=closure_src,
+                metadata={"stack_bytes": int(summary.stack_bytes), "dyn_ubuf_bytes": int(dyn_ub)}, copy_binaries=True,
             )
             recorded_aid, recorded_bins = target_aid, rec.binary_paths
         elif (ex := store.get_verified_artifact(target_aid)) is not None:
@@ -1005,6 +1065,7 @@ def run_stage_b_compile(
     return StageBResult(
         passed=True, elapsed_sec=time.monotonic() - t0, spill_bytes=sp, vloopv2_hit=vl, compiler_summary=summary,
         microarch_profile=ma_prof, generated_cce=ldump, lowered_tir=ltir, artifact_id=recorded_aid, binary_paths=recorded_bins,
+        dyn_ubuf_bytes=dyn_ub,
     )
 
 
@@ -1033,7 +1094,12 @@ def validate_prewarm_manifest_v1(manifest_path: str | Path, plan: RegimeCompileP
     for tkey, spec in plan.unique_specs_by_key.items():
         if not isinstance(entry := tasks.get(tkey), Mapping):
             missing.append(tkey)
-        elif entry.get("passed") is False or str(entry.get("status", "")).upper() == "FAIL" or has_unreserved_vf_stack_overflow(spec, int(entry.get("stack_bytes", 0) or 0), ""):
+        elif (
+            entry.get("passed") is False
+            or str(entry.get("status", "")).upper() == "FAIL"
+            or has_unreserved_vf_stack_overflow(spec, int(entry.get("stack_bytes", 0) or 0), "")
+            or has_dyn_ubuf_overflow(int(entry.get("dyn_ubuf_bytes", 0) or 0))
+        ):
             failed.append(tkey)
         else:
             raw_bins = ([ap] if (ap := str(entry.get("artifact_path", "") or "").strip()) else []) + (
@@ -1101,10 +1167,15 @@ def _run_driver_spec(
     comb = (proc.stdout or "") + "\n" + (proc.stderr or "")
     _, _, summary = _parse_cce_res_usage_with_summary(comb, asm_or_dump_text=ldump)
     s_bytes = int(summary.stack_bytes)
+    dyn_ub = resolve_dyn_ubuf_bytes(0, comb)
     if proc.returncode != 0:
         return False, s_bytes, comb, (), _classify_stage_b_overflow_fault_code(f"{comb}\n{ldump}", summary, fc_default)
     if spec is not None and has_unreserved_vf_stack_overflow(spec, s_bytes, comb):
         return False, s_bytes, comb, (), "VF_STACK_OVERFLOW"
+    if has_dyn_ubuf_overflow(dyn_ub, comb):
+        ub_limit = resolve_ub_nominal_bytes()
+        ovf_msg = f"stage_b_dyn_ubuf_overflow: dyn_ubuf_bytes={dyn_ub} > ub_nominal_bytes={ub_limit}"
+        return False, s_bytes, f"{comb}\n{ovf_msg}".strip(), (), "UB_SRAM_OVERFLOW"
     _merge_cache_locked(w_cache, resolved_tl_cache)
     return True, s_bytes, comb, tuple(_collect_built_bins(work_dir, w_cache, resolved_tl_cache, pre_bins, emit_path)), ""
 
@@ -1215,8 +1286,15 @@ class StageBCompileGate:
             if (rec := self.artifact_store.get_verified_artifact(tkey)) is not None:
                 prev = existing_tasks.get(tkey)
                 sb = int(rec.metadata.get("stack_bytes", prev.get("stack_bytes", 0) if isinstance(prev, Mapping) else 0) or 0)
+                dyn_ub = int(rec.metadata.get("dyn_ubuf_bytes", prev.get("dyn_ubuf_bytes", 0) if isinstance(prev, Mapping) else 0) or 0)
                 bins = tuple(Path(p) for p in rec.binary_paths if is_verified_binary_file(Path(p)))
-                cached_res[tkey] = (False, sb, f"stage_b_vf_stack_overflow: stack_bytes={sb}", bins, "VF_STACK_OVERFLOW") if has_unreserved_vf_stack_overflow(spec, sb, "") else (True, sb, "", bins, "")
+                if has_unreserved_vf_stack_overflow(spec, sb, ""):
+                    cached_res[tkey] = (False, sb, f"stage_b_vf_stack_overflow: stack_bytes={sb}", bins, "VF_STACK_OVERFLOW")
+                elif has_dyn_ubuf_overflow(dyn_ub):
+                    ub_limit = resolve_ub_nominal_bytes()
+                    cached_res[tkey] = (False, sb, f"stage_b_dyn_ubuf_overflow: dyn_ubuf_bytes={dyn_ub} > ub_nominal_bytes={ub_limit}", bins, "UB_SRAM_OVERFLOW")
+                else:
+                    cached_res[tkey] = (True, sb, f"dyn_ubuf_bytes: {dyn_ub}" if dyn_ub > 0 else "", bins, "")
             else:
                 missed.append(spec)
 
@@ -1268,13 +1346,18 @@ class StageBCompileGate:
                     mplan = dict(latest["plan_index"]) if isinstance(latest.get("plan_index"), Mapping) else {}
                     for tkey, spec in active_plan.unique_specs_by_key.items():
                         ok, sb, diag, bins, fc = all_res[tkey]
+                        dyn_ub = resolve_dyn_ubuf_bytes(0, diag)
                         max_sb = max(max_sb, int(sb))
                         if ok and has_unreserved_vf_stack_overflow(spec, sb, diag):
                             ok, fc = False, "VF_STACK_OVERFLOW"
+                        elif ok and has_dyn_ubuf_overflow(dyn_ub, diag):
+                            ub_limit = resolve_ub_nominal_bytes()
+                            ok, fc = False, "UB_SRAM_OVERFLOW"
+                            diag = f"stage_b_dyn_ubuf_overflow: dyn_ubuf_bytes={dyn_ub} > ub_nominal_bytes={ub_limit}"
                         rbins = bins
                         if ok and tkey in compiled_res and bins:
                             bk = "ascendc_trackb" if _is_trackb_spec(spec) else "tilelang"
-                            rec = self.artifact_store.record_verified_artifact(tkey, binary_paths=bins, backend_kind=bk, flags=" ".join(spec.compile_flags), metadata={"stack_bytes": int(sb), "regime_tag": active_plan.regime_tag}, copy_binaries=True)
+                            rec = self.artifact_store.record_verified_artifact(tkey, binary_paths=bins, backend_kind=bk, flags=" ".join(spec.compile_flags), metadata={"stack_bytes": int(sb), "dyn_ubuf_bytes": int(dyn_ub), "regime_tag": active_plan.regime_tag}, copy_binaries=True)
                             rbins = tuple(Path(p) for p in rec.binary_paths)
                         if not ok:
                             all_ok = False
@@ -1282,7 +1365,7 @@ class StageBCompileGate:
                                 first_fc, first_diag = fc or "STAGE_B_COMPILE_FAILED", diag
                         mtasks[tkey] = {
                             "builder_name": spec.builder_name, "artifact_path": str(rbins[0]) if rbins else "",
-                            "binary_paths": [str(p) for p in rbins], "stack_bytes": int(sb),
+                            "binary_paths": [str(p) for p in rbins], "stack_bytes": int(sb), "dyn_ubuf_bytes": int(dyn_ub),
                             "compile_flags": list(spec.compile_flags), "passed": bool(ok),
                             "status": "PASS" if ok else "FAIL", "fault_code": "" if ok else (fc or "STAGE_B_COMPILE_FAILED"),
                         }
@@ -1361,6 +1444,7 @@ __all__ = [
     "ModuleSelectorPlanExtractor", "StageBCompileBackend", "StageBCompileGate", "StageBResult", "_resolve_artifact_store",
     "ascend_compile_session", "build_post_selector_regime_plan", "build_stage_b_driver_source",
     "compile_trackb_shared_so", "compute_compile_task_key", "compute_trackb_shared_so_filename",
-    "has_unreserved_vf_stack_overflow", "parse_cce_res_usage", "resolve_trackb_compile_flags",
+    "has_dyn_ubuf_overflow", "has_unreserved_vf_stack_overflow", "parse_cce_res_usage",
+    "resolve_dyn_ubuf_bytes", "resolve_trackb_compile_flags", "resolve_ub_nominal_bytes",
     "run_l1_compile_check", "run_stage_b_ascendc_compile", "run_stage_b_compile", "validate_prewarm_manifest_v1",
 ]
