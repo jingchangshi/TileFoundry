@@ -5,11 +5,9 @@ Also covers the Tier-1 behavior registry.
 
 from __future__ import annotations
 
-import inspect
 import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any
 
 from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
@@ -377,34 +375,34 @@ def _ctx_float(ctx: Mapping[str, object], key: str, default: float = 0.0) -> flo
     return float(raw) if (isinstance(raw := ctx.get(key), (int, float)) and not isinstance(raw, bool)) else default
 
 
-def _penalty_spill_and_stack(s: BishengResourceSummary, ctx: Mapping[str, Any]) -> float:
-    b = float(ctx.get("base_ref", 1.0))
+def _penalty_spill_and_stack(s: BishengResourceSummary, ctx: Mapping[str, object]) -> float:
+    b = _ctx_float(ctx, "base_ref", 1.0)
     return (b * min(1.5, 0.20 + 0.004 * s.spill_bytes) + s.spill_bytes * 0.01) if s.spill_bytes > 0 else (min(b * 0.25, float(s.stack_bytes) * 0.002) if s.stack_bytes > 1024 else 0.0)
 
 
-def _penalty_software_loop(s: BishengResourceSummary, ctx: Mapping[str, Any]) -> float:
-    return (max(float(ctx.get("vec_floor_us", 0.0)), float(ctx.get("base_ref", 1.0)) * 0.5) * min(2.0, 0.35 * s.software_loops)) if (s.software_loops > 0 and s.vloopv2_loops == 0) else 0.0
+def _penalty_software_loop(s: BishengResourceSummary, ctx: Mapping[str, object]) -> float:
+    return (max(_ctx_float(ctx, "vec_floor_us", 0.0), _ctx_float(ctx, "base_ref", 1.0) * 0.5) * min(2.0, 0.35 * s.software_loops)) if (s.software_loops > 0 and s.vloopv2_loops == 0) else 0.0
 
 
-def _penalty_local_membar(s: BishengResourceSummary, ctx: Mapping[str, Any]) -> float:
-    return max(1.0, float(ctx.get("vec_floor_us", 0.0)) * 0.25) if s.has_local_membar_in_vf_call else 0.0
+def _penalty_local_membar(s: BishengResourceSummary, ctx: Mapping[str, object]) -> float:
+    return max(1.0, _ctx_float(ctx, "vec_floor_us", 0.0) * 0.25) if s.has_local_membar_in_vf_call else 0.0
 
 
-def _penalty_vf_fusion_breaks(s: BishengResourceSummary, ctx: Mapping[str, Any]) -> float:
-    return (max(1.0, float(ctx.get("vec_floor_us", 0.0)) * 0.18, float(ctx.get("base_ref", 1.0)) * 0.12) * float(min(6, s.vf_fusion_breaks))) if s.vf_fusion_breaks > 0 else 0.0
+def _penalty_vf_fusion_breaks(s: BishengResourceSummary, ctx: Mapping[str, object]) -> float:
+    return (max(1.0, _ctx_float(ctx, "vec_floor_us", 0.0) * 0.18, _ctx_float(ctx, "base_ref", 1.0) * 0.12) * float(min(6, s.vf_fusion_breaks))) if s.vf_fusion_breaks > 0 else 0.0
 
 
-def _penalty_alias_serialized(s: BishengResourceSummary, ctx: Mapping[str, Any]) -> float:
-    return (max(float(ctx.get("hbm_floor_us", 0.0)), float(ctx.get("vec_floor_us", 0.0)), float(ctx.get("base_ref", 1.0)) * 0.25) * min(2.5, 0.30 * s.alias_serialized_buffers)) if s.alias_serialized_buffers > 0 else 0.0
+def _penalty_alias_serialized(s: BishengResourceSummary, ctx: Mapping[str, object]) -> float:
+    return (max(_ctx_float(ctx, "hbm_floor_us", 0.0), _ctx_float(ctx, "vec_floor_us", 0.0), _ctx_float(ctx, "base_ref", 1.0) * 0.25) * min(2.5, 0.30 * s.alias_serialized_buffers)) if s.alias_serialized_buffers > 0 else 0.0
 
 
-def _penalty_dual_issue_collapse(s: BishengResourceSummary, ctx: Mapping[str, Any]) -> float:
+def _penalty_dual_issue_collapse(s: BishengResourceSummary, ctx: Mapping[str, object]) -> float:
     sev = max(0.0, min(1.0, float(s.dual_issue_ipc_collapse)))
-    return (max(float(ctx.get("vec_floor_us", 0.0)), float(ctx.get("base_ref", 1.0)) * 0.20) * 0.45 * sev) if sev > 0.0 else 0.0
+    return (max(_ctx_float(ctx, "vec_floor_us", 0.0), _ctx_float(ctx, "base_ref", 1.0) * 0.20) * 0.45 * sev) if sev > 0.0 else 0.0
 
 
-def _penalty_dcache_dcci(s: BishengResourceSummary, ctx: Mapping[str, Any]) -> float:
-    b = float(ctx.get("base_ref", 1.0))
+def _penalty_dcache_dcci(s: BishengResourceSummary, ctx: Mapping[str, object]) -> float:
+    b = _ctx_float(ctx, "base_ref", 1.0)
     return min(2.0 * b, float(s.dcache_dcci_flushes) * max(1.5, 0.08 * b)) if s.dcache_dcci_flushes > 0 else 0.0
 
 
@@ -422,26 +420,18 @@ def _penalty_dcache_bypass_narrow_store(s: BishengResourceSummary, ctx: Mapping[
     return eh * 0.5 * max(0.0, amp - 1.0)
 
 
-def _positional_params(fn: Callable[..., Any]) -> list[str] | None:
+def _invoke_parse_fn(parse_fn: Callable[..., object], res_text: str, asm_or_dump_text: str) -> object:
     try:
-        sig = inspect.signature(fn)
-    except (ValueError, TypeError):
-        return None
-    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()):
-        return None
-    return [p.name for p in sig.parameters.values() if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        return parse_fn(res_text, asm_or_dump_text)
+    except TypeError:
+        return parse_fn(_combined(res_text, asm_or_dump_text))
 
 
-def _invoke_parse_fn(parse_fn: Callable[..., Any], res_text: str, asm_or_dump_text: str) -> Any:
-    params = _positional_params(parse_fn)
-    return parse_fn(_combined(res_text, asm_or_dump_text)) if (params is not None and len(params) == 1) else parse_fn(res_text, asm_or_dump_text)
-
-
-def _invoke_penalty_fn(penalty_fn: Callable[..., float], summary: BishengResourceSummary, ctx: Mapping[str, Any]) -> float:
-    params = _positional_params(penalty_fn)
-    if params is not None and len(params) == 1:
-        return float(penalty_fn(ctx) if params[0].lower() in ("ctx", "context") else penalty_fn(summary))
-    return float(penalty_fn(summary, ctx))
+def _invoke_penalty_fn(penalty_fn: Callable[..., float], summary: BishengResourceSummary, ctx: Mapping[str, object]) -> float:
+    try:
+        return float(penalty_fn(summary, ctx))
+    except TypeError:
+        return float(penalty_fn(summary))
 
 
 @dataclass(frozen=True)
@@ -449,7 +439,7 @@ class CompilerBehaviorDetector:
     """One compiler-level phenomenon parsed from dumps and penalized in Tier-1."""
 
     name: str
-    parse_fn: Callable[..., Any]
+    parse_fn: Callable[..., object]
     penalty_fn: Callable[..., float]
     summary_field: str | None = None
     description: str = ""
@@ -468,7 +458,7 @@ class CompilerBehaviorRegistry:
         self._detectors: dict[str, CompilerBehaviorDetector] = {d.name: d for d in (detectors or ())}
 
     def register(
-        self, detector_or_name: CompilerBehaviorDetector | str, parse_fn: Callable[..., Any] | None = None,
+        self, detector_or_name: CompilerBehaviorDetector | str, parse_fn: Callable[..., object] | None = None,
         penalty_fn: Callable[..., float] | None = None, *, summary_field: str | None = None,
         description: str = "", overwrite: bool = True,
     ) -> CompilerBehaviorDetector:
@@ -521,7 +511,7 @@ class CompilerBehaviorRegistry:
                 extra_signals[det.name] = val
         return BishengResourceSummary.from_dict({**fields, "extra_signals": extra_signals})
 
-    def compute_tier1_penalties(self, summary: BishengResourceSummary, context: Mapping[str, Any] | None = None) -> tuple[float, dict[str, float]]:
+    def compute_tier1_penalties(self, summary: BishengResourceSummary, context: Mapping[str, object] | None = None) -> tuple[float, dict[str, float]]:
         """Evaluate every registered detector's Tier-1 penalty and return (total_us, breakdown)."""
         base_ctx, total, breakdown = dict(context or {}), 0.0, {}
         for det in self._detectors.values():
@@ -532,7 +522,7 @@ class CompilerBehaviorRegistry:
         return total, breakdown
 
 
-_DEFAULT_DETECTORS: tuple[tuple[str, Callable[..., Any], Callable[..., float], str | None, str], ...] = (
+_DEFAULT_DETECTORS: tuple[tuple[str, Callable[..., object], Callable[..., float], str | None, str], ...] = (
     ("register_stack_spill", _detect_spill_and_stack, _penalty_spill_and_stack, "spill_bytes", "(a) Vector/scalar register pressure and stack spill bytes"),
     ("loop_vectorization_vloopv2", _detect_loop_vectorization, _penalty_software_loop, "software_loops", "(b) Hardware VLOOPv2 zero-overhead loop hit vs software branch fallback"),
     ("vf_local_membar", _detect_local_membar_in_vf, _penalty_local_membar, "has_local_membar_in_vf_call", "(c) LocalMemBar/PIPE_ALL serialization inside SimdVF / asc_vf_call"),
@@ -556,7 +546,7 @@ DEFAULT_COMPILER_BEHAVIOR_REGISTRY: CompilerBehaviorRegistry = _build_default_re
 
 
 def register_compiler_detector(
-    name: str, parse_fn: Callable[..., Any], penalty_fn: Callable[..., float], *,
+    name: str, parse_fn: Callable[..., object], penalty_fn: Callable[..., float], *,
     registry: CompilerBehaviorRegistry | None = None, summary_field: str | None = None, description: str = "", overwrite: bool = True,
 ) -> CompilerBehaviorDetector:
     return (registry if registry is not None else DEFAULT_COMPILER_BEHAVIOR_REGISTRY).register(name, parse_fn, penalty_fn, summary_field=summary_field, description=description, overwrite=overwrite)

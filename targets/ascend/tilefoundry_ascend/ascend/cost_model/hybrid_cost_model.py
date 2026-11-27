@@ -639,7 +639,7 @@ class HybridAscendCostModel:
             self.save_calibration(self.calibration_path)
         return a_us
 
-    def observe_batch(self, items: Sequence[tuple[Any, ...]], *, persist: bool = True) -> list[float]:
+    def observe_batch(self, items: Sequence[tuple[object, ...]], *, persist: bool = True) -> list[float]:
         out = []
         for entry in items:
             if len(entry) not in (2, 3):

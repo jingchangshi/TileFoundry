@@ -501,10 +501,11 @@ def _module_defines_authored_regimes(mod_text: str, regimes: Sequence[RegimeTarg
     )
 
 
+_DEFAULT_REGISTRIES: dict[type[CannbenchOpsRegistry], CannbenchOpsRegistry] = {}
+
+
 class CannbenchOpsRegistry:
     """Dynamic registry discovering all 60+ operators in cann-bench/tasks."""
-
-    _DEFAULT_INSTANCE: CannbenchOpsRegistry | None = None
 
     def __init__(
         self, tasks_root: str | Path | None = None, *, source_root: str | Path | None = None, pure_golden: bool = False
@@ -526,9 +527,10 @@ class CannbenchOpsRegistry:
     @classmethod
     def default(cls) -> CannbenchOpsRegistry:
         """Return cached default CannbenchOpsRegistry instance."""
-        if cls._DEFAULT_INSTANCE is None:
-            cls._DEFAULT_INSTANCE = cls()
-        return cls._DEFAULT_INSTANCE
+        if (inst := _DEFAULT_REGISTRIES.get(cls)) is None:
+            inst = cls()
+            _DEFAULT_REGISTRIES[cls] = inst
+        return inst
 
     def _resolve_tasks_root(self, tasks_root: str | Path | None) -> Path:
         if tasks_root is not None:

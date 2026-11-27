@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
@@ -275,12 +274,10 @@ def _resolve_static_ledger_gm_bytes(ledger: PhysicalLedgerLike) -> int:
     if isinstance(ledger, _FullGridTrafficLedgerLike):
         total_fn = ledger.total_gm_bytes
         if callable(total_fn):
-            positional = [
-                p
-                for p in inspect.signature(total_fn).parameters.values()
-                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            ]
-            val = total_fn(effective_blocks) if positional and positional[0].default is inspect.Parameter.empty else total_fn()
+            try:
+                val = total_fn(effective_blocks)
+            except TypeError:
+                val = total_fn()
             return max(0, int(val))
         if isinstance(total_fn, int) and not isinstance(total_fn, bool):
             return max(0, total_fn)

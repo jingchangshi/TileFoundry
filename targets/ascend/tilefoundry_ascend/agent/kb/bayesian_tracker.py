@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TypeVar
 
 from tilefoundry_ascend.agent.kb.schema import (
     AscendCausalRule,
@@ -149,8 +149,8 @@ def _upsert_tabu(entries: list[_T], match_fn: Callable[[_T], bool], new_entry: _
 
 
 def _tabu_active(
-    entries: Sequence[TabuEntry] | Sequence[FamilyTabuEntry],
-    reg: str, sha: str, cur_round: int, key_match: Callable[[Any], bool],
+    entries: Sequence[_T],
+    reg: str, sha: str, cur_round: int, key_match: Callable[[_T], bool],
 ) -> bool:
     return any(e.regime_tag == reg and e.parent_sha == sha and cur_round <= e.expire_round and key_match(e) for e in entries)
 
@@ -456,13 +456,57 @@ class BayesianRuleTracker:
         selected = [rule for _key, rule in candidates]
         return tuple(selected[:top_k] if top_k is not None and top_k >= 0 else selected)
 
-    def select_top_rules(self, context: Mapping[str, object], **kwargs: Any) -> tuple[AscendCausalRule, ...]:
+    def select_top_rules(
+        self,
+        context: Mapping[str, object],
+        *,
+        top_k: int | None = None,
+        topology_axes: object | None = None,
+        operator_name: str = "",
+        runtime_backend: str | None = None,
+        regime_tag: str = "",
+        parent_sha: str = "",
+        current_round: int | None = None,
+        symptom_ranking: Sequence[tuple[str | SymptomFamily, float]] = (),
+    ) -> tuple[AscendCausalRule, ...]:
         """Select the highest-ranked matching rules after scoped tabu filtering."""
-        return self.rank_applicable_rules(context, **kwargs)
+        return self.rank_applicable_rules(
+            context,
+            top_k=top_k,
+            topology_axes=topology_axes,
+            operator_name=operator_name,
+            runtime_backend=runtime_backend,
+            regime_tag=regime_tag,
+            parent_sha=parent_sha,
+            current_round=current_round,
+            symptom_ranking=symptom_ranking,
+        )
 
-    def rank_matching_rules(self, context: Mapping[str, object], **kwargs: Any) -> tuple[AscendCausalRule, ...]:
+    def rank_matching_rules(
+        self,
+        context: Mapping[str, object],
+        *,
+        top_k: int | None = None,
+        topology_axes: object | None = None,
+        operator_name: str = "",
+        runtime_backend: str | None = None,
+        regime_tag: str = "",
+        parent_sha: str = "",
+        current_round: int | None = None,
+        symptom_ranking: Sequence[tuple[str | SymptomFamily, float]] = (),
+    ) -> tuple[AscendCausalRule, ...]:
         """Rank all matching rules after backend and scoped tabu filtering."""
-        return self.rank_applicable_rules(context, **kwargs)
+        return self.rank_applicable_rules(
+            context,
+            top_k=top_k,
+            topology_axes=topology_axes,
+            operator_name=operator_name,
+            runtime_backend=runtime_backend,
+            regime_tag=regime_tag,
+            parent_sha=parent_sha,
+            current_round=current_round,
+            symptom_ranking=symptom_ranking,
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Serialize global, 3-axis posteriors, and scoped tabu state into JSON-safe dict."""

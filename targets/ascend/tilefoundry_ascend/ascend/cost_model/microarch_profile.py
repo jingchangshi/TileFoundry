@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
-from typing import Any
+from typing import Protocol
 
 from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
 
@@ -55,7 +55,12 @@ def _dtype_bytes_strict(dtype_name: object) -> float:
     raise ValueError(f"Unknown Ascend dtype {dtype_name!r}; refusing 16-bit silent fallback")
 
 
-def _dtype_bits(dtype_name: object, dt_cls: Any = None) -> int:
+class _DataTypeObj(Protocol):
+    @property
+    def bits(self) -> int: ...
+
+
+def _dtype_bits(dtype_name: object, dt_cls: Callable[[str], _DataTypeObj] | None = None) -> int:
     if dt_cls is not None:
         try:
             return int(dt_cls(str(dtype_name)).bits)
@@ -64,11 +69,22 @@ def _dtype_bits(dtype_name: object, dt_cls: Any = None) -> int:
     return max(1, int(round(_dtype_bytes_strict(dtype_name) * 8.0)))
 
 
-def _safe_num(val: object, default: float | int, is_float: bool = False) -> Any:
+def _safe_float(val: object, default: float) -> float:
+    if isinstance(val, bool) or not isinstance(val, (int, float, str)):
+        return default
     try:
-        v = float(val) if is_float else int(val)  # type: ignore[arg-type]
-        return (v if math.isfinite(v) else default) if is_float else v
-    except Exception:
+        v = float(val)
+        return v if math.isfinite(v) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(val: object, default: int) -> int:
+    if isinstance(val, bool) or not isinstance(val, (int, float, str)):
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
         return default
 
 
@@ -127,7 +143,7 @@ class MicroarchProfile(JsonRecordMixin):
             return raw
         if not isinstance(raw, Mapping):
             raise TypeError(f"Expected MicroarchProfile or Mapping, got {type(raw).__name__}")
-        kw: dict[str, Any] = {}
+        kw: dict[str, int | float | str] = {}
         for f in fields(cls):
             val = raw.get(f.name)
             if val is None:
@@ -135,11 +151,11 @@ class MicroarchProfile(JsonRecordMixin):
             if f.name == "source_kind":
                 kw[f.name] = str(val)
             elif f.name.endswith("_factor"):
-                kw[f.name] = max(1.0, _safe_num(val, 1.0, True))
+                kw[f.name] = max(1.0, _safe_float(val, 1.0))
             elif f.name in _MIN1_FIELDS:
-                kw[f.name] = max(1, _safe_num(val, 1))
+                kw[f.name] = max(1, _safe_int(val, 1))
             else:
-                kw[f.name] = max(0, _safe_num(val, 0))
+                kw[f.name] = max(0, _safe_int(val, 0))
         return cls(**kw)
 
 
@@ -174,12 +190,13 @@ def _map_tl_scope_name(raw_scope: object) -> str | None:
     return _TL_SCOPE_MAP.get(str(raw_scope or "").strip().lower())
 
 
-def _extract_region_info(arg: object, *, tirx: Any, DataTypeCls: Any, var_bindings: Mapping[str, int] | None) -> tuple[str | None, int, int, str]:
+def _extract_region_info(arg: object, *, tirx_call_cls: type[object], DataTypeCls: Callable[[str], _DataTypeObj] | None, var_bindings: Mapping[str, int] | None) -> tuple[str | None, int, int, str]:
     extents: Sequence[object] = ()
     explicit: int | None = None
     buf = getattr(arg, "buffer", None)
-    if isinstance(arg, tirx.Call):
-        op_name, args = str(getattr(arg.op, "name", arg.op)).lower(), list(arg.args)
+    if isinstance(arg, tirx_call_cls):
+        op_obj = getattr(arg, "op", None)
+        op_name, args = str(getattr(op_obj, "name", op_obj)).lower(), list(getattr(arg, "args", ()))
         if ("region" in op_name or "access_ptr" in op_name) and args:
             buf = getattr(args[0], "buffer", None)
             extents = args[2:] if "region" in op_name else ()
@@ -303,7 +320,7 @@ def extract_microarch_profile_from_tirx(prim_func: object, *, var_bindings: Mapp
             ann = getattr(stmt, "annotations", None) or {}
             raw_st = ann.get("num_stages", ann.get("software_pipeline_stage"))
             if raw_st is not None:
-                c["pipeline_depth"] = max(c["pipeline_depth"], max(1, _safe_num(raw_st, 1)))
+                c["pipeline_depth"] = max(c["pipeline_depth"], max(1, _safe_int(raw_st, 1)))
             if getattr(stmt, "thread_binding", None) is not None:
                 _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf)
                 return
@@ -318,7 +335,7 @@ def extract_microarch_profile_from_tirx(prim_func: object, *, var_bindings: Mapp
             _walk(stmt.else_case, repeat=repeat, in_simtvf=in_simtvf)
         elif isinstance(stmt, tirx.AttrStmt):
             ak = str(getattr(stmt, "attr_key", "")).lower()
-            av = _safe_num(getattr(stmt, "value", None), 0)
+            av = _safe_int(getattr(stmt, "value", None), 0)
             if "stage" in ak and av > 1:
                 c["pipeline_depth"] = max(c["pipeline_depth"], av)
             _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf or ("simt" in ak) or ("simt" in str(getattr(stmt, "node", "")).lower()) or (ak == "pragma_parallel"))
@@ -345,8 +362,8 @@ def extract_microarch_profile_from_tirx(prim_func: object, *, var_bindings: Mapp
         elif isinstance(stmt, tirx.Evaluate) and isinstance(stmt.value, tirx.Call):
             op_name, args = str(getattr(stmt.value.op, "name", stmt.value.op)).lower(), list(stmt.value.args)
             if "copy" in op_name and len(args) >= 2:
-                src_s, src_b, _, _ = _extract_region_info(args[0], tirx=tirx, DataTypeCls=TLDataType, var_bindings=var_bindings)
-                dst_s, dst_b, _, _ = _extract_region_info(args[1], tirx=tirx, DataTypeCls=TLDataType, var_bindings=var_bindings)
+                src_s, src_b, _, _ = _extract_region_info(args[0], tirx_call_cls=tirx.Call, DataTypeCls=TLDataType, var_bindings=var_bindings)
+                dst_s, dst_b, _, _ = _extract_region_info(args[1], tirx_call_cls=tirx.Call, DataTypeCls=TLDataType, var_bindings=var_bindings)
                 xfer = max(src_b, dst_b)
                 edge = _COPY_EDGE_KEYS.get((src_s or "", dst_s or ""))
                 if edge and xfer > 0:
@@ -357,7 +374,7 @@ def extract_microarch_profile_from_tirx(prim_func: object, *, var_bindings: Mapp
                     c["ub_store_bytes"] += repeat * xfer
             elif ("gemm" in op_name or "mmad" in op_name) and len(args) >= 2:
                 c["cube_mmad_count"] += repeat
-                elems = [_extract_region_info(args[i], tirx=tirx, DataTypeCls=TLDataType, var_bindings=var_bindings)[2] for i in range(min(3, len(args)))]
+                elems = [_extract_region_info(args[i], tirx_call_cls=tirx.Call, DataTypeCls=TLDataType, var_bindings=var_bindings)[2] for i in range(min(3, len(args)))]
                 ba = getattr(args[0].args[0] if isinstance(args[0], tirx.Call) and args[0].args else args[0], "buffer", None)
                 bb = getattr(args[1].args[0] if isinstance(args[1], tirx.Call) and args[1].args else args[1], "buffer", None)
                 sa = _eval_extents((getattr(ba, "shape", ()) or ())[-2:], var_bindings) if ba else None
@@ -415,7 +432,7 @@ def merge_microarch_profiles(stage_a: MicroarchProfile | Mapping[str, object] | 
         return pb
     if pb.is_empty:
         return pa
-    merged: dict[str, Any] = {"source_kind": "merged"}
+    merged: dict[str, int | float | str] = {"source_kind": "merged"}
     for f in fields(MicroarchProfile):
         if f.name != "source_kind":
             av, bv = getattr(pa, f.name), getattr(pb, f.name)

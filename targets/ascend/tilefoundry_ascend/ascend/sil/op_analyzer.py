@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import TypedDict
 
 import yaml
 
@@ -65,7 +65,7 @@ def _is_prime_or_odd(n: int) -> bool:
     return n > 1 and (n % 2 == 1)
 
 
-def _case_physics_kind(proto: Mapping[str, Any], axes: TopologyAxes) -> CasePhysicsKind:
+def _case_physics_kind(proto: Mapping[str, object], axes: TopologyAxes) -> CasePhysicsKind:
     category = str(proto.get("category", "")).strip().lower()
     return infer_case_physics_kind(axes, has_reduction=category in ("normalization", "reduction"))
 
@@ -86,13 +86,13 @@ def _extend_unique_dtypes(target: list[str], values: object, *, lower: bool = Fa
 
 
 def infer_contraction_and_axes_from_proto(
-    proto: Mapping[str, Any],
-    cases: Sequence[Mapping[str, Any]] = (),
+    proto: Mapping[str, object],
+    cases: Sequence[Mapping[str, object]] = (),
     *,
-    spec_map: Mapping[str, Any] | None = None,
-    sf_map: Mapping[str, Any] | None = None,
+    spec_map: Mapping[str, object] | None = None,
+    sf_map: Mapping[str, object] | None = None,
     features: object | None = None,
-    regimes: Any = (),
+    regimes: object = (),
     dtypes: Iterable[str] = (),
     any_empty_group_hint: bool = False,
 ) -> tuple[TopologyAxes, dict[str, bool]]:
@@ -284,7 +284,7 @@ def infer_contraction_and_axes_from_proto(
     return axes, flags
 
 
-def _extract_feature_flags(features: object | None) -> dict[str, Any]:
+def _extract_feature_flags(features: object | None) -> dict[str, object]:
     if not isinstance(features, Mapping):
         return {}
     cube_ratio_raw = features.get("cube_to_vector_ratio")
@@ -316,10 +316,10 @@ def resolve_canonical_topology_axes(
         if isinstance(direct, Mapping) and all(k in direct for k in ("compute_engine", "memory_ring", "iteration_regularity")):
             return TopologyAxes.from_dict(direct)
 
-    spec_map: Mapping[str, Any] = {}
-    proto_map: Mapping[str, Any] = {}
-    sf_map: Mapping[str, Any] = {}
-    regimes: Any = ()
+    spec_map: Mapping[str, object] = {}
+    proto_map: Mapping[str, object] = {}
+    sf_map: Mapping[str, object] = {}
+    regimes: object = ()
     dtypes: list[str] = []
 
     if isinstance(spec_or_name, Mapping):
@@ -368,28 +368,29 @@ class OpAdvisoryExtractor:
 
     def __init__(self, ops_root: str | Path = DEFAULT_OPS_ROOT) -> None:
         self.ops_root = _resolve_ops_root_path(ops_root)
-        self._manifest_cache: dict[str, Any] | None = None
-        self._perf_cache: dict[str, Any] | None = None
+        self._manifest_cache: dict[str, object] | None = None
+        self._perf_cache: dict[str, object] | None = None
         facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
         if not isinstance(facts, AscendSpaceFacts):
             raise RuntimeError("ascend.950pr target did not provide AscendSpaceFacts")
         self.facts = facts
 
     @property
-    def manifest(self) -> dict[str, Any]:
+    def manifest(self) -> dict[str, object]:
         if self._manifest_cache is None:
             self._manifest_cache = json.loads((self.ops_root / "suite_manifest.json").read_text(encoding="utf-8"))
         return self._manifest_cache
 
     @property
-    def perf_metadata(self) -> dict[str, Any]:
+    def perf_metadata(self) -> dict[str, object]:
         if self._perf_cache is None:
             self._perf_cache = json.loads((self.ops_root / "metadata" / "950pr.json").read_text(encoding="utf-8"))
         return self._perf_cache
 
-    def list_operators(self) -> list[dict[str, Any]]:
+    def list_operators(self) -> list[dict[str, object]]:
         """Return all operator entries declared in suite_manifest.json."""
-        return list(self.manifest.get("operators", []))
+        raw_ops = self.manifest.get("operators", ())
+        return list(raw_ops) if isinstance(raw_ops, list) else []
 
     def _find_op_entry(self, op_name: str, level: str | int | None = None) -> tuple[int, Path]:
         target_level: int | None = None

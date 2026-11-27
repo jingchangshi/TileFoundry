@@ -16,6 +16,27 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal, Protocol
+
+UnitKind = Literal["tilelang_dsl", "cce_cpp20"]
+VALID_UNIT_KINDS: tuple[UnitKind, ...] = ("tilelang_dsl", "cce_cpp20")
+
+
+class CompileTaskSpecLike(Protocol):
+    """L0 structural port matching L1 CompileTaskSpec specialization fields."""
+
+    @property
+    def builder_name(self) -> str: ...
+    @property
+    def static_kwargs(self) -> tuple[tuple[str, object], ...]: ...
+    @property
+    def pass_configs(self) -> tuple[tuple[str, object], ...]: ...
+    @property
+    def compile_flags(self) -> tuple[str, ...]: ...
+    @property
+    def unit_kind(self) -> UnitKind: ...
+    @property
+    def unit_source(self) -> str: ...
 
 from tilefoundry_ascend.ascend.compile_cache.cpp_closure import (
     _split_cpp_units, extract_reachable_trackb_source, select_active_trackb_kernel, strip_cpp_comments_and_strings,
@@ -337,21 +358,67 @@ def _canonical_json_value(val: object) -> object:
     return val if isinstance(val, (str, int, float, bool)) or val is None else str(val)
 
 
+def _canonical_kv_map(
+    raw: Mapping[str, object] | Sequence[tuple[str, object]] | None,
+) -> dict[str, object]:
+    if raw is None:
+        return {}
+    items = raw.items() if isinstance(raw, Mapping) else raw
+    return {str(k): _canonical_json_value(v) for k, v in sorted(items, key=lambda kv: str(kv[0]))}
+
+
 def compute_compile_task_key(
-    *, normalized_kernel_unit_src: str, cann_target: str = "dav-3510", pass_configs: Mapping[str, object] | None = None,
-    compile_flags: Sequence[str] = (), static_spec_signature: str = "", compiler_stamp: str = "",
+    spec: CompileTaskSpecLike | None = None,
+    *,
+    normalized_kernel_unit_src: str = "",
+    cann_target: str = "dav-3510",
+    pass_configs: Mapping[str, object] | Sequence[tuple[str, object]] | None = None,
+    compile_flags: Sequence[str] = (),
+    static_spec_signature: str = "",
+    compiler_stamp: str = "",
+    unit_kind: UnitKind | None = None,
+    builder_name: str = "",
+    static_kwargs: Mapping[str, object] | Sequence[tuple[str, object]] | None = None,
 ) -> str:
     """Compute canonical SHA256 task key shared across Stage-B, Prewarm, and L1..L4."""
+    eff_unit_kind = (
+        unit_kind
+        if unit_kind is not None
+        else (spec.unit_kind if spec is not None else "tilelang_dsl")
+    )
+    if eff_unit_kind not in VALID_UNIT_KINDS:
+        raise ValueError(
+            f"Unsupported unit_kind {eff_unit_kind!r}; expected one of {VALID_UNIT_KINDS}"
+        )
+    eff_src = (
+        normalized_kernel_unit_src
+        if normalized_kernel_unit_src
+        else (spec.unit_source if spec is not None else "")
+    )
+    eff_builder = builder_name if builder_name else (spec.builder_name if spec is not None else "")
+    eff_static_kwargs = (
+        static_kwargs
+        if static_kwargs is not None
+        else (spec.static_kwargs if spec is not None else None)
+    )
+    eff_pass_configs = (
+        pass_configs if pass_configs is not None else (spec.pass_configs if spec is not None else None)
+    )
+    eff_flags = compile_flags if compile_flags else (spec.compile_flags if spec is not None else ())
     payload = json.dumps(
         {
+            "builder_name": str(eff_builder),
             "cann_target": str(cann_target),
-            "compile_flags": sorted({str(f).strip() for f in compile_flags if str(f).strip()}),
+            "compile_flags": sorted({str(f).strip() for f in eff_flags if str(f).strip()}),
             "compiler_stamp": str(compiler_stamp),
-            "normalized_kernel_unit_src": str(normalized_kernel_unit_src),
-            "pass_configs": _canonical_json_value(pass_configs) if pass_configs is not None else {},
+            "normalized_kernel_unit_src": str(eff_src),
+            "pass_configs": _canonical_kv_map(eff_pass_configs),
+            "static_kwargs": _canonical_kv_map(eff_static_kwargs),
             "static_spec_signature": str(static_spec_signature),
+            "unit_kind": str(eff_unit_kind),
         },
-        sort_keys=True, separators=(",", ":"),
+        sort_keys=True,
+        separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -374,13 +441,24 @@ def resolve_unified_tl_cache_dir(
 
 
 def compute_artifact_id(
-    *, closure_src: str, flags: str = "", arch: str = "dav-3510", cann_series: str = "cann_9_3", spec_key: str = "", compiler_stamp: str = ""
+    *,
+    closure_src: str,
+    flags: str = "",
+    arch: str = "dav-3510",
+    cann_series: str = "cann_9_3",
+    spec_key: str = "",
+    compiler_stamp: str = "",
+    unit_kind: UnitKind = "tilelang_dsl",
 ) -> str:
     """Compute SHA256 hex digest identifying a compiled kernel artifact."""
     target_tag = f"{arch}:{cann_series}" if cann_series and cann_series != "cann_9_3" else str(arch)
     return compute_compile_task_key(
-        normalized_kernel_unit_src=str(closure_src), cann_target=target_tag,
-        compile_flags=tuple(tok for tok in str(flags).split() if tok), static_spec_signature=str(spec_key), compiler_stamp=str(compiler_stamp),
+        normalized_kernel_unit_src=str(closure_src),
+        cann_target=target_tag,
+        compile_flags=tuple(tok for tok in str(flags).split() if tok),
+        static_spec_signature=str(spec_key),
+        compiler_stamp=str(compiler_stamp),
+        unit_kind=unit_kind,
     )
 
 

@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
+from tilefoundry.analysis.facts import (
+    MemoryHierarchyFacts,
+    PerformanceServiceFacts,
+    ThroughputFacts,
+)
 from tilefoundry.target.base import (
     Architecture,
     Device,
@@ -27,6 +32,13 @@ from tilefoundry.target.hardware.envelope import HardwareDocument
 from tilefoundry.utils.python_source import PythonExpr
 from tilefoundry_ascend.ascend.target.architecture import DaVinci950
 from tilefoundry_ascend.ascend.target.device import Ascend950PR
+from tilefoundry_ascend.ascend.target.facts import (
+    AscendSpaceFacts,
+    ascend_space_facts,
+    memory_hierarchy,
+    performance_service,
+    throughput,
+)
 from tilefoundry_ascend.ascend.target.spec import (
     ARCHITECTURE_SCHEMA,
     ASCEND_950DT_ID,
@@ -155,19 +167,6 @@ class AscendTarget(Target):
             if level is not None:
                 return facts_result(self, facts_type, level)
             return super().get_facts(facts_type, query)
-
-        from tilefoundry.analysis.facts import (  # noqa: PLC0415
-            MemoryHierarchyFacts,
-            PerformanceServiceFacts,
-            ThroughputFacts,
-        )
-        from tilefoundry_ascend.ascend.target.facts import (  # noqa: PLC0415
-            AscendSpaceFacts,
-            ascend_space_facts,
-            memory_hierarchy,
-            performance_service,
-            throughput,
-        )
 
         if facts_type is AscendSpaceFacts:
             return facts_result(self, facts_type, ascend_space_facts(self, query))

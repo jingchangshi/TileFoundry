@@ -184,10 +184,14 @@ def _optional_positive_float(raw: object) -> float | None:
 def _coerce_case_int(raw: object) -> int | None:
     if isinstance(raw, bool) or raw is None:
         return None
-    try:
-        return int(raw.strip()) if isinstance(raw, str) else int(raw)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    if isinstance(raw, str):
+        try:
+            return int(raw.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def _append_anchor_with_fallback(

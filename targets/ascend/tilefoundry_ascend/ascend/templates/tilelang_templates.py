@@ -1,7 +1,7 @@
 """TileLang @T.prim_func parameterized templates for canonical Ascend 950 3-axis shells."""
 
 import contextlib
-from typing import Any
+import types
 
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 from tilefoundry_ascend.ascend.templates.shells import (
@@ -16,7 +16,7 @@ from tilefoundry_ascend.ascend.templates.shells import (
 )
 
 
-def _get_tl_ascend() -> Any:
+def _get_tl_ascend() -> types.ModuleType:
     """Import tilelang.ascend.language lazily so package import works without full tilelang."""
     import tilelang.ascend.language as tl_ascend  # noqa: PLC0415
 
@@ -43,7 +43,9 @@ def _align64(val: int) -> int:
     return ((max(1, int(val)) + 63) // 64) * 64
 
 
-def build_pure_regbase_simd_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_pure_regbase_simd_template(
+    policy: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Shell 1 (aiv_only/gm_ub_stream/affine_simd): pure RegBase SIMD VF.
 
     Unlocks 256 KB UB, packs rows, and unrolls two rows.
@@ -188,7 +190,9 @@ def build_pure_regbase_simd_template(policy: dict[str, Any] | None = None) -> di
     }
 
 
-def build_simt_and_hybrid_ub_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_simt_and_hybrid_ub_template(
+    policy: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Shell 2 (aiv_only/ub_random_atomic/irregular_simt): hybrid SIMT/SIMD kernel.
 
     Shared slots carry eight datablocks of padding to avoid UB bank conflicts
@@ -245,7 +249,9 @@ def build_simt_and_hybrid_ub_template(policy: dict[str, Any] | None = None) -> d
     }
 
 
-def build_dense_and_quant_gemm_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_dense_and_quant_gemm_template(
+    policy: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Shell 3 (aic_only/gm_l1_l0_fixpipe/affine_simd): dense/quantized GEMM.
 
     Applies SWAT swizzling and Half-L1 isolation.
@@ -332,7 +338,9 @@ def build_dense_and_quant_gemm_template(policy: dict[str, Any] | None = None) ->
     }
 
 
-def build_grouped_gemm_epilogue_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_grouped_gemm_epilogue_template(
+    policy: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Shell 4 (coupled_1c2v/l0c_ub_epilogue/ragged_group): grouped GEMM.
 
     Moves results directly from L0C to UB with SPLIT_M.
@@ -418,7 +426,9 @@ def build_grouped_gemm_epilogue_template(policy: dict[str, Any] | None = None) -
     }
 
 
-def build_heterogeneous_cv_ring_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_heterogeneous_cv_ring_template(
+    policy: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Shell 5 (coupled_1c2v/bidirectional_cv_ring/affine_simd): heterogeneous CV ring.
 
     Routes Cube QK^T through UB and L1 into Cube PV.
@@ -569,7 +579,9 @@ def build_heterogeneous_cv_ring_template(policy: dict[str, Any] | None = None) -
     }
 
 
-def build_persistent_chunk_state_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_persistent_chunk_state_template(
+    policy: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Shell 6 (coupled_1c2v/persistent_onchip_state/affine_simd): persistent state.
 
     Each (B, H) pair owns a core and keeps FP32 state resident in UB. The decay
@@ -645,7 +657,9 @@ def build_persistent_chunk_state_template(policy: dict[str, Any] | None = None) 
     }
 
 
-def build_striped_register_vm_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_striped_register_vm_template(
+    policy: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Shell 7 (aiv_only/persistent_onchip_state/dynamic_opcode_stream): striped VM.
 
     Partitions the horizontal W dimension into UB-resident stripes.

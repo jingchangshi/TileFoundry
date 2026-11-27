@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal, TypeVar
+
+_T = TypeVar("_T")
 
 from tilefoundry_ascend.ascend.json_record import JsonRecordMixin, atomic_write_text, json_clone as _json_clone
 from tilefoundry_ascend.ascend.target.facts import AscendSpaceFacts, cube_macs_per_cycle
@@ -25,7 +27,7 @@ VALID_FREEDOM_FACETS: tuple[str, ...] = (
 )
 
 
-def _as_seq(raw: Any, field_name: str, conv: Any, label: str) -> tuple[Any, ...]:
+def _as_seq(raw: object, field_name: str, conv: Callable[[object], _T], label: str) -> tuple[_T, ...]:
     if raw is None:
         return ()
     if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
@@ -33,7 +35,7 @@ def _as_seq(raw: Any, field_name: str, conv: Any, label: str) -> tuple[Any, ...]
     return tuple(conv(item) for item in raw)
 
 
-def _as_dict(raw: Any, field_name: str, conv: Any) -> dict[str, Any]:
+def _as_dict(raw: object, field_name: str, conv: Callable[[object], _T]) -> dict[str, _T]:
     if raw is None:
         return {}
     if not isinstance(raw, Mapping):
@@ -41,11 +43,11 @@ def _as_dict(raw: Any, field_name: str, conv: Any) -> dict[str, Any]:
     return {str(k): conv(v) for k, v in raw.items()}
 
 
-def _as_str_tuple(raw: Any, field_name: str) -> tuple[str, ...]: return _as_seq(raw, field_name, str, "strings")
-def _as_int_tuple(raw: Any, field_name: str) -> tuple[int, ...]: return _as_seq(raw, field_name, int, "ints")
-def _as_int_dict(raw: Any, field_name: str) -> dict[str, int]: return _as_dict(raw, field_name, int)
-def _as_float_dict(raw: Any, field_name: str) -> dict[str, float]: return _as_dict(raw, field_name, float)
-def _as_str_dict(raw: Any, field_name: str) -> dict[str, str]: return _as_dict(raw, field_name, str)
+def _as_str_tuple(raw: object, field_name: str) -> tuple[str, ...]: return _as_seq(raw, field_name, str, "strings")
+def _as_int_tuple(raw: object, field_name: str) -> tuple[int, ...]: return _as_seq(raw, field_name, int, "ints")
+def _as_int_dict(raw: object, field_name: str) -> dict[str, int]: return _as_dict(raw, field_name, int)
+def _as_float_dict(raw: object, field_name: str) -> dict[str, float]: return _as_dict(raw, field_name, float)
+def _as_str_dict(raw: object, field_name: str) -> dict[str, str]: return _as_dict(raw, field_name, str)
 
 
 def _require_nonempty_str(val: object, label: str) -> None:
@@ -904,7 +906,7 @@ class RegimeSlice(JsonRecordMixin):
         return self.case_ratios[len(self.case_ratios) // 2]
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> RegimeSlice:
+    def from_dict(cls, payload: Mapping[str, object]) -> RegimeSlice:
         raw_ratios = payload.get("case_ratios") or ()
         if isinstance(raw_ratios, (str, bytes)) or not isinstance(raw_ratios, Sequence):
             raise ValueError("RegimeSlice.case_ratios must be a sequence")

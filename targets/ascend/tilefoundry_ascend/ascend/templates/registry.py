@@ -6,7 +6,7 @@ import contextlib
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
 from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
 from tilefoundry_ascend.ascend.passes.observation_space import ObservationVector5D
@@ -172,7 +172,7 @@ class ComposableComputeSlotSpec(JsonRecordMixin):
             ):
                 raise ValueError("atom_sequence composition requires unlocking pipeline_and_sync_graph, dma_and_cache_hierarchy, or exec_mode_and_spr")
 
-    def render_contract(self, policy: Mapping[str, Any] | None = None) -> str:
+    def render_contract(self, policy: Mapping[str, object] | None = None) -> str:
         """Render [Coordination Shell + SchedulePolicy + Compute Graph] AscendC artifact."""
         norm = normalize_schedule_policy(self.coordination_shell, policy)
         norm["freedom_mask"] = self.freedom_mask.to_dict()
@@ -201,9 +201,9 @@ class CoordinationShellSpec:
     title: str
     description: str
     core_domain: str
-    tilelang_builder: Callable[[dict[str, Any]], dict[str, Any]]
-    ascendc_renderer: Callable[[dict[str, Any]], str]
-    default_policy: dict[str, Any] = field(default_factory=dict)
+    tilelang_builder: Callable[[dict[str, object]], dict[str, object]]
+    ascendc_renderer: Callable[[dict[str, object]], str]
+    default_policy: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -211,12 +211,12 @@ class RenderedTemplate:
     """Dual-track template rendering output for a TopologyAxes shell and SchedulePolicy."""
 
     topology_axes: TopologyAxes
-    policy: dict[str, Any]
+    policy: dict[str, object]
     prim_func: object | None = None
     pass_configs: dict[str, object] = field(default_factory=dict)
     compile_flags: tuple[str, ...] = ()
     ascendc_cpp: str = ""
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 class TemplateRegistry:
@@ -232,20 +232,20 @@ class TemplateRegistry:
         ordered = [ax for ax in CANONICAL_TOPOLOGY_PRESETS if ax in self._specs]
         return tuple(ordered + [ax for ax in self._specs if ax not in CANONICAL_TOPOLOGY_PRESETS])
 
-    def resolve_shell_axes(self, topology_axes: TopologyAxes | Mapping[str, Any]) -> TopologyAxes:
+    def resolve_shell_axes(self, topology_axes: TopologyAxes | Mapping[str, object]) -> TopologyAxes:
         return resolve_canonical_shell_axes(topology_axes, self._specs)
 
-    def get_spec(self, topology_axes: TopologyAxes | Mapping[str, Any]) -> CoordinationShellSpec:
+    def get_spec(self, topology_axes: TopologyAxes | Mapping[str, object]) -> CoordinationShellSpec:
         return self._specs[self.resolve_shell_axes(topology_axes)]
 
-    def default_policy(self, topology_axes: TopologyAxes | Mapping[str, Any]) -> dict[str, Any]:
+    def default_policy(self, topology_axes: TopologyAxes | Mapping[str, object]) -> dict[str, object]:
         shell_axes = self.resolve_shell_axes(topology_axes)
         return normalize_schedule_policy(shell_axes, self._specs[shell_axes].default_policy)
 
     def render(
         self,
-        topology_axes: TopologyAxes | Mapping[str, Any],
-        policy: Mapping[str, Any] | object | None = None,
+        topology_axes: TopologyAxes | Mapping[str, object],
+        policy: Mapping[str, object] | object | None = None,
         *,
         track: Literal["tilelang", "ascendc", "both"] = "both",
     ) -> RenderedTemplate:
@@ -265,8 +265,8 @@ class TemplateRegistry:
 
     def render_template(
         self,
-        topology_axes: TopologyAxes | Mapping[str, Any],
-        policy: Mapping[str, Any] | object | None = None,
+        topology_axes: TopologyAxes | Mapping[str, object],
+        policy: Mapping[str, object] | object | None = None,
         *,
         track: Literal["tilelang", "ascendc", "both"] = "both",
     ) -> RenderedTemplate:
@@ -276,7 +276,7 @@ class TemplateRegistry:
     def render_with_compute_slot(
         self,
         slot_spec: ComposableComputeSlotSpec,
-        policy: Mapping[str, Any] | object | None = None,
+        policy: Mapping[str, object] | object | None = None,
     ) -> RenderedTemplate:
         """Render a coordination shell infused with a ComposableComputeSlotSpec compute body."""
         base_policy = normalize_schedule_policy(slot_spec.coordination_shell, policy)
@@ -318,8 +318,8 @@ def get_template_registry() -> TemplateRegistry:
 
 
 def render_template(
-    topology_axes: TopologyAxes | Mapping[str, Any],
-    policy: Mapping[str, Any] | object | None = None,
+    topology_axes: TopologyAxes | Mapping[str, object],
+    policy: Mapping[str, object] | object | None = None,
     *,
     track: Literal["tilelang", "ascendc", "both"] = "both",
 ) -> RenderedTemplate:
@@ -378,7 +378,7 @@ def _extract_c_param_name(param_decl: str) -> str:
     return ident.group(1) if ident and ident.group(1) not in _C_TYPE_KEYWORDS else ""
 
 
-def _format_host_launcher_stub(host_signature: str | Mapping[str, Any], entry_fn: str) -> str:
+def _format_host_launcher_stub(host_signature: str | Mapping[str, object], entry_fn: str) -> str:
     if isinstance(host_signature, Mapping):
         fn_name = _sanitize_c_ident(str(host_signature.get("name") or host_signature.get("op_name") or f"launch_{entry_fn}"), f"launch_{entry_fn}")
         param_parts, call_args = ["void* stream"], []
@@ -426,7 +426,7 @@ def _format_host_launcher_stub(host_signature: str | Mapping[str, Any], entry_fn
 def _extract_body_from_input(
     source_or_slot: object | None,
     *,
-    policy: Mapping[str, Any] | object | None,
+    policy: Mapping[str, object] | object | None,
     lowered_kernel_cpp: str | None,
 ) -> tuple[str, str, TopologyAxes | None]:
     """Extract (raw_cpp, op_name, topology_axes) from slot, shell, PrimFunc, or C++ source."""
@@ -478,9 +478,9 @@ def _looks_like_file_scope_cpp(body: str) -> bool:
 def materialize_top_translation_unit(
     source_or_slot: object | None,
     *,
-    policy: Mapping[str, Any] | object | None = None,
+    policy: Mapping[str, object] | object | None = None,
     lowered_kernel_cpp: str | None = None,
-    host_signature: str | Mapping[str, Any] | None = None,
+    host_signature: str | Mapping[str, object] | None = None,
 ) -> str:
     """Materialize a self-contained AscendC translation unit at ConstraintRelaxationMask.top()."""
     raw_cpp, op_name, axes = _extract_body_from_input(source_or_slot, policy=policy, lowered_kernel_cpp=lowered_kernel_cpp)

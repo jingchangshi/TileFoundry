@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import MISSING, Field, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Self, Union, get_args, get_origin, get_type_hints
+from typing import ClassVar, Literal, Self, Union, get_args, get_origin, get_type_hints
 
 
 def atomic_write_text(path: Path | str, content: str) -> None:
@@ -38,7 +38,7 @@ def atomic_write_text(path: Path | str, content: str) -> None:
             tmp_path.unlink(missing_ok=True)
 
 
-def json_clone(value: Any) -> Any:
+def json_clone(value: object) -> object:
     """Recursively convert records, mappings, and sequences into JSON-compatible values."""
     if isinstance(value, Enum):
         return value.value
@@ -54,12 +54,12 @@ def json_clone(value: Any) -> Any:
 
 
 @functools.lru_cache(maxsize=None)
-def _dataclass_field_hints(cls: type[Any]) -> tuple[tuple[Field[Any], Any], ...]:
+def _dataclass_field_hints(cls: type[object]) -> tuple[tuple[Field[object], object], ...]:
     hints = get_type_hints(cls)
-    return tuple((f, hints.get(f.name, Any)) for f in fields(cls))
+    return tuple((f, hints.get(f.name, object)) for f in fields(cls))
 
 
-def _default_for_field(f: Field[Any]) -> tuple[bool, Any]:
+def _default_for_field(f: Field[object]) -> tuple[bool, object]:
     if f.default is not MISSING:
         return True, f.default
     if f.default_factory is not MISSING:
@@ -67,7 +67,7 @@ def _default_for_field(f: Field[Any]) -> tuple[bool, Any]:
     return False, None
 
 
-def _unwrap_optional(hint: Any) -> tuple[bool, Any]:
+def _unwrap_optional(hint: object) -> tuple[bool, object]:
     origin = get_origin(hint)
     if origin in (Union, types.UnionType):
         args = get_args(hint)
@@ -82,7 +82,9 @@ def _unwrap_optional(hint: Any) -> tuple[bool, Any]:
     return False, hint
 
 
-def _coerce_value(hint: Any, raw: Any, *, has_default: bool = False, default_val: Any = None) -> Any:
+def _coerce_value(
+    hint: object, raw: object, *, has_default: bool = False, default_val: object = None
+) -> object:
     is_opt, inner = _unwrap_optional(hint)
     if raw is None:
         if is_opt:
@@ -129,7 +131,7 @@ def _coerce_value(hint: Any, raw: Any, *, has_default: bool = False, default_val
                 return None
             raise TypeError(f"Expected Mapping for dict field, got {type(raw).__name__}")
         key_hint = args[0] if len(args) == 2 else str
-        val_hint = args[1] if len(args) == 2 else Any
+        val_hint = args[1] if len(args) == 2 else object
         return {_coerce_value(key_hint, k): _coerce_value(val_hint, v) for k, v in raw.items()}
 
     if origin is Literal:
@@ -151,18 +153,18 @@ class JsonRecordMixin:
 
     _json_sort_keys: ClassVar[bool] = False
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         """Serialize dataclass fields into a JSON-compatible dictionary."""
         if not is_dataclass(self):
             raise TypeError(f"{type(self).__name__} must be a dataclass to use JsonRecordMixin")
         return {f.name: json_clone(getattr(self, f.name)) for f in fields(self)}
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> Self:
+    def from_dict(cls, payload: Mapping[str, object]) -> Self:
         """Reconstruct a dataclass instance from a serialized mapping."""
         if not is_dataclass(cls):
             raise TypeError(f"{cls.__name__} must be a dataclass to use JsonRecordMixin")
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, object] = {}
         for f, hint in _dataclass_field_hints(cls):
             has_default, default_val = _default_for_field(f)
             is_opt, inner = _unwrap_optional(hint)

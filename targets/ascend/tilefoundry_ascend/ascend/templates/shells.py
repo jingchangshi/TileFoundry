@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypedDict
+from typing import TypedDict, TypeVar
+
+_T = TypeVar("_T")
 
 from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask, TopologyAxes
 
@@ -28,7 +30,7 @@ CANONICAL_TOPOLOGY_PRESETS: tuple[TopologyAxes, ...] = (
 )
 
 
-def _read_attr_or_key(obj: object | None, key: str, default: Any = None) -> Any:
+def _read_attr_or_key(obj: object | None, key: str, default: _T = None) -> object | _T:
     if obj is None:
         return default
     if isinstance(obj, Mapping):
@@ -36,20 +38,20 @@ def _read_attr_or_key(obj: object | None, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
-def coerce_topology_axes(axes_or_mapping: TopologyAxes | Mapping[str, Any]) -> TopologyAxes:
+def coerce_topology_axes(axes_or_mapping: TopologyAxes | Mapping[str, object]) -> TopologyAxes:
     """Coerce TopologyAxes or axis-dict into a validated TopologyAxes instance."""
     if isinstance(axes_or_mapping, TopologyAxes):
         return axes_or_mapping
     if isinstance(axes_or_mapping, Mapping):
         return TopologyAxes.from_dict(axes_or_mapping)
     raise TypeError(
-        f"Expected TopologyAxes or Mapping[str, Any], got {type(axes_or_mapping).__name__}"
+        f"Expected TopologyAxes or Mapping[str, object], got {type(axes_or_mapping).__name__}"
     )
 
 
 def resolve_canonical_shell_axes(
-    axes: TopologyAxes | Mapping[str, Any],
-    available: Mapping[TopologyAxes, Any] | None = None,
+    axes: TopologyAxes | Mapping[str, object],
+    available: Mapping[TopologyAxes, object] | None = None,
 ) -> TopologyAxes:
     """Resolve an arbitrary 3-axis TopologyAxes onto its registered coordination shell preset."""
     target = coerce_topology_axes(axes)
@@ -140,7 +142,7 @@ SCHEDULE_POLICY_KEYS: tuple[str, ...] = (
     "w4_mode",
 )
 
-DEFAULT_POLICIES_BY_AXES: dict[TopologyAxes, dict[str, Any]] = {
+DEFAULT_POLICIES_BY_AXES: dict[TopologyAxes, dict[str, object]] = {
     SHELL_AIV_SIMD_STREAM: {
         "tile_mnk": (8, 128, 1),
         "row_pack_factor": 4,
@@ -266,14 +268,14 @@ _DTYPE_BRIDGE_ALIASES: dict[str, str] = {
 
 
 def normalize_schedule_policy(
-    topology_axes: TopologyAxes | Mapping[str, Any],
-    policy: Mapping[str, Any] | object | None = None,
-) -> dict[str, Any]:
+    topology_axes: TopologyAxes | Mapping[str, object],
+    policy: Mapping[str, object] | object | None = None,
+) -> dict[str, object]:
     """Resolve *topology_axes* to its canonical shell and merge SchedulePolicy overrides."""
     shell_axes = resolve_canonical_shell_axes(topology_axes, DEFAULT_POLICIES_BY_AXES)
-    merged = dict(DEFAULT_POLICIES_BY_AXES[shell_axes])
+    merged: dict[str, object] = dict(DEFAULT_POLICIES_BY_AXES[shell_axes])
     merged["topology_axes"] = shell_axes.to_dict()
-    policy_map: Mapping[str, Any] | None = None
+    policy_map: Mapping[str, object] | None = None
     if policy is not None:
         if isinstance(policy, Mapping):
             policy_map = policy
