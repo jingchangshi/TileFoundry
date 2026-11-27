@@ -12,23 +12,23 @@
 6. **CoW Helper & $3\sigma$ Guards**: `patch_regime_into_module` namespaces `_{regime_tag}_*`; `PromotionCoordinator` enforces additive $\mu\text{s}$ conservation, $3\sigma_{\text{paired}}$ CEGAR non-regression, & `>=0.97x` active.
 7. **Closed 13+1 Simplex & `TypedFault`**: `13+1` `SymptomFamily` (`UNMODELED_SILICON_RESIDUAL`, `seed_rules.yaml` AST whitelist), 3-axis Bayesian tracking, Scoped Tabu, & infra-fault immunity (`INFRA_*`).
 8. **Pure Cache & Honest Gates**: No magic cache cap (`len(cases)//2`) or float-tol/host-ptr keys; enforce closure `ArtifactStore`, L3 `Delta|Cache|==0`, and L4 `AgentGates` v2 (`rc=75` `device_fault`).
-9. **CANN 9.3 Sole Mainline**: Target `cann_9_3` (`dav-3510`) exclusively in templates, dialects, verifiers, audits; keep `cann_9_2` inert (no runtime shims/headers).
+9. **CANN 9.3 Sole Mainline**: Target `cann_9_3` (`dav-3510`) exclusively in templates, dialects, verifiers, and `audit_tilelang_surface_sync.py`.
 10. **Zero-Magic CostModel (`off`)**: `cost_model_mode` (`off` default/`shadow`/`advisory`) uses paired t-stat gating; zero heuristic `eta`/latency floors; Stage-A/B legality stays on.
 
 ## Block B: Section-Sliced Read Routing (DO NOT Read Full Specs)
 
-> **Routing Rule**: Routine subtasks **DO NOT** read [Architecture Overview](./docs/ascend/00_architecture_overview.md) and **NEVER** read full `01_*.md` or `02_*.md`; slice **ONLY** the matched `[SEC-*]` range below.
+> **Routing Rule**: Routine subtasks **DO NOT** read [Architecture Overview](./docs/ascend/00_architecture_overview.md) and **NEVER** read full `01_*.md`/`02_*.md`; slice **ONLY** the matched `[SEC-*]` range.
 
 | Target Code Scope | `[SEC-*]` | Exact Sliced Route |
 | :--- | :--- | :--- |
-| `ascend/sil/`, `pytorch_frontend.py`, `regime_solver.py` | `[SEC-C1]` | [`01_mece_contracts_and_routing.md` (`L5-L21`)](./docs/ascend/01_mece_contracts_and_routing.md#L5-L21) |
-| `orchestrator/llm_constraints.py`, `portfolio_runner.py`, `seed_synthesizer.py`, `campaign_runner.py` | `[SEC-C2]` | [`01_mece_contracts_and_routing.md` (`L22-L43`)](./docs/ascend/01_mece_contracts_and_routing.md#L22-L43) |
-| `observation_space.py`, `msprof_report_parser.py`, `agent/kb/` | `[SEC-C3]` | [`01_mece_contracts_and_routing.md` (`L44-L70`)](./docs/ascend/01_mece_contracts_and_routing.md#L44-L70) |
+| `ascend/sil/`, `pytorch_frontend.py`, `ascend/schedule/regime_solver.py` | `[SEC-C1]` | [`01_mece_contracts_and_routing.md` (`L5-L21`)](./docs/ascend/01_mece_contracts_and_routing.md#L5-L21) |
+| `agent/orchestrator/{llm_constraints,portfolio_runner,regime_slice_patcher,seed_synthesizer}.py`, `campaign_runner.py` | `[SEC-C2]` | [`01_mece_contracts_and_routing.md` (`L22-L43`)](./docs/ascend/01_mece_contracts_and_routing.md#L22-L43) |
+| `observation_space.py`, `agent/npu/msprof_probe.py`, `agent/kb/` | `[SEC-C3]` | [`01_mece_contracts_and_routing.md` (`L44-L70`)](./docs/ascend/01_mece_contracts_and_routing.md#L44-L70) |
 | `cost_model/` | `[SEC-G1]` | [`02_residual_convergence_and_gates.md` (`L5-L32`)](./docs/ascend/02_residual_convergence_and_gates.md#L5-L32) |
-| `gate_funnel.py`, `envelope_inspector.py`, `verifier.py` | `[SEC-G2]` | [`02_residual_convergence_and_gates.md` (`L33-L40`)](./docs/ascend/02_residual_convergence_and_gates.md#L33-L40) |
-| `test_npu_acceptance.py`, `l3_contract.py`, `surrogate_cannbench.py` | `[SEC-G3]` | [`02_residual_convergence_and_gates.md` (`L41-L55`)](./docs/ascend/02_residual_convergence_and_gates.md#L41-L55) |
+| `agent/gates/`, `envelope_inspector.py`, `verifier.py` | `[SEC-G2]` | [`02_residual_convergence_and_gates.md` (`L33-L40`)](./docs/ascend/02_residual_convergence_and_gates.md#L33-L40) |
+| `tests/ascend/l0_foundation/`, `l2_paired_eval.py`, `l3_contract.py`, `test_npu_acceptance.py` | `[SEC-G3]` | [`02_residual_convergence_and_gates.md` (`L41-L55`)](./docs/ascend/02_residual_convergence_and_gates.md#L41-L55) |
 
-Index (human/plugin entry only): [Ascend Plugin README](./targets/ascend/README.md) | [E2E Architecture SVG](./docs/reports/tilefoundry_ascend_e2e_architecture.svg)
+Index: [Ascend Plugin README](./targets/ascend/README.md) | [E2E Architecture SVG](./docs/reports/tilefoundry_ascend_e2e_architecture.svg)
 
 ## Block C: Worker Isolation, Hygiene Lints & AgentGates Execution
 

@@ -33,10 +33,10 @@ Optimization insights follow a strict downward graduation path so structural slo
 ## [SEC-G2] Unified Compile Session & Anchor-Specialized Two-Snapshot Ledger
 
 - **Unified `ascend_compile_session`**: Host lowering and driver build entrypoints (`build_stage_b_driver_source` and companions) must hold one contiguous `_ascend_ctx()` scope across `PyTorchSemanticAnalyzer`, anchor specialization, and `tilelang.lower` + `ReadOnlyAscendPassTap`. Exiting the target context prior to lowering strips hardware UB/L1 ceilings, vector lane widths, and target flags.
-- **Pre-Lowering Anchor Specialization & `ArtifactStore`**: `EnvelopeInspector` (`envelope_inspector.py`, `gate_funnel.py`, `verifier.py`) specializes dynamic-shape `PrimFunc` schedules via `PrimFunc.specialize` + `arith.Analyzer` before snapshot capture, while `ArtifactStore` (`artifact_store.py`) indexes compiled `.so`/`.o` artifacts by canonical closure hash (`key = (source_sha, flags_sha, target, regime)`).
+- **Pre-Lowering Anchor Specialization & `ArtifactStore`**: `EnvelopeInspector` (`ascend/schedule/envelope_inspector.py` in `L2`), `gate_funnel.py` + `stage_b_gate.py` (`agent/gates/` in `L2`), and `verifier.py` (`ascend/sil/` in `L0`) specialize dynamic-shape `PrimFunc` schedules via `PrimFunc.specialize` + `arith.Analyzer` before snapshot capture, while `ArtifactStore` (`ascend/compile_cache/artifact_store.py` in `L0`) indexes compiled `.so`/`.o` artifacts by canonical closure hash (`key = (source_sha, flags_sha, target, regime)`).
 - **Preserved Two-Snapshot Diff**: Pre-lowering intended buffers and post-lowering physical buffers are compared side-by-side (`degraded_single_buffers`, lowered stage count, serialized barriers, `ObjectivePhysicalLedger`) across all canonical canary operators with zero operator-name branching.
 - **Formal Legality & Direct `TypedFault` Emission**: `SILVerifier` enforces 14 hardware redlines plus C++ CFG cross-core flag-balance checks and Stage-A TileLang AST rules (`T.Stage`, `T.Parallel`); stages emit structured `TypedFault` records directly (`fault_types.py`).
-- **CANN 9.3 Sole Active Mainline & No `syntax_repair` Heuristic KB**: Target `cann_9_3` (`dav-3510`) exclusively (`cann_9_2` is an inert placeholder). `syntax_repair` runs only on compiler-error candidates (never `NOOP_IDENTICAL`), feeding objective compiler diagnostics plus the `G5` lock.
+- **CANN 9.3 Sole Active Mainline & No `syntax_repair` Heuristic KB**: Target `cann_9_3` (`dav-3510`) exclusively (`cann_9_3.toml`). `syntax_repair` runs only on compiler-error candidates (never `NOOP_IDENTICAL`), feeding objective compiler diagnostics plus the `G5` lock.
 
 ## [SEC-G3] Compilation Idempotence & Orthogonal Tail Guard
 
@@ -44,11 +44,11 @@ Every candidate promotion passes the 5-tier verification pyramid (`L0`–`L4`):
 
 | Tier | Scope | Enforced Guarantees |
 | :--- | :--- | :--- |
-| `L0` | Static repo & AST audit | 6 repo hygiene lints (`scripts/*_lint.py`), AST inequality whitelist, static rejection of float-tolerance or host-pointer keys in `_KERNEL_CACHE` |
+| `L0` | Static repo & AST audit | 6 repo hygiene lints (`scripts/*_lint.py`), `tests/ascend/l0_foundation/`, AST inequality whitelist, static rejection of float-tolerance or host-pointer keys in `_KERNEL_CACHE` |
 | `L1` | Schedule & CFG legality | Parallel `run_l0_l1_round_filter` (`SILVerifier`, Schedule Redlines `G1..G5`, `ReadOnlyAscendPassTap`), `ArtifactStore` pre-compilation & `NOOP_IDENTICAL` short-circuit |
-| `L2` | Lowered host envelope & paired eval | Contiguous `ascend_compile_session`, real-anchor Two-Snapshot diff, adaptive `TF_POISON_PILL_READY_FD` timeout, `explore_creative` full pass-through |
+| `L2` | Lowered host envelope & Stage-B | Contiguous `ascend_compile_session`, Two-Snapshot diff, `StageBCompileGate` (`agent/gates/stage_b_gate.py`) quotient pre-compile, adaptive `TF_POISON_PILL_READY_FD` timeout, `explore_creative` pass-through |
 | `L3` | Full contract, CEGAR & idempotence | Full shape suite (`l3_contract.py`), `PromotionCoordinator` ($3\sigma_{\text{paired}}$ non-regression + $2\sigma_{\text{paired}}$ gain + unbounded CEGAR guardrails), `L3Resolution` (`PROMOTED`/`CANDIDATE_REJECTED`/`INFRA_DEFERRED`), Two-Pass `Delta\|Cache\| == 0` |
-| `L4` | Official real-NPU gate | CANNBench protocol correctness & latency (`surrogate_cannbench.py`, `test_npu_acceptance.py`) via `AgentGates` leased NPU & signed v2 receipt with `device_fault` (`rc=75`) isolation |
+| `L4` | Official real-NPU gate | Paired eval & CANNBench protocol (`agent/npu/l2_paired_eval.py`, `agent/npu/l3_l4_gates.py`, `tests/ascend/benchmarks/test_npu_acceptance.py`) via `AgentGates` leased NPU & signed v2 receipt with `device_fault` (`rc=75`) isolation |
 
 - **Compilation Cache Idempotence Law**: `_KERNEL_CACHE` never uses heuristic capacity caps (e.g., `len(cases) // 2`) or float-tolerance/host-pointer keys. `L3` compiles twice under shape replay and dynamic outer-axis perturbation and requires `Delta|Cache| == 0`.
 - **CEGAR Guardrails & Orthogonal Tail Guard**: `evaluate_promotion_gate` requires active worst anchor `>= 0.97x` within $3\sigma_{\text{paired}}$, all untouched siblings non-regressing within $3\sigma_{\text{paired}}$, net regime gain $\ge 2\sigma_{\text{paired}}$, and zero regression across all accumulated CEGAR `GuardrailCaseSpec` anchors.

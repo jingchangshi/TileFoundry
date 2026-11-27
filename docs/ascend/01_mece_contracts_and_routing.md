@@ -12,7 +12,7 @@ Every candidate kernel maps to one cell in `TopologyAxes` (`3 x 6 x 4 = 72` orth
 | `memory_ring` | `VALID_MEMORY_RINGS` (6) | `gm_ub_stream`, `ub_random_atomic`, `gm_l1_l0_fixpipe`, `l0c_ub_epilogue`, `bidirectional_cv_ring`, `persistent_onchip_state` |
 | `iteration_regularity` | `VALID_ITERATION_REGULARITIES` (4) | `affine_simd`, `irregular_simt`, `ragged_group`, `dynamic_opcode_stream` |
 
-Multi-shape dispatch (`ascend/sil/`, single semantic frontend `PyTorchSemanticAnalyzer` in `pytorch_frontend.py`, `regime_solver.py`) classifies cases purely from physical ratios (zero operator-name branching):
+Multi-shape dispatch (`ascend/sil/`, `pytorch_frontend.py` in `L0`; `ascend/schedule/regime_solver.py` in `L2`) classifies cases purely from physical ratios (zero operator-name branching):
 
 - **`CasePhysicsRatios` & 5D `PhaseSignature`**: Computes `stride_ratio`, `contig_atom_ratio`, `is_atom_aligned`, `working_set_sram_ratio`, `working_set_vreg_ratio`, `wave_occupancy_ratio`, `oi_ridge_ratio`, `inner_contiguous_bytes`, and `has_empty_group`, projecting to `phase_signature = (engine, layout, residency, alignment, wave)`.
 - **Sub-Atom Separation**: When `contig_atom_ratio < 1.0`, reduction cases receive the distinct `_subatom` tag (`sub_atom_simt` alignment band) so sub-atom reductions never merge silently with wide aligned vector reductions.
@@ -33,17 +33,17 @@ Legal transformation freedom is partitioned into the 7-facet `ConstraintRelaxati
 | `pipeline_and_sync_graph` | Locked | Cross-pipe event allocation, software pipelining, ping-pong double buffering, flag balance |
 | `grid_and_workspace_topology` | Locked | Asymmetric core mapping, dynamic tail balancing, GM workspace partitioning |
 
-- **Dual-Track Routing (`CapabilityGate`)**: Combines 3-axis `(TopologyAxes, PipeGapReport, CasePhysicsRatios)` routing with `ISAGapScanner` to select `tilelang_dsl` vs `ascendc_template` (`Router=ON/OFF` ablatable) across `seed_synthesizer.py`, `portfolio_runner.py`, and `campaign_runner.py`.
-- **Unified 3-Layer Prompt (`llm_constraints.py`, zero Layer 1.5)**:
+- **Dual-Track Routing (`CapabilityGate`)**: Combines 3-axis `(TopologyAxes, PipeGapReport, CasePhysicsRatios)` routing with `ISAGapScanner` (`agent/router/` in `L2`) to select `tilelang_dsl` vs `ascendc_template` (`Router=ON/OFF` ablatable) across `agent/orchestrator/seed_synthesizer.py`, `portfolio_runner.py` (`L3`), and `agent/campaign/campaign_runner.py` (`L5`).
+- **Unified 3-Layer Prompt (`agent/orchestrator/llm_constraints.py`, zero Layer 1.5)**:
   - **L1 (`format_hardware_and_sil_layer`)**: DaVinci950 memory caps, 14 `SILVerifier` redlines, Z3 modulo pipeline bounds, 7-facet lock state, and universal Schedule Integrity Redlines `G1..G4`—each paired with its canonical escape path (`G1` vector/matrix over scalar loops, `G2` `>=32B` burst packing over `<32B` DCache-bypass stores, `G3` `T.dynamic` + 2D `T.copy` over key pollution/unrolled copies, `G4` disjoint `coupled_1c2v` subcore GM slices).
-  - **L2 (`format_target_dialect_layer`)**: Active `cann_9_3` `dav-3510` API surface (`cann_9_2.toml` is a frozen inert placeholder—target `cann_9_3` exclusively with zero `cann_9_2` conditional shims), two-stage on-demand pruning, 4 lowering guardrails, and `seed_rules.yaml` entries guarded by `anti_precondition` and `l2_pmu_available`.
+  - **L2 (`format_target_dialect_layer`)**: Active `cann_9_3` (`dav-3510`) API surface exclusively (`cann_9_3.toml`, `dialect_surface.py`, audited by `scripts/audit_tilelang_surface_sync.py`), two-stage on-demand pruning, 4 lowering guardrails, and `seed_rules.yaml` entries guarded by `anti_precondition` and `l2_pmu_available`.
   - **L3 (Causal Feedback)**: Top-ranked KB hypotheses matched to the active `SymptomFamily` and 3-axis Bayesian utility.
 - **`syntax_repair` & `explore_creative` Discipline**: Syntax repair and Stage-0 retries apply `L1 + L2 + G5` Parent Monotonicity Lock (`format_g5_parent_monotonicity_lock`, forbidding dropping `T.Pipelined` stages or downgrading execution domains). `explore_creative` remains `Rule-Blind` to L3 heuristics, gated by L1 legality, compilation, and bounded analytical pass-through (`predicted_us <= 1.5 * parent_analytical_us`).
-- **CoW Helper Isolation & Lossless Track-B Closures**: `patch_regime_into_module` clones/prefixes regime helpers as `_{regime_tag}_*`, prunes dead helpers, and pairs with `render_active_symbol_closure_view` + Mode A/B `apply_scoped_trackb_patch` (zero middle truncation) and `PromotionCoordinator` ($3\sigma_{\text{paired}}$ CEGAR guardrail & `L3Resolution` states). `llm_client.py` defaults to `max_sandbox_tool_calls=0`.
+- **CoW Helper Isolation & Lossless Track-B Closures**: `patch_regime_into_module` and `split_readonly_host_tail` (`agent/orchestrator/regime_slice_patcher.py` in `L3`) clone/prefix regime helpers as `_{regime_tag}_*`, prune dead helpers, and pair with `agent/gates/cpp_slice_protocol.py` (`L2`) closure views (zero middle truncation) and `PromotionCoordinator` (`L5`, $3\sigma_{\text{paired}}$ CEGAR guardrail & `L3Resolution` states). `llm_client.py` defaults to `max_sandbox_tool_calls=0`.
 
 ## [SEC-C3] 5D Observation, 13 Symptom Families & Frozen KB
 
-`ObservationVector5D` and `AxisResidual5D` (`observation_space.py`, `msprof_report_parser.py`) bridge L0 physical ledger, L1 BiSheng compiler summary, and L2 MSProf telemetry across 5 orthogonal axes (`compute_issue`, `offchip_dma`, `onchip_sram_reg`, `pipeline_sync`, `grid_irregularity`/`grid_wave`):
+`ObservationVector5D` and `AxisResidual5D` (`ascend/passes/observation_space.py` in `L0`, `agent/npu/msprof_probe.py` in `L4`) bridge L0 physical ledger, L1 BiSheng compiler summary, and L2 MSProf telemetry across 5 orthogonal axes (`compute_issue`, `offchip_dma`, `onchip_sram_reg`, `pipeline_sync`, `grid_irregularity`/`grid_wave`):
 
 - **`transfer_inflation_ratio`**: `measured_hbm_bytes / max(1.0, blueprint_min_gm_bytes)` when measured HBM bytes exist, else `(blueprint_min_gm_bytes + static_extra_roundtrip_bytes) / max(1.0, blueprint_min_gm_bytes)`.
 - **`effective_compute_eta`**: `blueprint_compute_floor_us / max(1e-3, measured_latency_us)`.
