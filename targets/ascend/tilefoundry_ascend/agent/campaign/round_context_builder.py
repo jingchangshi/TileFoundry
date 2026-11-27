@@ -13,11 +13,11 @@ from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
     DeterministicSearchBoundaryLedger, is_clean_calibration_sample,
 )
 from tilefoundry_ascend.agent.campaign.helpers import (
-    derive_topology_axes, lookup_case_dims_safe, regime_mean_recoverable_excess_us,
-    resolve_active_trackb_kernel, resolve_cannbench_tasks_root as _helpers_tasks_root,
-    resolve_operator_entrypoint_safe, resolve_operator_semantics,
-    resolve_trackb_freedom_mask, run_l0_gate, select_active_regime,
-    slice_contract_instruction, source_sha256,
+    OperatorSemanticsCache, derive_topology_axes, dispatch_l0_gate, lookup_case_dims_safe,
+    regime_mean_recoverable_excess_us, resolve_active_trackb_kernel,
+    resolve_cannbench_tasks_root as _helpers_tasks_root, resolve_operator_entrypoint_safe,
+    resolve_operator_semantics_for_gates, resolve_trackb_freedom_mask, run_l0_gate,
+    select_active_regime, slice_contract_instruction, source_sha256,
 )
 from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor
 from tilefoundry_ascend.agent.gates.cpp_slice_protocol import (
@@ -60,7 +60,7 @@ from tilefoundry_ascend.ascend.cost_model import (
 )
 from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import CostGateDecision
 from tilefoundry_ascend.ascend.cost_model.experience_lake import ExperienceLake
-from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket, HirRooflineSummary
+from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.schedule.regime_solver import (
     RegimePiecewiseSolver, RegimePlanResult, recompute_regime_for_live_buffers,
@@ -234,9 +234,7 @@ class RoundContextBuilder:
         self._golden_abi_block_cache: str | None = None
         self._blueprint_provenance: dict[str, object] = {}
         self._active_kernel_cache: dict[tuple[str, str], str | None] = {}
-        self._operator_proto_cache: Mapping[str, object] | None = None
-        self._operator_semantics_cache: PyTorchOpSemantics | None = None
-        self._operator_semantics_loaded: bool = False
+        self._semantics_cache = OperatorSemanticsCache()
         self._update_blueprint_provenance(None)
         self._regime_blueprints: dict[str, HirBlueprintPacket] = dict(regime_blueprints) if regime_blueprints is not None else {}
 
@@ -322,34 +320,28 @@ class RoundContextBuilder:
             return self._resolve_active_trackb_kernel_fn(module_source, regime_spec)
         return resolve_active_trackb_kernel(module_source, regime_spec, cache=self._active_kernel_cache)
 
-    def _resolve_operator_semantics_for_gates(self) -> PyTorchOpSemantics | None:
-        if self._resolve_op_semantics_fn is not None:
-            return self._resolve_op_semantics_fn()
-        if self._operator_semantics_loaded:
-            return self._operator_semantics_cache
-        self._operator_semantics_loaded = True
-        sem, proto = resolve_operator_semantics(
-            self._config.operator_name, source_root=self._source_root, pure_golden=bool(self._config.pure_golden),
-            tasks_root=self._resolve_cannbench_tasks_root(), cannbench_repo=self._cannbench_repo, env_file=self._env_file,
+    def _resolve_op_sem(self) -> PyTorchOpSemantics | None:
+        return resolve_operator_semantics_for_gates(
+            self._config.operator_name, source_root=self._source_root,
+            pure_golden=bool(self._config.pure_golden), tasks_root=self._resolve_cannbench_tasks_root(),
+            cannbench_repo=self._cannbench_repo, env_file=self._env_file,
+            cache=self._semantics_cache, override_fn=self._resolve_op_semantics_fn,
         )
-        if proto is not None:
-            self._operator_proto_cache = proto
-        self._operator_semantics_cache = sem
-        return sem
 
-    def _run_l0(
+    def _exec_l0(
         self, module_source: str, regime_spec: RegimeTargetSpec, *, anchor_dims_override: Mapping[str, object] | None = None,
     ) -> StageAResult:
-        if self._run_l0_fn is not None:
-            return self._run_l0_fn(module_source, regime_spec, anchor_dims_override=anchor_dims_override)
-        op_sem = self._resolve_operator_semantics_for_gates()
-        return run_l0_gate(
-            module_source, regime_spec, target=self._target, enable_track_router=self._enable_track_router,
-            freedom_masks=self._freedom_masks, anchor_dims_override=anchor_dims_override,
-            op_semantics=op_sem, op_proto=self._operator_proto_cache,
+        return dispatch_l0_gate(
+            module_source, regime_spec, l0_checker=self._run_l0_fn,
+            default_fn=lambda ms, rs, anchor_dims_override=None: run_l0_gate(
+                ms, rs, target=self._target, enable_track_router=self._enable_track_router,
+                freedom_masks=self._freedom_masks, anchor_dims_override=anchor_dims_override,
+                op_semantics=self._resolve_op_sem(), op_proto=self._semantics_cache.proto,
+            ),
+            anchor_dims_override=anchor_dims_override,
         )
 
-    def _derive_topology_axes(
+    def _axes(
         self, ledger: ObjectivePhysicalLedger | None, *, features: object | None = None, route: object | None = None
     ) -> TopologyAxes:
         return derive_topology_axes(
@@ -373,7 +365,7 @@ class RoundContextBuilder:
                     incumbent_source, regime_spec, stone.dsl_source, operator_entrypoint=op_entry,
                     sibling_specs=eff_sibs, active_kernel=self._resolve_active_trackb_kernel(incumbent_source, regime_spec),
                 )
-                l0 = self._run_l0(patched, regime_spec)
+                l0 = self._exec_l0(patched, regime_spec)
                 if not l0.passed:
                     logger.warning("Skipping invalid stepping-stone %s for regime %s: %s", stone.candidate_id, regime_spec.regime_tag, l0.error_message[:160])
                     continue
@@ -501,19 +493,6 @@ class RoundContextBuilder:
             lines.append(f"- tilelang_7pipe_isa_coverage: {float(getattr(pipe_gaps, 'coverage_ratio', 1.0)):.2%}, missing_count={len(missing)}, sample_gaps={list(missing[:6])}")
         return "\n".join(lines) + "\n\n"
 
-    def _lookup_case_dims_safe(self, case_num: int, regime_tag: str = "") -> dict[str, object]:
-        if self._lookup_case_dims_fn is not None:
-            cnum = int(case_num)
-            if cnum in self._case_dims_cache:
-                return dict(self._case_dims_cache[cnum])
-            dims = dict(self._lookup_case_dims_fn(cnum, regime_tag))
-            self._case_dims_cache[cnum] = dict(dims)
-            return dims
-        return lookup_case_dims_safe(
-            self._config.operator_name, case_num, regime_tag=regime_tag, regime_specs=self._regime_specs,
-            cache=self._case_dims_cache, cannbench_repo=self._cannbench_repo, env_file=self._env_file,
-        )
-
     @staticmethod
     def _format_trackb_hotpath_section(regime_spec: RegimeTargetSpec, active_kernel: str | None = None) -> tuple[str, str]:
         backend = normalize_runtime_backend(regime_spec.runtime_backend)
@@ -601,7 +580,7 @@ class RoundContextBuilder:
             escalation_tier=esc_tier, track=track, enable_track_router=bool(self._enable_track_router),
             sil_advisory=self._sil_advisory, freedom_mask=self._freedom_masks.get(regime_spec.regime_tag),
             ub_256kb_unlock=bool(parent_ledger.uses_unreserved_ubuf) if parent_ledger else False,
-            blueprint=blueprint, current_ledger=parent_ledger, topology_axes=self._derive_topology_axes(parent_ledger),
+            blueprint=blueprint, current_ledger=parent_ledger, topology_axes=self._axes(parent_ledger),
             active_symptom=rule.symptom_family.value if hasattr(rule.symptom_family, "value") else str(rule.symptom_family),
         )
         op_name = str(getattr(self._config, "operator_name", "") or getattr(self._config, "operator", "") or "")
@@ -661,7 +640,7 @@ class RoundContextBuilder:
             sil_advisory=self._sil_advisory, freedom_mask=self._freedom_masks.get(regime_spec.regime_tag),
             ub_256kb_unlock=bool(parent_ledger.uses_unreserved_ubuf) if parent_ledger else False,
             blueprint=blueprint, current_ledger=parent_ledger, excluded_mechanisms=excluded_mechanisms,
-            topology_axes=self._derive_topology_axes(parent_ledger),
+            topology_axes=self._axes(parent_ledger),
         )
         op_name = str(getattr(self._config, "operator_name", "") or getattr(self._config, "operator", "") or "")
         dom = get_input_domain_envelope(op_name)
@@ -701,7 +680,7 @@ class RoundContextBuilder:
         if state.semantic_topology_axes is not None:
             self._semantic_topology_axes = state.semantic_topology_axes
         if state.operator_proto_cache is not None:
-            self._operator_proto_cache = state.operator_proto_cache
+            self._semantics_cache.proto = state.operator_proto_cache
         if state.regime_blueprints:
             self._regime_blueprints = dict(state.regime_blueprints)
         for k, v in state.freedom_masks.items():
@@ -732,10 +711,14 @@ class RoundContextBuilder:
         bn_anchor = bottleneck_anchor_for_regime(state.best_result, selected_spec.regime_tag)
         bn_dims = None
         if bn_anchor is not None:
-            rbn = self._lookup_case_dims_safe(bn_anchor.case_num, selected_spec.regime_tag)
+            rbn = lookup_case_dims_safe(
+                self._config.operator_name, bn_anchor.case_num, regime_tag=selected_spec.regime_tag,
+                regime_specs=self._regime_specs, cache=self._case_dims_cache, cannbench_repo=self._cannbench_repo,
+                env_file=self._env_file, override_lookup_fn=self._lookup_case_dims_fn,
+            )
             if rbn:
                 bn_dims = {str(k): int(v) for k, v in rbn.items() if isinstance(v, int) and not isinstance(v, bool)}
-        base_sa = self._run_l0(parent_src, selected_spec, anchor_dims_override=bn_dims or None)
+        base_sa = self._exec_l0(parent_src, selected_spec, anchor_dims_override=bn_dims or None)
         pledger = base_sa.ledger if base_sa.ledger is not None else (stone.ledger if stone else None)
         if pledger is None:
             raise RuntimeError(f"Stage-A L0 produced no ledger for regime {selected_spec.regime_tag!r}: {base_sa.error_message}")
@@ -745,7 +728,7 @@ class RoundContextBuilder:
         local_best = rbest if rbest.anchors else state.best_result
         prev_rel = state.last_local_rel_gain_by_regime.get(selected_spec.regime_tag)
         mean_rec = regime_mean_recoverable_excess_us(state.best_result, selected_spec, dispatch_floor_us=state.calibrated_dispatch_floor_us)
-        paxes = self._derive_topology_axes(pledger, features=pfeat, route=base_sa.route)
+        paxes = self._axes(pledger, features=pfeat, route=base_sa.route)
         bkey = f"{selected_spec.regime_tag}:{paxes.key()}"
         shist = self._boundary_ledger.spearman_history.get(bkey) or []
         clean_n = 0
@@ -846,7 +829,7 @@ class RoundContextBuilder:
                 logger.debug("ExperienceLake per-round cost replay skipped: %s", exc)
         pcost = self._cost_advisor.predict_candidate_us(pwl, bisheng_res=pcomp)
         pbound = str(self._cost_advisor.resolve_dominant_bound(pledger, pres, fallback_cost_pred=pcost) or "")
-        op_sem = self._resolve_operator_semantics_for_gates()
+        op_sem = self._resolve_op_sem()
         has_rec = bool(getattr(getattr(bp, "semantics", None), "has_associative_outer_recurrence", False) or getattr(op_sem, "has_associative_outer_recurrence", False))
         pshift = bool(stag >= 2 and float(eta_case if bn_anchor else local_best.avg_roofline_eta) < 0.15 and has_rec and paxes.compute_engine == "aiv_only")
         amask = (
@@ -925,7 +908,7 @@ class RoundContextBuilder:
                 config_selector_name=selected_spec.config_selector_fn or None, dims=adims, pass_configs=ppc or None,
                 compile_flags=pcf or None, cost_model=self._cost_advisor.underlying_cost_model, axes=paxes,
                 live_plan=live_plan, blueprint=bp, sil_advisory=self._sil_advisory,
-                ordered_tensor_shapes=extract_ordered_tensor_shapes(case_entry=selected_spec.representative_case_entry, dims=adims, proto=self._operator_proto_cache),
+                ordered_tensor_shapes=extract_ordered_tensor_shapes(case_entry=selected_spec.representative_case_entry, dims=adims, proto=self._semantics_cache.proto),
             ) or str(self._cost_advisor.build_prompt_guidance(decision=gdec, base_cfg=pk, dims=adims, regime_tag=selected_spec.regime_tag, top_k=4) or "")
         deficit = max(0, self._config.k_rule_workers - len(rrules))
         tot_cr = max(2, 1 + deficit) if (pshift or p2_esc) else (1 + deficit)

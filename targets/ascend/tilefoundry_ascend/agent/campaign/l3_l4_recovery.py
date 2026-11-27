@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Protocol, TypeVar
 
 from tilefoundry_ascend.agent.campaign.helpers import (
-    ensure_candidate_bytes, lookup_case_dims_safe, persist_runtime_state,
-    source_sha256, write_source_and_verify,
+    ensure_candidate_bytes, extract_knob_signature as _helpers_extract_knob_signature,
+    lookup_case_dims_safe, persist_runtime_state, source_sha256, write_source_and_verify,
 )
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import PendingPromotion
 from tilefoundry_ascend.agent.contracts import NpuExecutionPort
@@ -27,7 +27,7 @@ from tilefoundry_ascend.agent.npu import (
 )
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec, GuardrailCaseSpec, RegimeTargetSpec, get_operator_task,
-    lookup_case_dims, lookup_case_metadata, resolve_regime_for_case,
+    lookup_case_metadata, resolve_regime_for_case,
 )
 from tilefoundry_ascend.agent.specs.fault_types import L3Resolution
 from tilefoundry_ascend.ascend.cost_model.experience_lake import append_counterexample_boundary
@@ -197,7 +197,8 @@ class PendingL4(JsonRecordMixin):
             norm["blocked_env_rounds_used"] = max(0, int(norm.get("same_card_retries_used") or 0))
         if "blocked_env_round_limit" not in norm and norm.get("same_card_retry_limit") is not None:
             raw_lim = norm["same_card_retry_limit"]
-            norm["blocked_env_round_limit"] = max(0, int(raw_lim))  # type: ignore[arg-type]
+            if isinstance(raw_lim, (int, float, str)) and not isinstance(raw_lim, bool):
+                norm["blocked_env_round_limit"] = max(0, int(raw_lim))
         return super().from_dict(norm)
 
 
@@ -326,20 +327,9 @@ def extract_knob_signature(
     resolve_regime_config_fn: Callable[[str, RegimeTargetSpec, Mapping[str, object] | None], ResolvedRegimeConfigLike] | None = None,
 ) -> str:
     """Extract canonical sorted knob signature for deterministic boundary ledger."""
-    if not mod_src.strip() or resolve_regime_config_fn is None:
+    if resolve_regime_config_fn is None:
         return ""
-    anchor_dims = regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-    try:
-        resolved = resolve_regime_config_fn(mod_src, regime_spec, anchor_dims)
-    except (SyntaxError, AttributeError, ImportError, KeyError, NameError, OSError, RuntimeError, TypeError, ValueError):
-        return ""
-    parts: list[str] = []
-    if resolved.selector_name:
-        parts.extend(f"{k}={resolved.builder_kwargs[k]!r}" for k in sorted(resolved.builder_kwargs) if str(k).lower() not in SHAPE_DIM_KEYS)
-    parts.extend(f"pc.{k}={resolved.pass_configs[k]!r}" for k in sorted(resolved.pass_configs))
-    if resolved.compile_flags:
-        parts.append(f"flags={' '.join(sorted(str(f) for f in resolved.compile_flags))}")
-    return ",".join(parts)
+    return _helpers_extract_knob_signature(mod_src, regime_spec, resolve_fn=resolve_regime_config_fn)
 
 
 def is_prime_gt2(value: int) -> bool:
@@ -605,6 +595,7 @@ class L3L4RecoveryCoordinator:
             self.pending_promotion = self.active_promotion = None
             self._persist_runtime_state("active_promotion", None)
             self._persist_runtime_state("pending_promotion", None)
+            assert current.candidate_result is not None
             return current.candidate_source, current.candidate_result, stagnation_by_regime, None, False
 
         def _candidate_failure(res: L3AcceptanceResult):
@@ -940,22 +931,6 @@ class L3L4RecoveryCoordinator:
         """Extract canonical sorted knob signature for deterministic boundary ledger."""
         return extract_knob_signature(mod_src, regime_spec, resolve_regime_config_fn=self._resolve_regime_config_fn)
 
-    def _lookup_case_dims_safe(self, case_num: int, regime_tag: str = "") -> dict[str, object]:
-        if self._lookup_case_dims_fn is not None:
-            cnum = int(case_num)
-            if cnum in self.case_dims_cache:
-                return dict(self.case_dims_cache[cnum])
-            try:
-                dims = dict(lookup_case_dims(self._operator_name, cnum, cannbench_repo=self._cannbench_repo, env_file=self._env_file))
-            except (FileNotFoundError, OSError, KeyError, ValueError, TypeError):
-                dims = dict(self._lookup_case_dims_fn(cnum, regime_tag))
-            self.case_dims_cache[cnum] = dict(dims)
-            return dims
-        return lookup_case_dims_safe(
-            self._operator_name, case_num, regime_tag=regime_tag, regime_specs=self.regime_specs,
-            cache=self.case_dims_cache, cannbench_repo=self._cannbench_repo, env_file=self._env_file,
-        )
-
     def evaluate_incumbent_on_new_anchors(
         self, incumbent_source: str, new_specs: Sequence[AnchorCaseSpec]
     ) -> list[AnchorEvalMetrics]:
@@ -993,7 +968,11 @@ class L3L4RecoveryCoordinator:
         fstage = str(getattr(l3_res, "failure_stage", "") or "")
         probes, pending_specs = [], []
         for cnum in targets:
-            dims = self._lookup_case_dims_safe(cnum, regime_spec.regime_tag)
+            dims = lookup_case_dims_safe(
+                self._operator_name, cnum, regime_tag=regime_spec.regime_tag, regime_specs=self.regime_specs,
+                cache=self.case_dims_cache, cannbench_repo=self._cannbench_repo, env_file=self._env_file,
+                override_lookup_fn=self._lookup_case_dims_fn, cannbench_first=True,
+            )
             rtag = regime_spec.regime_tag
             if dims and self.regime_specs:
                 try:

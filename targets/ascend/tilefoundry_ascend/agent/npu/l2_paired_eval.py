@@ -591,7 +591,7 @@ def prewarm_anchor_reference_cache(
     sorted_ids = sorted({int(a.case_num) for a in anchors})
     op_dir = resolved_cache / "operators" / task.replace("/", "__") if task else None
     marker_p = op_dir / ".ref_prewarm_v1.json" if op_dir is not None else None
-    cy_sha = _resolve_cases_yaml_sha256(repo, operator_name) if task else ""
+    cy_sha = resolve_cases_yaml_sha256(repo, operator_name) if task else ""
     if task and sorted_ids and op_dir and marker_p and _ref_prewarm_marker_matches(_load_json_dict(marker_p), op_dir=op_dir, cases_yaml_sha256=cy_sha, sorted_case_ids=sorted_ids):
         return resolved_cache
     env_vals = parse_simple_env_file(env_file) if env_file is not None else {}
@@ -626,9 +626,15 @@ def prewarm_anchor_reference_cache(
     return resolved_cache
 
 
-def _resolve_cases_yaml_sha256(repo: Path, operator_name: str) -> str:
+def resolve_cases_yaml_sha256(
+    repo: Path | None, operator_name: str, *, tasks_root: Path | None = None
+) -> str:
+    """Return SHA-256 hex digest of *operator_name*'s cases.yaml, or empty string."""
     try:
-        cases_path = resolve_cannbench_tasks_root(repo) / get_operator_task(operator_name) / "cases.yaml"
+        eff_root = tasks_root if tasks_root is not None else (resolve_cannbench_tasks_root(repo) if repo is not None else None)
+        if eff_root is None or not operator_name:
+            return ""
+        cases_path = eff_root / get_operator_task(operator_name) / "cases.yaml"
         return _sha256_file(cases_path) if cases_path.is_file() else ""
     except (OSError, ValueError, KeyError, RuntimeError):
         return ""

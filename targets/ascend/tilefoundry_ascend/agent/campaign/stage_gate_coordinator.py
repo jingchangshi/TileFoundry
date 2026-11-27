@@ -2,145 +2,81 @@
 
 from __future__ import annotations
 
-import ast
-import asyncio
-import hashlib
-import json
-import logging
-import os
-import subprocess
-import tempfile
-import threading
-import time
+import ast, asyncio, hashlib, json, logging, os, subprocess, tempfile, threading, time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 import yaml
 
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import DeterministicSearchBoundaryLedger
 from tilefoundry_ascend.agent.campaign.helpers import (
-    derive_topology_axes,
-    extract_cost_pred_us,
-    lookup_case_dims_safe,
-    resolve_active_trackb_kernel,
-    resolve_active_trackb_kernels,
-    resolve_cann_root_from_env_file,
-    resolve_cannbench_tasks_root,
-    resolve_operator_entrypoint_safe,
-    resolve_operator_semantics,
-    resolve_trackb_freedom_mask,
-    run_l0_gate,
-    slice_contract_instruction,
-    source_sha256,
+    OperatorSemanticsCache, build_width_failure_result, compile_trackb_stage_b,
+    count_trackb_workspace_stages, derive_topology_axes, dispatch_l0_gate,
+    extract_candidate_topology_axes, extract_cost_pred_us, extract_knob_signature,
+    is_noop_identical_failure, ledger_has_cube_engine, ledger_has_hardware_dma,
+    lookup_case_dims_safe, merge_interval_wall_sec, normalize_primary_vf_overflow,
+    persist_round_candidate_artifact, resolve_active_trackb_kernel, resolve_active_trackb_kernels,
+    resolve_cannbench_tasks_root, resolve_cases_yaml_sha256_for_operator,
+    resolve_operator_entrypoint_safe, resolve_operator_semantics_for_gates,
+    resolve_trackb_freedom_mask, run_hybrid_trackb_stage_b, run_l0_gate,
+    slice_contract_instruction, source_sha256, stage_b_has_vf_overflow,
 )
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import evaluate_promotion_gate
 from tilefoundry_ascend.agent.contracts import (
-    CampaignStateSnapshot,
-    CompileTaskSpec,
-    NpuExecutionPort,
-    RegimeCompilePlan,
+    CampaignStateSnapshot, NpuExecutionPort, RegimeCompilePlan,
 )
 from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor, create_cost_advisor
 from tilefoundry_ascend.agent.gates.gate_funnel import (
-    StageAResult,
-    StageBResult,
-    _normalize_trackb_unit_source,
-    compile_trackb_shared_so,
-    compute_trackb_shared_so_filename,
-    evaluate_ascendc_candidate,
-    extract_ordered_tensor_shapes,
-    resolve_trackb_compile_flags,
-    run_stage_a_static,
-    run_stage_b_ascendc_compile,
+    StageAResult, StageBResult, evaluate_ascendc_candidate, extract_ordered_tensor_shapes,
+    resolve_trackb_compile_flags, run_stage_a_static,
 )
 from tilefoundry_ascend.agent.gates.stage_b_gate import (
-    ModuleSelectorPlanExtractor,
-    StageBCompileGate,
-    build_post_selector_regime_plan,
-    has_unreserved_vf_stack_overflow,
+    ModuleSelectorPlanExtractor, StageBCompileGate, build_post_selector_regime_plan,
     run_l1_compile_check,
 )
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker, append_kb_event_shard
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule
 from tilefoundry_ascend.agent.npu import (
-    AgentGatesDeviceFaultError,
-    AnchorEvalMetrics,
-    CandidateSurrogateResult,
-    L0L1CandidateCheck,
-    L0L1RoundResults,
-    L2BatchResults,
-    OccupancyExhaustedError,
-    _normalized_module_ast_signature,
-    aggregate_surrogate_result,
-    lookup_case_static_spec,
-    run_surrogate_batch_via_agent_gates,
+    AgentGatesDeviceFaultError, AnchorEvalMetrics, CandidateSurrogateResult, L0L1CandidateCheck,
+    L0L1RoundResults, L2BatchResults, OccupancyExhaustedError, _normalized_module_ast_signature,
+    aggregate_surrogate_result, lookup_case_static_spec, run_surrogate_batch_via_agent_gates,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
-    GenerationRequest,
-    KernelLLMBackend,
-    create_llm_backend_from_env,
-    extract_creative_payload,
-    extract_python_dsl,
+    GenerationRequest, KernelLLMBackend, create_llm_backend_from_env,
+    extract_creative_payload, extract_python_dsl,
 )
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
-    build_syntax_repair_request,
-    check_repair_monotonicity,
-    classify_stage_failure_for_repair,
-    extract_lowered_compiler_excerpt_with_lang,
-    parse_scoped_search_replace_blocks,
+    build_syntax_repair_request, check_repair_monotonicity, classify_stage_failure_for_repair,
+    extract_lowered_compiler_excerpt_with_lang, parse_scoped_search_replace_blocks,
 )
 from tilefoundry_ascend.agent.orchestrator.regime_slice_patcher import (
-    _compact_trackb_snippet_source,
-    _detect_trackb_dead_code_edit,
-    _extract_p2_focus_lines_and_diag,
-    _has_prim_func_builder,
-    _render_trackb_tu_from_module,
-    _resolve_selector_compile_flags,
-    extract_regime_snippet,
-    patch_regime_into_module,
-    resolve_regime_config,
+    _compact_trackb_snippet_source, _detect_trackb_dead_code_edit,
+    _extract_p2_focus_lines_and_diag, _has_prim_func_builder, _render_trackb_tu_from_module,
+    _resolve_selector_compile_flags, patch_regime_into_module, resolve_regime_config,
 )
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     rank_stage_a_candidates_with_cost_model,
 )
 from tilefoundry_ascend.agent.specs.anchor_specs import (
-    AnchorCaseSpec,
-    GuardrailCaseSpec,
-    RegimeTargetSpec,
-    build_anchor_var_bindings,
-    compute_case_eq3_score,
-    default_source_root,
-    extract_trackb_cpp_source,
-    get_operator_task,
-    parse_simple_env_file,
-    resolve_regime_for_case,
+    AnchorCaseSpec, GuardrailCaseSpec, RegimeTargetSpec, build_anchor_var_bindings,
+    compute_case_eq3_score, default_source_root, extract_trackb_cpp_source, get_operator_task,
+    parse_simple_env_file, resolve_regime_for_case,
 )
 from tilefoundry_ascend.agent.specs.fault_types import FaultPlane, TypedFault, coerce_fault_plane
-from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
-    ArtifactRecord,
-    ArtifactStore,
-    compute_compile_task_key,
-    is_verified_binary_file,
-    resolve_unified_tl_cache_dir,
-)
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import ArtifactStore, resolve_unified_tl_cache_dir
 from tilefoundry_ascend.ascend.cost_model import (
-    BishengResourceSummary,
-    CostFeatures,
-    build_cost_features_from_ledger,
+    BishengResourceSummary, CostFeatures, build_cost_features_from_ledger,
 )
 from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (
-    CostGateDecision,
-    is_paradigm_shift_exempt,
+    CostGateDecision, is_paradigm_shift_exempt,
 )
 from tilefoundry_ascend.ascend.cost_model.experience_lake import compute_source_sha256
-from tilefoundry_ascend.ascend.json_record import atomic_write_text
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.schedule.regime_solver import RegimePlanResult
-from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import PyTorchOpSemantics
 from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask, TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendTarget
@@ -148,86 +84,33 @@ from tilefoundry_ascend.ascend.target import AscendTarget
 logger = logging.getLogger(__name__)
 _MAX_L1_COMPILE_WORKERS = 8
 _ORIG_RUN_L0_L1_ROUND_FILTER: object | None = None
-_SHAPE_DIM_KEYS: frozenset[str] = frozenset({
-    "b", "b_dim", "case_id", "case_num", "d", "d_dim", "d_nope", "d_rope", "half_dim",
-    "hidden_dim", "inner", "inner_dim", "k", "m", "n", "n_depth", "n_kv", "n_q",
-    "num_heads", "num_kv_heads", "rows", "s", "s_dim", "s_kv", "s_q", "seq_len", "shape",
-})
+_ItemT = TypeVar("_ItemT")
+_ResT = TypeVar("_ResT")
+
+
+def _pool_map(items: Sequence[_ItemT], fn: Callable[[_ItemT], _ResT]) -> list[_ResT]:
+    if len(items) <= 1:
+        return [fn(it) for it in items]
+    with ThreadPoolExecutor(max_workers=min(_MAX_L1_COMPILE_WORKERS, len(items))) as pool:
+        return list(pool.map(fn, items))
 
 
 def _repair_timeout_message(error_message: str, is_transport: bool) -> str:
     return f"[repair_timeout] {error_message}" if is_transport else error_message
 
 
-def _count_trackb_workspace_stages(source: str) -> int:
-    if not source.strip():
-        return 0
-    return max(0, len(re.findall(r"__global__\s+[^\n;{]*?\bvoid\s+[A-Za-z_]\w*", source)) - 1)
-
-
-def _extract_candidate_topology_axes(stage_a: StageAResult) -> TopologyAxes | None:
-    if stage_a.ledger is not None:
-        raw = getattr(stage_a.ledger, "topology_axes", None)
-        if isinstance(raw, TopologyAxes):
-            return raw
-    route = stage_a.route
-    if route is not None:
-        ra = route.get("topology_axes") if isinstance(route, Mapping) else getattr(route, "topology_axes", None)
-        if isinstance(ra, TopologyAxes):
-            return ra
-        if isinstance(ra, Mapping) and {"compute_engine", "memory_ring", "iteration_regularity"} <= set(ra):
-            return TopologyAxes.from_dict(ra)
-    return None
-
-
-def _is_noop_identical_failure(
-    *, failed_tier: str = "", error_message: str = "", result: object | None = None
-) -> bool:
-    if failed_tier == "noop_identical" or str(getattr(result, "fault_plane", "") or "") == "NOOP_IDENTICAL":
-        return True
-    return any(t in error_message.lower() for t in ("noop_identical", "trackb_dead_code_edit"))
-
-
-def _merge_interval_wall_sec(intervals: Sequence[tuple[float, float]]) -> float:
-    valid = sorted((a, b) for a, b in intervals if b > a)
-    if not valid:
-        return 0.0
-    total, cs, ce = 0.0, valid[0][0], valid[0][1]
-    for s, e in valid[1:]:
-        if s <= ce:
-            ce = max(ce, e)
-        else:
-            total += ce - cs
-            cs, ce = s, e
-    return total + (ce - cs)
-
-
-import re  # noqa: E402
-
-
 async def run_l0_l1_round_filter(
-    candidates: Sequence[tuple[str, str]],
-    *,
-    patch_fn: Callable[[str], str],
-    l0_checker: Callable[[str], StageAResult],
-    l1_compiler: Callable[[str], StageBResult],
+    candidates: Sequence[tuple[str, str]], *, patch_fn: Callable[[str], str],
+    l0_checker: Callable[[str], StageAResult], l1_compiler: Callable[[str], StageBResult],
     repatch_from_current_fn: Callable[[str, str], str] | None = None,
-    repair_backend: KernelLLMBackend | None = None,
-    max_syntax_repairs: int = 1,
-    slice_hint: str = "",
-    backend_kind: str = "tilelang_dsl",
-    parent_source: str = "",
-    parent_module_source: str = "",
-    trackb_prologue_line_offset: int = 0,
+    repair_backend: KernelLLMBackend | None = None, max_syntax_repairs: int = 1,
+    slice_hint: str = "", backend_kind: str = "tilelang_dsl", parent_source: str = "",
+    parent_module_source: str = "", trackb_prologue_line_offset: int = 0,
     stage_a_cost_ranker: Callable[[Sequence[tuple[str, str, StageAResult]]], Sequence[tuple[str, float]]] | None = None,
-    cost_prescreen_top_k: int | None = None,
-    sil_advisory: object | None = None,
-    sil_verification: object | None = None,
-    freedom_mask: ConstraintRelaxationMask | None = None,
-    vector_mode: str = "simdvf",
-    ub_256kb_unlock: bool = False,
-    creative_candidate_ids: Collection[str] = (),
-    parent_analytical_us: float | None = None,
+    cost_prescreen_top_k: int | None = None, sil_advisory: object | None = None,
+    sil_verification: object | None = None, freedom_mask: ConstraintRelaxationMask | None = None,
+    vector_mode: str = "simdvf", ub_256kb_unlock: bool = False,
+    creative_candidate_ids: Collection[str] = (), parent_analytical_us: float | None = None,
     stage_a_analytical_scorer: Callable[[str, str, StageAResult], float] | None = None,
     parent_topology_axes: TopologyAxes | None = None,
     candidate_topology_axes_fn: Callable[[str, StageAResult], TopologyAxes | None] | None = None,
@@ -243,11 +126,10 @@ async def run_l0_l1_round_filter(
     cum_repair_sec = 0.0
     base_src = parent_module_source if parent_module_source.strip() else parent_source
     base_sig = _normalized_module_ast_signature(base_src) if base_src.strip() else None
-    eff_pws = (
-        int(parent_workspace_stages)
-        if parent_workspace_stages is not None
-        else (_count_trackb_workspace_stages(base_src) if base_src.strip() else 0)
-    )
+    eff_pws = int(parent_workspace_stages) if parent_workspace_stages is not None else (count_trackb_workspace_stages(base_src) if base_src.strip() else 0)
+
+    def _fail(cid: str, tier: str, patched: str, snip: str, rep: bool, err: str, fp: str, fc: str, sa: StageAResult | None = None, sb: StageBResult | None = None) -> L0L1CandidateCheck:
+        return L0L1CandidateCheck(cid, False, tier, patched, snip, rep, stage_a=sa, stage_b=sb, error_message=err, fault_plane=fp, fault_code=fc)
 
     async def _try_repair(
         cur_src: str, diag: str, *, lowered_excerpt: str = "", lowered_excerpt_lang: str | None = None
@@ -265,20 +147,16 @@ async def run_l0_l1_round_filter(
             raw = await repair_backend.generate(req)
         except Exception as exc:
             t1 = time.monotonic()
-            repair_intervals.append((t0, t1))
-            cum_repair_sec += max(0.0, t1 - t0)
+            repair_intervals.append((t0, t1)); cum_repair_sec += max(0.0, t1 - t0)
             return None, f"{diag} | repair_transport: {type(exc).__name__}: {exc}", True
         t1 = time.monotonic()
-        repair_intervals.append((t0, t1))
-        cum_repair_sec += max(0.0, t1 - t0)
+        repair_intervals.append((t0, t1)); cum_repair_sec += max(0.0, t1 - t0)
         try:
             rep = extract_python_dsl(raw)
         except Exception as exc:
             return None, f"{diag} | repair_parse: {type(exc).__name__}: {exc}", False
-        if parent_source.strip():
-            v = check_repair_monotonicity(parent_source, rep, backend_kind=backend_kind)
-            if v:
-                return None, f"{diag} | repair_monotonicity_violation: {'; '.join(v)}", False
+        if parent_source.strip() and (v := check_repair_monotonicity(parent_source, rep, backend_kind=backend_kind)):
+            return None, f"{diag} | repair_monotonicity_violation: {'; '.join(v)}", False
         return rep, "", False
 
     async def _run_stage_a_phase(
@@ -292,29 +170,29 @@ async def run_l0_l1_round_filter(
                 patched = apf(snip)
             except Exception as exc:
                 err = f"ast_patch_error: {type(exc).__name__}: {exc}"
-                if _is_noop_identical_failure(error_message=err):
-                    return L0L1CandidateCheck(cid, False, "noop_identical", "", snip, is_rep, error_message=err, fault_plane="NOOP_IDENTICAL", fault_code="NOOP_IDENTICAL"), None
+                if is_noop_identical_failure(error_message=err):
+                    return _fail(cid, "noop_identical", "", snip, is_rep, err, "NOOP_IDENTICAL", "NOOP_IDENTICAL"), None
                 if repair_backend is None or att >= eff_max:
-                    return L0L1CandidateCheck(cid, False, "stage_a", "", snip, is_rep, error_message=err, fault_plane="STAGE_A_STATIC", fault_code="AST_PATCH_ERROR"), None
+                    return _fail(cid, "stage_a", "", snip, is_rep, err, "STAGE_A_STATIC", "AST_PATCH_ERROR"), None
                 ns, re_err, tr = await _try_repair(snip, err)
                 if ns is None:
-                    return L0L1CandidateCheck(cid, False, "stage_a", "", snip, is_rep, error_message=_repair_timeout_message(re_err, tr), fault_plane="STAGE_A_STATIC", fault_code="SYNTAX_REPAIR_FAILED"), None
+                    return _fail(cid, "stage_a", "", snip, is_rep, _repair_timeout_message(re_err, tr), "STAGE_A_STATIC", "SYNTAX_REPAIR_FAILED"), None
                 snip, is_rep, apf = ns, True, patch_fn
                 continue
             apf = patch_fn
             if base_sig is not None and (psig := _normalized_module_ast_signature(patched)) is not None and psig == base_sig:
-                return L0L1CandidateCheck(cid, False, "noop_identical", patched, snip, is_rep, error_message="noop_identical_to_parent", fault_plane="NOOP_IDENTICAL", fault_code="NOOP_IDENTICAL"), None
+                return _fail(cid, "noop_identical", patched, snip, is_rep, "noop_identical_to_parent", "NOOP_IDENTICAL", "NOOP_IDENTICAL"), None
             sa = await asyncio.to_thread(l0_checker, patched)
             if not sa.passed:
                 err = sa.error_message or "l0_static_failed"
-                if _is_noop_identical_failure(error_message=err, result=sa):
-                    return L0L1CandidateCheck(cid, False, "noop_identical", patched, snip, is_rep, stage_a=sa, error_message=err, fault_plane="NOOP_IDENTICAL", fault_code="NOOP_IDENTICAL"), None
+                if is_noop_identical_failure(error_message=err, result=sa):
+                    return _fail(cid, "noop_identical", patched, snip, is_rep, err, "NOOP_IDENTICAL", "NOOP_IDENTICAL", sa=sa), None
                 fp, fc = str(getattr(sa, "fault_plane", "") or "STAGE_A_STATIC"), str(getattr(sa, "fault_code", "") or "STAGE_A_FAILED")
                 if repair_backend is None or att >= eff_max or not classify_stage_failure_for_repair(fc):
-                    return L0L1CandidateCheck(cid, False, "stage_a", patched, snip, is_rep, stage_a=sa, error_message=err, fault_plane=fp, fault_code=fc), None
+                    return _fail(cid, "stage_a", patched, snip, is_rep, err, fp, fc, sa=sa), None
                 ns, re_err, tr = await _try_repair(snip, err)
                 if ns is None:
-                    return L0L1CandidateCheck(cid, False, "stage_a", patched, snip, is_rep, stage_a=sa, error_message=_repair_timeout_message(re_err, tr), fault_plane=fp, fault_code=fc), None
+                    return _fail(cid, "stage_a", patched, snip, is_rep, _repair_timeout_message(re_err, tr), fp, fc, sa=sa), None
                 snip, is_rep = ns, True
                 continue
             return None, (snip, patched, sa, is_rep, att)
@@ -345,15 +223,15 @@ async def run_l0_l1_round_filter(
             if sb.passed:
                 return L0L1CandidateCheck(cid, True, None, cp, cs, crep, stage_a=csa, stage_b=sb)
             err = sb.error_message or "l1_compile_failed"
-            if _is_noop_identical_failure(error_message=err, result=sb):
-                return L0L1CandidateCheck(cid, False, "noop_identical", cp, cs, crep, stage_a=csa, stage_b=sb, error_message=err, fault_plane="NOOP_IDENTICAL", fault_code="NOOP_IDENTICAL")
+            if is_noop_identical_failure(error_message=err, result=sb):
+                return _fail(cid, "noop_identical", cp, cs, crep, err, "NOOP_IDENTICAL", "NOOP_IDENTICAL", sa=csa, sb=sb)
             fp, fc = str(getattr(sb, "fault_plane", "") or "STAGE_B_COMPILE"), str(getattr(sb, "fault_code", "") or "STAGE_B_FAILED")
             if repair_backend is None or catt >= eff_max or not classify_stage_failure_for_repair(fc):
-                return L0L1CandidateCheck(cid, False, "stage_b", cp, cs, crep, stage_a=csa, stage_b=sb, error_message=err, fault_plane=fp, fault_code=fc)
+                return _fail(cid, "stage_b", cp, cs, crep, err, fp, fc, sa=csa, sb=sb)
             ex, ex_lang = extract_lowered_compiler_excerpt_with_lang(sb)
             ns, re_err, tr = await _try_repair(cs, err, lowered_excerpt=ex, lowered_excerpt_lang=ex_lang)
             if ns is None:
-                return L0L1CandidateCheck(cid, False, "stage_b", cp, cs, crep, stage_a=csa, stage_b=sb, error_message=_repair_timeout_message(re_err, tr), fault_plane=fp, fault_code=fc)
+                return _fail(cid, "stage_b", cp, cs, crep, _repair_timeout_message(re_err, tr), fp, fc, sa=csa, sb=sb)
             fchk, pstate = await _run_stage_a_phase(cid, ns, start_attempt=catt + 1, repaired=True, initial_patch_fn=_sb_repair_patch_fn(cp))
             if fchk is not None:
                 return fchk
@@ -368,12 +246,9 @@ async def run_l0_l1_round_filter(
         return await _run_stage_b_and_repairs(cid, *pstate, attempt_limit=attempt_limit)
 
     async def _phase2_repair(chk: L0L1CandidateCheck) -> L0L1CandidateCheck:
-        if chk.passed or chk.failed_tier == "noop_identical":
+        if chk.passed or chk.failed_tier == "noop_identical" or not classify_stage_failure_for_repair(str(chk.fault_code or "")):
             return chk
-        fc, fp = str(chk.fault_code or ""), str(chk.fault_plane or "")
-        if not classify_stage_failure_for_repair(fc):
-            return chk
-        err = chk.error_message or "l1_compile_failed"
+        fc, fp, err = str(chk.fault_code or ""), str(chk.fault_plane or ""), chk.error_message or "l1_compile_failed"
         if chk.failed_tier == "stage_b" and chk.stage_b is not None:
             ex, ex_lang = extract_lowered_compiler_excerpt_with_lang(chk.stage_b)
             ns, re_err, tr = await _try_repair(chk.snippet_source, err, lowered_excerpt=ex, lowered_excerpt_lang=ex_lang)
@@ -383,7 +258,7 @@ async def run_l0_l1_round_filter(
         else:
             ns, re_err, tr = await _try_repair(chk.snippet_source, err)
             if ns is None:
-                return L0L1CandidateCheck(chk.candidate_id, False, "stage_a", chk.patched_module_source, chk.snippet_source, chk.repaired, stage_a=chk.stage_a, error_message=_repair_timeout_message(re_err, tr), fault_plane=fp or "STAGE_A_STATIC", fault_code=("SYNTAX_REPAIR_FAILED" if fc == "AST_PATCH_ERROR" else fc) or "STAGE_A_FAILED")
+                return _fail(chk.candidate_id, "stage_a", chk.patched_module_source, chk.snippet_source, chk.repaired, _repair_timeout_message(re_err, tr), fp or "STAGE_A_STATIC", ("SYNTAX_REPAIR_FAILED" if fc == "AST_PATCH_ERROR" else fc) or "STAGE_A_FAILED", sa=chk.stage_a)
             ipf = None
         fchk, pstate = await _run_stage_a_phase(chk.candidate_id, ns, start_attempt=1, repaired=True, initial_patch_fn=ipf)
         if fchk is not None:
@@ -392,11 +267,10 @@ async def run_l0_l1_round_filter(
         return await _run_stage_b_and_repairs(chk.candidate_id, *pstate)
 
     def _finalize(items: Sequence[L0L1CandidateCheck]) -> L0L1RoundResults:
-        ws, cs = _merge_interval_wall_sec(repair_intervals), float(cum_repair_sec)
+        ws, cs = merge_interval_wall_sec(repair_intervals), float(cum_repair_sec)
         return L0L1RoundResults([replace(c, wall_repair_sec=ws, cum_repair_worker_sec=cs) for c in items], wall_repair_sec=ws, cum_repair_worker_sec=cs)
 
-    use_prescreen = stage_a_cost_ranker is not None and cost_prescreen_top_k is not None and int(cost_prescreen_top_k) > 0
-    if not use_prescreen:
+    if not (stage_a_cost_ranker is not None and cost_prescreen_top_k is not None and int(cost_prescreen_top_k) > 0):
         if skip_repair_when_survivors_exist and repair_backend is not None and max_attempts > 0:
             p1 = list(await asyncio.gather(*(_check_one(cid, s, attempt_limit=0) for cid, s in candidates)))
             return _finalize(p1 if any(c.passed for c in p1) else list(await asyncio.gather(*(_phase2_repair(c) for c in p1))))
@@ -419,23 +293,19 @@ async def run_l0_l1_round_filter(
     exempt, same = [], []
     for item in passers:
         _i, cid, _sn, patched, sa, _r, _a = item
-        ca = candidate_topology_axes_fn(patched, sa) if candidate_topology_axes_fn else _extract_candidate_topology_axes(sa)
-        cws = int(candidate_workspace_stages_fn(patched, sa)) if candidate_workspace_stages_fn else _count_trackb_workspace_stages(patched)
+        ca = candidate_topology_axes_fn(patched, sa) if candidate_topology_axes_fn else extract_candidate_topology_axes(sa)
+        cws = int(candidate_workspace_stages_fn(patched, sa)) if candidate_workspace_stages_fn else count_trackb_workspace_stages(patched)
         (exempt if is_paradigm_shift_exempt(ca, parent_topology_axes, cand_workspace_stages=cws, parent_workspace_stages=eff_pws, is_creative=(cid in cids)) else same).append(item)
     if len(same) > top_k:
-        ranked = list(stage_a_cost_ranker([(cid, patched, sa) for _i, cid, _sn, patched, sa, _r, _a in same]))
-        pbid: dict[str, float] = {}
-        obid: dict[str, int] = {}
-        for ridx, (rcid, rsc) in enumerate(ranked):
+        pbid, obid = {}, {}
+        for ridx, (rcid, rsc) in enumerate(stage_a_cost_ranker([(cid, patched, sa) for _i, cid, _sn, patched, sa, _r, _a in same])):
             if (sid := str(rcid)) not in pbid:
                 pbid[sid], obid[sid] = float(rsc), ridx
         ssame = sorted(same, key=lambda it: (pbid.get(it[1], float("inf")), obid.get(it[1], len(same) + it[0]), it[0]))
         kept_same, reserve_same = ssame[:top_k], ssame[top_k:]
     else:
         pbid, kept_same, reserve_same = {}, same, []
-    kept = [*exempt, *kept_same]
-    ks_ids = {it[1] for it in kept_same}
-    passed_l1 = 0
+    kept, ks_ids, passed_l1 = [*exempt, *kept_same], {it[1] for it in kept_same}, 0
     if kept:
         for (idx, cid, *_), chk in zip(kept, await asyncio.gather(*(_run_stage_b_and_repairs(cid, cs, p, sa, r, a) for _i, cid, cs, p, sa, r, a in kept))):
             by_idx[idx] = chk
@@ -449,12 +319,13 @@ async def run_l0_l1_round_filter(
             if chk.passed:
                 passed_l1 += 1
         else:
-            by_idx[idx] = L0L1CandidateCheck(cid, False, "cost_prescreen", p, cs, r, stage_a=sa, stage_b=None, error_message=f"cost_prescreen_pruned:pred_us={pbid.get(cid, float('inf')):.2f}", fault_plane="COST_PRESCREEN", fault_code="COST_PRESCREEN_PRUNED")
+            by_idx[idx] = _fail(cid, "cost_prescreen", p, cs, r, f"cost_prescreen_pruned:pred_us={pbid.get(cid, float('inf')):.2f}", "COST_PRESCREEN", "COST_PRESCREEN_PRUNED", sa=sa)
     return _finalize([by_idx[i] for i in range(len(candidates))])
 
 
 class StageGateConfig(Protocol):
     """Configuration surface consumed by StageGateCoordinator."""
+
     operator_name: str
     device_id: str
     warmup: int
@@ -569,13 +440,9 @@ class StageGateCoordinator:
         incumbent_anchor_us_by_case: Mapping[int, float] | None = None,
         freedom_masks: Mapping[str, ConstraintRelaxationMask] | None = None,
     ) -> None:
-        self._config: StageGateConfig = config or _DefaultStageGateConfig(
-            operator_name=operator_name, device_id=device_id, warmup=warmup, repeat=repeat,
-            max_syntax_repairs=max_syntax_repairs, cost_prescreen_top_k=cost_prescreen_top_k, pure_golden=pure_golden,
-        )
+        self._config: StageGateConfig = config or _DefaultStageGateConfig(operator_name=operator_name, device_id=device_id, warmup=warmup, repeat=repeat, max_syntax_repairs=max_syntax_repairs, cost_prescreen_top_k=cost_prescreen_top_k, pure_golden=pure_golden)
         self._target_module_path = Path(target_module_path).resolve() if target_module_path else Path("module.py")
-        self._regime_specs = tuple(regime_specs)
-        self._initial_anchors = tuple(initial_anchors)
+        self._regime_specs, self._initial_anchors = tuple(regime_specs), tuple(initial_anchors)
         self._scoreboard_anchors = tuple(scoreboard_anchors or initial_anchors)
         self._guardrail_cases: list[GuardrailCaseSpec] = guardrail_cases if guardrail_cases is not None else []
         self._backend, self._tracker = backend, (tracker or BayesianRuleTracker())
@@ -587,13 +454,10 @@ class StageGateCoordinator:
         self._cannbench_repo = Path(cannbench_repo).resolve() if cannbench_repo is not None else None
         self._checkpoint_path = Path(checkpoint_path).resolve() if checkpoint_path is not None else None
         self._experience_lake_dir = Path(experience_lake_dir).resolve() if experience_lake_dir is not None else None
-        self._run_id, self._l4_device_pool = run_id, tuple(l4_device_pool)
-        self._enable_track_router = bool(enable_track_router)
+        self._run_id, self._l4_device_pool, self._enable_track_router = run_id, tuple(l4_device_pool), bool(enable_track_router)
         self._sil_advisory, self._topology_axes, self._semantic_topology_axes = sil_advisory, topology_axes, semantic_topology_axes
-        self._npu_port = npu_port
-        self._l0_checker, self._l1_compiler, self._l2_batch_evaluator = l0_checker, l1_compiler, l2_batch_evaluator
-        self._static_width_dims_fn = static_width_dims_fn
-        self._resolve_op_semantics_fn = resolve_op_semantics_fn
+        self._npu_port, self._l0_checker, self._l1_compiler, self._l2_batch_evaluator = npu_port, l0_checker, l1_compiler, l2_batch_evaluator
+        self._static_width_dims_fn, self._resolve_op_semantics_fn = static_width_dims_fn, resolve_op_semantics_fn
         self._persist_artifact_fn, self._record_kb_event_fn = persist_artifact_fn, record_kb_event_fn
         self._active_incumbent_source = active_incumbent_source
         self._incumbent_anchor_us_by_case: dict[int, float] = dict(incumbent_anchor_us_by_case or {})
@@ -602,38 +466,12 @@ class StageGateCoordinator:
         self._case_static_spec_cache: dict[int, dict[str, object]] = {}
         self._cases_yaml_sha256_cache: str | None = None
         self._active_kernel_cache: dict[tuple[str, str], str | None] = {}
-        self._operator_proto_cache: Mapping[str, object] | None = None
-        self._operator_semantics_cache: PyTorchOpSemantics | None = None
-        self._operator_semantics_loaded: bool = False
+        self._semantics_cache = OperatorSemanticsCache()
         self._l1_summary_cache: dict[tuple[str, str], BishengResourceSummary | None] = {}
         self._last_l2_timing_meta: dict[str, object] = {}
         self._last_guardrail_metrics_by_cid: dict[str, dict[int, AnchorEvalMetrics]] = {}
         self._last_tail_guard_reject_reason: str = ""
         self._pending_speculative: list[tuple[int, str, object, asyncio.Task[SpeculativeCreativeResult]]] = []
-
-    @staticmethod
-    def _ledger_has_cube_engine(ledger: ObjectivePhysicalLedger | None) -> bool:
-        return ledger is not None and (
-            ledger.pipe_cycles.get("AIC.PIPE_M", 0) > 0 or ledger.pipe_cycles.get("AIC.CUBE", 0) > 0
-            or ledger.pipe_cycles.get("CUBE_L0C", 0) > 0 or bool(ledger.metadata.get("has_cube_matmul"))
-        )
-
-    @staticmethod
-    def _ledger_has_hardware_dma(ledger: ObjectivePhysicalLedger | None) -> bool:
-        return ledger is not None and (
-            ledger.pipe_cycles.get("PIPE_MTE2", 0) > 0 or ledger.pipe_cycles.get("PIPE_MTE3", 0) > 0
-            or any(wl.peak_allocated_bytes > 0 for wl in ledger.waterlines.values())
-        )
-
-    @staticmethod
-    def _stage_b_has_vf_overflow(stage_b: StageBResult, compile_flags: Sequence[str] = (), builder_name: str = "") -> bool:
-        if stage_b.fault_code == "VF_STACK_OVERFLOW":
-            return True
-        diag = f"{stage_b.error_message}\n{stage_b.full_diagnostic}"
-        if not stage_b.passed and ("vf_stack" in diag.lower() or "stack frame size" in diag.lower()):
-            return True
-        sbytes = int(stage_b.compiler_summary.stack_bytes) if stage_b.compiler_summary is not None else 0
-        return has_unreserved_vf_stack_overflow(CompileTaskSpec("", builder_name, (), (), tuple(str(f) for f in compile_flags)), sbytes, diag)
 
     def _get_backend(self) -> KernelLLMBackend:
         if self._backend is None:
@@ -647,18 +485,12 @@ class StageGateCoordinator:
         )
 
     def _resolve_cases_yaml_sha256(self) -> str:
-        if self._cases_yaml_sha256_cache is not None:
-            return self._cases_yaml_sha256_cache
-        digest = ""
-        if self._config.operator_name and (troot := resolve_cannbench_tasks_root(cannbench_repo=self._cannbench_repo, env_file=self._env_file, source_root=self._source_root)):
-            try:
-                cp = troot / get_operator_task(self._config.operator_name) / "cases.yaml"
-                if cp.is_file():
-                    digest = hashlib.sha256(cp.read_bytes()).hexdigest()
-            except (FileNotFoundError, KeyError, OSError, RuntimeError, ValueError):
-                digest = ""
-        self._cases_yaml_sha256_cache = digest
-        return digest
+        if self._cases_yaml_sha256_cache is None:
+            self._cases_yaml_sha256_cache = resolve_cases_yaml_sha256_for_operator(
+                self._config.operator_name, cannbench_repo=self._cannbench_repo,
+                env_file=self._env_file, source_root=self._source_root,
+            )
+        return self._cases_yaml_sha256_cache
 
     def _lookup_case_static_spec_safe(self, case_num: int) -> dict[str, object] | None:
         if not self._config.operator_name:
@@ -679,11 +511,10 @@ class StageGateCoordinator:
         specs, seen = [], set()
         for item in (*self._scoreboard_anchors, *self._guardrail_cases):
             cnum = int(item.case_num)
-            if cnum in seen:
-                continue
-            seen.add(cnum)
-            if (ss := self._lookup_case_static_spec_safe(cnum)) is not None:
-                specs.append((cnum, str(item.regime_tag or ""), ss))
+            if cnum not in seen:
+                seen.add(cnum)
+                if (ss := self._lookup_case_static_spec_safe(cnum)) is not None:
+                    specs.append((cnum, str(item.regime_tag or ""), ss))
         return specs
 
     def _belongs_to_regime(self, dims: Mapping[str, object], regime_spec: RegimeTargetSpec) -> bool:
@@ -703,40 +534,11 @@ class StageGateCoordinator:
             features=features, route=route,
         )
 
-    def _extract_knob_signature(self, mod_src: str, regime_spec: RegimeTargetSpec) -> str:
-        if not mod_src.strip():
-            return ""
-        adims = regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-        try:
-            res = resolve_regime_config(mod_src, regime_spec, dims=adims)
-        except (SyntaxError, AttributeError, ImportError, KeyError, NameError, OSError, RuntimeError, TypeError, ValueError):
-            return ""
-        parts = [f"{k}={res.builder_kwargs[k]!r}" for k in sorted(res.builder_kwargs) if str(k).lower() not in _SHAPE_DIM_KEYS] if res.selector_name else []
-        parts.extend(f"pc.{k}={res.pass_configs[k]!r}" for k in sorted(res.pass_configs))
-        if res.compile_flags:
-            parts.append(f"flags={' '.join(sorted(str(f) for f in res.compile_flags))}")
-        return ",".join(parts)
-
     def _persist_round_candidate_artifact(self, check: L0L1CandidateCheck, *, round_idx: int) -> None:
         if self._persist_artifact_fn is not None:
             self._persist_artifact_fn(check, round_idx)
-            return
-        if self._checkpoint_path is None:
-            return
-        adir = self._checkpoint_path.parent / "candidates"
-        stem = f"r{round_idx}_{check.candidate_id.removeprefix(f'r{round_idx}_')}"
-        atomic_write_text(adir / f"{stem}.py", check.patched_module_source or check.snippet_source)
-        lines = [
-            f"candidate_id: {check.candidate_id}", f"round: {round_idx}", f"passed: {check.passed}",
-            f"failed_tier: {check.failed_tier or ''}", f"repaired: {check.repaired}", f"error_message: {check.error_message}",
-        ]
-        if check.stage_a is not None:
-            lines.extend([f"stage_a_passed: {check.stage_a.passed}", f"stage_a_backend_kind: {check.stage_a.backend_kind}", f"stage_a_error: {check.stage_a.error_message}"])
-        if check.stage_b is not None:
-            lines.extend([f"stage_b_passed: {check.stage_b.passed}", f"stage_b_error: {check.stage_b.error_message}", f"stage_b_spill_bytes: {check.stage_b.spill_bytes}", f"stage_b_vloopv2_hit: {check.stage_b.vloopv2_hit}"])
-            if check.stage_b.full_diagnostic:
-                lines.extend(["stage_b_full_diagnostic:", check.stage_b.full_diagnostic])
-        atomic_write_text(adir / f"{stem}.diag.txt", "\n".join(lines) + "\n")
+        else:
+            persist_round_candidate_artifact(self._checkpoint_path, check, round_idx=round_idx)
 
     def _record_kb_event(
         self, *, rule_id: str, postcondition_realized: bool, speed_gain: float = 0.0,
@@ -762,37 +564,18 @@ class StageGateCoordinator:
         artifact_store: ArtifactStore | None = None, regime_tag: str = "",
         verify_shared_link: bool = False, emit_shared_so_cache_dir: Path | None = None,
     ) -> StageBResult:
-        env_vals = parse_simple_env_file(self._env_file) if self._env_file else None
-        eff_store = artifact_store or ArtifactStore(resolve_unified_tl_cache_dir(env_vals=env_vals, source_root=self._source_root))
-        cann_root = resolve_cann_root_from_env_file(self._env_file)
-        flags = list(resolve_trackb_compile_flags(cpp_source, selector_flags))
-        bs_bin = str(cann_root / "bin" / "bisheng") if (cann_root and (cann_root / "bin" / "bisheng").is_file()) else None
-        if cann_root and (cann_root / "include").is_dir():
-            flags.append(f"-I{cann_root / 'include'}")
-        extra_kwargs: dict[str, object] = {}
-        if verify_shared_link:
-            extra_kwargs["verify_shared_link"] = True
-        if emit_shared_so_cache_dir is not None:
-            extra_kwargs["emit_shared_so_cache_dir"] = emit_shared_so_cache_dir
-        return run_stage_b_ascendc_compile(
-            cpp_source, compile_flags=flags, bisheng_bin=bs_bin, cann_root=cann_root,
-            artifact_store=eff_store, regime_tag=regime_tag, **extra_kwargs,
+        return compile_trackb_stage_b(
+            cpp_source, selector_flags, env_file=self._env_file, source_root=self._source_root,
+            artifact_store=artifact_store, regime_tag=regime_tag,
+            verify_shared_link=verify_shared_link, emit_shared_so_cache_dir=emit_shared_so_cache_dir,
         )
 
     def _resolve_operator_semantics_for_gates(self) -> PyTorchOpSemantics | None:
-        if self._resolve_op_semantics_fn is not None:
-            return self._resolve_op_semantics_fn()
-        if self._operator_semantics_loaded:
-            return self._operator_semantics_cache
-        self._operator_semantics_loaded = True
-        sem, proto = resolve_operator_semantics(
-            self._config.operator_name, source_root=self._source_root, pure_golden=bool(self._config.pure_golden),
-            cannbench_repo=self._cannbench_repo, env_file=self._env_file,
+        return resolve_operator_semantics_for_gates(
+            self._config.operator_name, source_root=self._source_root,
+            pure_golden=bool(self._config.pure_golden), cannbench_repo=self._cannbench_repo,
+            env_file=self._env_file, cache=self._semantics_cache, override_fn=self._resolve_op_semantics_fn,
         )
-        if proto is not None:
-            self._operator_proto_cache = proto
-        self._operator_semantics_cache = sem
-        return sem
 
     def _resolve_trackb_baseline_tu(self, regime_spec: RegimeTargetSpec, *, incumbent_source: str = "") -> str | None:
         if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
@@ -815,7 +598,7 @@ class StageGateCoordinator:
             module_source, regime_spec, target=self._target, enable_track_router=self._enable_track_router,
             freedom_masks=self._freedom_masks, active_incumbent_source=self._active_incumbent_source,
             target_module_path=self._target_module_path, anchor_dims_override=anchor_dims_override,
-            op_semantics=op_sem, op_proto=self._operator_proto_cache, baseline_tb_tu=btb_tu,
+            op_semantics=op_sem, op_proto=self._semantics_cache.proto, baseline_tb_tu=btb_tu,
         )
         if not primary.passed or regime_spec.runtime_backend == "ascendc_trackb":
             return primary
@@ -853,7 +636,7 @@ class StageGateCoordinator:
                         target=self._target, var_bindings=build_anchor_var_bindings(dims, kwargs=resolved.builder_kwargs) or None,
                         enable_track_router=self._enable_track_router, case_ratios=regime_spec.representative_case_ratios,
                         require_hardware_dma=bool(op_sem and not op_sem.has_indirect_index), require_cube_engine=False,
-                        ordered_tensor_shapes=extract_ordered_tensor_shapes(case_entry=regime_spec.representative_case_entry, dims=dims, proto=self._operator_proto_cache),
+                        ordered_tensor_shapes=extract_ordered_tensor_shapes(case_entry=regime_spec.representative_case_entry, dims=dims, proto=self._semantics_cache.proto),
                     )
                     if not cres.passed:
                         return StageAResult(passed=False, prim_func=primary.prim_func, ledger=primary.ledger, features=primary.features, route=primary.route, error_message=f"combine_kernel({combine_fn}): {cres.error_message}", elapsed_ms=primary.elapsed_ms + cres.elapsed_ms)
@@ -870,9 +653,9 @@ class StageGateCoordinator:
             tms = primary.elapsed_ms + tb_res.elapsed_ms
             if not tb_res.passed:
                 return replace(tb_res, error_message=f"trackb_ascendc({tb_ext[0]}): {tb_res.error_message}", elapsed_ms=tms)
-            if op_sem and op_sem.has_gemm_contraction and not (self._ledger_has_cube_engine(primary.ledger) or self._ledger_has_cube_engine(tb_res.ledger)):
+            if op_sem and op_sem.has_gemm_contraction and not (ledger_has_cube_engine(primary.ledger) or ledger_has_cube_engine(tb_res.ledger)):
                 return replace(tb_res, passed=False, error_message=f"trackb_ascendc({tb_ext[0]}): missing_cube_engine_primitives: zero AIC.PIPE_M cycles", elapsed_ms=tms)
-            if op_sem and not op_sem.has_indirect_index and not (self._ledger_has_hardware_dma(primary.ledger) or self._ledger_has_hardware_dma(tb_res.ledger)):
+            if op_sem and not op_sem.has_indirect_index and not (ledger_has_hardware_dma(primary.ledger) or ledger_has_hardware_dma(tb_res.ledger)):
                 return replace(tb_res, passed=False, error_message=f"trackb_ascendc({tb_ext[0]}): missing_hardware_dma_staging: zero PIPE_MTE2 cycles", elapsed_ms=tms)
             return replace(tb_res, elapsed_ms=tms)
         return primary
@@ -880,15 +663,10 @@ class StageGateCoordinator:
     def _run_l0(
         self, module_source: str, regime_spec: RegimeTargetSpec, *, anchor_dims_override: Mapping[str, object] | None = None
     ) -> StageAResult:
-        if self._l0_checker is not None:
-            if anchor_dims_override is not None:
-                try:
-                    return self._l0_checker(module_source, regime_spec, anchor_dims_override=anchor_dims_override)
-                except TypeError as exc:
-                    if "unexpected keyword argument" not in str(exc) or "anchor_dims_override" not in str(exc):
-                        raise
-            return self._l0_checker(module_source, regime_spec)
-        return self._default_l0_checker(module_source, regime_spec, anchor_dims_override=anchor_dims_override)
+        return dispatch_l0_gate(
+            module_source, regime_spec, l0_checker=self._l0_checker,
+            default_fn=self._default_l0_checker, anchor_dims_override=anchor_dims_override,
+        )
 
     def _collect_regime_cases_by_id(
         self, regime_spec: RegimeTargetSpec, *, extra_dims: Sequence[Mapping[str, object]] = ()
@@ -926,95 +704,6 @@ class StageGateCoordinator:
             cases_by_id["__primary__"] = dict(adims)
         return cases_by_id
 
-    def _build_width_failure_result(
-        self, width_res: StageBResult, total_elapsed: float, *, compile_flags: Sequence[str] = (), builder_name: str = ""
-    ) -> StageBResult:
-        if self._stage_b_has_vf_overflow(width_res, compile_flags=compile_flags, builder_name=builder_name):
-            sb = int(width_res.compiler_summary.stack_bytes) if width_res.compiler_summary else 0
-            return StageBResult(passed=False, error_message=f"stage_b_max_row_width_vf_stack_overflow: stack_bytes={sb} ({width_res.error_message})", full_diagnostic=width_res.full_diagnostic, compiler_summary=width_res.compiler_summary, elapsed_sec=total_elapsed, fault_plane="STAGE_B_COMPILE", fault_code="VF_STACK_OVERFLOW", failed_tier="stage_b")
-        return StageBResult(passed=False, error_message=f"stage_b_max_row_width_compile_failed: {width_res.error_message}", full_diagnostic=width_res.full_diagnostic, compiler_summary=width_res.compiler_summary, elapsed_sec=total_elapsed, fault_plane=width_res.fault_plane or "STAGE_B_COMPILE", fault_code=width_res.fault_code or "STAGE_B_COMPILE_FAILED", failed_tier=width_res.failed_tier or "stage_b")
-
-    def _normalize_primary_vf_overflow(self, res: StageBResult, *, compile_flags: Sequence[str] = (), builder_name: str = "") -> StageBResult:
-        if not res.passed and self._stage_b_has_vf_overflow(res, compile_flags=compile_flags, builder_name=builder_name):
-            return replace(res, fault_plane=res.fault_plane or "STAGE_B_COMPILE", fault_code="VF_STACK_OVERFLOW", failed_tier=res.failed_tier or "stage_b")
-        return res
-
-    def _run_hybrid_trackb_stage_b(
-        self, module_source: str, tb_extracted: tuple[str, str], regime_spec: RegimeTargetSpec,
-        resolved: object, unified_tl_cache: Path, eff_store: ArtifactStore,
-    ) -> tuple[StageBResult | None, ArtifactRecord | None, float, StageBResult | None]:
-        tb_sym, tb_cpp = tb_extracted
-        cflags = getattr(resolved, "compile_flags", ()) or ()
-        tu = _render_trackb_tu_from_module(module_source, tb_cpp, regime_spec, require_renderer=False)
-        peff = tuple(resolve_trackb_compile_flags(tu, cflags or None))
-        ntu = _normalize_trackb_unit_source(tu, regime_tag=regime_spec.regime_tag)
-        cann_root = resolve_cann_root_from_env_file(self._env_file)
-        bflags = list(resolve_trackb_compile_flags(tu, cflags or None))
-        fflags = [*bflags, f"-I{cann_root / 'include'}"] if (cann_root and (cann_root / "include").is_dir()) else bflags
-        cached_rec = None
-        for fl in ((fflags, bflags) if fflags != bflags else (bflags,)):
-            rec = eff_store.get_verified_artifact(compute_compile_task_key(normalized_kernel_unit_src=ntu, cann_target="dav-3510", pass_configs=None, compile_flags=fl, static_spec_signature=""))
-            if rec is not None:
-                cached_rec = rec
-                break
-        primary_so_ok = not ('extern "C"' in tu and "<<<" in tu) or is_verified_binary_file(unified_tl_cache / compute_trackb_shared_so_filename(tu, peff))
-        run_prim = cached_rec is None or not primary_so_ok
-        missing_sos: list[tuple[str, tuple[str, ...]]] = []
-        seen_c, seen_k = set(), {(tu, peff)}
-        for anc in (*self._scoreboard_anchors, *self._guardrail_cases):
-            cn = int(anc.case_num)
-            if cn in seen_c:
-                continue
-            seen_c.add(cn)
-            artag = str(anc.regime_tag or regime_spec.regime_tag)
-            adims = self._lookup_case_static_spec_safe(cn) or self._lookup_case_dims_safe(cn, artag)
-            if not adims:
-                continue
-            aspec = replace(regime_spec, regime_tag=artag, representative_anchor_dims=dict(adims))
-            atu = _render_trackb_tu_from_module(module_source, tb_cpp, aspec, require_renderer=False, anchor_dims_override=dict(adims))
-            aflags = _resolve_selector_compile_flags(module_source, aspec, dims=dict(adims)) or (tuple(cflags) if not aspec.config_selector_fn and cflags else ())
-            aeff = tuple(resolve_trackb_compile_flags(atu, aflags))
-            if (atu, aeff) not in seen_k:
-                seen_k.add((atu, aeff))
-                if 'extern "C"' in atu and "<<<" in atu and not is_verified_binary_file(unified_tl_cache / compute_trackb_shared_so_filename(atu, aeff)):
-                    missing_sos.append((atu, aeff))
-        bs_bin = str(cann_root / "bin" / "bisheng") if (cann_root and (cann_root / "bin" / "bisheng").is_file()) else None
-        tb_b, tb_sec, sec_err = None, 0.0, ""
-        ntasks = (1 if run_prim else 0) + len(missing_sos)
-
-        def _rprim() -> StageBResult:
-            return self._compile_trackb_stage_b(tu, selector_flags=cflags or None, artifact_store=eff_store, regime_tag=regime_spec.regime_tag, verify_shared_link=True, emit_shared_so_cache_dir=unified_tl_cache)
-
-        def _rsec(it: tuple[str, tuple[str, ...]]) -> tuple[bool, float, str]:
-            t0 = time.monotonic()
-            ok, _, em = compile_trackb_shared_so(it[0], cache_dir=unified_tl_cache, compile_flags=it[1], bisheng_bin=bs_bin, cann_root=cann_root)
-            return ok, time.monotonic() - t0, em
-
-        if ntasks == 1:
-            if run_prim:
-                tb_b = _rprim()
-                tb_sec = tb_b.elapsed_sec
-            else:
-                ok, dt, em = _rsec(missing_sos[0])
-                tb_sec, sec_err = dt, "" if ok else (em or "shared_link_failed")
-        elif ntasks > 1:
-            with ThreadPoolExecutor(max_workers=min(_MAX_L1_COMPILE_WORKERS, ntasks)) as pool:
-                pf = pool.submit(_rprim) if run_prim else None
-                sfs = [pool.submit(_rsec, it) for it in missing_sos]
-                if pf is not None:
-                    tb_b = pf.result()
-                    tb_sec += tb_b.elapsed_sec
-                for sf in sfs:
-                    ok, dt, em = sf.result()
-                    tb_sec += dt
-                    if not ok and not sec_err:
-                        sec_err = em or "shared_link_failed"
-        if tb_b is not None and not tb_b.passed:
-            return tb_b, cached_rec, tb_sec, self._normalize_primary_vf_overflow(replace(tb_b, error_message=f"trackb_ascendc({tb_sym}): {tb_b.error_message}", elapsed_sec=tb_sec))
-        if sec_err:
-            return tb_b, cached_rec, tb_sec, StageBResult(passed=False, error_message=f"trackb_ascendc({tb_sym}): {sec_err}", elapsed_sec=tb_sec, fault_plane="STAGE_B_COMPILE", fault_code="STAGE_B_ASCENDC_SHARED_LINK_FAILED", failed_tier="stage_b")
-        return tb_b, cached_rec, tb_sec, None
-
     def _run_l1(
         self, module_source: str, regime_spec: RegimeTargetSpec, *,
         static_width_dims_fn: Callable[[RegimeTargetSpec], Sequence[Mapping[str, object]]] | None = None,
@@ -1026,19 +715,17 @@ class StageGateCoordinator:
         if self._l1_compiler is not None:
             pb = self._l1_compiler(module_source, regime_spec)
             if not pb.passed:
-                return self._normalize_primary_vf_overflow(pb)
-            if self._stage_b_has_vf_overflow(pb):
-                return self._build_width_failure_result(pb, pb.elapsed_sec)
+                return normalize_primary_vf_overflow(pb)
+            if stage_b_has_vf_overflow(pb):
+                return build_width_failure_result(pb, pb.elapsed_sec)
             tot, seen = pb.elapsed_sec, ([dict(adims)] if adims else [])
             for wd_raw in ewd:
-                wd = dict(wd_raw)
-                if not wd or wd in seen:
-                    continue
-                seen.append(wd)
-                wb = self._l1_compiler(module_source, replace(regime_spec, representative_anchor_dims=wd))
-                tot += wb.elapsed_sec
-                if not wb.passed or self._stage_b_has_vf_overflow(wb):
-                    return self._build_width_failure_result(wb, tot)
+                if (wd := dict(wd_raw)) and wd not in seen:
+                    seen.append(wd)
+                    wb = self._l1_compiler(module_source, replace(regime_spec, representative_anchor_dims=wd))
+                    tot += wb.elapsed_sec
+                    if not wb.passed or stage_b_has_vf_overflow(wb):
+                        return build_width_failure_result(wb, tot)
             return replace(pb, elapsed_sec=tot) if tot != pb.elapsed_sec else pb
         env_vals = parse_simple_env_file(self._env_file) if self._env_file else None
         utl_cache = resolve_unified_tl_cache_dir(env_vals=env_vals, source_root=self._source_root)
@@ -1050,9 +737,9 @@ class StageGateCoordinator:
             efl = tuple(resolve_trackb_compile_flags(tu, sfl))
             tb_res = self._compile_trackb_stage_b(tu, selector_flags=sfl or None, artifact_store=store, regime_tag=regime_spec.regime_tag)
             if not tb_res.passed:
-                return self._normalize_primary_vf_overflow(tb_res, compile_flags=efl, builder_name="_render_trackb_tu")
-            if self._stage_b_has_vf_overflow(tb_res, compile_flags=efl, builder_name="_render_trackb_tu"):
-                return self._build_width_failure_result(tb_res, tb_res.elapsed_sec, compile_flags=efl, builder_name="_render_trackb_tu")
+                return normalize_primary_vf_overflow(tb_res, compile_flags=efl, builder_name="_render_trackb_tu")
+            if stage_b_has_vf_overflow(tb_res, compile_flags=efl, builder_name="_render_trackb_tu"):
+                return build_width_failure_result(tb_res, tb_res.elapsed_sec, compile_flags=efl, builder_name="_render_trackb_tu")
             seen_k, pend = {(tu, efl)}, []
             for cd in self._collect_regime_cases_by_id(regime_spec, extra_dims=ewd).values():
                 if not cd:
@@ -1062,18 +749,12 @@ class StageGateCoordinator:
                 cfl = _resolve_selector_compile_flags(module_source, cspec, dims=dict(cd))
                 ceff = tuple(resolve_trackb_compile_flags(ctu, cfl))
                 if (ctu, ceff) not in seen_k:
-                    seen_k.add((ctu, ceff))
-                    pend.append((ctu, cfl, ceff))
-            _compile_item = lambda it: (it[2], self._compile_trackb_stage_b(it[0], selector_flags=it[1] or None, artifact_store=store, regime_tag=regime_spec.regime_tag))
-            if len(pend) > 1:
-                with ThreadPoolExecutor(max_workers=min(_MAX_L1_COMPILE_WORKERS, len(pend))) as pool:
-                    xres = list(pool.map(_compile_item, pend))
-            else:
-                xres = [_compile_item(it) for it in pend]
+                    seen_k.add((ctu, ceff)); pend.append((ctu, cfl, ceff))
+            xres = _pool_map(pend, lambda it: (it[2], self._compile_trackb_stage_b(it[0], selector_flags=it[1] or None, artifact_store=store, regime_tag=regime_spec.regime_tag)))
             tot = tb_res.elapsed_sec + sum(r.elapsed_sec for _, r in xres)
             for efl_i, wb in xres:
-                if not wb.passed or self._stage_b_has_vf_overflow(wb, compile_flags=efl_i, builder_name="_render_trackb_tu"):
-                    return self._build_width_failure_result(wb, tot, compile_flags=efl_i, builder_name="_render_trackb_tu")
+                if not wb.passed or stage_b_has_vf_overflow(wb, compile_flags=efl_i, builder_name="_render_trackb_tu"):
+                    return build_width_failure_result(wb, tot, compile_flags=efl_i, builder_name="_render_trackb_tu")
             return replace(tb_res, elapsed_sec=tot) if tot != tb_res.elapsed_sec else tb_res
         try:
             resolved = resolve_regime_config(module_source, regime_spec, dims=adims)
@@ -1081,7 +762,12 @@ class StageGateCoordinator:
             return StageBResult(passed=False, error_message=f"l1_config_resolve_error: {type(exc).__name__}: {exc}")
         tb_b, cached_tb_rec, tb_sec = None, None, 0.0
         if regime_spec.runtime_backend == "hybrid_trackb" and tb_ext is not None:
-            tb_b, cached_tb_rec, tb_sec, fres = self._run_hybrid_trackb_stage_b(module_source, tb_ext, regime_spec, resolved, utl_cache, store)
+            tb_b, cached_tb_rec, tb_sec, fres = run_hybrid_trackb_stage_b(
+                module_source, tb_ext, regime_spec, resolved, utl_cache, store,
+                env_file=self._env_file, source_root=self._source_root,
+                scoreboard_anchors=self._scoreboard_anchors, guardrail_cases=self._guardrail_cases,
+                lookup_dims_fn=lambda cn, rt: self._lookup_case_static_spec_safe(cn) or self._lookup_case_dims_safe(cn, rt),
+            )
             if fres is not None:
                 return fres
         anchor_case_specs, cases_sha = self._resolve_stage_b_anchor_case_specs(), self._resolve_cases_yaml_sha256()
@@ -1094,20 +780,25 @@ class StageGateCoordinator:
                     default_builder_kwargs=dict(resolved.builder_kwargs), default_pass_configs=dict(resolved.pass_configs or {}),
                     default_compile_flags=tuple(resolved.compile_flags or ()),
                 )
-                plan = build_post_selector_regime_plan(
-                    module_source, regime_spec.regime_tag or "default", cases_by_id, ext,
-                    env_file=self._env_file, source_root=self._source_root,
-                )
+                plan = build_post_selector_regime_plan(module_source, regime_spec.regime_tag or "default", cases_by_id, ext, env_file=self._env_file, source_root=self._source_root)
             except (SyntaxError, AttributeError, ImportError, KeyError, NameError, RuntimeError, TypeError, ValueError):
                 plan = None
+
+        def _check_l1(bname: str, bkw: Mapping[str, object], pc: Mapping[str, object] | None, cf: Sequence[str] | None, d: dict[str, object] | None, acs: Sequence[tuple[int, str, dict[str, object]]] | None) -> StageBResult:
+            return run_l1_compile_check(
+                module_source, builder_name=bname, builder_kwargs=bkw, config_selector_name=regime_spec.config_selector_fn or None,
+                pass_configs=pc or None, compile_flags=cf or None, dims=d, anchor_case_specs=acs, operator_name=self._config.operator_name,
+                cases_yaml_sha256=cases_sha, source_root=self._source_root, env_file=self._env_file, regime_tag=regime_spec.regime_tag,
+                tl_cache_dir=utl_cache, artifact_store=store,
+            )
+
         cann_setup = ((env_vals or {}).get("TILEFOUNDRY_NPU_CANN_SETUP") or os.environ.get("TILEFOUNDRY_NPU_CANN_SETUP") or "").strip()
         tl_src = ((env_vals or {}).get("TILEFOUNDRY_NPU_TILELANG_SOURCE") or os.environ.get("TILEFOUNDRY_NPU_TILELANG_SOURCE") or "").strip()
         pb: StageBResult | None = None
         tot = 0.0
         if (bool(cann_setup) or bool(tl_src)) and plan is not None and plan.unique_specs_by_key:
             rc = StageBCompileGate(plan, store, env_file=self._env_file, source_root=self._source_root).run(module_source)
-            tot = rc.elapsed_sec
-            bsum = BishengResourceSummary(stack_bytes=rc.max_stack_bytes)
+            tot, bsum = rc.elapsed_sec, BishengResourceSummary(stack_bytes=rc.max_stack_bytes)
             if not rc.passed:
                 fc = rc.fault_code or "L1_COMPILE_FAILED"
                 pb = StageBResult(passed=False, error_message=f"{'l1_vf_stack_overflow' if fc == 'VF_STACK_OVERFLOW' else 'l1_compile_failed'}: {rc.diagnostic}", full_diagnostic=rc.diagnostic, compiler_summary=bsum, elapsed_sec=tot, fault_plane="STAGE_B_COMPILE", fault_code=fc, failed_tier="stage_b")
@@ -1116,80 +807,47 @@ class StageGateCoordinator:
                 art = store.get_verified_artifact(fk)
                 pb = StageBResult(passed=True, elapsed_sec=tot, compiler_summary=bsum, artifact_id=art.artifact_id if art else fk, binary_paths=art.binary_paths if art else ())
         elif plan is not None and plan.unique_specs_by_key:
-            fdims: dict[str, dict[str, object]] = {}
-            for cid, cspecs in plan.tasks_by_case_id.items():
-                for csp in cspecs:
-                    if csp.task_key not in fdims:
-                        fdims[csp.task_key] = dict(cases_by_id.get(cid) or adims or {})
+            fdims = {csp.task_key: dict(cases_by_id.get(cid) or adims or {}) for cid, cspecs in plan.tasks_by_case_id.items() for csp in cspecs}
             sitems = list(plan.unique_specs_by_key.values())
-
-            def _run_spec(sp: CompileTaskSpec) -> tuple[CompileTaskSpec, StageBResult]:
-                return sp, run_l1_compile_check(
-                    module_source, builder_name=sp.builder_name, builder_kwargs={k: v for k, v in sp.static_kwargs},
-                    config_selector_name=regime_spec.config_selector_fn or None, pass_configs={k: v for k, v in sp.pass_configs} or None,
-                    compile_flags=list(sp.compile_flags) or None, dims=fdims.get(sp.task_key) or (dict(adims) if adims else None),
-                    anchor_case_specs=anchor_case_specs or None, operator_name=self._config.operator_name,
-                    cases_yaml_sha256=cases_sha, source_root=self._source_root, env_file=self._env_file,
-                    regime_tag=regime_spec.regime_tag, tl_cache_dir=utl_cache, artifact_store=store,
-                )
-
+            _run_spec = lambda sp: (sp, _check_l1(sp.builder_name, dict(sp.static_kwargs), dict(sp.pass_configs), list(sp.compile_flags), fdims.get(sp.task_key) or (dict(adims) if adims else None), anchor_case_specs or None))
             psp = sitems[0]
             _, pb = _run_spec(psp)
             tot = pb.elapsed_sec
             if pb.passed:
-                if self._stage_b_has_vf_overflow(pb, compile_flags=psp.compile_flags, builder_name=psp.builder_name):
-                    return self._build_width_failure_result(pb, tot, compile_flags=psp.compile_flags, builder_name=psp.builder_name)
-                ex = sitems[1:]
-                if len(ex) > 1:
-                    with ThreadPoolExecutor(max_workers=min(_MAX_L1_COMPILE_WORKERS, len(ex))) as pool:
-                        exres = list(pool.map(_run_spec, ex))
-                else:
-                    exres = [_run_spec(sp) for sp in ex]
+                if stage_b_has_vf_overflow(pb, compile_flags=psp.compile_flags, builder_name=psp.builder_name):
+                    return build_width_failure_result(pb, tot, compile_flags=psp.compile_flags, builder_name=psp.builder_name)
+                exres = _pool_map(sitems[1:], _run_spec)
                 tot += sum(wb.elapsed_sec for _, wb in exres)
                 for sp, wb in exres:
-                    if not wb.passed or self._stage_b_has_vf_overflow(wb, compile_flags=sp.compile_flags, builder_name=sp.builder_name):
-                        return self._build_width_failure_result(wb, tot, compile_flags=sp.compile_flags, builder_name=sp.builder_name)
+                    if not wb.passed or stage_b_has_vf_overflow(wb, compile_flags=sp.compile_flags, builder_name=sp.builder_name):
+                        return build_width_failure_result(wb, tot, compile_flags=sp.compile_flags, builder_name=sp.builder_name)
             else:
-                pb = self._normalize_primary_vf_overflow(pb, compile_flags=psp.compile_flags, builder_name=psp.builder_name)
+                pb = normalize_primary_vf_overflow(pb, compile_flags=psp.compile_flags, builder_name=psp.builder_name)
         else:
-            pb = run_l1_compile_check(
-                module_source, builder_name=resolved.builder_name, builder_kwargs=resolved.builder_kwargs,
-                config_selector_name=regime_spec.config_selector_fn or None, pass_configs=resolved.pass_configs or None,
-                compile_flags=resolved.compile_flags or None, dims=dict(adims) if adims else None,
-                anchor_case_specs=anchor_case_specs or None, operator_name=self._config.operator_name,
-                cases_yaml_sha256=cases_sha, source_root=self._source_root, env_file=self._env_file,
-                regime_tag=regime_spec.regime_tag, tl_cache_dir=utl_cache, artifact_store=store,
-            )
+            pb = _check_l1(resolved.builder_name, resolved.builder_kwargs, resolved.pass_configs, resolved.compile_flags, dict(adims) if adims else None, anchor_case_specs or None)
             tot = pb.elapsed_sec
             if pb.passed:
-                if self._stage_b_has_vf_overflow(pb, compile_flags=resolved.compile_flags, builder_name=resolved.builder_name):
-                    return self._build_width_failure_result(pb, tot, compile_flags=resolved.compile_flags, builder_name=resolved.builder_name)
+                if stage_b_has_vf_overflow(pb, compile_flags=resolved.compile_flags, builder_name=resolved.builder_name):
+                    return build_width_failure_result(pb, tot, compile_flags=resolved.compile_flags, builder_name=resolved.builder_name)
                 seen_fb = [dict(adims)] if adims else []
                 for wd_raw in ewd:
-                    wd = dict(wd_raw)
-                    if not wd or wd in seen_fb:
+                    if not (wd := dict(wd_raw)) or wd in seen_fb:
                         continue
                     seen_fb.append(wd)
                     try:
                         wr = resolve_regime_config(module_source, regime_spec, dims=wd)
                     except (SyntaxError, AttributeError, ImportError, KeyError, NameError, RuntimeError, TypeError, ValueError):
                         wr = resolved
-                    wb = run_l1_compile_check(
-                        module_source, builder_name=wr.builder_name, builder_kwargs=wr.builder_kwargs,
-                        config_selector_name=regime_spec.config_selector_fn or None, pass_configs=wr.pass_configs or None,
-                        compile_flags=wr.compile_flags or None, dims=wd, operator_name=self._config.operator_name,
-                        cases_yaml_sha256=cases_sha, source_root=self._source_root, env_file=self._env_file,
-                        regime_tag=regime_spec.regime_tag, tl_cache_dir=utl_cache, artifact_store=store,
-                    )
+                    wb = _check_l1(wr.builder_name, wr.builder_kwargs, wr.pass_configs, wr.compile_flags, wd, None)
                     tot += wb.elapsed_sec
-                    if not wb.passed or self._stage_b_has_vf_overflow(wb, compile_flags=wr.compile_flags, builder_name=wr.builder_name):
-                        return self._build_width_failure_result(wb, tot, compile_flags=wr.compile_flags, builder_name=wr.builder_name)
+                    if not wb.passed or stage_b_has_vf_overflow(wb, compile_flags=wr.compile_flags, builder_name=wr.builder_name):
+                        return build_width_failure_result(wb, tot, compile_flags=wr.compile_flags, builder_name=wr.builder_name)
             else:
-                pb = self._normalize_primary_vf_overflow(pb, compile_flags=resolved.compile_flags, builder_name=resolved.builder_name)
+                pb = normalize_primary_vf_overflow(pb, compile_flags=resolved.compile_flags, builder_name=resolved.builder_name)
         assert pb is not None
         if not pb.passed and regime_spec.runtime_backend == "hybrid_trackb" and tb_ext is not None and not _has_prim_func_builder(module_source, regime_spec.builder_candidates):
             if tb_b is not None:
-                return self._normalize_primary_vf_overflow(replace(tb_b, elapsed_sec=tb_sec) if tb_sec != tb_b.elapsed_sec else tb_b, compile_flags=resolved.compile_flags, builder_name="_render_trackb_tu")
+                return normalize_primary_vf_overflow(replace(tb_b, elapsed_sec=tb_sec) if tb_sec != tb_b.elapsed_sec else tb_b, compile_flags=resolved.compile_flags, builder_name="_render_trackb_tu")
             if cached_tb_rec is not None:
                 return StageBResult(passed=True, elapsed_sec=tb_sec, binary_paths=cached_tb_rec.binary_paths, artifact_id=cached_tb_rec.artifact_id)
         if not pb.passed:
@@ -1455,7 +1113,6 @@ class StageGateCoordinator:
 
     async def screen_and_score_round(self, snapshot: CampaignStateSnapshot, batch: CandidateBatch) -> StageGateOutcome:
         """Execute StageGatePort protocol screening against an immutable CampaignStateSnapshot."""
-        _ = snapshot
         return await self.execute_round_gates(batch, snapshot=snapshot)
 
     async def execute_round_gates(
@@ -1467,9 +1124,7 @@ class StageGateCoordinator:
         """Execute LLM generation, speculative creative harvesting, and L0->L1->L2 gates."""
         eff_inc = snapshot.incumbent_source if snapshot is not None else self._active_incumbent_source
         inc_anchor_map = dict(snapshot.incumbent_anchor_us_by_case) if snapshot is not None else self._incumbent_anchor_us_by_case
-        eff_backend = backend or self._backend
-        if eff_backend is None and batch.worker_specs:
-            eff_backend = self._get_backend()
+        eff_backend = backend or (self._get_backend() if (self._backend is None and batch.worker_specs) else self._backend)
         eff_psha = parent_sha or source_sha256(batch.parent_module_source)
         eff_paxes = batch.parent_axes or self._derive_topology_axes(batch.parent_ledger)
         eff_mask = batch.active_mask or resolve_trackb_freedom_mask(batch.regime_spec, freedom_masks=self._freedom_masks, baseline_source=eff_inc, target_module_path=self._target_module_path)
@@ -1487,25 +1142,20 @@ class StageGateCoordinator:
         async def _call_exploit(wid: str, wkind: str, rule: AscendCausalRule | None, req: GenerationRequest) -> tuple[str, str, AscendCausalRule | None, str | None, str, str, bool]:
             assert eff_backend is not None
             try:
-                raw = await eff_backend.generate(req)
+                return wid, wkind, rule, extract_python_dsl(await eff_backend.generate(req)), "", "", False
             except (OSError, subprocess.SubprocessError, TimeoutError, RuntimeError, ConnectionError) as exc:
                 return wid, wkind, rule, None, "", f"llm_transport:{type(exc).__name__}:{exc}", True
-            try:
-                return wid, wkind, rule, extract_python_dsl(raw), "", "", False
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 return wid, wkind, rule, None, "", f"llm_parse:{type(exc).__name__}:{exc}", False
 
         async def _call_creative(wid: str, req: GenerationRequest) -> SpeculativeCreativeResult:
             assert eff_backend is not None
             try:
-                raw = await eff_backend.generate(req)
+                cr = extract_creative_payload(await eff_backend.generate(req))
+                rh, rm = str(cr.get("physical_hypothesis", "")).strip(), str(cr.get("target_local_metric", "")).strip()
+                return SpeculativeCreativeResult(batch.round_idx, wid, cr["dsl_source"], f"{rh} [target_metric={rm}]" if (rh and rm) else (rh or rm), "", False)
             except (OSError, subprocess.SubprocessError, TimeoutError, RuntimeError, ConnectionError) as exc:
                 return SpeculativeCreativeResult(batch.round_idx, wid, None, "", f"llm_transport:{type(exc).__name__}:{exc}", True)
-            try:
-                cr = extract_creative_payload(raw)
-                rh, rm = str(cr.get("physical_hypothesis", "")).strip(), str(cr.get("target_local_metric", "")).strip()
-                hyp = f"{rh} [target_metric={rm}]" if (rh and rm) else (rh or rm)
-                return SpeculativeCreativeResult(batch.round_idx, wid, cr["dsl_source"], hyp, "", False)
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 return SpeculativeCreativeResult(batch.round_idx, wid, None, "", f"llm_parse:{type(exc).__name__}:{exc}", False)
 
@@ -1523,7 +1173,7 @@ class StageGateCoordinator:
                 finally:
                     self.repair_sec += max(0.0, time.monotonic() - t0)
 
-        def _build_l0_l1_inputs(non_cr: int) -> tuple[object | None, str, _TimedRepair | None, dict[str, object]]:
+        def _make_filter_runner(non_cr: int) -> tuple[object | None, str, _TimedRepair | None, Callable[..., object]]:
             pk, ranker, paus, scorer = None, None, None, None
             gd = batch.gate_decision
             if gd is not None and gd.engaged and gd.allow_candidate_pruning:
@@ -1551,7 +1201,7 @@ class StageGateCoordinator:
                 scorer = _score
 
             def _cand_l0(mod_src: str) -> StageAResult:
-                ksig = self._extract_knob_signature(mod_src, batch.regime_spec)
+                ksig = extract_knob_signature(mod_src, batch.regime_spec)
                 if (ir := self._boundary_ledger.precheck_known_infeasible(regime_tag=batch.regime_spec.regime_tag, cand_sha=compute_source_sha256(mod_src), knob_signature=ksig)) is not None:
                     return StageAResult(passed=False, prim_func=None, ledger=None, error_message=ir, backend_kind=batch.regime_spec.runtime_backend)
                 if (de := _detect_trackb_dead_code_edit(batch.parent_module_source, mod_src, batch.regime_spec)) is not None:
@@ -1572,22 +1222,30 @@ class StageGateCoordinator:
             op_entry = resolve_operator_entrypoint_safe(self._config.operator_name)
             _pa = lambda bsrc, snip: patch_regime_into_module(bsrc, batch.regime_spec, snip, operator_entrypoint=op_entry, sibling_specs=self._regime_specs, active_kernel=ak)
             trep = _TimedRepair(eff_backend) if (eff_backend is not None and self._config.max_syntax_repairs > 0) else None
-            bkw: dict[str, object] = {
-                "patch_fn": lambda s: _pa(batch.parent_module_source, s),
-                "repatch_from_current_fn": lambda cs, s: _pa(cs, s),
-                "l0_checker": _cand_l0, "l1_compiler": lambda ms: self._run_l1(ms, batch.regime_spec),
-                "repair_backend": trep, "max_syntax_repairs": self._config.max_syntax_repairs,
-                "slice_hint": slice_contract_instruction(batch.func_name, batch.regime_spec, operator_entrypoint=op_entry),
-                "backend_kind": batch.regime_spec.runtime_backend, "parent_source": repsrc, "parent_module_source": batch.parent_module_source,
-                "trackb_prologue_line_offset": off, "stage_a_cost_ranker": ranker, "cost_prescreen_top_k": pk,
-                "sil_advisory": self._sil_advisory, "freedom_mask": eff_mask,
-                "ub_256kb_unlock": bool(batch.parent_ledger.uses_unreserved_ubuf) if batch.parent_ledger else False,
-                "creative_candidate_ids": set(batch.creative_candidate_ids), "parent_analytical_us": paus,
-                "stage_a_analytical_scorer": scorer, "parent_topology_axes": eff_paxes,
-                "candidate_topology_axes_fn": lambda _ms, sa: self._derive_topology_axes(sa.ledger, features=sa.features, route=sa.route) if sa.ledger else None,
-                "skip_repair_when_survivors_exist": True,
-            }
-            return ranker, ak, trep, bkw
+            ub_unlock = bool(batch.parent_ledger.uses_unreserved_ubuf) if batch.parent_ledger else False
+            shint = slice_contract_instruction(batch.func_name, batch.regime_spec, operator_entrypoint=op_entry)
+
+            async def _run_filter(
+                cands: Sequence[tuple[str, str]], *, l1_fn: Callable[[str], StageBResult] | None = None,
+                cr_ids: Collection[str] | None = None, keep_repair: bool = True, keep_ranker: bool = True,
+            ) -> L0L1RoundResults:
+                return await run_l0_l1_round_filter(
+                    cands, patch_fn=lambda s: _pa(batch.parent_module_source, s),
+                    repatch_from_current_fn=lambda cs, s: _pa(cs, s), l0_checker=_cand_l0,
+                    l1_compiler=l1_fn or (lambda ms: self._run_l1(ms, batch.regime_spec)),
+                    repair_backend=trep if keep_repair else None,
+                    max_syntax_repairs=self._config.max_syntax_repairs if keep_repair else 0,
+                    slice_hint=shint, backend_kind=batch.regime_spec.runtime_backend, parent_source=repsrc,
+                    parent_module_source=batch.parent_module_source, trackb_prologue_line_offset=off,
+                    stage_a_cost_ranker=ranker if keep_ranker else None, cost_prescreen_top_k=pk,
+                    sil_advisory=self._sil_advisory, freedom_mask=eff_mask, ub_256kb_unlock=ub_unlock,
+                    creative_candidate_ids=cr_ids if cr_ids is not None else set(batch.creative_candidate_ids),
+                    parent_analytical_us=paus, stage_a_analytical_scorer=scorer, parent_topology_axes=eff_paxes,
+                    candidate_topology_axes_fn=lambda _ms, sa: self._derive_topology_axes(sa.ledger, features=sa.features, route=sa.route) if sa.ledger else None,
+                    skip_repair_when_survivors_exist=True,
+                )
+
+            return ranker, ak, trep, _run_filter
 
         def _spawn_cr() -> list[tuple[int, str, AscendCausalRule | None, asyncio.Task[SpeculativeCreativeResult]]]:
             if any(not t.done() for _, _, _, t in self._pending_speculative) and cr_specs:
@@ -1619,16 +1277,16 @@ class StageGateCoordinator:
         round_ak, l0_l1_sec, repair_sec, llm_sec = "", 0.0, 0.0, 0.0
         exp_non_cr = sum(1 for cid, _ in raw_candidates if meta_by_id.get(cid, ("", None, ""))[0] != "creative_explore") + len(ex_specs)
         can_stream = run_l0_l1_round_filter is _ORIG_RUN_L0_L1_ROUND_FILTER and bool(ex_specs)
-        pre_ctx = _build_l0_l1_inputs(exp_non_cr) if can_stream else None
+        pre_ctx = _make_filter_runner(exp_non_cr) if can_stream else None
         if pre_ctx is not None and pre_ctx[0] is None:
-            _, ak_val, trep, bfkw = pre_ctx
+            _, ak_val, trep, run_filter = pre_ctx
             sl1_sem = threading.Semaphore(2)
 
             async def _stream_one(wid: str, snip: str, *, is_cr: bool) -> L0L1CandidateCheck:
-                skw = {**bfkw, "l1_compiler": lambda ms: _with_sem(sl1_sem, lambda: self._run_l1(ms, batch.regime_spec)), "repair_backend": None, "max_syntax_repairs": 0, "stage_a_cost_ranker": None, "creative_candidate_ids": ({wid} if (is_cr or wid in batch.creative_candidate_ids) else ()), "skip_repair_when_survivors_exist": True}
-                res = await run_l0_l1_round_filter(
-                    [(wid, snip)],
-                    **skw,  # type: ignore[arg-type]
+                res = await run_filter(
+                    [(wid, snip)], l1_fn=lambda ms: _with_sem(sl1_sem, lambda: self._run_l1(ms, batch.regime_spec)),
+                    cr_ids=({wid} if (is_cr or wid in batch.creative_candidate_ids) else ()),
+                    keep_repair=False, keep_ranker=False,
                 )
                 return res[0]
 
@@ -1654,11 +1312,8 @@ class StageGateCoordinator:
                 if not any(c.passed for c in l0_l1_checks) and self._config.max_syntax_repairs > 0 and trep is not None:
                     repairable = [(w, s) for (w, s), c in zip(raw_candidates, l0_l1_checks) if c.failed_tier != "noop_identical"]
                     if repairable:
-                        rkw = {**bfkw, "creative_candidate_ids": ({c for c, _ in raw_candidates if meta_by_id.get(c, ("", None, ""))[0] == "creative_explore"} | set(batch.creative_candidate_ids)), "skip_repair_when_survivors_exist": True}
-                        rep_res = await run_l0_l1_round_filter(
-                            repairable,
-                            **rkw,  # type: ignore[arg-type]
-                        )
+                        cr_ids = {c for c, _ in raw_candidates if meta_by_id.get(c, ("", None, ""))[0] == "creative_explore"} | set(batch.creative_candidate_ids)
+                        rep_res = await run_filter(repairable, cr_ids=cr_ids)
                         rby_id = {c.candidate_id: c for c in rep_res}
                         l0_l1_checks = [rby_id.get(c.candidate_id, c) for c in l0_l1_checks]
                 repair_sec = trep.repair_sec if trep else 0.0
@@ -1674,14 +1329,10 @@ class StageGateCoordinator:
             _harv_cr(ctasks)
             if raw_candidates:
                 non_cr = sum(1 for c, _ in raw_candidates if meta_by_id.get(c, ("", None, ""))[0] != "creative_explore")
-                _, round_ak, trep, fkw = _build_l0_l1_inputs(non_cr)
-                fkw["creative_candidate_ids"] = {c for c, _ in raw_candidates if meta_by_id.get(c, ("", None, ""))[0] == "creative_explore"} | set(batch.creative_candidate_ids)
+                _, round_ak, trep, run_filter = _make_filter_runner(non_cr)
+                cr_ids = {c for c, _ in raw_candidates if meta_by_id.get(c, ("", None, ""))[0] == "creative_explore"} | set(batch.creative_candidate_ids)
                 ft0 = time.monotonic()
-                fres = await run_l0_l1_round_filter(
-                    raw_candidates,
-                    **fkw,  # type: ignore[arg-type]
-                )
-                l0_l1_checks = list(fres)
+                l0_l1_checks = list(await run_filter(raw_candidates, cr_ids=cr_ids))
                 repair_sec = trep.repair_sec if trep else 0.0
                 l0_l1_sec = max(0.0, max(0.0, time.monotonic() - ft0) - repair_sec)
 
@@ -1689,7 +1340,7 @@ class StageGateCoordinator:
         inf_added, pruned_list, ksig_cid, ub_cid, pred_cid, axes_cid, faults_cid = 0, [], {}, {}, {}, {}, {}
         for chk in l0_l1_checks:
             self._persist_round_candidate_artifact(chk, round_idx=batch.round_idx)
-            ksig_cid[chk.candidate_id] = self._extract_knob_signature(chk.patched_module_source, batch.regime_spec) if chk.patched_module_source else ""
+            ksig_cid[chk.candidate_id] = extract_knob_signature(chk.patched_module_source, batch.regime_spec) if chk.patched_module_source else ""
             ub_wl = (getattr(chk.stage_a.ledger, "waterlines", {}) or {}).get("UB") if (chk.stage_a and chk.stage_a.ledger) else None
             ub_cid[chk.candidate_id] = int(getattr(ub_wl, "peak_allocated_bytes", 0) or 0) if ub_wl else 0
             if chk.stage_a is not None and (chk.stage_a.passed or chk.stage_a.ledger is not None):
@@ -1776,13 +1427,7 @@ def _with_sem(sem: threading.Semaphore, fn: Callable[[], StageBResult]) -> Stage
 
 
 __all__ = [
-    "CandidateBatch",
-    "OccupancyExhaustedError",
-    "SpeculativeCreativeResult",
-    "StageGateConfig",
-    "StageGateCoordinator",
-    "StageGateOutcome",
-    "resolve_active_trackb_kernel",
-    "resolve_active_trackb_kernels",
-    "run_l0_l1_round_filter",
+    "CandidateBatch", "OccupancyExhaustedError", "SpeculativeCreativeResult", "StageGateConfig",
+    "StageGateCoordinator", "StageGateOutcome", "resolve_active_trackb_kernel",
+    "resolve_active_trackb_kernels", "run_l0_l1_round_filter",
 ]

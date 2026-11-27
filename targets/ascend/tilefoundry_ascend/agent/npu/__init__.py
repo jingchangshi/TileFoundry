@@ -32,7 +32,7 @@ from tilefoundry_ascend.agent.npu.l2_paired_eval import (
     measure_npu_ring_burst_stats, measure_npu_ring_burst_us,
     measure_paired_interleaved_micro_burst, prewarm_anchor_reference_cache,
     prewarm_surrogate_tilelang_cache, prewarm_surrogate_tilelang_cache_with_stats,
-    run_l0_static_precheck,
+    resolve_cases_yaml_sha256, run_l0_static_precheck,
     run_multi_operator_surrogate_batch_via_agent_gates, run_poison_pill_subprocess,
     run_surrogate_batch_via_agent_gates,
 )
@@ -80,7 +80,7 @@ __all__ = [
     "measure_npu_ring_burst_us", "measure_paired_interleaved_micro_burst",
     "order_candidates_by_idle_preflight", "prewarm_anchor_reference_cache",
     "prewarm_surrogate_tilelang_cache", "prewarm_surrogate_tilelang_cache_with_stats",
-    "run_l0_static_precheck",
+    "resolve_cases_yaml_sha256", "run_l0_static_precheck",
     "run_l3_full_contract_via_agent_gates", "run_l4_official_cannbench_via_agent_gates",
     "run_micro_probe_via_agent_gates", "run_msprof_detail",
     "run_multi_operator_surrogate_batch_via_agent_gates", "run_poison_pill_subprocess",

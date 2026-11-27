@@ -20,7 +20,8 @@ from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
 )
 from tilefoundry_ascend.agent.campaign.helpers import (
     derive_topology_axes, ensure_candidate_bytes as _helpers_ensure_candidate_bytes,
-    lookup_case_dims_safe, persist_runtime_state as _helpers_persist_runtime_state,
+    lookup_case_dims_safe, persist_round_candidate_artifact as _helpers_persist_candidate_artifact,
+    persist_runtime_state as _helpers_persist_runtime_state,
     source_sha256, write_source_and_verify as _helpers_write_source_and_verify,
 )
 from tilefoundry_ascend.agent.campaign.l3_l4_recovery import PendingL4
@@ -187,12 +188,12 @@ class TelemetryLedgerWriter:
         self.compile_wall_streak_by_regime: dict[str, int] = {}
         self.active_promotion: PendingPromotion | None = None
         self.pending_promotion: PendingPromotion | None = None
-        self.pending_l4: object | None = None
+        self.pending_l4: PendingL4 | None = None
 
     def _is_real_npu_path(self) -> bool:
         return bool(self._real_npu_path_fn()) if self._real_npu_path_fn is not None else self._is_real_npu_path_flag
 
-    def _derive_topology_axes(
+    def _resolve_axes(
         self, ledger: ObjectivePhysicalLedger | None, *, features: object | None = None, route: object | None = None
     ) -> TopologyAxes:
         if self._derive_topology_axes_fn is not None:
@@ -202,7 +203,7 @@ class TelemetryLedgerWriter:
             sil_advisory=self._sil_advisory, features=features, route=route,
         )
 
-    def _lookup_case_dims_safe(self, case_num: int, regime_tag: str = "") -> dict[str, object]:
+    def _dims(self, case_num: int, regime_tag: str = "") -> dict[str, object]:
         return lookup_case_dims_safe(
             self._operator_name, case_num, regime_tag=regime_tag, regime_specs=self._regime_specs,
             cache=self._case_dims_cache, cannbench_repo=self._cannbench_repo, env_file=self._env_file,
@@ -291,7 +292,7 @@ class TelemetryLedgerWriter:
             if anc.cand_us <= 0.0:
                 continue
             eval_tier = eval_tier_override if eval_tier_override is not None else ("l2_pass" if anc.accuracy_passed else "l2_acc_fail")
-            dims = self._lookup_case_dims_safe(anc.case_num, anc.regime_tag)
+            dims = self._dims(anc.case_num, anc.regime_tag)
             proj_wl = project_case_workload(ledger_dict, microarch_profile=prof_dict, case_dims=dims, policy=pol_dict, t_hw_us=anc.t_hw_us, axes=axes, target=self._target)
             cand_msprof = self.msprof_cache.get((cand_sha, anc.regime_tag))
             bn_case = bn_by_regime.get(anc.regime_tag, -1)
@@ -374,7 +375,7 @@ class TelemetryLedgerWriter:
             except (SyntaxError, RuntimeError, ValueError, TypeError, OSError):
                 stage_a = None
         ledger = stage_a.ledger if stage_a is not None else None
-        axes = self._derive_topology_axes(ledger, features=stage_a.features if stage_a else None, route=stage_a.route if stage_a else None)
+        axes = self._resolve_axes(ledger, features=stage_a.features if stage_a else None, route=stage_a.route if stage_a else None)
         prof_dict = dict(getattr(ledger, "microarch_profile", None) or {})
         ledger_dict = ledger.to_dict() if ledger is not None else {}
         axes_dict = axes.to_dict() if hasattr(axes, "to_dict") else {}
@@ -397,7 +398,7 @@ class TelemetryLedgerWriter:
             if elapsed_us <= 0.0:
                 continue
             anc = by_case.get(cnum)
-            rtag, dims = (anc.regime_tag if anc else first_reg), self._lookup_case_dims_safe(cnum, anc.regime_tag if anc else first_reg)
+            rtag, dims = (anc.regime_tag if anc else first_reg), self._dims(cnum, anc.regime_tag if anc else first_reg)
             if anc is not None:
                 t_hw, ref_perf = anc.t_hw_us, anc.ref_perf_us
             else:
@@ -625,7 +626,7 @@ class TelemetryLedgerWriter:
         eff_ub, eff_knobs, eff_preds, eff_meas = ub_bytes_by_cid or {}, knob_sig_by_cid or {}, pred_by_cid or {}, dict(measured_by_cid or {})
         eff_timings = {str(k): float(v) for k, v in (stage_timings_sec or {}).items()}
         eff_prewarm = {str(k): int(v) for k, v in (prewarm_stats or {}).items()}
-        eff_paxes = parent_axes if parent_axes is not None else self._derive_topology_axes(None)
+        eff_paxes = parent_axes if parent_axes is not None else self._resolve_axes(None)
         eff_tdir = telemetry_dir if telemetry_dir is not None else (self._checkpoint_path.parent / "telemetry" if self._checkpoint_path is not None else None)
         top_cid, emitted = (top_chk.candidate_id if top_chk is not None else None), 0
         if eff_tdir is not None:
@@ -737,18 +738,7 @@ class TelemetryLedgerWriter:
 
     def persist_round_candidate_artifact(self, check: L0L1CandidateCheck, *, round_idx: int) -> None:
         """Write generated source and untruncated L0/L1 diagnostics beside the checkpoint."""
-        if (adir := self.round_candidate_artifact_dir()) is None:
-            return
-        stem = f"r{round_idx}_{check.candidate_id.removeprefix(f'r{round_idx}_')}"
-        atomic_write_text(adir / f"{stem}.py", check.patched_module_source or check.snippet_source)
-        lines = [f"candidate_id: {check.candidate_id}", f"round: {round_idx}", f"passed: {check.passed}", f"failed_tier: {check.failed_tier or ''}", f"repaired: {check.repaired}", f"error_message: {check.error_message}"]
-        if check.stage_a is not None:
-            lines.extend([f"stage_a_passed: {check.stage_a.passed}", f"stage_a_backend_kind: {check.stage_a.backend_kind}", f"stage_a_error: {check.stage_a.error_message}"])
-        if check.stage_b is not None:
-            lines.extend([f"stage_b_passed: {check.stage_b.passed}", f"stage_b_error: {check.stage_b.error_message}", f"stage_b_spill_bytes: {check.stage_b.spill_bytes}", f"stage_b_vloopv2_hit: {check.stage_b.vloopv2_hit}"])
-            if check.stage_b.full_diagnostic:
-                lines.extend(["stage_b_full_diagnostic:", check.stage_b.full_diagnostic])
-        atomic_write_text(adir / f"{stem}.diag.txt", "\n".join(lines) + "\n")
+        _helpers_persist_candidate_artifact(self._checkpoint_path, check, round_idx=round_idx)
 
     def save_checkpoint(
         self, *, incumbent_source: str, baseline_result: CandidateSurrogateResult,
@@ -758,7 +748,7 @@ class TelemetryLedgerWriter:
         escalated_rounds: Sequence[int], admitted_rule_ids: Sequence[str], stop_reason: str,
         l4_result: L4CannbenchResult | None, stagnation_by_regime: Mapping[str, int] | None = None,
         last_unpromoted_regime: str | None = None, pending_promotion: PendingPromotion | None = None,
-        pending_l4: object | None = None, active_promotion: PendingPromotion | None = None,
+        pending_l4: PendingL4 | None = None, active_promotion: PendingPromotion | None = None,
         scoreboard_anchors: Sequence[AnchorCaseSpec] | None = None,
         guardrail_cases: Sequence[GuardrailCaseSpec] | None = None,
         calibrated_dispatch_floor_us: float | None = None,
@@ -811,11 +801,11 @@ class TelemetryLedgerWriter:
 
     def restore_from_checkpoint(
         self, *, round_record_from_dict: Callable[[Mapping[str, object]], object] | None = None,
-        pending_l4_from_dict: Callable[[Mapping[str, object]], object] | None = None,
+        pending_l4_from_dict: Callable[[Mapping[str, object]], PendingL4] | None = None,
     ) -> tuple[
         str, CandidateSurrogateResult, CandidateSurrogateResult, list[AnchorCaseSpec], set[str],
         str | None, int, list[object], list[int], list[int], list[int], list[str],
-        dict[str, int], str | None, PendingPromotion | None, object | None,
+        dict[str, int], str | None, PendingPromotion | None, PendingL4 | None,
     ]:
         """Rehydrate persisted campaign state and verify candidate bytes on disk."""
         assert self._checkpoint_path is not None

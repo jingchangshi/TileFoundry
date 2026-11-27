@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import MAX_CLEAN_CALIBRATION_BURST_CV
@@ -38,7 +38,7 @@ class PendingPromotion(JsonRecordMixin):
     target_path: str = ""
     round_idx: int = 0
     regime_tag: str = ""
-    candidate_result: CandidateSurrogateResult = None  # type: ignore[assignment]
+    candidate_result: CandidateSurrogateResult | None = None
     candidate_id: str = ""
     builder_name: str = ""
     parent_lane: str = ""
@@ -73,17 +73,16 @@ def classify_l3_resolution(
 
 
 def _guardrail_point(g_metric: AnchorEvalMetrics, *, inc_us: float, paired: bool) -> AnchorConservationPoint:
-    pfields = {f.name for f in fields(AnchorConservationPoint)}
-    kw: dict[str, object] = {
-        "case_num": int(g_metric.case_num), "regime_tag": str(g_metric.regime_tag),
-        "ref_us": float(g_metric.ref_perf_us), "inc_us": inc_us, "cand_us": float(g_metric.cand_us),
-        "t_roof_us": float(g_metric.t_hw_us),
-        "paired_rel_mad": float(getattr(g_metric, "paired_rel_mad", 0.0) or 0.0),
-        "accuracy_passed": bool(g_metric.accuracy_passed),
-    }
-    if paired and {"cand_burst_cv", "ref_burst_cv", "burst_count"} <= pfields:
-        kw.update({"cand_burst_cv": float(g_metric.burst_batch_cv), "ref_burst_cv": 0.0, "burst_count": max(1, int(g_metric.ring_burst_k))})
-    return AnchorConservationPoint(**kw)  # type: ignore[arg-type]
+    return AnchorConservationPoint(
+        case_num=int(g_metric.case_num), regime_tag=str(g_metric.regime_tag),
+        ref_us=float(g_metric.ref_perf_us), inc_us=inc_us, cand_us=float(g_metric.cand_us),
+        t_roof_us=float(g_metric.t_hw_us),
+        paired_rel_mad=float(getattr(g_metric, "paired_rel_mad", 0.0) or 0.0),
+        accuracy_passed=bool(g_metric.accuracy_passed),
+        cand_burst_cv=float(g_metric.burst_batch_cv) if paired else 0.0,
+        ref_burst_cv=0.0,
+        burst_count=max(1, int(g_metric.ring_burst_k)) if paired else 1,
+    )
 
 
 def _maybe_retest_noisy(

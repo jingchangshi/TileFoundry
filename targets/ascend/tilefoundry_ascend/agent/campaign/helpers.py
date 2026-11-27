@@ -2,27 +2,39 @@
 
 from __future__ import annotations
 
-import hashlib, json, math
-from collections.abc import Mapping, Sequence
-from dataclasses import fields
+import hashlib, json, math, re, time
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from tilefoundry_ascend.agent.contracts import CompileTaskSpec
 from tilefoundry_ascend.agent.gates.cpp_slice_protocol import select_active_trackb_kernel
 from tilefoundry_ascend.agent.gates.gate_funnel import (
-    StageAResult, evaluate_ascendc_candidate, extract_ordered_tensor_shapes, run_stage_a_static,
+    StageAResult, StageBResult, _normalize_trackb_unit_source, compile_trackb_shared_so,
+    compute_trackb_shared_so_filename, evaluate_ascendc_candidate, extract_ordered_tensor_shapes,
+    resolve_trackb_compile_flags, run_stage_a_static, run_stage_b_ascendc_compile,
 )
-from tilefoundry_ascend.agent.npu import AnchorEvalMetrics, CandidateSurrogateResult
+from tilefoundry_ascend.agent.gates.stage_b_gate import has_unreserved_vf_stack_overflow
+from tilefoundry_ascend.agent.npu import (
+    AnchorEvalMetrics, CandidateSurrogateResult, L0L1CandidateCheck, resolve_cases_yaml_sha256,
+)
 from tilefoundry_ascend.agent.orchestrator.regime_slice_patcher import (
     _active_trackb_kernel, _ordered_top_level_trackb_kernels,
-    _render_trackb_tu_from_module, _trackb_kernel_names, resolve_regime_config,
+    _render_trackb_tu_from_module, _resolve_selector_compile_flags, _trackb_kernel_names,
+    resolve_regime_config,
 )
 from tilefoundry_ascend.agent.specs.anchor_specs import (
-    AnchorCaseSpec, CannbenchOpsRegistry, PerfTargetSpec, RegimeTargetSpec,
+    AnchorCaseSpec, CannbenchOpsRegistry, GuardrailCaseSpec, PerfTargetSpec, RegimeTargetSpec,
     _has_flat_operator_layout, build_anchor_var_bindings, extract_trackb_cpp_source,
     get_operator_entrypoint, lookup_case_dims, parse_simple_env_file, resolve_cannbench_repo,
     resolve_cannbench_tasks_root as _resolve_tasks_from_repo,
 )
 from tilefoundry_ascend.agent.specs.latency_algebra import AnchorConservationPoint, is_regime_saturated, regime_bandit_ucb_us
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
+    ArtifactRecord, ArtifactStore, compute_compile_task_key, is_verified_binary_file,
+    resolve_unified_tl_cache_dir,
+)
 from tilefoundry_ascend.ascend.json_record import atomic_write_text
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
@@ -117,23 +129,72 @@ def resolve_cannbench_tasks_root(*, cannbench_repo: Path | None = None, env_file
         return in_repo if (in_repo is not None and _has_flat_operator_layout(in_repo)) else None
 
 
+def resolve_cases_yaml_sha256_for_operator(
+    operator_name: str, *, cannbench_repo: Path | None = None, env_file: Path | None = None,
+    source_root: Path | None = None,
+) -> str:
+    """Resolve SHA-256 hex digest of *operator_name* cases.yaml via L4 canonical helper."""
+    if not operator_name:
+        return ""
+    troot = resolve_cannbench_tasks_root(cannbench_repo=cannbench_repo, env_file=env_file, source_root=source_root)
+    return resolve_cases_yaml_sha256(None, operator_name, tasks_root=troot) if troot is not None else ""
+
+
 def lookup_case_dims_safe(
     operator_name: str, case_num: int, *, regime_tag: str = "", regime_specs: Sequence[RegimeTargetSpec] = (),
     cache: dict[int, dict[str, object]] | None = None, cannbench_repo: Path | None = None, env_file: Path | None = None,
+    override_lookup_fn: Callable[[int, str], dict[str, object]] | None = None, cannbench_first: bool = False,
 ) -> dict[str, object]:
-    """Look up case dimensions with cache and representative-regime fallback."""
+    """Look up case dimensions with cache, optional hook override, and regime fallback."""
     cnum = int(case_num)
     if cache is not None and cnum in cache:
         return dict(cache[cnum])
     dims: dict[str, object] = {}
-    try:
-        dims = dict(lookup_case_dims(operator_name, cnum, cannbench_repo=cannbench_repo, env_file=env_file))
-    except (FileNotFoundError, OSError, KeyError, ValueError, TypeError):
-        if (hit := next((s for s in regime_specs if regime_tag and s.regime_tag == regime_tag), regime_specs[0] if regime_specs else None)) is not None:
-            dims = dict(hit.representative_anchor_dims or hit.representative_hir_dims)
+    if override_lookup_fn is not None and not cannbench_first:
+        dims = dict(override_lookup_fn(cnum, regime_tag))
+    else:
+        try:
+            dims = dict(lookup_case_dims(operator_name, cnum, cannbench_repo=cannbench_repo, env_file=env_file))
+        except (FileNotFoundError, OSError, KeyError, ValueError, TypeError):
+            if override_lookup_fn is not None:
+                dims = dict(override_lookup_fn(cnum, regime_tag))
+            elif (hit := next((s for s in regime_specs if regime_tag and s.regime_tag == regime_tag), regime_specs[0] if regime_specs else None)) is not None:
+                dims = dict(hit.representative_anchor_dims or hit.representative_hir_dims)
     if cache is not None:
         cache[cnum] = dict(dims)
     return dims
+
+
+@dataclass
+class OperatorSemanticsCache:
+    """Cached PyTorch golden semantics and proto metadata for gate checks."""
+
+    semantics: PyTorchOpSemantics | None = None
+    proto: Mapping[str, object] | None = None
+    loaded: bool = False
+
+
+def resolve_operator_semantics_for_gates(
+    operator_name: str, *, source_root: Path, pure_golden: bool = False,
+    tasks_root: Path | None = None, cannbench_repo: Path | None = None, env_file: Path | None = None,
+    cache: OperatorSemanticsCache | None = None,
+    override_fn: Callable[[], PyTorchOpSemantics | None] | None = None,
+) -> PyTorchOpSemantics | None:
+    """Resolve and optionally cache operator golden semantics for gate checks."""
+    if override_fn is not None:
+        return override_fn()
+    if cache is not None and cache.loaded:
+        return cache.semantics
+    sem, proto = resolve_operator_semantics(
+        operator_name, source_root=source_root, pure_golden=pure_golden,
+        tasks_root=tasks_root, cannbench_repo=cannbench_repo, env_file=env_file,
+    )
+    if cache is not None:
+        cache.loaded = True
+        cache.semantics = sem
+        if proto is not None:
+            cache.proto = proto
+    return sem
 
 
 def resolve_operator_semantics(
@@ -158,8 +219,10 @@ def derive_topology_axes(
     semantic_topology_axes: TopologyAxes | None = None, sil_advisory: object | None = None, features: object | None = None, route: object | None = None,
 ) -> TopologyAxes:
     """Resolve canonical TopologyAxes from explicit overrides, route, or ledger."""
-    if topology_axes is not None or semantic_topology_axes is not None:
-        return topology_axes or semantic_topology_axes  # type: ignore[return-value]
+    if topology_axes is not None:
+        return topology_axes
+    if semantic_topology_axes is not None:
+        return semantic_topology_axes
     if sil_advisory is not None:
         return resolve_canonical_topology_axes(sil_advisory, features=features)
     if route is not None:
@@ -275,20 +338,87 @@ def slice_contract_instruction(func_name: str, regime_spec: RegimeTargetSpec, *,
     )
 
 
+def dispatch_l0_gate(
+    module_source: str, regime_spec: RegimeTargetSpec, *,
+    l0_checker: Callable[..., StageAResult] | None = None,
+    default_fn: Callable[..., StageAResult] | None = None,
+    anchor_dims_override: Mapping[str, object] | None = None,
+) -> StageAResult:
+    """Invoke injected L0 checker with optional anchor_dims_override fallback."""
+    if l0_checker is not None:
+        if anchor_dims_override is not None:
+            try:
+                return l0_checker(module_source, regime_spec, anchor_dims_override=anchor_dims_override)
+            except TypeError as exc:
+                if "unexpected keyword argument" not in str(exc) or "anchor_dims_override" not in str(exc):
+                    raise
+        return l0_checker(module_source, regime_spec)
+    assert default_fn is not None
+    return default_fn(module_source, regime_spec, anchor_dims_override=anchor_dims_override)
+
+
+_KNOB_SHAPE_DIM_KEYS: frozenset[str] = frozenset({
+    "b", "b_dim", "batch", "case_id", "case_num", "d", "d_dim", "d_nope", "d_rope", "half_dim",
+    "hidden_dim", "inner", "inner_dim", "k", "k_dim", "m", "m_dim", "m_rows", "n", "n_depth",
+    "n_dim", "n_kv", "n_q", "num_heads", "num_kv_heads", "q_rows", "q_total_rows", "rows", "s",
+    "s_dim", "s_kv", "s_q", "seq_len", "shape", "v_rows", "epsilon", "tl_dtype", "dtype",
+    "input_layout", "is_causal",
+})
+
+
+def extract_knob_signature(
+    mod_src: str, regime_spec: RegimeTargetSpec, *,
+    resolve_fn: Callable[[str, RegimeTargetSpec, Mapping[str, object] | None], object] | None = None,
+) -> str:
+    """Extract canonical sorted knob signature for deterministic boundary ledger."""
+    if not mod_src.strip():
+        return ""
+    adims = regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+    try:
+        res = resolve_fn(mod_src, regime_spec, adims) if resolve_fn is not None else resolve_regime_config(mod_src, regime_spec, dims=adims)
+    except (SyntaxError, AttributeError, ImportError, KeyError, NameError, OSError, RuntimeError, TypeError, ValueError):
+        return ""
+    sel = str(getattr(res, "selector_name", "") or "")
+    bkw = getattr(res, "builder_kwargs", {}) or {}
+    pc = getattr(res, "pass_configs", {}) or {}
+    cf = getattr(res, "compile_flags", ()) or ()
+    parts = [f"{k}={bkw[k]!r}" for k in sorted(bkw) if str(k).lower() not in _KNOB_SHAPE_DIM_KEYS] if sel else []
+    parts.extend(f"pc.{k}={pc[k]!r}" for k in sorted(pc))
+    if cf:
+        parts.append(f"flags={' '.join(sorted(str(f) for f in cf))}")
+    return ",".join(parts)
+
+
+def persist_round_candidate_artifact(checkpoint_path: Path | None, check: L0L1CandidateCheck, *, round_idx: int) -> None:
+    """Write generated source and untruncated L0/L1 diagnostics beside the checkpoint."""
+    if checkpoint_path is None:
+        return
+    adir = checkpoint_path.parent / "candidates"
+    stem = f"r{round_idx}_{check.candidate_id.removeprefix(f'r{round_idx}_')}"
+    atomic_write_text(adir / f"{stem}.py", check.patched_module_source or check.snippet_source)
+    lines = [f"candidate_id: {check.candidate_id}", f"round: {round_idx}", f"passed: {check.passed}", f"failed_tier: {check.failed_tier or ''}", f"repaired: {check.repaired}", f"error_message: {check.error_message}"]
+    if check.stage_a is not None:
+        lines.extend([f"stage_a_passed: {check.stage_a.passed}", f"stage_a_backend_kind: {check.stage_a.backend_kind}", f"stage_a_error: {check.stage_a.error_message}"])
+    if check.stage_b is not None:
+        lines.extend([f"stage_b_passed: {check.stage_b.passed}", f"stage_b_error: {check.stage_b.error_message}", f"stage_b_spill_bytes: {check.stage_b.spill_bytes}", f"stage_b_vloopv2_hit: {check.stage_b.vloopv2_hit}"])
+        if check.stage_b.full_diagnostic:
+            lines.extend(["stage_b_full_diagnostic:", check.stage_b.full_diagnostic])
+    atomic_write_text(adir / f"{stem}.diag.txt", "\n".join(lines) + "\n")
+
+
 def to_conservation_point(cand: AnchorEvalMetrics, inc: AnchorEvalMetrics | None) -> AnchorConservationPoint:
     """Convert candidate and incumbent anchor metrics into an AnchorConservationPoint."""
     inc_us = float(inc.cand_us) if (inc is not None and inc.cand_us > 0.0) else float(cand.cand_us)
     is_paired = float(getattr(cand, "paired_speedup_vs_incumbent", 0.0) or 0.0) > 0.0
     cmad = float(getattr(cand, "paired_rel_mad", 0.0) or 0.0)
-    kw: dict[str, object] = {
-        "case_num": int(cand.case_num), "regime_tag": str(cand.regime_tag), "ref_us": float(cand.ref_perf_us),
-        "inc_us": inc_us, "cand_us": float(cand.cand_us), "t_roof_us": float(cand.t_hw_us),
-        "paired_rel_mad": cmad if is_paired else max(cmad, float(getattr(inc, "paired_rel_mad", 0.0) or 0.0) if inc else 0.0),
-        "accuracy_passed": bool(cand.accuracy_passed),
-    }
-    if {"cand_burst_cv", "ref_burst_cv", "burst_count"} <= {f.name for f in fields(AnchorConservationPoint)}:
-        kw.update({"cand_burst_cv": float(cand.burst_batch_cv), "ref_burst_cv": (0.0 if is_paired else (float(inc.burst_batch_cv) if inc else 0.0)), "burst_count": max(1, int(cand.ring_burst_k))})
-    return AnchorConservationPoint(**kw)  # type: ignore[arg-type]
+    return AnchorConservationPoint(
+        case_num=int(cand.case_num), regime_tag=str(cand.regime_tag), ref_us=float(cand.ref_perf_us),
+        inc_us=inc_us, cand_us=float(cand.cand_us), t_roof_us=float(cand.t_hw_us),
+        paired_rel_mad=cmad if is_paired else max(cmad, float(getattr(inc, "paired_rel_mad", 0.0) or 0.0) if inc else 0.0),
+        accuracy_passed=bool(cand.accuracy_passed), cand_burst_cv=float(cand.burst_batch_cv),
+        ref_burst_cv=(0.0 if is_paired else (float(inc.burst_batch_cv) if inc else 0.0)),
+        burst_count=max(1, int(cand.ring_burst_k)),
+    )
 
 
 def is_regime_satisfied(perf_target: PerfTargetSpec | None, regime_spec: RegimeTargetSpec | str, best_result: CandidateSurrogateResult, active_anchors: Sequence[AnchorCaseSpec]) -> bool:
@@ -344,3 +474,153 @@ def select_active_regime(
         if tpts and cpts and regime_bandit_ucb_us(tpts, floor, 0) - regime_bandit_ucb_us(cpts, floor, 0) <= 2.0 * math.sqrt(sum(p.sigma_paired_us() ** 2 for p in cpts)):
             return by_tag[current_regime]
     return top_spec
+
+
+def count_trackb_workspace_stages(source: str) -> int:
+    """Count extra global kernel stages beyond the primary Track-B kernel."""
+    return max(0, len(re.findall(r"__global__\s+[^\n;{]*?\bvoid\s+[A-Za-z_]\w*", source)) - 1) if source.strip() else 0
+
+
+def extract_candidate_topology_axes(stage_a: StageAResult) -> TopologyAxes | None:
+    """Extract TopologyAxes from StageAResult ledger or route if available."""
+    if stage_a.ledger is not None and isinstance(raw := getattr(stage_a.ledger, "topology_axes", None), TopologyAxes):
+        return raw
+    if (route := stage_a.route) is not None:
+        ra = route.get("topology_axes") if isinstance(route, Mapping) else getattr(route, "topology_axes", None)
+        if isinstance(ra, TopologyAxes):
+            return ra
+        if isinstance(ra, Mapping) and {"compute_engine", "memory_ring", "iteration_regularity"} <= set(ra):
+            return TopologyAxes.from_dict(ra)
+    return None
+
+
+def is_noop_identical_failure(*, failed_tier: str = "", error_message: str = "", result: object | None = None) -> bool:
+    """Return True when failure indicates a noop or dead-code edit."""
+    return failed_tier == "noop_identical" or str(getattr(result, "fault_plane", "") or "") == "NOOP_IDENTICAL" or any(t in error_message.lower() for t in ("noop_identical", "trackb_dead_code_edit"))
+
+
+def merge_interval_wall_sec(intervals: Sequence[tuple[float, float]]) -> float:
+    """Merge overlapping time intervals and return total active wall seconds."""
+    valid = sorted((a, b) for a, b in intervals if b > a)
+    if not valid:
+        return 0.0
+    total, cs, ce = 0.0, valid[0][0], valid[0][1]
+    for s, e in valid[1:]:
+        if s <= ce:
+            ce = max(ce, e)
+        else:
+            total += ce - cs; cs, ce = s, e
+    return total + (ce - cs)
+
+
+def ledger_has_cube_engine(ledger: ObjectivePhysicalLedger | None) -> bool:
+    """Return True if *ledger* exhibits non-zero AIC cube activity."""
+    return ledger is not None and (ledger.pipe_cycles.get("AIC.PIPE_M", 0) > 0 or ledger.pipe_cycles.get("AIC.CUBE", 0) > 0 or ledger.pipe_cycles.get("CUBE_L0C", 0) > 0 or bool(ledger.metadata.get("has_cube_matmul")))
+
+
+def ledger_has_hardware_dma(ledger: ObjectivePhysicalLedger | None) -> bool:
+    """Return True if *ledger* exhibits hardware DMA staging or on-chip waterlines."""
+    return ledger is not None and (ledger.pipe_cycles.get("PIPE_MTE2", 0) > 0 or ledger.pipe_cycles.get("PIPE_MTE3", 0) > 0 or any(wl.peak_allocated_bytes > 0 for wl in ledger.waterlines.values()))
+
+
+def stage_b_has_vf_overflow(stage_b: StageBResult, compile_flags: Sequence[str] = (), builder_name: str = "") -> bool:
+    """Return True if *stage_b* indicates VF stack overflow."""
+    if stage_b.fault_code == "VF_STACK_OVERFLOW":
+        return True
+    diag = f"{stage_b.error_message}\n{stage_b.full_diagnostic}"
+    if not stage_b.passed and ("vf_stack" in diag.lower() or "stack frame size" in diag.lower()):
+        return True
+    sbytes = int(stage_b.compiler_summary.stack_bytes) if stage_b.compiler_summary is not None else 0
+    return has_unreserved_vf_stack_overflow(CompileTaskSpec("", builder_name, (), (), tuple(str(f) for f in compile_flags)), sbytes, diag)
+
+
+def build_width_failure_result(width_res: StageBResult, total_elapsed: float, *, compile_flags: Sequence[str] = (), builder_name: str = "") -> StageBResult:
+    """Build normalized StageBResult for a width-sweep or secondary spec failure."""
+    if stage_b_has_vf_overflow(width_res, compile_flags=compile_flags, builder_name=builder_name):
+        sb = int(width_res.compiler_summary.stack_bytes) if width_res.compiler_summary else 0
+        return StageBResult(passed=False, error_message=f"stage_b_max_row_width_vf_stack_overflow: stack_bytes={sb} ({width_res.error_message})", full_diagnostic=width_res.full_diagnostic, compiler_summary=width_res.compiler_summary, elapsed_sec=total_elapsed, fault_plane="STAGE_B_COMPILE", fault_code="VF_STACK_OVERFLOW", failed_tier="stage_b")
+    return StageBResult(passed=False, error_message=f"stage_b_max_row_width_compile_failed: {width_res.error_message}", full_diagnostic=width_res.full_diagnostic, compiler_summary=width_res.compiler_summary, elapsed_sec=total_elapsed, fault_plane=width_res.fault_plane or "STAGE_B_COMPILE", fault_code=width_res.fault_code or "STAGE_B_COMPILE_FAILED", failed_tier=width_res.failed_tier or "stage_b")
+
+
+def normalize_primary_vf_overflow(res: StageBResult, *, compile_flags: Sequence[str] = (), builder_name: str = "") -> StageBResult:
+    """Normalize primary StageBResult fault metadata when VF stack overflow occurs."""
+    return replace(res, fault_plane=res.fault_plane or "STAGE_B_COMPILE", fault_code="VF_STACK_OVERFLOW", failed_tier=res.failed_tier or "stage_b") if (not res.passed and stage_b_has_vf_overflow(res, compile_flags=compile_flags, builder_name=builder_name)) else res
+
+
+def compile_trackb_stage_b(
+    cpp_source: str, selector_flags: Sequence[str] | str | None = None, *,
+    env_file: Path | None = None, source_root: Path | None = None,
+    artifact_store: ArtifactStore | None = None, regime_tag: str = "",
+    verify_shared_link: bool = False, emit_shared_so_cache_dir: Path | None = None,
+) -> StageBResult:
+    """Compile Track-B C++20 translation unit via bisheng Stage-B."""
+    env_vals = parse_simple_env_file(env_file) if env_file else None
+    eff_store = artifact_store or ArtifactStore(resolve_unified_tl_cache_dir(env_vals=env_vals, source_root=source_root))
+    cann_root = resolve_cann_root_from_env_file(env_file)
+    flags = list(resolve_trackb_compile_flags(cpp_source, selector_flags))
+    bs_bin = str(cann_root / "bin" / "bisheng") if (cann_root and (cann_root / "bin" / "bisheng").is_file()) else None
+    if cann_root and (cann_root / "include").is_dir():
+        flags.append(f"-I{cann_root / 'include'}")
+    extra = {k: v for k, v in (("verify_shared_link", verify_shared_link), ("emit_shared_so_cache_dir", emit_shared_so_cache_dir)) if v}
+    return run_stage_b_ascendc_compile(cpp_source, compile_flags=flags, bisheng_bin=bs_bin, cann_root=cann_root, artifact_store=eff_store, regime_tag=regime_tag, **extra)
+
+
+def run_hybrid_trackb_stage_b(
+    module_source: str, tb_extracted: tuple[str, str], regime_spec: RegimeTargetSpec,
+    resolved: object, unified_tl_cache: Path, eff_store: ArtifactStore, *,
+    env_file: Path | None, source_root: Path | None,
+    scoreboard_anchors: Sequence[AnchorCaseSpec], guardrail_cases: Sequence[GuardrailCaseSpec],
+    lookup_dims_fn: Callable[[int, str], dict[str, object]],
+) -> tuple[StageBResult | None, ArtifactRecord | None, float, StageBResult | None]:
+    """Compile primary and anchor-specialized Track-B TUs for hybrid regimes."""
+    tb_sym, tb_cpp = tb_extracted
+    cflags = getattr(resolved, "compile_flags", ()) or ()
+    tu = _render_trackb_tu_from_module(module_source, tb_cpp, regime_spec, require_renderer=False)
+    peff = tuple(resolve_trackb_compile_flags(tu, cflags or None))
+    ntu = _normalize_trackb_unit_source(tu, regime_tag=regime_spec.regime_tag)
+    cann_root = resolve_cann_root_from_env_file(env_file)
+    bflags = list(resolve_trackb_compile_flags(tu, cflags or None))
+    fflags = [*bflags, f"-I{cann_root / 'include'}"] if (cann_root and (cann_root / "include").is_dir()) else bflags
+    cached_rec = next((r for fl in ((fflags, bflags) if fflags != bflags else (bflags,)) if (r := eff_store.get_verified_artifact(compute_compile_task_key(normalized_kernel_unit_src=ntu, cann_target="dav-3510", pass_configs=None, compile_flags=fl, static_spec_signature=""))) is not None), None)
+    run_prim = cached_rec is None or ('extern "C"' in tu and "<<<" in tu and not is_verified_binary_file(unified_tl_cache / compute_trackb_shared_so_filename(tu, peff)))
+    missing_sos: list[tuple[str, tuple[str, ...]]] = []
+    seen_c, seen_k = set(), {(tu, peff)}
+    for anc in (*scoreboard_anchors, *guardrail_cases):
+        if (cn := int(anc.case_num)) in seen_c or not (adims := lookup_dims_fn(cn, artag := str(anc.regime_tag or regime_spec.regime_tag))):
+            seen_c.add(cn); continue
+        seen_c.add(cn)
+        aspec = replace(regime_spec, regime_tag=artag, representative_anchor_dims=dict(adims))
+        atu = _render_trackb_tu_from_module(module_source, tb_cpp, aspec, require_renderer=False, anchor_dims_override=dict(adims))
+        aflags = _resolve_selector_compile_flags(module_source, aspec, dims=dict(adims)) or (tuple(cflags) if not aspec.config_selector_fn and cflags else ())
+        aeff = tuple(resolve_trackb_compile_flags(atu, aflags))
+        if (atu, aeff) not in seen_k:
+            seen_k.add((atu, aeff))
+            if 'extern "C"' in atu and "<<<" in atu and not is_verified_binary_file(unified_tl_cache / compute_trackb_shared_so_filename(atu, aeff)):
+                missing_sos.append((atu, aeff))
+    bs_bin = str(cann_root / "bin" / "bisheng") if (cann_root and (cann_root / "bin" / "bisheng").is_file()) else None
+    tb_b, tb_sec, sec_err = None, 0.0, ""
+    ntasks = (1 if run_prim else 0) + len(missing_sos)
+    _rprim = lambda: compile_trackb_stage_b(tu, selector_flags=cflags or None, env_file=env_file, source_root=source_root, artifact_store=eff_store, regime_tag=regime_spec.regime_tag, verify_shared_link=True, emit_shared_so_cache_dir=unified_tl_cache)
+
+    def _rsec(it: tuple[str, tuple[str, ...]]) -> tuple[bool, float, str]:
+        t0 = time.monotonic()
+        ok, _, em = compile_trackb_shared_so(it[0], cache_dir=unified_tl_cache, compile_flags=it[1], bisheng_bin=bs_bin, cann_root=cann_root)
+        return ok, time.monotonic() - t0, em
+
+    if ntasks == 1 and run_prim:
+        tb_b = _rprim(); tb_sec = tb_b.elapsed_sec
+    elif ntasks == 1:
+        ok, dt, em = _rsec(missing_sos[0]); tb_sec, sec_err = dt, "" if ok else (em or "shared_link_failed")
+    elif ntasks > 1:
+        with ThreadPoolExecutor(max_workers=min(8, ntasks)) as pool:
+            pf = pool.submit(_rprim) if run_prim else None
+            sfs = [pool.submit(_rsec, it) for it in missing_sos]
+            if pf is not None:
+                tb_b = pf.result(); tb_sec += tb_b.elapsed_sec
+            for ok, dt, em in (sf.result() for sf in sfs):
+                tb_sec += dt; sec_err = sec_err or ("" if ok else (em or "shared_link_failed"))
+    if tb_b is not None and not tb_b.passed:
+        return tb_b, cached_rec, tb_sec, normalize_primary_vf_overflow(replace(tb_b, error_message=f"trackb_ascendc({tb_sym}): {tb_b.error_message}", elapsed_sec=tb_sec))
+    if sec_err:
+        return tb_b, cached_rec, tb_sec, StageBResult(passed=False, error_message=f"trackb_ascendc({tb_sym}): {sec_err}", elapsed_sec=tb_sec, fault_plane="STAGE_B_COMPILE", fault_code="STAGE_B_ASCENDC_SHARED_LINK_FAILED", failed_tier="stage_b")
+    return tb_b, cached_rec, tb_sec, None

@@ -73,4 +73,13 @@ class LocalHardwareProbePort:
 
     def run_msprof_detail(self, *args: object, **kwargs: object) -> object:
         """Warm up and profile an NPU callable via TileLang ``bench_with_msprof``."""
-        return run_msprof_detail(*args, **kwargs)  # type: ignore[arg-type]
+        fn = kwargs.get("fn", args[0] if args else None)
+        if not callable(fn):
+            raise TypeError("run_msprof_detail requires a callable first argument")
+        raw_w, raw_r, raw_c = kwargs.get("n_warmup", 3), kwargs.get("n_repeat", 5), kwargs.get("cache_size_mb", 256)
+        return run_msprof_detail(
+            fn,
+            n_warmup=int(raw_w) if isinstance(raw_w, (int, float)) and not isinstance(raw_w, bool) else 3,
+            n_repeat=int(raw_r) if isinstance(raw_r, (int, float)) and not isinstance(raw_r, bool) else 5,
+            cache_size_mb=int(raw_c) if isinstance(raw_c, (int, float)) and not isinstance(raw_c, bool) else 256,
+        )

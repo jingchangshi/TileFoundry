@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse, asyncio, hashlib, json, logging, os, subprocess, sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
@@ -19,7 +19,7 @@ from tilefoundry_ascend.agent.gates.gate_funnel import GateFunnel
 from tilefoundry_ascend.agent.gates.stage_b_gate import _ensure_tilelang_on_sys_path
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.npu import (
-    DEFAULT_L4_CANNBENCH_WAIT_SEC, CandidateSurrogateResult, L2BatchResults, L3AcceptanceResult,
+    DEFAULT_L4_CANNBENCH_WAIT_SEC, L3AcceptanceResult,
     collect_bottleneck_msprof_via_agent_gates, run_l3_full_contract_via_agent_gates,
     run_l4_official_cannbench_via_agent_gates, run_micro_probe_via_agent_gates,
 )
@@ -104,15 +104,29 @@ def _resolve_worktree(cfg: MarathonConfig) -> tuple[Path, Path]:
     return src, cand.resolve()
 
 
-def run_operator_marathon(config: MarathonConfig | None = None, **overrides: object) -> int:
+def run_operator_marathon(
+    config: MarathonConfig | None = None,
+    *,
+    operator_name: str | None = None,
+    max_rounds: int | None = None,
+    resume: bool | None = None,
+) -> int:
     """Configure workspace, environment, and run ExtremeCampaignRunner."""
     if config is None:
-        cfg = MarathonConfig(**overrides)  # type: ignore[arg-type]
-    elif overrides:
-        merged = {**{k: getattr(config, k) for k in config.__dataclass_fields__}, **overrides}
-        cfg = MarathonConfig(**merged)  # type: ignore[arg-type]
+        if operator_name is None:
+            raise ValueError("operator_name is required when config is None")
+        cfg = MarathonConfig(
+            operator_name=operator_name,
+            max_rounds=80 if max_rounds is None else max_rounds,
+            resume=resume,
+        )
     else:
-        cfg = config
+        cfg = replace(
+            config,
+            operator_name=config.operator_name if operator_name is None else operator_name,
+            max_rounds=config.max_rounds if max_rounds is None else max_rounds,
+            resume=config.resume if resume is None else resume,
+        )
     src_root, worktree = _resolve_worktree(cfg)
     for e in (str(worktree / "targets" / "ascend"), str(worktree / "src"), str(worktree)):
         if e not in sys.path:
@@ -196,21 +210,19 @@ def run_operator_marathon(config: MarathonConfig | None = None, **overrides: obj
         preg = CannbenchOpsRegistry(tasks_root=crepo, source_root=worktree, pure_golden=True)
         p_anc = preg.get_anchors(cfg.operator_name)
         s_specs = s_specs or preg.get_regime_specs(cfg.operator_name)
-    rkw = {
-        "config": ccfg, "target_module_path": target_mod, "regime_specs": s_specs, "perf_target": ptgt, "llm_backend": llm,
-        "tracker": tracker, "flywheel_distiller": fly, "l2_batch_evaluator": l2_ev,
-        "msprof_collector": lambda op, cp, ancs: collect_bottleneck_msprof_via_agent_gates(op, cp, ancs, source_root=worktree, env_file=env_file, device_id=pdev, timeout_sec=600, **({"device_pool": dpool} if dpool else {})),
-        "l3_contract_runner": _l3_run,
-        "l4_cannbench_runner": lambda mp, **kw: run_l4_official_cannbench_via_agent_gates(operator_name=cfg.operator_name, candidate_module_path=mp, source_root=worktree, device_id=str(kw.get("device_id") or pdev), timeout_sec=DEFAULT_L4_CANNBENCH_WAIT_SEC, resume_execution_id=str(kw.get("resume_execution_id") or ""), resume_run_id=str(kw.get("resume_run_id") or ""), on_execution_started=kw.get("on_execution_started")),
-        "checkpoint_path": ckpt, "campaign_kb_path": kbp, "cost_calibration_path": state_dir / "cost_model_calibration.jsonl",
-        "experience_lake_dir": ldir, "source_root": worktree, "env_file": env_file, "cannbench_repo": crepo,
-        "regime_blueprints": seed_out.blueprints_by_regime if seed_out else None,
-        "topology_axes": seed_out.semantics.base_axes if seed_out else None,
-        "stagnation_discount": cfg.stagnation_discount, "op_logger": op_log,
-    }
-    if cfg.pure_golden:
-        rkw["anchors"] = p_anc
-    runner = ExtremeCampaignRunner(**rkw)  # type: ignore[arg-type]
+    runner = ExtremeCampaignRunner(
+        config=ccfg, target_module_path=target_mod, anchors=p_anc, regime_specs=s_specs,
+        perf_target=ptgt, llm_backend=llm, tracker=tracker, flywheel_distiller=fly,
+        l2_batch_evaluator=l2_ev,
+        msprof_collector=lambda op, cp, ancs: collect_bottleneck_msprof_via_agent_gates(op, cp, ancs, source_root=worktree, env_file=env_file, device_id=pdev, timeout_sec=600, **({"device_pool": dpool} if dpool else {})),
+        l3_contract_runner=_l3_run,
+        l4_cannbench_runner=lambda mp, *, device_id="", resume_execution_id="", resume_run_id="", on_execution_started=None: run_l4_official_cannbench_via_agent_gates(operator_name=cfg.operator_name, candidate_module_path=mp, source_root=worktree, device_id=str(device_id or pdev), timeout_sec=DEFAULT_L4_CANNBENCH_WAIT_SEC, resume_execution_id=str(resume_execution_id or ""), resume_run_id=str(resume_run_id or ""), on_execution_started=on_execution_started),
+        checkpoint_path=ckpt, campaign_kb_path=kbp, cost_calibration_path=state_dir / "cost_model_calibration.jsonl",
+        experience_lake_dir=ldir, source_root=worktree, env_file=env_file, cannbench_repo=crepo,
+        regime_blueprints=seed_out.blueprints_by_regime if seed_out else None,
+        topology_axes=seed_out.semantics.base_axes if seed_out else None,
+        stagnation_discount=cfg.stagnation_discount, op_logger=op_log,
+    )
     report = asyncio.run(runner.run(resume=resume_flag))
     if mirror is not None and target_mod.is_file():
         mirror.parent.mkdir(parents=True, exist_ok=True)

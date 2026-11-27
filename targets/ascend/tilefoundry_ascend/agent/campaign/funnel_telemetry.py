@@ -24,14 +24,14 @@ _SHA_CODES = frozenset(
 _KNOB_CODES = frozenset({"VF_STACK_OVERFLOW", "UB_SRAM_OVERFLOW", "L1_SRAM_OVERFLOW"})
 
 
-def _num(raw: object, cast: type[int] | type[float], default: int | float) -> int | float:
+def _num(raw: object, conv: type[int] | type[float], default: int | float) -> int | float:
     if isinstance(raw, bool):
         return default
     if isinstance(raw, (int, float)):
-        return cast(raw)
+        return conv(raw)
     if isinstance(raw, str):
         try:
-            return cast(raw.strip())
+            return conv(raw.strip())
         except ValueError:
             return default
     return default
