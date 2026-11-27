@@ -39,7 +39,7 @@ source = "CANN dav-3510 toolchain surface snapshot catalog"
 conditions = "Default CANN C++20 surface snapshot selected when unconfigured"
 
 [facts.toolchain.supported_cann_series]
-value = ["cann_9_2", "cann_9_3"]
+value = ["cann_9_3"]
 unit = "name"
 origin = "vendor"
 source = "CANN dav-3510 toolchain surface snapshot catalog"

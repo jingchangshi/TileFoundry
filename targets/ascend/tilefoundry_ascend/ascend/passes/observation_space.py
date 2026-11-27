@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Protocol, runtime_checkable
 
+from tilefoundry_ascend.ascend.json_record import JsonRecordMixin
 from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask
 
 _L2_FIELD_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -558,7 +559,7 @@ class AxisResidual5D:
 
 
 @dataclass(frozen=True)
-class ObservationVector5D:
+class ObservationVector5D(JsonRecordMixin):
     """Complete 5-axis hardware observation vector unifying L0, L1, and L2 telemetry."""
 
     compute_issue: ComputeIssueAxis

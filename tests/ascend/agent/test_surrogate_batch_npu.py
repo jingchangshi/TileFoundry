@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     default_source_root,
     get_default_anchors,
@@ -57,14 +57,7 @@ from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
     MicroProbeSpec,
     verify_micro_probe_hardware,
 )
-from tilefoundry_ascend.ascend.cost_model.msprof_report_parser import (
-    AggregatedMsprofReport,
-    P2InstructionDiveSummary,
-    extract_p2_from_objdump,
-    find_p2_trace_files,
-    parse_msprof_op_report,
-    parse_p2_instruction_trace,
-)
+from tilefoundry_ascend.agent.probes import LocalHardwareProbePort
 from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
 
 _ENV_SHIM_DIR = os.environ.get("TF_SURROGATE_SHIM_DIR", "").strip()
@@ -329,69 +322,6 @@ _P2_AIC_METRICS = (
 )
 
 
-def _locate_opprof_dirs(output_dir: Path) -> list[Path]:
-    """Return OPPROF_* directories under output_dir or output_dir itself if CSVs exist."""
-    opprof_dirs = sorted(
-        path for path in output_dir.rglob("OPPROF_*") if path.is_dir()
-    )
-    if opprof_dirs:
-        return opprof_dirs
-    if any(output_dir.rglob("*.csv")):
-        return [output_dir]
-    return []
-
-
-def _aggregated_report_to_telemetry(report: AggregatedMsprofReport) -> dict[str, object]:
-    """Convert an AggregatedMsprofReport into JSON-safe telemetry without fabricating counters."""
-    telemetry: dict[str, object] = dict(report.to_telemetry_dict())
-    if "bank_conflict_ratio" in telemetry and "ub_bank_conflict_ratio" not in telemetry:
-        telemetry["ub_bank_conflict_ratio"] = telemetry["bank_conflict_ratio"]
-    if "aic_mac_ratio" in telemetry and "aic_mad" not in telemetry:
-        telemetry["aic_mad"] = telemetry["aic_mac_ratio"]
-    if "aiv_vec_ratio" in telemetry and "aiv_vec" not in telemetry:
-        telemetry["aiv_vec"] = telemetry["aiv_vec_ratio"]
-    if "mte2_wait_ratio" in telemetry and "aiv_mte2" not in telemetry:
-        telemetry["aiv_mte2"] = telemetry["mte2_wait_ratio"]
-    if telemetry:
-        telemetry["msprof_source"] = "msprof_op"
-    return telemetry
-
-
-def _format_p2_summary_fields(
-    summary: P2InstructionDiveSummary,
-    *,
-    p2_source: str,
-) -> dict[str, object]:
-    """Serialize P2InstructionDiveSummary into compact JSON-safe deep-dive telemetry fields."""
-    hotspots = [spot.to_dict() for spot in summary.source_line_hotspots]
-    issue_intervals = {
-        pipe: stats.to_dict() for pipe, stats in summary.issue_interval_us.items()
-    }
-    summary_lines = [
-        (
-            f"{spot.source_location} ({spot.instruction_count} instrs, "
-            f"{spot.instruction_share:.1%}, pipes={','.join(spot.pipes)})"
-        )
-        for spot in summary.source_line_hotspots[:5]
-    ]
-    if summary.mte_waitflag_count > 0:
-        summary_lines.append(
-            f"mte_waitflag: {summary.mte_waitflag_count}/{summary.total_instructions} "
-            f"({summary.mte_waitflag_share:.1%})"
-        )
-    return {
-        "p2_source": p2_source,
-        "p2_total_instructions": summary.total_instructions,
-        "p2_mte_waitflag_count": summary.mte_waitflag_count,
-        "p2_mte_waitflag_share": summary.mte_waitflag_share,
-        "p2_attributed_instruction_share": summary.attributed_instruction_share,
-        "p2_instruction_mix": dict(summary.instruction_mix),
-        "p2_issue_interval_us": issue_intervals,
-        "p2_hotspots": hotspots,
-        "p2_summary_lines": summary_lines,
-    }
-
-
 def _discover_compiled_objects(
     mod_obj: object | None,
     module_path: Path | None,
@@ -433,277 +363,6 @@ def _discover_compiled_objects(
     return found
 
 
-def _build_msprof_op_case_driver_script(
-    *,
-    operator_name: str,
-    module_path: Path,
-    entrypoint: str,
-    case_num: int,
-    source_root: Path,
-    cannbench_repo: Path,
-) -> str:
-    """Build an isolated Python driver script invoking one operator case for msprof op."""
-    sys_paths = [
-        str((source_root / "src").resolve()),
-        str((source_root / "targets" / "ascend").resolve()),
-        str(source_root.resolve()),
-    ]
-    npu_cmp_mod = sys.modules.get("npu_compare")
-    npu_cmp_file = getattr(npu_cmp_mod, "__file__", None) if npu_cmp_mod is not None else None
-    if npu_cmp_file:
-        sys_paths.append(str(Path(str(npu_cmp_file)).resolve().parent))
-    config = {
-        "operator_name": operator_name,
-        "module_path": str(module_path.resolve()),
-        "entrypoint": entrypoint,
-        "case_num": int(case_num),
-        "source_root": str(source_root.resolve()),
-        "cannbench_repo": str(cannbench_repo.resolve()),
-        "sys_paths": sys_paths,
-        "shim_dir": os.environ.get("TF_SURROGATE_SHIM_DIR", "").strip(),
-    }
-    encoded_cfg = json.dumps(config)
-    return (
-        "import importlib\n"
-        "import importlib.util\n"
-        "import json\n"
-        "import sys\n"
-        "from pathlib import Path\n"
-        "import torch\n"
-        f"CFG = json.loads({encoded_cfg!r})\n"
-        "for path_item in CFG['sys_paths']:\n"
-        "    if path_item and path_item not in sys.path:\n"
-        "        sys.path.insert(0, path_item)\n"
-        "shim_dir = CFG['shim_dir']\n"
-        "if shim_dir and shim_dir not in sys.path and (Path(shim_dir) / 'npu_compare.py').is_file():\n"
-        "    sys.path.insert(0, shim_dir)\n"
-        "if not hasattr(torch, 'npu'):\n"
-        "    try:\n"
-        "        importlib.import_module('torch_npu')\n"
-        "    except ImportError:\n"
-        "        pass\n"
-        "torch.npu.set_device(0)\n"
-        "from tilefoundry_ascend.agent.campaign.anchor_specs import (\n"
-        "    AnchorCaseSpec,\n"
-        "    load_anchor_harness_and_cases,\n"
-        "    load_cannbench_contract_module,\n"
-        ")\n"
-        "source_root = Path(CFG['source_root'])\n"
-        "cannbench_repo = Path(CFG['cannbench_repo'])\n"
-        "contract_mod = load_cannbench_contract_module(source_root=source_root)\n"
-        "harness, cases = load_anchor_harness_and_cases(\n"
-        "    CFG['operator_name'],\n"
-        "    [AnchorCaseSpec('', int(CFG['case_num']), '', 1.0, 1.0)],\n"
-        "    cannbench_repo=cannbench_repo,\n"
-        "    source_root=source_root,\n"
-        ")\n"
-        "case = next(c for c in cases if int(c.case_num) == int(CFG['case_num']))\n"
-        "spec = importlib.util.spec_from_file_location('_tf_msprof_cand', CFG['module_path'])\n"
-        "if spec is None or spec.loader is None:\n"
-        "    raise RuntimeError(f\"failed to load {CFG['module_path']}\")\n"
-        "mod = importlib.util.module_from_spec(spec)\n"
-        "sys.modules['_tf_msprof_cand'] = mod\n"
-        "spec.loader.exec_module(mod)\n"
-        "fn = getattr(mod, CFG['entrypoint'])\n"
-        "inputs = harness.prepare(case)\n"
-        "npu_inputs = contract_mod.map_tensors(inputs, lambda x: x.npu())\n"
-        "params = harness.params(case, npu_inputs)\n"
-        "fn(**params)\n"
-        "torch.npu.synchronize()\n"
-    )
-
-
-def _run_msprof_op_subprocess(
-    *,
-    msprof_bin: str | None,
-    output_dir: Path,
-    aic_metrics: str,
-    warmup: int,
-    repeat: int,
-    app_argv: Sequence[str],
-    msprof_op_command: Sequence[str] | None = None,
-    timeout_sec: int = 180,
-) -> subprocess.CompletedProcess[str]:
-    """Execute msprof op (or an explicit custom wrapper command) into output_dir."""
-    if msprof_op_command is not None:
-        cmd = [
-            token.format(output_dir=str(output_dir), aic_metrics=aic_metrics)
-            if ("{output_dir}" in token or "{aic_metrics}" in token)
-            else token
-            for token in msprof_op_command
-        ]
-    else:
-        if not msprof_bin:
-            raise FileNotFoundError("msprof binary not found")
-        cmd = [
-            msprof_bin,
-            "op",
-            f"--output={output_dir}",
-            f"--aic-metrics={aic_metrics}",
-            f"--warm-up={max(0, int(warmup))}",
-            f"--launch-count={max(1, int(repeat))}",
-            *app_argv,
-        ]
-    return subprocess.run(
-        cmd,
-        text=True,
-        capture_output=True,
-        timeout=max(10, int(timeout_sec)),
-        check=False,
-    )
-
-
-def _parse_p2_from_report_dir(
-    report_dir: Path,
-    *,
-    compiled_obj_paths: Sequence[Path | str] = (),
-) -> dict[str, object]:
-    """Parse P2 instruction traces from report_dir, falling back to static DWARF objdump."""
-    trace_files = find_p2_trace_files(report_dir)
-    pc_start_candidate = next(iter(sorted(report_dir.rglob("pc_start_addr.txt"))), None)
-    for trace_file in trace_files:
-        summary = parse_p2_instruction_trace(
-            trace_file,
-            pc_start_addr_source=pc_start_candidate,
-        )
-        if summary.total_instructions > 0:
-            return _format_p2_summary_fields(summary, p2_source="msprof_p2_trace")
-    if compiled_obj_paths:
-        summary = extract_p2_from_objdump(compiled_obj_paths)
-        if summary.total_instructions > 0:
-            return _format_p2_summary_fields(summary, p2_source="llvm_objdump_dwarf")
-    return {}
-
-
-def _measure_msprof_op_metrics(
-    *,
-    operator_name: str = "",
-    candidate_id: str = "",
-    module_path: Path | str | None = None,
-    entrypoint: str = "",
-    case_num: int | None = None,
-    source_root: Path | None = None,
-    cannbench_repo: Path | None = None,
-    warmup: int = 1,
-    repeat: int = 3,
-    msprof_op_command: Sequence[str] | None = None,
-    case_runner_argv: Sequence[str] | None = None,
-    compiled_obj_paths: Sequence[Path | str] = (),
-) -> dict[str, object] | None:
-    """Run msprof op on one target case and return parsed CSV and optional P2 telemetry."""
-    if os.environ.get("TF_DISABLE_MSPROF_OP", "").strip() == "1":
-        return None
-    msprof_bin = shutil.which("msprof")
-    if msprof_op_command is None and not msprof_bin:
-        return None
-
-    is_p2_deep_dive = str(candidate_id).startswith("bottleneck_p2_")
-    has_runner = case_runner_argv is not None or (
-        module_path is not None and bool(operator_name) and case_num is not None
-    )
-    if msprof_op_command is None and not has_runner:
-        return None
-
-    with tempfile.TemporaryDirectory(prefix="tf_msprof_op_") as tmp_dir_raw:
-        tmp_dir = Path(tmp_dir_raw)
-        output_dir = tmp_dir / "out"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        if case_runner_argv is not None:
-            app_argv = list(case_runner_argv)
-        elif has_runner and module_path is not None and case_num is not None:
-            eff_source_root = source_root or default_source_root()
-            eff_cann_repo = cannbench_repo or _resolve_batch_cannbench_repo(eff_source_root)
-            eff_entrypoint = entrypoint or get_operator_entrypoint(operator_name)
-            driver_path = tmp_dir / "msprof_case_driver.py"
-            driver_path.write_text(
-                _build_msprof_op_case_driver_script(
-                    operator_name=operator_name,
-                    module_path=Path(module_path),
-                    entrypoint=eff_entrypoint,
-                    case_num=int(case_num),
-                    source_root=eff_source_root,
-                    cannbench_repo=eff_cann_repo,
-                ),
-                encoding="utf-8",
-            )
-            app_argv = [sys.executable, str(driver_path)]
-        else:
-            app_argv = []
-
-        requested_metrics = _P2_AIC_METRICS if is_p2_deep_dive else _P1_AIC_METRICS
-        try:
-            proc = _run_msprof_op_subprocess(
-                msprof_bin=msprof_bin,
-                output_dir=output_dir,
-                aic_metrics=requested_metrics,
-                warmup=warmup,
-                repeat=repeat,
-                app_argv=app_argv,
-                msprof_op_command=msprof_op_command,
-                timeout_sec=120 if is_p2_deep_dive else 180,
-            )
-        except subprocess.TimeoutExpired:
-            proc = subprocess.CompletedProcess(
-                args=[],
-                returncode=124,
-                stdout="",
-                stderr="msprof_op_timeout",
-            )
-        opprof_dirs = _locate_opprof_dirs(output_dir)
-        if is_p2_deep_dive and (proc.returncode != 0 or not opprof_dirs):
-            try:
-                proc = _run_msprof_op_subprocess(
-                    msprof_bin=msprof_bin,
-                    output_dir=output_dir,
-                    aic_metrics=_P1_AIC_METRICS,
-                    warmup=warmup,
-                    repeat=repeat,
-                    app_argv=app_argv,
-                    msprof_op_command=msprof_op_command,
-                    timeout_sec=180,
-                )
-            except subprocess.TimeoutExpired:
-                proc = subprocess.CompletedProcess(
-                    args=[],
-                    returncode=124,
-                    stdout="",
-                    stderr="msprof_op_timeout",
-                )
-            opprof_dirs = _locate_opprof_dirs(output_dir)
-
-        merged_obj_paths: list[Path | str] = list(compiled_obj_paths)
-        if is_p2_deep_dive and opprof_dirs:
-            seen_objs = {str(Path(p)) for p in merged_obj_paths}
-            for discovered in _discover_compiled_objects(None, None, opprof_dirs[-1]):
-                if str(discovered) not in seen_objs:
-                    seen_objs.add(str(discovered))
-                    merged_obj_paths.append(discovered)
-
-        telemetry: dict[str, object] = {}
-        if opprof_dirs:
-            try:
-                report = parse_msprof_op_report(opprof_dirs[-1])
-                if report.subkernels or report.parsed_tables:
-                    telemetry.update(_aggregated_report_to_telemetry(report))
-            except (FileNotFoundError, OSError, ValueError):
-                pass
-            if is_p2_deep_dive:
-                telemetry.update(
-                    _parse_p2_from_report_dir(
-                        opprof_dirs[-1],
-                        compiled_obj_paths=merged_obj_paths,
-                    )
-                )
-        elif is_p2_deep_dive and merged_obj_paths:
-            summary = extract_p2_from_objdump(merged_obj_paths)
-            if summary.total_instructions > 0:
-                telemetry.update(
-                    _format_p2_summary_fields(summary, p2_source="llvm_objdump_dwarf")
-                )
-
-        return telemetry or None
-
-
 def _measure_msprof_detail_metrics(
     fn_call=None,
     *,
@@ -721,32 +380,22 @@ def _measure_msprof_detail_metrics(
     compiled_obj_paths: Sequence[Path | str] = (),
     enable_msprof_op: bool = True,
 ) -> dict[str, object]:
-    """Measure NPU telemetry via msprof op CSVs first, falling back to tilelang.profiler."""
-    is_p2_deep_dive = str(candidate_id).startswith("bottleneck_p2_")
-    if enable_msprof_op:
-        op_metrics = _measure_msprof_op_metrics(
-            operator_name=operator_name,
-            candidate_id=candidate_id,
-            module_path=module_path,
-            entrypoint=entrypoint,
-            case_num=case_num,
-            source_root=source_root,
-            cannbench_repo=cannbench_repo,
-            warmup=warmup,
-            repeat=repeat,
-            msprof_op_command=msprof_op_command,
-            case_runner_argv=case_runner_argv,
-            compiled_obj_paths=compiled_obj_paths,
-        )
-        if op_metrics:
-            return op_metrics
-
+    """Measure NPU telemetry via tilelang.profiler msprof_detail backend."""
+    _ = (
+        operator_name,
+        candidate_id,
+        module_path,
+        entrypoint,
+        case_num,
+        source_root,
+        cannbench_repo,
+        msprof_op_command,
+        case_runner_argv,
+        compiled_obj_paths,
+        enable_msprof_op,
+    )
     if fn_call is None:
-        if is_p2_deep_dive and compiled_obj_paths:
-            summary = extract_p2_from_objdump(compiled_obj_paths)
-            if summary.total_instructions > 0:
-                return _format_p2_summary_fields(summary, p2_source="llvm_objdump_dwarf")
-        return {"error": "msprof_detail_failed: no_msprof_op_and_no_callable"}
+        return {"error": "msprof_detail_failed: no_callable"}
 
     try:
         profiler = importlib.import_module("tilelang.profiler")
@@ -757,19 +406,8 @@ def _measure_msprof_detail_metrics(
             backend="msprof_detail",
             device=torch.device("npu:0"),
         )
-        metrics: dict[str, object] = dict(_extract_msprof_metrics(prof))
-        if is_p2_deep_dive and compiled_obj_paths:
-            summary = extract_p2_from_objdump(compiled_obj_paths)
-            if summary.total_instructions > 0:
-                metrics.update(
-                    _format_p2_summary_fields(summary, p2_source="llvm_objdump_dwarf")
-                )
-        return metrics
+        return dict(_extract_msprof_metrics(prof))
     except Exception as exc:
-        if is_p2_deep_dive and compiled_obj_paths:
-            summary = extract_p2_from_objdump(compiled_obj_paths)
-            if summary.total_instructions > 0:
-                return _format_p2_summary_fields(summary, p2_source="llvm_objdump_dwarf")
         return {"error": f"msprof_detail_failed: {type(exc).__name__}: {exc}"[:300]}
 
 
@@ -812,7 +450,7 @@ from pathlib import Path
 
 import torch
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     load_anchor_harness_and_cases,
     load_cannbench_contract_module,
@@ -953,7 +591,7 @@ from pathlib import Path
 
 import torch
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     load_anchor_harness_and_cases,
     load_cannbench_contract_module,
@@ -2220,7 +1858,7 @@ def _run_fast_micro_probe(
     )
     passed, metrics = verify_micro_probe_hardware(
         spec,
-        min_speedup=float(min_speedup),
+        probe_port=LocalHardwareProbePort(),
     )
     payload = _fast_response_payload(
         request_id=request_id,

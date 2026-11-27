@@ -10,7 +10,7 @@ import torch
 import examples.ascend950pr_ops.grouped_matmul.kernels as gmm_kernels
 import examples.ascend950pr_ops.mla.kernels as mla_kernels
 import tests.ascend.benchmarks.test_npu_acceptance as npu_acceptance
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     CannbenchOpsRegistry,
     RegimeTargetSpec,
     discover_module_trackb_symbols,

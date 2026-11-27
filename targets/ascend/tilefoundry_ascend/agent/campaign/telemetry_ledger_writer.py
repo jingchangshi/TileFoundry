@@ -14,21 +14,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
-    AnchorCaseSpec,
-    GuardrailCaseSpec,
-    PerfTargetSpec,
-    RegimeTargetSpec,
-    compute_case_eq3_score,
-    lookup_case_dims,
-    lookup_case_metadata,
-)
-from tilefoundry_ascend.agent.campaign.fault_types import (
-    FaultPlane,
-    L3Resolution,
-    TypedFault,
-    coerce_fault_plane,
-)
 from tilefoundry_ascend.agent.campaign.flywheel_coordinator import FlywheelCoordinator
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
     ANOMALY_LOG_ERROR_THRESHOLD,
@@ -48,6 +33,23 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     bottleneck_anchor_for_regime,
     extract_ordered_tensor_shapes,
 )
+from tilefoundry_ascend.agent.contracts import CampaignRoundRecord
+from tilefoundry_ascend.agent.specs.anchor_specs import (
+    AnchorCaseSpec,
+    GuardrailCaseSpec,
+    PerfTargetSpec,
+    RegimeTargetSpec,
+    compute_case_eq3_score,
+    lookup_case_dims,
+    lookup_case_metadata,
+)
+from tilefoundry_ascend.agent.specs.fault_types import (
+    FaultPlane,
+    L3Resolution,
+    TypedFault,
+    coerce_fault_plane,
+)
+from tilefoundry_ascend.ascend.json_record import atomic_write_text
 from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
 from tilefoundry_ascend.agent.kb.bayesian_tracker import (
@@ -118,29 +120,6 @@ _STAGE_TO_PLANE: dict[str, FaultPlane] = {
     "l2_error": FaultPlane.CANDIDATE_NUMERIC,
     "candidate_numeric": FaultPlane.CANDIDATE_NUMERIC,
 }
-
-
-def atomic_write_text(path: Path, content: str) -> None:
-    """Atomically replace a file with UTF-8 content via same-directory temp file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            tmp_path = Path(fh.name)
-            fh.write(content)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
 
 
 def source_sha256(source: str) -> str:
@@ -1830,12 +1809,11 @@ class TelemetryLedgerWriter:
         """Rehydrate persisted campaign state and verify candidate bytes on disk."""
         assert self._checkpoint_path is not None
         eff_l4_from_dict = pending_l4_from_dict or PendingL4.from_dict
-        if round_record_from_dict is None:
-            from tilefoundry_ascend.agent.campaign.campaign_runner import CampaignRoundRecord
-
-            eff_round_from_dict = CampaignRoundRecord.from_dict
-        else:
-            eff_round_from_dict = round_record_from_dict
+        eff_round_from_dict = (
+            round_record_from_dict
+            if round_record_from_dict is not None
+            else CampaignRoundRecord.from_dict
+        )
 
         payload = json.loads(self._checkpoint_path.read_text(encoding="utf-8"))
         saved_run_id = payload.get("run_id")

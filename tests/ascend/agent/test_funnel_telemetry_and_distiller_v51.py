@@ -9,12 +9,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     RegimeTargetSpec,
     inject_lake_counterexample_anchors,
 )
-from tilefoundry_ascend.agent.campaign.fault_types import FaultPlane, TypedFault
+from tilefoundry_ascend.agent.specs.fault_types import FaultPlane, TypedFault
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
     MAX_CLEAN_CALIBRATION_BURST_CV,
     SPEARMAN_QUARANTINE_FLOOR,

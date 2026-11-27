@@ -24,7 +24,7 @@ from tilefoundry_ascend.agent.campaign import (
     build_arg_parser,
     marathon,
 )
-from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
+from tilefoundry_ascend.agent.specs.anchor_specs import CannbenchOpsRegistry
 from tilefoundry_ascend.agent.campaign.marathon import MarathonConfig, run_operator_marathon
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     CandidateSurrogateResult,

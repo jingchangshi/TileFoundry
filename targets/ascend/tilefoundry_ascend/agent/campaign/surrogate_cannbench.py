@@ -33,7 +33,7 @@ from typing import Protocol
 
 import yaml
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
     _static_width_signature,
@@ -49,7 +49,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     resolve_cannbench_repo,
     resolve_cannbench_tasks_root,
 )
-from tilefoundry_ascend.agent.campaign.latency_algebra import (
+from tilefoundry_ascend.agent.specs.latency_algebra import (
     compute_adaptive_poison_pill_timeout_sec,
 )
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
@@ -1736,7 +1736,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, {ascend_target_dir!r})
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     discover_module_trackb_symbols,
     get_default_regime_specs,
     get_operator_entrypoint,
@@ -4202,7 +4202,7 @@ def prewarm_anchor_reference_cache(
     script = (
         "import json, sys\n"
         f"sys.path.insert(0, {str(root / 'targets' / 'ascend')!r})\n"
-        "from tilefoundry_ascend.agent.campaign.anchor_specs import (\n"
+        "from tilefoundry_ascend.agent.specs.anchor_specs import (\n"
         "    AnchorCaseSpec, load_anchor_harness_and_cases, load_cannbench_contract_module\n"
         ")\n"
         f"op_name = {operator_name!r}\n"
@@ -4273,7 +4273,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, {ascend_target_dir!r})
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     discover_module_trackb_symbols,
     extract_trackb_cpp_source,
     get_default_regime_specs,
@@ -4632,7 +4632,7 @@ elif mode == "_get_combine_kernel":
         kwargs["compile_flags"] = tuple(kwargs["compile_flags"])
     compiled_obj = fn(**kwargs)
 elif mode == "trackb":
-    from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    from tilefoundry_ascend.agent.specs.anchor_specs import (
         discover_module_trackb_symbols,
         extract_trackb_cpp_source,
     )
@@ -5032,7 +5032,7 @@ from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, {ascend_target_dir!r})
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     discover_module_trackb_symbols,
     extract_trackb_cpp_source,
     get_default_regime_specs,

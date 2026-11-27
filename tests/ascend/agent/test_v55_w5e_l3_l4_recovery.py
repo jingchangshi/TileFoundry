@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from tilefoundry_ascend.agent.campaign import l3_l4_recovery
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     GuardrailCaseSpec,
     RegimeTargetSpec,
@@ -20,7 +20,7 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignRoundRecord,
     ResolvedRegimeConfig,
 )
-from tilefoundry_ascend.agent.campaign.fault_types import L3Resolution
+from tilefoundry_ascend.agent.specs.fault_types import L3Resolution
 from tilefoundry_ascend.agent.campaign.l3_l4_recovery import (
     L3L4RecoveryCoordinator,
     PendingL4,

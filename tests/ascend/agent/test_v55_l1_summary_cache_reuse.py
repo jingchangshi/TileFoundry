@@ -44,7 +44,7 @@ def _bootstrap_isolated_worktree() -> None:
 
 _bootstrap_isolated_worktree()
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: E402
+from tilefoundry_ascend.agent.specs.anchor_specs import (  # noqa: E402
     AnchorCaseSpec,
     RegimeTargetSpec,
 )

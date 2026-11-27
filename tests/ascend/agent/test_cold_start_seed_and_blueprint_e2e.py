@@ -24,7 +24,7 @@ from tilefoundry_ascend.agent import (
 from tilefoundry_ascend.agent.campaign import campaign_runner as campaign_runner_module
 from tilefoundry_ascend.agent.campaign import marathon
 from tilefoundry_ascend.agent.campaign import seed_synthesizer as seed_synthesizer_module
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     CannbenchOpsRegistry,
     build_semantic_regime_specs,
     campaign_case_regime_tag,

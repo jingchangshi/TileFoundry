@@ -58,3 +58,19 @@ def run_msprof_detail(
         device="npu",
     )
     return bench_with_msprof(fn, cache, n_repeat=max(1, int(n_repeat)), detailed=True)
+
+
+class LocalHardwareProbePort:
+    """Default local HardwareProbePort delegating to CANN env and msprof helpers."""
+
+    def ensure_cann_include_cpath(
+        self,
+        env: dict[str, str] | None = None,
+    ) -> list[str]:
+        """Discover CANN header directories and prepend missing entries to ``CPATH``."""
+        _ = env
+        return ensure_cann_include_cpath()
+
+    def run_msprof_detail(self, *args: object, **kwargs: object) -> object:
+        """Warm up and profile an NPU callable via TileLang ``bench_with_msprof``."""
+        return run_msprof_detail(*args, **kwargs)  # type: ignore[arg-type]

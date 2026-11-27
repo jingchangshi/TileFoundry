@@ -22,6 +22,7 @@ from tilefoundry_ascend.ascend.compile_cache.cpp_closure import (
     select_active_trackb_kernel,
     strip_cpp_comments_and_strings,
 )
+from tilefoundry_ascend.ascend.json_record import JsonRecordMixin, atomic_write_text
 
 _CPP_MARKERS: tuple[str, ...] = (
     "__global__",
@@ -143,19 +144,7 @@ def merge_tl_cache_tree(src_dir: Path, dst_dir: Path) -> None:
                     continue
                 if existing and not existing.endswith("\n"):
                     existing += "\n"
-                fd, tmp_name = tempfile.mkstemp(
-                    dir=str(target.parent), prefix=".compiled_entries."
-                )
-                tmp_path = Path(tmp_name)
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                        fh.write(existing + addition)
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                    os.replace(tmp_path, target)
-                finally:
-                    if tmp_path.exists():
-                        tmp_path.unlink(missing_ok=True)
+                atomic_write_text(target, existing + addition)
             elif not target.exists():
                 _atomic_copy_into_cache(item, target)
             elif target.is_file():
@@ -657,7 +646,7 @@ def compute_artifact_id(
 
 
 @dataclass(frozen=True)
-class ArtifactRecord:
+class ArtifactRecord(JsonRecordMixin):
     """Persisted metadata for one verified compiled kernel artifact."""
 
     artifact_id: str
@@ -672,22 +661,6 @@ class ArtifactRecord:
     metadata: dict[str, object] = field(default_factory=dict)
     recorded_at: float = 0.0
 
-    def to_dict(self) -> dict[str, object]:
-        """Serialize record into a JSON-compatible dictionary."""
-        return {
-            "artifact_id": self.artifact_id,
-            "backend_kind": self.backend_kind,
-            "binary_paths": list(self.binary_paths),
-            "arch": self.arch,
-            "cann_series": self.cann_series,
-            "flags": self.flags,
-            "spec_key": self.spec_key,
-            "compiler_stamp": self.compiler_stamp,
-            "closure_sha256": self.closure_sha256,
-            "metadata": dict(self.metadata),
-            "recorded_at": float(self.recorded_at),
-        }
-
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> ArtifactRecord:
         """Reconstruct ArtifactRecord from a JSON mapping."""
@@ -698,20 +671,12 @@ class ArtifactRecord:
             else ()
         )
         raw_meta = payload.get("metadata")
-        meta = dict(raw_meta) if isinstance(raw_meta, Mapping) else {}
-        return cls(
-            artifact_id=str(payload.get("artifact_id", "")),
-            backend_kind=str(payload.get("backend_kind", "tilelang")),
-            binary_paths=bins,
-            arch=str(payload.get("arch", "dav-3510")),
-            cann_series=str(payload.get("cann_series", "cann_9_3")),
-            flags=str(payload.get("flags", "")),
-            spec_key=str(payload.get("spec_key", "")),
-            compiler_stamp=str(payload.get("compiler_stamp", "")),
-            closure_sha256=str(payload.get("closure_sha256", "")),
-            metadata=meta,
-            recorded_at=float(payload.get("recorded_at", 0.0) or 0.0),
-        )
+        norm = dict(payload)
+        norm.setdefault("artifact_id", "")
+        norm["binary_paths"] = bins
+        norm["metadata"] = dict(raw_meta) if isinstance(raw_meta, Mapping) else {}
+        norm["recorded_at"] = float(payload.get("recorded_at", 0.0) or 0.0)
+        return super().from_dict(norm)
 
 
 class ArtifactStore:
@@ -750,20 +715,8 @@ class ArtifactStore:
         return records
 
     def _save_manifest_unlocked(self, records: Mapping[str, Mapping[str, object]]) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
         payload = {"version": 1, "artifacts": dict(records)}
-        encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-        fd, tmp_name = tempfile.mkstemp(dir=str(self.root), prefix=".artifact_manifest.")
-        tmp_path = Path(tmp_name)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(encoded)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp_path, self.manifest_path)
-        finally:
-            if tmp_path.exists():
-                tmp_path.unlink(missing_ok=True)
+        atomic_write_text(self.manifest_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
     def record_verified_artifact(
         self,

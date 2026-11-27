@@ -19,7 +19,7 @@ def _bootstrap_isolated_worktree() -> None:
         sys.path.insert(0, ascend_root)
     pkg_dir = root / "targets" / "ascend" / "tilefoundry_ascend"
     try:
-        mod = importlib.import_module("tilefoundry_ascend.agent.campaign.fault_types")
+        mod = importlib.import_module("tilefoundry_ascend.agent.specs.fault_types")
         mod_file = getattr(mod, "__file__", "") or ""
         if Path(mod_file).resolve().is_relative_to(root):
             return
@@ -36,6 +36,7 @@ def _bootstrap_isolated_worktree() -> None:
         ("tilefoundry_ascend", pkg_dir),
         ("tilefoundry_ascend.agent", pkg_dir / "agent"),
         ("tilefoundry_ascend.agent.campaign", pkg_dir / "agent" / "campaign"),
+        ("tilefoundry_ascend.agent.specs", pkg_dir / "agent" / "specs"),
     ):
         mod = types.ModuleType(mod_name)
         mod.__path__ = [str(sub_path)]
@@ -45,12 +46,12 @@ def _bootstrap_isolated_worktree() -> None:
 _bootstrap_isolated_worktree()
 
 import tilefoundry_ascend.agent.campaign.funnel_telemetry as funnel_telemetry  # noqa: E402
-from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: E402
+from tilefoundry_ascend.agent.specs.anchor_specs import (  # noqa: E402
     AnchorCaseSpec,
     RegimeTargetSpec,
     inject_lake_counterexample_anchors,
 )
-from tilefoundry_ascend.agent.campaign.fault_types import (  # noqa: E402
+from tilefoundry_ascend.agent.specs.fault_types import (  # noqa: E402
     FaultPlane,
     L3Resolution,
     TypedFault,
@@ -61,7 +62,7 @@ from tilefoundry_ascend.agent.campaign.funnel_telemetry import (  # noqa: E402
     append_round_funnel_event,
     assert_unmodeled_fault_share_bounded,
 )
-from tilefoundry_ascend.agent.campaign.latency_algebra import (  # noqa: E402
+from tilefoundry_ascend.agent.specs.latency_algebra import (  # noqa: E402
     MAD_TO_SIGMA,
     AnchorConservationPoint,
     calibrate_dispatch_floor_us,

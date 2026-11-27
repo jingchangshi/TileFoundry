@@ -9,7 +9,7 @@ from textwrap import dedent
 
 import pytest
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import RegimeTargetSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import RegimeTargetSpec
 from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
     OracleAccuracyResult,
     prepare_operator_seed_or_takeover,

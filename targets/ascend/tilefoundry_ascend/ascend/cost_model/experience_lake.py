@@ -14,8 +14,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import MicroarchProfile
-from tilefoundry_ascend.ascend.cost_model.pipe_schedule_eval import resolve_cube_macs_safe
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
+from tilefoundry_ascend.ascend.target.facts import resolve_cube_macs_safe
 
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 

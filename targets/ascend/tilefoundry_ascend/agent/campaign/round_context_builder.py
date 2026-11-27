@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol, TypeVar
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     CannbenchOpSpec,
     CannbenchOpsRegistry,
@@ -31,7 +31,7 @@ from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
     DeterministicSearchBoundaryLedger,
     is_clean_calibration_sample,
 )
-from tilefoundry_ascend.agent.campaign.latency_algebra import (
+from tilefoundry_ascend.agent.specs.latency_algebra import (
     AnchorConservationPoint,
     is_regime_saturated,
     regime_bandit_ucb_us,

@@ -8,12 +8,12 @@ from pathlib import Path
 import pytest
 
 import tilefoundry_ascend.agent.campaign.promotion_coordinator as pc_mod
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     GuardrailCaseSpec,
     RegimeTargetSpec,
 )
-from tilefoundry_ascend.agent.campaign.fault_types import L3Resolution
+from tilefoundry_ascend.agent.specs.fault_types import L3Resolution
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import (
     PromotionCoordinator,
     RankedL2Candidate,

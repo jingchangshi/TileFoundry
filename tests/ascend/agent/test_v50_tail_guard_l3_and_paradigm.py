@@ -80,7 +80,7 @@ def _ensure_cost_gate_policy_stub() -> None:
 _ensure_cost_gate_policy_stub()
 
 from tilefoundry_ascend.agent.campaign import campaign_runner, cli, surrogate_cannbench
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec, RegimeTargetSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec, RegimeTargetSpec
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult, StageBResult
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 

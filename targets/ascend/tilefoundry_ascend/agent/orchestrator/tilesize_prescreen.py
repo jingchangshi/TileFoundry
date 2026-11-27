@@ -8,11 +8,6 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import product
 
-from tilefoundry_ascend.ascend.cost_model.calibration_backtest import (
-    PrescreenAblationReport,
-    PrescreenAblationSample,
-    evaluate_prescreen_ablation,
-)
 from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import is_paradigm_shift_exempt
 from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
     CostFeatures,
@@ -1552,12 +1547,9 @@ def sweep_executable_lattice_zero_llm(
 __all__ = [
     "CostRankedCandidate",
     "LatticeSweepCandidate",
-    "PrescreenAblationReport",
-    "PrescreenAblationSample",
     "PrescreenScore",
     "TileConfigCandidate",
     "count_dsl_gemm_calls",
-    "evaluate_prescreen_ablation",
     "evaluate_tile_candidate",
     "format_prescreen_summary",
     "generate_aligned_neighborhood",

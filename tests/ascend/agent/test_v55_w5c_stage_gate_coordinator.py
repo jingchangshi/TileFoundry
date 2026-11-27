@@ -53,12 +53,12 @@ from tilefoundry_ascend.agent.campaign import (  # noqa: E402
     stage_gate_coordinator,
     surrogate_cannbench,
 )
-from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: E402
+from tilefoundry_ascend.agent.specs.anchor_specs import (  # noqa: E402
     AnchorCaseSpec,
     GuardrailCaseSpec,
     RegimeTargetSpec,
 )
-from tilefoundry_ascend.agent.campaign.fault_types import FaultPlane  # noqa: E402
+from tilefoundry_ascend.agent.specs.fault_types import FaultPlane  # noqa: E402
 from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import (  # noqa: E402
     CandidateBatch,
     OccupancyExhaustedError,

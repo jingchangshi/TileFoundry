@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from tilefoundry_ascend.agent import BayesianRuleTracker, FlywheelDistiller, GateFunnel
-from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
+from tilefoundry_ascend.agent.specs.anchor_specs import CannbenchOpsRegistry
 from tilefoundry_ascend.agent.flywheel import (
     decompose_ast_ablations,
     synthesize_micro_probe,

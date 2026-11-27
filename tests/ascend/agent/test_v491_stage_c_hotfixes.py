@@ -9,7 +9,7 @@ import pytest
 import tilelang
 from tvm import tirx
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import RegimeTargetSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import RegimeTargetSpec
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     PerfTargetCampaignRunner,

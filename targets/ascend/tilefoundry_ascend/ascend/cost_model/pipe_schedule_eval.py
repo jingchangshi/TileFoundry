@@ -8,6 +8,10 @@ from dataclasses import dataclass
 
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import MicroarchProfile
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
+from tilefoundry_ascend.ascend.target.facts import (
+    _CUBE_DTYPE_ALIASES,
+    resolve_cube_macs_safe,
+)
 
 MS_PIPE_SLOPE_US_PER_BYTE: dict[str, float] = {
     "MTE1": 5.54e-6,
@@ -29,48 +33,6 @@ DIRECTION_SLOPE_MULT: dict[str, float] = {
     "ub_to_l1": 0.50,
     "l0c_to_ub": 0.877,
 }
-
-_CUBE_DTYPE_ALIASES: dict[str, str] = {
-    "float16": "f16",
-    "fp16": "f16",
-    "bfloat16": "bf16",
-    "float32": "f32",
-    "fp32": "f32",
-    "int8": "i8",
-    "uint8": "u8",
-    "e4m3": "fp8e4m3",
-    "fp8_e4m3": "fp8e4m3",
-    "float8_e4m3": "fp8e4m3",
-    "float8_e4m3fn": "fp8e4m3",
-    "e5m2": "fp8e5m2",
-    "fp8_e5m2": "fp8e5m2",
-    "float8_e5m2": "fp8e5m2",
-    "float4_e2m1": "f4e2m1",
-    "fp4_e2m1": "f4e2m1",
-    "float4_e1m2": "f4e1m2",
-    "fp4_e1m2": "f4e1m2",
-}
-
-
-def resolve_cube_macs_safe(
-    facts: AscendSpaceFacts,
-    dtype_name: object,
-    *,
-    hf32: bool = False,
-) -> int:
-    """Resolve Cube MACs/cycle safely from canonical or full TIR dtype names."""
-    raw = str(getattr(dtype_name, "name", dtype_name) or "").strip().lower()
-    if not raw:
-        raise ValueError(f"Unsupported empty Cube operand dtype {dtype_name!r}")
-    canon = _CUBE_DTYPE_ALIASES.get(raw, raw)
-    if hf32 and canon in ("f32", "hf32"):
-        canon = "hf32"
-    try:
-        return int(facts.cube_macs_per_cycle(canon, hf32=hf32))
-    except (ValueError, KeyError, TypeError) as exc:
-        raise ValueError(
-            f"Unsupported Cube operand dtype {dtype_name!r} (canonical={canon!r})"
-        ) from exc
 
 
 @dataclass(frozen=True)

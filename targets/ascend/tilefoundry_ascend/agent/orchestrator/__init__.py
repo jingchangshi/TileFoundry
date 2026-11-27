@@ -1,13 +1,5 @@
 """Provider-backed kernel evolution, tile-size prescreening, and gate evaluation."""
 
-from tilefoundry_ascend.agent.orchestrator.e2e_evolution import (
-    EvolutionRoundRecord,
-    EvolutionTrajectory,
-    WorkerStepRecord,
-    build_hir_seed_request,
-    run_e2e_evolution,
-    synthesize_initial_dsl,
-)
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     FunnelEvaluation,
     GateFunnel,
@@ -68,16 +60,10 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     generate_aligned_neighborhood,
     prescreen_tile_configs,
 )
-from tilefoundry_ascend.agent.orchestrator.twin_bridge import (
-    verify_numerical_twin,
-    verify_reference_cpu_parity,
-)
 
 __all__ = [
     "AgyCliLLMBackend",
     "BeamCandidate",
-    "EvolutionRoundRecord",
-    "EvolutionTrajectory",
     "FunnelEvaluation",
     "GateFunnel",
     "GenerationRequest",
@@ -100,10 +86,8 @@ __all__ = [
     "TileConfigCandidate",
     "TwoLaneBeamSearch",
     "WorkerSpec",
-    "WorkerStepRecord",
     "build_creative_request",
     "build_exploit_request",
-    "build_hir_seed_request",
     "build_syntax_repair_request",
     "build_progressive_llm_constraints",
     "format_blueprint_delta_section",
@@ -121,13 +105,9 @@ __all__ = [
     "generate_aligned_neighborhood",
     "prescreen_dsl_tile_kwargs",
     "prescreen_tile_configs",
-    "run_e2e_evolution",
     "run_stage_a_static",
     "run_stage_b_ascendc_compile",
     "run_stage_b_compile",
     "run_stage_c_agent_gates",
     "synthesize_pybind_extension_wrapper",
-    "synthesize_initial_dsl",
-    "verify_numerical_twin",
-    "verify_reference_cpu_parity",
 ]

@@ -2,34 +2,9 @@
 
 from __future__ import annotations
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
-    ATTENTION_RESIDUAL_ANCHORS,
-    DEFAULT_ANCHORS,
-    DEFAULT_PERF_TARGETS,
-    DEFAULT_REGIME_SPECS,
-    INPUT_DOMAIN_ENVELOPES,
-    MLA_ANCHORS,
-    AnchorCaseSpec,
-    InputDomainEnvelope,
-    PerfTargetSpec,
-    RegimeSpec,
-    RegimeTargetSpec,
-    append_dynamic_anchor,
-    build_anchor_var_bindings,
-    compute_case_eq3_score,
-    get_default_anchors,
-    get_default_perf_target,
-    get_default_regime_specs,
-    get_input_domain_envelope,
-    load_anchor_harness_and_cases,
-    lookup_case_dims,
-    resolve_cannbench_repo,
-    resolve_regime_for_case,
-)
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     CampaignReport,
-    CampaignRoundRecord,
     PerfTargetCampaignRunner,
     ResolvedRegimeConfig,
     build_arg_parser,
@@ -68,6 +43,31 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     run_micro_probe_via_agent_gates,
     run_multi_operator_surrogate_batch_via_agent_gates,
     run_surrogate_batch_via_agent_gates,
+)
+from tilefoundry_ascend.agent.contracts import CampaignRoundRecord
+from tilefoundry_ascend.agent.specs.anchor_specs import (
+    ATTENTION_RESIDUAL_ANCHORS,
+    DEFAULT_ANCHORS,
+    DEFAULT_PERF_TARGETS,
+    DEFAULT_REGIME_SPECS,
+    INPUT_DOMAIN_ENVELOPES,
+    MLA_ANCHORS,
+    AnchorCaseSpec,
+    InputDomainEnvelope,
+    PerfTargetSpec,
+    RegimeSpec,
+    RegimeTargetSpec,
+    append_dynamic_anchor,
+    build_anchor_var_bindings,
+    compute_case_eq3_score,
+    get_default_anchors,
+    get_default_perf_target,
+    get_default_regime_specs,
+    get_input_domain_envelope,
+    load_anchor_harness_and_cases,
+    lookup_case_dims,
+    resolve_cannbench_repo,
+    resolve_regime_for_case,
 )
 
 __all__ = [

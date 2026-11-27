@@ -1,6 +1,6 @@
 """Track-B CCE (C++20) templates for canonical Ascend 950 (dav-3510) 3-axis shells.
 
-Templates target cann_9_3 (dav-3510) exclusively; cann_9_2 is an inert placeholder.
+Templates target cann_9_3 (dav-3510) exclusively.
 Cube shells keep static #include <c_api/asc_cube.h>.
 """
 
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from tilefoundry_ascend.ascend.templates.registry import (
+from tilefoundry_ascend.ascend.templates.shells import (
     SHELL_AIC_GEMM_FIXPIPE,
     SHELL_AIV_SIMD_STREAM,
     SHELL_AIV_SIMT_ATOMIC,

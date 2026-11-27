@@ -1,6 +1,6 @@
 """Ascend TileLang DSL and Track-B CCE C++20 surface definitions.
 
-Active SDK target is cann_9_3 (dav-3510) exclusively; cann_9_2 is an inert placeholder.
+Active SDK target is cann_9_3 (dav-3510) exclusively.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Literal
 
 DialectId = Literal["tilelang_dsl", "inline_cce_vf", "cce_cpp20"]
-VALID_CANN_SERIES: tuple[str, ...] = ("cann_9_2", "cann_9_3")
+VALID_CANN_SERIES: tuple[str, ...] = ("cann_9_3",)
 DEFAULT_CANN_SERIES: str = "cann_9_3"
 _CANN_SURFACE_DIR = Path(__file__).resolve().parent / "cann_surface"
 
@@ -1156,23 +1156,15 @@ def _normalize_cann_series_from_path(raw: str) -> str | None:
     text = raw.strip()
     if not text:
         return None
-    if "9.2" in text or "cann_9_2" in text:
-        return "cann_9_2"
     if "9.3" in text or "9.4" in text or "cann_9_3" in text:
         return "cann_9_3"
     cand = Path(text).expanduser()
     for ver_file in (cand / "version.info", cand / "ascend_toolkit_install.info"):
         if ver_file.is_file():
             content = ver_file.read_text(encoding="utf-8", errors="ignore")
-            if "9.2." in content:
-                return "cann_9_2"
             if "9.3." in content or "9.4." in content:
                 return "cann_9_3"
     return None
-
-
-def _clamp_implicit_cann_series(series: str) -> str:
-    return DEFAULT_CANN_SERIES if series == "cann_9_2" else series
 
 
 def resolve_cann_series(
@@ -1180,7 +1172,7 @@ def resolve_cann_series(
     *,
     cann_home: str | Path | None = None,
 ) -> str:
-    """Resolve CANN snapshot series, clamping implicit/env/path cann_9_2 to cann_9_3."""
+    """Resolve the active CANN snapshot series (cann_9_3)."""
     if explicit is not None and str(explicit).strip():
         norm = str(explicit).strip().lower()
         if norm not in VALID_CANN_SERIES:
@@ -1196,15 +1188,15 @@ def resolve_cann_series(
                     f"Unsupported CANN series {raw!r} from {env_key}; "
                     f"expected one of {VALID_CANN_SERIES}"
                 )
-            return _clamp_implicit_cann_series(raw)
+            return raw
     if cann_home is not None:
         inferred = _normalize_cann_series_from_path(str(cann_home))
         if inferred is not None:
-            return _clamp_implicit_cann_series(inferred)
+            return inferred
     for env_key in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME"):
         inferred = _normalize_cann_series_from_path(os.environ.get(env_key, ""))
         if inferred is not None:
-            return _clamp_implicit_cann_series(inferred)
+            return inferred
     return DEFAULT_CANN_SERIES
 
 
@@ -1247,7 +1239,7 @@ def _load_cached_cann_surface(series: str) -> DialectSurfaceSpec:
 def load_cann_surface(cann_series: str | None = None) -> DialectSurfaceSpec:
     """Load a self-contained dav-3510 C++20 DialectSurfaceSpec from TOML snapshot resources.
 
-    CCE_CPP20_SURFACE binds to DEFAULT_CANN_SERIES ("cann_9_3"); cann_9_2 is inert.
+    CCE_CPP20_SURFACE binds to DEFAULT_CANN_SERIES ("cann_9_3").
     """
     return _load_cached_cann_surface(resolve_cann_series(cann_series))
 

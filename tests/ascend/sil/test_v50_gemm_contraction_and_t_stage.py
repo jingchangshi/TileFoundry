@@ -28,16 +28,6 @@ from tilefoundry_ascend.ascend.target.dialect_surface import filter_primitives_o
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _AR_KERNELS_PATH = _REPO_ROOT / "examples" / "ascend950pr_ops" / "attention_residual" / "kernels.py"
-_CANN_92_TOML_PATH = (
-    _REPO_ROOT
-    / "targets"
-    / "ascend"
-    / "tilefoundry_ascend"
-    / "ascend"
-    / "target"
-    / "cann_surface"
-    / "cann_9_2.toml"
-)
 
 
 def _load_ar_kernels_module():
@@ -273,8 +263,8 @@ def test_attention_residual_pass_configs_and_vf_stack_flag_policy(
     )
 
 
-def test_cann_9_3_surface_adds_new_primitives_and_leaves_cann_9_2_inert() -> None:
-    """Expose T.Stage, T.assume_no_conflict, and AscendMGroupedTileScheduler on CANN 9.3 only."""
+def test_cann_9_3_surface_exposes_new_primitives() -> None:
+    """Expose T.Stage, T.assume_no_conflict, and AscendMGroupedTileScheduler on CANN 9.3."""
     spec_93 = load_cann_surface("cann_9_3")
     by_sym_93 = {entry.symbol: entry for entry in spec_93.primitives}
     assert "T.Stage" in by_sym_93
@@ -308,7 +298,3 @@ def test_cann_9_3_surface_adds_new_primitives_and_leaves_cann_9_2_inert() -> Non
     }
     assert "AscendMGroupedTileScheduler" in ragged_prims
     assert "AscendMGroupedTileScheduler" not in affine_prims
-
-    cann_92_text = _CANN_92_TOML_PATH.read_text(encoding="utf-8")
-    for sym in ("T.Stage", "T.assume_no_conflict", "AscendMGroupedTileScheduler"):
-        assert sym not in cann_92_text

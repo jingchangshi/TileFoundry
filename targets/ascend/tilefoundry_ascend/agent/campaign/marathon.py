@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     CannbenchOpsRegistry,
     PerfTargetSpec,
@@ -34,6 +34,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_operator_task,
     parse_simple_env_file,
 )
+from tilefoundry_ascend.ascend.json_record import atomic_write_text
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CAMPAIGN_DEVICE_IDS_ENV_KEY,
     CampaignConfig,
@@ -259,22 +260,6 @@ def short_operator_tag(operator_name: str) -> str:
     """Return short filesystem tag for an operator name or task id."""
     norm = operator_name.rsplit("/", 1)[-1] if "/" in operator_name else operator_name
     return norm.replace("_", "-")
-
-
-def atomic_write_text(path: Path, text: str) -> None:
-    """Atomically write UTF-8 text via mkstemp, fsync, and replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
 
 
 def _resolve_cann_root_from_env(env_file: Path | None) -> Path | None:

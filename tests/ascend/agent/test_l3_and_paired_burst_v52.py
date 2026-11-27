@@ -18,8 +18,8 @@ from tests.ascend.benchmarks.l3_contract import (
     infrastructure_failure,
 )
 from tilefoundry_ascend.agent.campaign import surrogate_cannbench
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec
-from tilefoundry_ascend.agent.campaign.fault_types import FaultPlane, TypedFault
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec
+from tilefoundry_ascend.agent.specs.fault_types import FaultPlane, TypedFault
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
     DeterministicSearchBoundaryLedger,
     RoundFunnelEvent,

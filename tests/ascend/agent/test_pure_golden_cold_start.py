@@ -17,7 +17,7 @@ import pytest
 from tests.ascend.benchmarks.cannbench_contract import ParamBuilder
 from tilefoundry_ascend.agent.campaign import marathon
 from tilefoundry_ascend.agent.campaign import surrogate_cannbench
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     DEFAULT_REGIME_SPECS,
     AnchorCaseSpec,
     CannbenchOpsRegistry,

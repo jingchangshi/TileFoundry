@@ -17,7 +17,7 @@ import pytest
 import yaml
 
 from tilefoundry_ascend.agent.campaign import surrogate_cannbench
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec
 from tilefoundry_ascend.agent.orchestrator import gate_funnel
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,

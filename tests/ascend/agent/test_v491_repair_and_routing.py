@@ -15,7 +15,7 @@ from tilefoundry_ascend.agent import (
     PortfolioRunner,
     TwoLaneBeamSearch,
 )
-from tilefoundry_ascend.agent.campaign.anchor_specs import RegimeTargetSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import RegimeTargetSpec
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     _reject_trackb_context_markers,
     patch_regime_into_module,

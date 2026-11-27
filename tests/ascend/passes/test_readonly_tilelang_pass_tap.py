@@ -102,24 +102,26 @@ def test_reconcile_post_lower_device_mod_tracks_asymmetric_sid_aiv_pipe_v() -> N
     assert res.ledger.ub_scalar_compute_loops == 0
 
 
-def test_resolve_cann_series_clamps_implicit_cann92_to_cann93(
+def test_resolve_cann_series_resolves_cann93(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify env/path cann_9_2 resolves to cann_9_3 while explicit cann_9_2 remains selectable."""
+    """Verify default, env, and path resolution consistently resolve to cann_9_3."""
     monkeypatch.delenv("TILEFOUNDRY_CANN_SERIES", raising=False)
     monkeypatch.delenv("TILEFOUNDRY_NPU_CANN_SERIES", raising=False)
     monkeypatch.delenv("ASCEND_HOME_PATH", raising=False)
     monkeypatch.delenv("ASCEND_TOOLKIT_HOME", raising=False)
 
-    monkeypatch.setenv("TILEFOUNDRY_CANN_SERIES", "cann_9_2")
+    assert resolve_cann_series() == DEFAULT_CANN_SERIES == "cann_9_3"
+
+    monkeypatch.setenv("TILEFOUNDRY_CANN_SERIES", "cann_9_3")
     assert resolve_cann_series() == DEFAULT_CANN_SERIES == "cann_9_3"
     monkeypatch.delenv("TILEFOUNDRY_CANN_SERIES", raising=False)
 
-    monkeypatch.setenv("TILEFOUNDRY_NPU_CANN_SERIES", "cann_9_2")
+    monkeypatch.setenv("TILEFOUNDRY_NPU_CANN_SERIES", "cann_9_3")
     assert resolve_cann_series() == "cann_9_3"
     monkeypatch.delenv("TILEFOUNDRY_NPU_CANN_SERIES", raising=False)
 
-    monkeypatch.setenv("ASCEND_HOME_PATH", "/opt/Ascend/cann-9.2.0")
+    monkeypatch.setenv("ASCEND_HOME_PATH", "/opt/Ascend/cann-9.3.0")
     assert resolve_cann_series() == "cann_9_3"
-    assert resolve_cann_series(cann_home="/opt/Ascend/cann-9.2.0") == "cann_9_3"
-    assert resolve_cann_series("cann_9_2") == "cann_9_2"
+    assert resolve_cann_series(cann_home="/opt/Ascend/cann-9.3.0") == "cann_9_3"
+    assert resolve_cann_series("cann_9_3") == "cann_9_3"

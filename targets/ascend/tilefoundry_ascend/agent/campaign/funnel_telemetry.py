@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
-from tilefoundry_ascend.agent.campaign.fault_types import (
+from tilefoundry_ascend.agent.specs.fault_types import (
     FaultPlane,
     L3Resolution,
     TypedFault,

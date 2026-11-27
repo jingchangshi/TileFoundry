@@ -4,7 +4,7 @@ import contextlib
 from typing import Any
 
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
-from tilefoundry_ascend.ascend.templates.registry import (
+from tilefoundry_ascend.ascend.templates.shells import (
     SHELL_AIC_GEMM_FIXPIPE,
     SHELL_AIV_SIMD_STREAM,
     SHELL_AIV_SIMT_ATOMIC,

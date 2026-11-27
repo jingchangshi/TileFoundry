@@ -19,24 +19,12 @@ import tempfile
 import time
 from typing import TypeVar
 
-from tilefoundry_ascend.agent.campaign import (
-    l3_l4_recovery as _l3_l4_recovery_mod,
-    stage_gate_coordinator as _stage_gate_coordinator_mod,
-    telemetry_ledger_writer as _telemetry_ledger_writer_mod,
-)
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
-    AnchorCaseSpec, CasePhysicsRatios, GuardrailCaseSpec, PerfTargetSpec, RegimeTargetSpec,
-    compute_case_eq3_score, default_source_root, extract_trackb_cpp_source, get_default_anchors,
-    get_default_perf_target, get_default_regime_specs, get_operator_module_relpath,
-    lookup_case_dims, lookup_case_metadata, parse_simple_env_file, resolve_cannbench_repo,
-    resolve_cannbench_tasks_root, resolve_regime_for_case,
-)
+import tilefoundry_ascend.agent.campaign.l3_l4_recovery as _l3_l4_recovery_mod
+import tilefoundry_ascend.agent.campaign.stage_gate_coordinator as _stage_gate_coordinator_mod
+import tilefoundry_ascend.agent.campaign.telemetry_ledger_writer as _telemetry_ledger_writer_mod
 from tilefoundry_ascend.agent.campaign.calibration_service import (
     CalibrationService, CalibrationSnapshot,
     _invoke_with_optional_kwargs as _cal_invoke_with_optional_kwargs,
-)
-from tilefoundry_ascend.agent.campaign.fault_types import (
-    FaultPlane, L3Resolution, TypedFault, coerce_fault_plane,
 )
 from tilefoundry_ascend.agent.campaign.flywheel_coordinator import FlywheelCoordinator
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
@@ -45,14 +33,27 @@ from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
 )
 from tilefoundry_ascend.agent.campaign.l3_l4_recovery import (
     CAMPAIGN_DEVICE_IDS_ENV_KEY, L3L4RecoveryCoordinator, PendingL4,
-    atomic_write_text as _atomic_write_text, canonical_device_id as _canonical_device_id,
+    canonical_device_id as _canonical_device_id,
     is_occupancy_blocked_env as _is_occupancy_blocked_env, parse_device_ids,
     resolve_campaign_device_plan, resolve_l4_device_pool as _resolve_l4_device_pool,
     write_source_and_verify,
 )
-from tilefoundry_ascend.agent.campaign.latency_algebra import (
+from tilefoundry_ascend.agent.contracts import CampaignRoundRecord
+from tilefoundry_ascend.agent.probes import LocalHardwareProbePort
+from tilefoundry_ascend.agent.specs.anchor_specs import (
+    AnchorCaseSpec, GuardrailCaseSpec, PerfTargetSpec, RegimeTargetSpec,
+    compute_case_eq3_score, default_source_root, extract_trackb_cpp_source, get_default_anchors,
+    get_default_perf_target, get_default_regime_specs, get_operator_module_relpath,
+    lookup_case_dims, lookup_case_metadata, parse_simple_env_file, resolve_cannbench_repo,
+    resolve_cannbench_tasks_root, resolve_regime_for_case,
+)
+from tilefoundry_ascend.agent.specs.fault_types import (
+    FaultPlane, L3Resolution, TypedFault, coerce_fault_plane,
+)
+from tilefoundry_ascend.agent.specs.latency_algebra import (
     calibrate_dispatch_floor_us, compute_paired_sigma_us, geometric_speedup,
 )
+from tilefoundry_ascend.ascend.json_record import atomic_write_text as _atomic_write_text
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import (
     PendingPromotion, PromotionCoordinator, RankedL2Candidate, RankedL2Survivors,
     select_top_two_l2_survivors, to_conservation_point,
@@ -128,7 +129,11 @@ from tilefoundry_ascend.ascend.schedule.regime_solver import (
     RegimePiecewiseSolver, RegimePlanResult,
 )
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import PyTorchOpSemantics
-from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask, TopologyAxes
+from tilefoundry_ascend.ascend.sil.schema import (
+    CasePhysicsRatios,
+    ConstraintRelaxationMask,
+    TopologyAxes,
+)
 from tilefoundry_ascend.ascend.target import AscendTarget
 
 logger = logging.getLogger(__name__)
@@ -188,146 +193,6 @@ class CampaignConfig:
     pure_golden: bool = False
     cost_model_mode: str = "off"
     enable_phase0_lattice_sweep: bool = False
-
-
-@dataclass(frozen=True)
-class CampaignRoundRecord:
-    """Telemetry snapshot recorded at the completion of one campaign round."""
-
-    round_idx: int
-    regime_tag: str
-    builder_name: str
-    parent_lane: str
-    creative_effort: str
-    l0_l1_passed_ids: tuple[str, ...]
-    l0_l1_failed: tuple[tuple[str, str, str], ...]
-    best_round_speedup: float
-    best_so_far_speedup: float
-    promoted: bool
-    l3_resolution: str = L3Resolution.NOT_RUN.value
-    stagnation_rounds_after: int = 0
-    admitted_rule_ids: tuple[str, ...] = ()
-    best_round_surrogate_score: float = 0.0
-    best_so_far_surrogate_score: float = 0.0
-    pruned_rule_ids: tuple[str, ...] = ()
-    promotion_attempts: tuple[dict[str, str], ...] = ()
-    trackb_evidence: tuple[dict[str, object], ...] = ()
-    cost_model_mode: str = "off"
-    cost_model_engaged: bool = False
-    cost_model_reason: str = ""
-    local_rel_gain: float = 0.0
-    tail_guard_reject_reason: str = ""
-    paradigm_shift_active: bool = False
-    paradigm_shift_rule_ids: tuple[str, ...] = ()
-    round_spearman_rho: float | None = None
-    prescreen_pruned_ids: tuple[str, ...] = ()
-    l3_failed_cases: tuple[int, ...] = ()
-    l3_failure_stage: str = ""
-    infeasible_boundaries_added: int = 0
-    stage_timings_sec: dict[str, float] = field(default_factory=dict)
-    prewarm_stats: dict[str, int] = field(default_factory=dict)
-    cost_advisor_predictions: int = 0
-
-    def to_dict(self) -> dict[str, object]:
-        """Serialize CampaignRoundRecord into a JSON-compatible dictionary."""
-        return {
-            "round_idx": self.round_idx, "regime_tag": self.regime_tag,
-            "builder_name": self.builder_name, "parent_lane": self.parent_lane,
-            "creative_effort": self.creative_effort,
-            "l0_l1_passed_ids": list(self.l0_l1_passed_ids),
-            "l0_l1_failed": [list(item) for item in self.l0_l1_failed],
-            "best_round_speedup": round(self.best_round_speedup, 6),
-            "best_so_far_speedup": round(self.best_so_far_speedup, 6),
-            "best_round_surrogate_score": round(self.best_round_surrogate_score, 6),
-            "best_so_far_surrogate_score": round(self.best_so_far_surrogate_score, 6),
-            "promoted": self.promoted, "l3_resolution": self.l3_resolution,
-            "stagnation_rounds_after": self.stagnation_rounds_after,
-            "admitted_rule_ids": list(self.admitted_rule_ids),
-            "pruned_rule_ids": list(self.pruned_rule_ids),
-            "promotion_attempts": [dict(item) for item in self.promotion_attempts],
-            "trackb_evidence": [dict(item) for item in self.trackb_evidence],
-            "cost_model_mode": self.cost_model_mode,
-            "cost_model_engaged": self.cost_model_engaged,
-            "cost_model_reason": self.cost_model_reason,
-            "local_rel_gain": round(self.local_rel_gain, 6),
-            "tail_guard_reject_reason": self.tail_guard_reject_reason,
-            "paradigm_shift_active": bool(self.paradigm_shift_active),
-            "paradigm_shift_rule_ids": list(self.paradigm_shift_rule_ids),
-            "round_spearman_rho": (
-                round(float(self.round_spearman_rho), 6)
-                if self.round_spearman_rho is not None else None
-            ),
-            "prescreen_pruned_ids": list(self.prescreen_pruned_ids),
-            "l3_failed_cases": list(self.l3_failed_cases),
-            "l3_failure_stage": self.l3_failure_stage,
-            "infeasible_boundaries_added": int(self.infeasible_boundaries_added),
-            "stage_timings_sec": {
-                str(k): round(float(v), 6) for k, v in self.stage_timings_sec.items()
-            },
-            "prewarm_stats": {str(k): int(v) for k, v in self.prewarm_stats.items()},
-            "cost_advisor_predictions": int(self.cost_advisor_predictions),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> CampaignRoundRecord:
-        """Reconstruct CampaignRoundRecord from a JSON mapping."""
-        failed = tuple(
-            (str(it[0]), str(it[1]), str(it[2]))
-            for it in payload.get("l0_l1_failed", ())
-            if isinstance(it, Sequence) and len(it) >= 3
-        )
-        raw_rho = payload.get("round_spearman_rho")
-        rho = float(raw_rho) if raw_rho is not None and not isinstance(raw_rho, bool) else None
-        raw_t = payload.get("stage_timings_sec")
-        timings = (
-            {str(k): float(v) for k, v in raw_t.items()
-             if isinstance(v, (int, float)) and not isinstance(v, bool)}
-            if isinstance(raw_t, Mapping) else {}
-        )
-        raw_pw = payload.get("prewarm_stats")
-        prewarm = (
-            {str(k): int(v) for k, v in raw_pw.items()
-             if isinstance(v, (int, float)) and not isinstance(v, bool)}
-            if isinstance(raw_pw, Mapping) else {}
-        )
-        return cls(
-            round_idx=int(payload["round_idx"]), regime_tag=str(payload["regime_tag"]),
-            builder_name=str(payload["builder_name"]), parent_lane=str(payload["parent_lane"]),
-            creative_effort=str(payload["creative_effort"]),
-            l0_l1_passed_ids=tuple(str(x) for x in payload.get("l0_l1_passed_ids", ())),
-            l0_l1_failed=failed, best_round_speedup=float(payload["best_round_speedup"]),
-            best_so_far_speedup=float(payload["best_so_far_speedup"]),
-            promoted=bool(payload["promoted"]),
-            l3_resolution=str(payload.get("l3_resolution", L3Resolution.NOT_RUN.value)),
-            stagnation_rounds_after=int(payload["stagnation_rounds_after"]),
-            admitted_rule_ids=tuple(str(x) for x in payload.get("admitted_rule_ids", ())),
-            best_round_surrogate_score=float(payload.get("best_round_surrogate_score", 0.0)),
-            best_so_far_surrogate_score=float(payload.get("best_so_far_surrogate_score", 0.0)),
-            pruned_rule_ids=tuple(str(x) for x in payload.get("pruned_rule_ids", ())),
-            promotion_attempts=tuple(
-                {str(k): str(v) for k, v in item.items()}
-                for item in payload.get("promotion_attempts", ()) if isinstance(item, Mapping)
-            ),
-            trackb_evidence=tuple(
-                dict(it) for it in payload.get("trackb_evidence", ()) if isinstance(it, Mapping)
-            ),
-            cost_model_mode=str(payload.get("cost_model_mode", "off") or "off"),
-            cost_model_engaged=bool(payload.get("cost_model_engaged", False)),
-            cost_model_reason=str(payload.get("cost_model_reason", "") or ""),
-            local_rel_gain=float(payload.get("local_rel_gain", 0.0) or 0.0),
-            tail_guard_reject_reason=str(payload.get("tail_guard_reject_reason", "") or ""),
-            paradigm_shift_active=bool(payload.get("paradigm_shift_active", False)),
-            paradigm_shift_rule_ids=tuple(
-                str(x) for x in payload.get("paradigm_shift_rule_ids", ())
-            ),
-            round_spearman_rho=rho,
-            prescreen_pruned_ids=tuple(str(x) for x in (payload.get("prescreen_pruned_ids") or ())),
-            l3_failed_cases=tuple(int(x) for x in (payload.get("l3_failed_cases") or ())),
-            l3_failure_stage=str(payload.get("l3_failure_stage", "") or ""),
-            infeasible_boundaries_added=int(payload.get("infeasible_boundaries_added", 0) or 0),
-            stage_timings_sec=timings, prewarm_stats=prewarm,
-            cost_advisor_predictions=int(payload.get("cost_advisor_predictions", 0) or 0),
-        )
 
 
 @dataclass
@@ -3444,6 +3309,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     flywheel = FlywheelDistiller(
         funnel=GateFunnel(skip_stage_b=True),
         tracker=tracker,
+        probe_port=LocalHardwareProbePort(),
     )
     runner = PerfTargetCampaignRunner(
         config=cfg,

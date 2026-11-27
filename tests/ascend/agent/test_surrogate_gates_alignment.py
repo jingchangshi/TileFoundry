@@ -12,7 +12,7 @@ from typing import Any, Mapping
 import pytest
 
 from tilefoundry_ascend.agent.campaign import surrogate_cannbench
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec
 
 _FAST_GATE = "tilefoundry-npu-device-fast"
 _L3_GATE = "tilefoundry-npu-l3-promotion"

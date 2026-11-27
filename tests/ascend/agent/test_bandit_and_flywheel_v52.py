@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from tilefoundry_ascend.agent.campaign import campaign_runner, surrogate_cannbench
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     CannbenchOpsRegistry,
     PerfTargetSpec,
@@ -31,7 +31,6 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     aggregate_surrogate_result,
     build_anchor_metrics,
 )
-from tilefoundry_ascend.agent.campaign.transfer_audit import summarize_funnel_and_transfer
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
     FlywheelDistiller,
     _validate_distilled_rule,
@@ -626,97 +625,6 @@ def make_kernel():
     assert edge["origin_operator"] == "demo_op"
     assert float(edge["origin_timestamp"]) > 0.0
     assert edge["distilled_rule_ids"] == admitted
-
-
-def test_e_transfer_audit_excludes_seed_rules_and_pre_origin_events(tmp_path: Path) -> None:
-    """Transfer matrix excludes seed rules and causal-filters same-op events <= origin_ts."""
-    lake_dir = tmp_path / "lake"
-    rules_dir = lake_dir / "kb" / "distilled_rules"
-    rules_dir.mkdir(parents=True, exist_ok=True)
-    (rules_dir / "R_FLYWHEEL_01.json").write_text(
-        json.dumps(
-            {
-                "rule_id": "R_FLYWHEEL_01",
-                "origin_operator": "op_src",
-                "origin_timestamp": 1000.0,
-                "topology_axes": {
-                    "compute_engine": "aiv_only",
-                    "memory_ring": "gm_ub_stream",
-                    "iteration_regularity": "dense_static",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    ev_dir = lake_dir / "kb" / "evidence"
-    ev_dir.mkdir(parents=True, exist_ok=True)
-    (ev_dir / "winning_edges.jsonl").write_text(
-        json.dumps(
-            {
-                "operator": "op_src",
-                "rule_id": "R08_SEED_RULE",
-                "staged_rule_ids": ["R_FLYWHEEL_01"],
-                "timestamp": 1000.0,
-                "topology_axes": {
-                    "compute_engine": "aiv_only",
-                    "memory_ring": "gm_ub_stream",
-                    "iteration_regularity": "dense_static",
-                },
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    axes = {
-        "compute_engine": "aiv_only",
-        "memory_ring": "gm_ub_stream",
-        "iteration_regularity": "dense_static",
-    }
-    events = [
-        {
-            "operator": "op_other",
-            "rule_id": "R08_SEED_RULE",
-            "topology_axes": axes,
-            "promoted_l3": True,
-            "delta_speedup": 0.40,
-            "timestamp": 2000.0,
-        },
-        {
-            "operator": "op_src",
-            "rule_id": "R_FLYWHEEL_01",
-            "topology_axes": axes,
-            "promoted_l3": True,
-            "delta_speedup": 0.50,
-            "timestamp": 900.0,
-        },
-        {
-            "operator": "op_src",
-            "rule_id": "R_FLYWHEEL_01",
-            "topology_axes": axes,
-            "promoted_l3": True,
-            "delta_speedup": 0.20,
-            "timestamp": 1100.0,
-        },
-        {
-            "operator": "op_target",
-            "rule_id": "R_FLYWHEEL_01",
-            "topology_axes": axes,
-            "promoted_l3": True,
-            "delta_speedup": 0.30,
-            "timestamp": 950.0,
-        },
-    ]
-    report = summarize_funnel_and_transfer(events, experience_lake_dir=lake_dir)
-    matrix = report["distilled_rule_transfer_matrix"]
-    assert isinstance(matrix, list)
-    rids = {row["rule_id"] for row in matrix}
-    assert "R08_SEED_RULE" not in rids
-    assert rids == {"R_FLYWHEEL_01"}
-    by_target = {row["target_operator"]: row for row in matrix}
-    assert by_target["op_src"]["dispatches"] == 1
-    assert by_target["op_src"]["first_hit_delta_speedup"] == 0.2
-    assert by_target["op_target"]["dispatches"] == 1
 
 
 def test_f_trackb_malformed_search_replace_raises_patch_anchor_miss() -> None:

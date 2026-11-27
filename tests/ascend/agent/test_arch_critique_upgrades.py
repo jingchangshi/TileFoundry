@@ -10,9 +10,7 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import CampaignConfig
 from tilefoundry_ascend.agent.campaign.marathon import MarathonConfig
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import PortfolioRunner
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
-    PrescreenAblationSample,
     TileConfigCandidate,
-    evaluate_prescreen_ablation,
     evaluate_tile_candidate,
 )
 from tilefoundry_ascend.agent.router import (
@@ -516,35 +514,3 @@ def test_tilesize_prescreen_default_off_per_dtype_half_l1_and_ablation_gate() ->
     assert fp16_score.half_l1_penalty == 0.0
     assert no_split_score.half_l1_penalty == 0.0
     assert no_split_score.score <= fp16_score.score
-
-    assert evaluate_prescreen_ablation([]).recommended_enable is False
-
-    anchor_regressed = evaluate_prescreen_ablation(
-        [
-            PrescreenAblationSample("gqa_anchor", baseline_score=0.80, prescreen_score=0.77, is_anchor=True),
-            PrescreenAblationSample("gemm_new", baseline_score=0.50, prescreen_score=0.65, is_anchor=False),
-        ],
-        min_mean_gain=0.01,
-    )
-    assert anchor_regressed.recommended_enable is False
-    assert anchor_regressed.anchor_regression_count == 1
-    assert anchor_regressed.anchor_regressions == ("gqa_anchor",)
-
-    low_gain = evaluate_prescreen_ablation(
-        [
-            PrescreenAblationSample("op1", baseline_score=0.80, prescreen_score=0.802, is_anchor=True),
-        ],
-        min_mean_gain=0.01,
-    )
-    assert low_gain.recommended_enable is False
-
-    approved = evaluate_prescreen_ablation(
-        [
-            PrescreenAblationSample("gqa_anchor", baseline_score=0.80, prescreen_score=0.83, is_anchor=True),
-            PrescreenAblationSample("gemm_new", baseline_score=0.50, prescreen_score=0.55, is_anchor=False),
-        ],
-        min_mean_gain=0.01,
-    )
-    assert approved.recommended_enable is True
-    assert approved.anchor_regression_count == 0
-    assert approved.mean_gain == pytest.approx(0.04)

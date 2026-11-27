@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec, RegimeTargetSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec, RegimeTargetSpec
 from tilefoundry_ascend.agent.campaign.calibration_service import (
     CalibrationService,
     CalibrationSnapshot,

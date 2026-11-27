@@ -40,7 +40,7 @@ from tilefoundry_ascend.agent.campaign import (
     patch_regime_into_module,
     surrogate_cannbench,
 )
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     DEFAULT_REGIME_SPECS,
     CannbenchOpsRegistry,
 )

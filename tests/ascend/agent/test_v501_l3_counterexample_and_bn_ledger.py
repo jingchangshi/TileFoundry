@@ -15,7 +15,7 @@ from tilefoundry_ascend.agent.campaign import (
     stage_gate_coordinator,
     surrogate_cannbench,
 )
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
     RegimeTargetSpec,

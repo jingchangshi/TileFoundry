@@ -14,13 +14,13 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
-    CasePhysicsRatios,
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     RegimeTargetSpec,
     extract_trackb_cpp_source,
     get_operator_entrypoint,
     parse_simple_env_file,
 )
+from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
 from tilefoundry_ascend.agent.orchestrator import (
     cpp_slice_protocol as _cpp_slice_protocol_mod,
 )
@@ -46,6 +46,8 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import extract_python_dsl
 
+from tilefoundry_ascend.ascend.json_record import atomic_write_text as _atomic_write_text
+
 DEFAULT_READONLY_HOST_EXPORTS: tuple[str, ...] = (
     "kernel",
     "ref_kernel",
@@ -54,29 +56,6 @@ DEFAULT_READONLY_HOST_EXPORTS: tuple[str, ...] = (
     "_KERNEL_CACHE",
     "_ENTRY_CACHE",
 )
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Atomically write *content* to *path* using a same-directory temporary file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            tmp_path = Path(fh.name)
-            fh.write(content)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
 
 
 def _derive_dynamic_protected_symbols(

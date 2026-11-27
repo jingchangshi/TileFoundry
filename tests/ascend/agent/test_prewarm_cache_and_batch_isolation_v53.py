@@ -16,7 +16,7 @@ import yaml
 
 from tests.ascend.agent import test_surrogate_batch_npu as batch_harness
 from tilefoundry_ascend.agent.campaign import marathon, surrogate_cannbench
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec
 from tilefoundry_ascend.agent.campaign.campaign_runner import resolve_campaign_device_plan
 
 
@@ -745,7 +745,7 @@ def test_poison_pill_subprocess_isolates_crash_and_timeout_without_breaking_pair
     site_dir.mkdir()
     (site_dir / "sitecustomize.py").write_text(
         "from types import SimpleNamespace\n"
-        "from tilefoundry_ascend.agent.campaign import anchor_specs\n"
+        "from tilefoundry_ascend.agent.specs import anchor_specs\n"
         "class _T:\n"
         "    def npu(self): return self\n"
         "class _H:\n"

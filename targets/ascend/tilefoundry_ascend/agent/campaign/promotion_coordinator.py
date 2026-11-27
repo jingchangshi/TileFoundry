@@ -7,14 +7,14 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     GuardrailCaseSpec,
     RegimeTargetSpec,
 )
-from tilefoundry_ascend.agent.campaign.fault_types import L3Resolution
+from tilefoundry_ascend.agent.specs.fault_types import L3Resolution
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import MAX_CLEAN_CALIBRATION_BURST_CV
-from tilefoundry_ascend.agent.campaign.latency_algebra import (
+from tilefoundry_ascend.agent.specs.latency_algebra import (
     AnchorConservationPoint,
     check_family_and_sibling_non_regression,
     check_guardrail_non_regression,

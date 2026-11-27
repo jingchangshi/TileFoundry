@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec, PerfTargetSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec, PerfTargetSpec
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     PerfTargetCampaignRunner,
@@ -39,8 +39,6 @@ from tilefoundry_ascend.ascend.cost_model import (
     HybridAscendCostModel,
     build_cost_features_from_ledger,
     evaluate_cost_model_ranking,
-    load_official_reports,
-    run_cost_model_backtest,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
@@ -395,147 +393,3 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
     assert set(changed_rids).issubset(set(prior_trials))
     assert "r1_rule_0" in report.rounds[0].l0_l1_passed_ids
     assert "r1_creative" in report.rounds[0].l0_l1_passed_ids
-
-    rep_dir1 = tmp_path / "reports_a"
-    rep_dir2 = tmp_path / "reports_b"
-    payload = {
-        "operators": [
-            {
-                "rel_path": "level2/fake_op_a",
-                "operator": "FakeOpA",
-                "score": 80.0,
-                "cases": [
-                    {
-                        "case_id": "level2/fake_op_a_1",
-                        "elapsed_us": 6.0,
-                        "t_hw_us": 2.0,
-                        "baseline_perf_us": 10.0,
-                        "speedup": 1.67,
-                        "perf_score": 80.0,
-                        "accuracy": {"passed": True},
-                    },
-                    {
-                        "case_id": "level2/fake_op_a_2",
-                        "elapsed_us": 18.0,
-                        "t_hw_us": 10.0,
-                        "baseline_perf_us": 30.0,
-                        "speedup": 1.67,
-                        "perf_score": 80.0,
-                        "accuracy": {"passed": True},
-                    },
-                ],
-            },
-            {
-                "rel_path": "level3/fake_op_b",
-                "operator": "FakeOpB",
-                "score": 70.0,
-                "cases": [
-                    {
-                        "case_id": "level3/fake_op_b_1",
-                        "elapsed_us": 9.0,
-                        "t_hw_us": 3.0,
-                        "baseline_perf_us": 15.0,
-                        "speedup": 1.67,
-                        "perf_score": 70.0,
-                        "accuracy": {"passed": True},
-                    },
-                    {
-                        "case_id": "level3/fake_op_b_2",
-                        "elapsed_us": 24.0,
-                        "t_hw_us": 12.0,
-                        "baseline_perf_us": 36.0,
-                        "speedup": 1.50,
-                        "perf_score": 70.0,
-                        "accuracy": {"passed": True},
-                    },
-                ],
-            },
-        ]
-    }
-    rep_dir1.mkdir(parents=True)
-    rep_dir2.mkdir(parents=True)
-    (rep_dir1 / "official_final.json").write_text(json.dumps(payload), encoding="utf-8")
-    (rep_dir2 / "official_final.json").write_text(json.dumps(payload), encoding="utf-8")
-    missing_ops = tmp_path / "no_tasks_here"
-    with pytest.raises(ValueError, match="Canonical ops_root does not exist"):
-        load_official_reports([rep_dir1, rep_dir2], ops_root=missing_ops)
-
-    tmp_ops = tmp_path / "ops_tasks"
-    op_a_dir = tmp_ops / "level2" / "fake_op_a"
-    op_b_dir = tmp_ops / "level3" / "fake_op_b"
-    op_a_dir.mkdir(parents=True)
-    op_b_dir.mkdir(parents=True)
-    (tmp_ops / "metadata").mkdir(parents=True)
-    (tmp_ops / "metadata" / "950pr.json").write_text(
-        json.dumps({"level2": {}, "level3": {}}),
-        encoding="utf-8",
-    )
-    (tmp_ops / "suite_manifest.json").write_text(
-        json.dumps(
-            {
-                "operators": [
-                    {"id": "fake_op_a", "level": "L2", "path": "tasks/level2/fake_op_a"},
-                    {"id": "fake_op_b", "level": "L3", "path": "tasks/level3/fake_op_b"},
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    (op_a_dir / "proto.yaml").write_text(
-        "operator:\n"
-        "  name: fake_op_a\n"
-        "  category: ElementWise\n"
-        "  inputs:\n"
-        "    - name: x\n"
-        "      dtype: [float16]\n"
-        "  outputs:\n"
-        "    - name: y\n"
-        "      dtype: [float16]\n"
-        "  formula: y = exp(x)\n",
-        encoding="utf-8",
-    )
-    (op_a_dir / "cases.yaml").write_text(
-        "cases:\n"
-        "  - case_id: 1\n"
-        "    input_shape: [[16, 1024]]\n"
-        "    dtype: [float16]\n"
-        "  - case_id: 2\n"
-        "    input_shape: [[32, 2048]]\n"
-        "    dtype: [float16]\n",
-        encoding="utf-8",
-    )
-    (op_b_dir / "proto.yaml").write_text(
-        "operator:\n"
-        "  name: fake_op_b\n"
-        "  category: Contraction\n"
-        "  inputs:\n"
-        "    - name: x\n"
-        "      dtype: [float16]\n"
-        "    - name: w\n"
-        "      dtype: [float16]\n"
-        "  outputs:\n"
-        "    - name: y\n"
-        "      dtype: [float16]\n"
-        "  formula: y = x @ w\n",
-        encoding="utf-8",
-    )
-    (op_b_dir / "cases.yaml").write_text(
-        "cases:\n"
-        "  - case_id: 1\n"
-        "    input_shape: [[64, 128], [128, 256]]\n"
-        "    dtype: [float16, float16]\n"
-        "  - case_id: 2\n"
-        "    input_shape: [[128, 256], [256, 512]]\n"
-        "    dtype: [float16, float16]\n",
-        encoding="utf-8",
-    )
-
-    recs, scanned, dedup_reps = load_official_reports([rep_dir1, rep_dir2], ops_root=tmp_ops)
-    assert scanned == 2
-    assert dedup_reps == 2
-    assert len(recs) == 4
-
-    summary = run_cost_model_backtest([rep_dir1, rep_dir2], ops_root=tmp_ops)
-    assert summary.unique_operator_cases == 4
-    assert summary.p0_p1_loco_cv.mean_intra_group_spearman_rho == pytest.approx(1.0)
-    assert summary.enable_prescreen_recommended is False

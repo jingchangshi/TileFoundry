@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
     RegimeTargetSpec,

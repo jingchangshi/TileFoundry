@@ -53,7 +53,7 @@ from typing import TypeVar
 
 import yaml
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
+from tilefoundry_ascend.agent.specs.anchor_specs import CannbenchOpsRegistry
 
 EVIDENCE_ENV = "TF_L3_EVIDENCE_PATH"
 PROFILE_ENV = "TF_L3_PROFILE"

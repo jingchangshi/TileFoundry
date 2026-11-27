@@ -21,7 +21,7 @@ from tilefoundry.vendor.tilelang_z3 import (
     Reuse,
     Task,
 )
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
     RegimeTargetSpec,

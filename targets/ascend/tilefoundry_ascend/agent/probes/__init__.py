@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tilefoundry_ascend.agent.probes._cann_env import (
+    LocalHardwareProbePort,
     ensure_cann_include_cpath,
     run_msprof_detail,
 )
@@ -18,6 +19,7 @@ from tilefoundry_ascend.agent.probes.probe_ssbuf_latency import run_ssbuf_probe
 
 __all__ = [
     "DEFAULT_HBM_BURST_BYTES",
+    "LocalHardwareProbePort",
     "build_hbm_burst_probe_func",
     "ensure_cann_include_cpath",
     "run_fixpipe_probe",

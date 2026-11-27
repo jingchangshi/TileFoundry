@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from tilefoundry_ascend.agent.campaign import marathon, surrogate_cannbench
-from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry, RegimeTargetSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import CannbenchOpsRegistry, RegimeTargetSpec
 from tilefoundry_ascend.agent.campaign.campaign_runner import _extract_trackb_cpp_source
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import run_l1_compile_check
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (

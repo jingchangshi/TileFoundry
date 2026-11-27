@@ -174,7 +174,7 @@ def _ensure_cost_advisor_stub() -> None:
 _ensure_cost_advisor_stub()
 
 from tilefoundry_ascend.agent.campaign import campaign_runner  # noqa: E402
-from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: E402
+from tilefoundry_ascend.agent.specs.anchor_specs import (  # noqa: E402
     AnchorCaseSpec,
     GuardrailCaseSpec,
     PerfTargetSpec,

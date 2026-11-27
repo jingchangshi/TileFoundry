@@ -9,14 +9,14 @@ import pytest
 import torch
 
 from tests.ascend.agent import test_surrogate_batch_npu as npu_batch
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     GuardrailCaseSpec,
     RegimeTargetSpec,
     collect_distinct_static_width_dims,
     compute_case_aligned_eta,
 )
-from tilefoundry_ascend.agent.campaign.latency_algebra import (
+from tilefoundry_ascend.agent.specs.latency_algebra import (
     MAD_TO_SIGMA,
     AnchorConservationPoint,
     calibrate_dispatch_floor_from_series,

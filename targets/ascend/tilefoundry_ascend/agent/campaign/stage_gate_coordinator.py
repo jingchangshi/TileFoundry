@@ -22,9 +22,8 @@ from typing import Protocol, TypeVar
 
 import yaml
 
-from tilefoundry_ascend.agent.campaign import surrogate_cannbench as _surrogate_cannbench
-
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+import tilefoundry_ascend.agent.campaign.surrogate_cannbench as _surrogate_cannbench
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     CannbenchOpsRegistry,
     GuardrailCaseSpec,
@@ -44,11 +43,12 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     resolve_cannbench_tasks_root,
     resolve_regime_for_case,
 )
-from tilefoundry_ascend.agent.campaign.fault_types import (
+from tilefoundry_ascend.agent.specs.fault_types import (
     FaultPlane,
     TypedFault,
     coerce_fault_plane,
 )
+from tilefoundry_ascend.ascend.json_record import atomic_write_text
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import DeterministicSearchBoundaryLedger
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import evaluate_promotion_gate
 from tilefoundry_ascend.agent.campaign.regime_slice_patcher import (
@@ -457,27 +457,7 @@ class StageGateCoordinator:
         }
         return runner(*args, **accepted)
 
-    @staticmethod
-    def _atomic_write_text(path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(path.parent),
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as fh:
-                tmp_path = Path(fh.name)
-                fh.write(content)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp_path, path)
-        finally:
-            if tmp_path is not None and tmp_path.exists():
-                tmp_path.unlink(missing_ok=True)
+    _atomic_write_text = staticmethod(atomic_write_text)
 
     @staticmethod
     def _find_top_level_func(tree: ast.Module, names: Sequence[str]) -> ast.FunctionDef | None:

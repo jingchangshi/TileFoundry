@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     GuardrailCaseSpec,
     PerfTargetSpec,
@@ -23,7 +23,7 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     PendingL4,
     PerfTargetCampaignRunner,
 )
-from tilefoundry_ascend.agent.campaign.fault_types import FaultPlane, L3Resolution, TypedFault
+from tilefoundry_ascend.agent.specs.fault_types import FaultPlane, L3Resolution, TypedFault
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import PendingPromotion
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     AgentGatesDeviceFaultError,

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec, PerfTargetSpec, RegimeTargetSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec, PerfTargetSpec, RegimeTargetSpec
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     PerfTargetCampaignRunner,

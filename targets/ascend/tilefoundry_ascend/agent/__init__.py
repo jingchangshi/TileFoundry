@@ -3,21 +3,20 @@
 from __future__ import annotations
 
 from tilefoundry_ascend.agent.campaign import (
-    AnchorCaseSpec,
     AnchorEvalMetrics,
     CampaignConfig,
     CampaignReport,
-    CampaignRoundRecord,
     CandidateSurrogateResult,
     L3AcceptanceResult,
     L4CannbenchResult,
     PerfTargetCampaignRunner,
-    PerfTargetSpec,
-    RegimeTargetSpec,
-    append_dynamic_anchor,
-    get_default_anchors,
-    get_default_perf_target,
     run_surrogate_batch_via_agent_gates,
+)
+from tilefoundry_ascend.agent.contracts import (
+    CampaignRoundRecord,
+    EvolutionRoundRecord,
+    EvolutionTrajectory,
+    WorkerStepRecord,
 )
 from tilefoundry_ascend.agent.flywheel import (
     FlywheelDistillationReport,
@@ -38,13 +37,10 @@ from tilefoundry_ascend.agent.kb import (
 from tilefoundry_ascend.agent.orchestrator import (
     AgyCliLLMBackend,
     BeamCandidate,
-    EvolutionRoundRecord,
-    EvolutionTrajectory,
     GateFunnel,
     GenerationRequest,
     MockLLMBackend,
     PortfolioRunner,
-    StaticDynamicResidual,
     StreamWatchdogConfig,
     TileConfigCandidate,
     TwoLaneBeamSearch,
@@ -57,14 +53,20 @@ from tilefoundry_ascend.agent.orchestrator import (
     generate_aligned_neighborhood,
     prescreen_dsl_tile_kwargs,
     prescreen_tile_configs,
-    run_e2e_evolution,
-    verify_numerical_twin,
-    verify_reference_cpu_parity,
 )
 from tilefoundry_ascend.agent.router import (
     CapabilityGate,
     RouteDecision,
     route_execution_track,
+)
+from tilefoundry_ascend.agent.specs import (
+    AnchorCaseSpec,
+    PerfTargetSpec,
+    RegimeTargetSpec,
+    StaticDynamicResidual,
+    append_dynamic_anchor,
+    get_default_anchors,
+    get_default_perf_target,
 )
 
 __all__ = [
@@ -99,6 +101,7 @@ __all__ = [
     "TileConfigCandidate",
     "TwoLaneBeamSearch",
     "UnsafePredicateError",
+    "WorkerStepRecord",
     "append_dynamic_anchor",
     "build_predicate_context",
     "build_progressive_llm_constraints",
@@ -115,11 +118,8 @@ __all__ = [
     "prescreen_dsl_tile_kwargs",
     "prescreen_tile_configs",
     "route_execution_track",
-    "run_e2e_evolution",
     "run_surrogate_batch_via_agent_gates",
     "safe_eval_predicate",
     "save_rules_yaml",
     "validate_rule_predicate",
-    "verify_numerical_twin",
-    "verify_reference_cpu_parity",
 ]

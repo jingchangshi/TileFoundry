@@ -1,13 +1,8 @@
-"""Tests for 60-op CannbenchOpsRegistry, CannbenchContractOracle, LOO ablation, and proxy guards."""
+"""Tests for 60-op CannbenchOpsRegistry, LOO ablation, and dim passthrough."""
 
 from __future__ import annotations
 
-import asyncio
-import math
-
-import torch
-
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     CannbenchOpsRegistry,
     get_default_anchors,
     get_default_perf_target,
@@ -25,20 +20,13 @@ from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
     decompose_leave_one_out_ablations,
 )
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
-from tilefoundry_ascend.agent.orchestrator.e2e_evolution import run_e2e_evolution
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
-    StageBResult,
     _filter_kwargs_for_callable,
     _merge_dims_into_kwargs,
 )
-from tilefoundry_ascend.agent.orchestrator.llm_client import MockLLMBackend
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     _RULE_CONCEPT_DESCRIPTIONS,
-)
-from tilefoundry_ascend.agent.orchestrator.twin_bridge import (
-    CannbenchContractOracle,
-    compare_cannbench_tensor,
 )
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 
@@ -76,72 +64,6 @@ def test_cannbench_ops_registry_discovers_all_60_ops_and_stratifies() -> None:
     assert m_args.operator == "swi_glu"
 
 
-def test_cannbench_contract_oracle_synthesis_and_mere_mare_bit_exact() -> None:
-    """Verify CannbenchContractOracle synthesis for special and grouped cases."""
-    pos_zero = torch.tensor([0.0], dtype=torch.float32)
-    neg_zero = torch.tensor([-0.0], dtype=torch.float32)
-    assert compare_cannbench_tensor(pos_zero, pos_zero, threshold=0.0)["passed"] is True
-    assert compare_cannbench_tensor(neg_zero, pos_zero, threshold=0.0)["passed"] is False
-
-    gold = torch.tensor([1.0, 2.0, 4.0], dtype=torch.float32)
-    close = torch.tensor([1.0001, 2.0001, 4.0001], dtype=torch.float32)
-    far = torch.tensor([1.5, 2.0, 4.0], dtype=torch.float32)
-    assert compare_cannbench_tensor(close, gold, threshold=1e-3)["passed"] is True
-    assert compare_cannbench_tensor(far, gold, threshold=1e-3)["passed"] is False
-
-    exp_oracle = CannbenchContractOracle("level1/exp")
-    t_inf, _ = exp_oracle.synthesize_case_inputs(12)
-    assert bool(torch.isinf(t_inf[0]).any().item())
-    t_nan, _ = exp_oracle.synthesize_case_inputs(13)
-    assert bool(torch.isnan(t_nan[0]).any().item())
-
-    unique_oracle = CannbenchContractOracle("level3/unique")
-    assert unique_oracle.cases
-    rms_oracle = CannbenchContractOracle("rms_norm")
-    tensors, kwargs = rms_oracle.synthesize_case_inputs(1)
-    assert bool((kwargs["gamma"] != 0).any().item())
-
-    def _rms_norm_cand(x: torch.Tensor, gamma: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
-        xf = x.to(torch.float32)
-        rms = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + epsilon)
-        return (xf * rms * gamma.to(torch.float32)).to(x.dtype)
-
-    ok, reports = rms_oracle.verify_candidate(_rms_norm_cand, case_nums=[1, 7])
-    assert ok is True, reports
-
-    q4_oracle = CannbenchContractOracle("q4_0_dequant_matmul")
-    q4_tensors, q4_kw = q4_oracle.synthesize_case_inputs(2)
-    assert q4_kw["qweight"].dtype == torch.uint8
-    assert bool((q4_kw["scales"] > 0).all().item())
-    assert q4_tensors
-
-    gmm_oracle = CannbenchContractOracle("grouped_matmul_swiglu_quant")
-    _gmm_t, gmm_kw = gmm_oracle.synthesize_case_inputs(7)
-    glist = gmm_kw["group_list"]
-    assert len(glist) >= 2 and any(glist[i] == glist[i - 1] for i in range(1, len(glist)))
-
-    kv_oracle = CannbenchContractOracle("kv_cache_append")
-    small_kv_case = min(kv_oracle.cases, key=lambda c: sum(math.prod(s) for s in c["input_shape"]))
-    cid = int(small_kv_case["case_id"])
-    raw_before, _ = kv_oracle.synthesize_case_inputs(cid)
-    snap_k = raw_before[0].clone()
-
-    def _mutating_kv(k_cache, v_cache, new_k, new_v, slot_mapping):
-        total = k_cache.shape[0] * k_cache.shape[1]
-        fk = k_cache.reshape(total, *k_cache.shape[2:])
-        fv = v_cache.reshape(total, *v_cache.shape[2:])
-        slots = slot_mapping.to(torch.long)
-        for i in range(new_k.shape[0]):
-            s = int(slots[i].item())
-            fk[s] = new_k[i]
-            fv[s] = new_v[i]
-        return k_cache, v_cache
-
-    kv_ok, kv_rep = kv_oracle.verify_candidate(_mutating_kv, case_nums=[cid])
-    assert kv_ok is True, kv_rep
-    assert torch.equal(raw_before[0], snap_k)
-
-
 def test_arbitrary_dim_passthrough_and_r22_r33_descriptions() -> None:
     """Verify arbitrary dims pass through gate_funnel and R22-R33 descriptions exist."""
     def _custom_builder(m_dim: int, k_dim: int, hidden_dim: int, seq_len: int):
@@ -154,62 +76,6 @@ def test_arbitrary_dim_passthrough_and_r22_r33_descriptions() -> None:
     for r_idx in range(22, 34):
         prefix = f"R{r_idx}_"
         assert any(k.startswith(prefix) for k in _RULE_CONCEPT_DESCRIPTIONS), f"missing {prefix}"
-
-
-def test_proxy_device_uses_proportional_pipe_cycles_and_never_prunes_rules() -> None:
-    """Verify _proxy_device derives proportional PMU ratios and skips hardware rule pruning."""
-    baseline_dsl = """
-import tilelang.ascend.language as T
-
-def make_kernel():
-    @T.prim_func
-    def main(
-        X: T.Tensor((128, 128), "bfloat16"),
-        W: T.Tensor((128, 128), "bfloat16"),
-        Y: T.Tensor((128, 128), "float32"),
-    ):
-        with T.Kernel(1):
-            x_l1 = T.alloc_l1((128, 64), "bfloat16")
-            w_l1 = T.alloc_l1((128, 64), "bfloat16")
-            acc = T.alloc_l0c((128, 128), "float32")
-            for kt in T.Pipelined(2, num_stages=1):
-                T.copy(X[0:128, kt * 64 : (kt + 1) * 64], x_l1)
-                T.copy(W[0:128, kt * 64 : (kt + 1) * 64], w_l1)
-                T.gemm(x_l1, w_l1, acc, transpose_B=True, clear_accum=kt == 0)
-            T.copy(acc, Y[0:128, 0:128])
-    return main
-"""
-    tracker = BayesianRuleTracker.from_seed_yaml()
-    for rid, post in tracker.posteriors.items():
-        post.failures = 10
-        post.beta = 20.0
-    for axis_key in ("ce:aic_only", "mr:gm_ub_stream"):
-        for rid in list(tracker.rules)[:3]:
-            st = tracker._ensure_axis_posterior(axis_key, rid)
-            st.failures = 10
-            st.beta = 20.0
-
-    backend = MockLLMBackend(default_response=baseline_dsl)
-    funnel = GateFunnel(compile_runner=lambda _dsl: StageBResult(passed=True))
-    traj = asyncio.run(
-        run_e2e_evolution(
-            problem_name="proxy_no_prune",
-            hir_source="pass",
-            shape_contract="make_kernel()",
-            backend=backend,
-            funnel=funnel,
-            tracker=tracker,
-            initial_dsl_source=baseline_dsl,
-            factory_name="make_kernel",
-            num_rounds=1,
-            k_rule_workers=2,
-        )
-    )
-    assert traj.total_rounds == 1
-    assert traj.rounds[0].pruned_rule_ids == ()
-    assert not any(p.pruned for p in tracker.posteriors.values())
-    for bmap in tracker.axis_posteriors.values():
-        assert not any(p.pruned for p in bmap.values())
 
 
 def test_leave_one_out_ast_and_config_ablation_on_candidate_dsl() -> None:

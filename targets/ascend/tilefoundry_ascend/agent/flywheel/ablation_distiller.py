@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
+from tilefoundry_ascend.agent.contracts import EvolutionTrajectory, HardwareProbePort
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import (
     _RESIDUAL_DEFAULTS,
@@ -26,13 +26,13 @@ from tilefoundry_ascend.agent.kb.schema import (
     save_rules_yaml,
     validate_rule_predicate,
 )
-from tilefoundry_ascend.agent.orchestrator.e2e_evolution import EvolutionTrajectory
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
     StageAResult,
     extract_ordered_tensor_shapes,
     run_stage_a_static,
 )
+from tilefoundry_ascend.agent.specs.ops_registry import CannbenchOpsRegistry
 from tilefoundry_ascend.ascend.passes.observation_space import (
     AxisResidual5D,
     ComputeIssueAxis,
@@ -2467,6 +2467,7 @@ def verify_micro_probe_hardware(
     spec: MicroProbeSpec,
     *,
     probe_runner: Callable[[MicroProbeSpec], Mapping[str, float]] | None = None,
+    probe_port: HardwareProbePort | None = None,
     sigma_paired_us: float | None = None,
     paired_rel_mad: float | None = None,
 ) -> tuple[bool, dict[str, float]]:
@@ -2522,12 +2523,12 @@ def verify_micro_probe_hardware(
     import tilelang  # noqa: PLC0415
     import torch  # noqa: PLC0415
 
-    from tilefoundry_ascend.agent.probes import (  # noqa: PLC0415
-        ensure_cann_include_cpath,
-        run_msprof_detail,
-    )
-
-    ensure_cann_include_cpath()
+    if probe_port is None:
+        raise RuntimeError(
+            "HardwareProbePort is required for live micro-probe verification "
+            "when probe_runner is None."
+        )
+    probe_port.ensure_cann_include_cpath()
 
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         raise RuntimeError("Ascend NPU device is required for live micro-probe verification.")
@@ -2556,7 +2557,7 @@ def verify_micro_probe_hardware(
                 out = kernel(seed, scratch)
                 torch.npu.synchronize()
                 torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
-                prof = run_msprof_detail(
+                prof = probe_port.run_msprof_detail(
                     lambda: kernel(seed, scratch),
                     n_warmup=3,
                     n_repeat=6,
@@ -2565,7 +2566,7 @@ def verify_micro_probe_hardware(
                 out = kernel(seed)
                 torch.npu.synchronize()
                 torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
-                prof = run_msprof_detail(
+                prof = probe_port.run_msprof_detail(
                     lambda: kernel(seed),
                     n_warmup=3,
                     n_repeat=6,
@@ -2579,7 +2580,7 @@ def verify_micro_probe_hardware(
             out = kernel(a, b)
             torch.npu.synchronize()
             torch.testing.assert_close(out.cpu(), a.cpu() + b.cpu(), atol=1e-4, rtol=1e-4)
-            prof = run_msprof_detail(
+            prof = probe_port.run_msprof_detail(
                 lambda: kernel(a, b),
                 n_warmup=3,
                 n_repeat=6,
@@ -3106,12 +3107,14 @@ class FlywheelDistiller:
         funnel: GateFunnel,
         tracker: BayesianRuleTracker,
         probe_runner: Callable[[MicroProbeSpec], Mapping[str, float]] | None = None,
+        probe_port: HardwareProbePort | None = None,
         sigma_paired_us: float | None = None,
         paired_rel_mad: float | None = None,
     ) -> None:
         self._funnel = funnel
         self._tracker = tracker
         self._probe_runner = probe_runner
+        self._probe_port = probe_port
         self._sigma_paired_us = sigma_paired_us
         self._paired_rel_mad = paired_rel_mad
 
@@ -3518,6 +3521,7 @@ class FlywheelDistiller:
             ok, metrics = verify_micro_probe_hardware(
                 probe,
                 probe_runner=self._probe_runner,
+                probe_port=self._probe_port,
                 sigma_paired_us=eff_sigma_arg,
                 paired_rel_mad=eff_mad_arg,
             )

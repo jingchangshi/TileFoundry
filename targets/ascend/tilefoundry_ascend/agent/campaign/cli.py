@@ -9,7 +9,9 @@ import os
 import sys
 from pathlib import Path
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import parse_simple_env_file
+from tilefoundry_ascend.agent.orchestrator.llm_client import create_llm_backend_from_env
+from tilefoundry_ascend.agent.probes import LocalHardwareProbePort
+from tilefoundry_ascend.agent.specs.anchor_specs import parse_simple_env_file
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CAMPAIGN_DEVICE_IDS_ENV_KEY,
     CampaignConfig,
@@ -189,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     flywheel = FlywheelDistiller(
         funnel=GateFunnel(skip_stage_b=True),
         tracker=tracker,
+        probe_port=LocalHardwareProbePort(),
         probe_runner=(
             lambda spec: run_micro_probe_via_agent_gates(
                 spec,

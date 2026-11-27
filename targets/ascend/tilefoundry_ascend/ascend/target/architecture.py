@@ -71,7 +71,7 @@ class DaVinci950(Architecture):
     cce_arch: str = "dav-3510"
     supported_skus: tuple[str, ...] = ("ascend_950pr", "ascend_950dt")
     default_cann_series: str = "cann_9_3"
-    supported_cann_series: tuple[str, ...] = ("cann_9_2", "cann_9_3")
+    supported_cann_series: tuple[str, ...] = ("cann_9_3",)
 
     @property
     def forbid_cube_int4(self) -> bool:

@@ -22,7 +22,7 @@ from tests.ascend.benchmarks.cannbench_contract import (
     _format_nonfinite_diagnostic,
     _wrap_comparator_with_nonfinite_diag,
 )
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     RegimeTargetSpec,
     build_semantic_regime_specs,
@@ -54,7 +54,6 @@ from tilefoundry_ascend.agent.kb import (
     rank_symptom_families,
 )
 from tilefoundry_ascend.agent.orchestrator import llm_client
-from tilefoundry_ascend.agent.orchestrator.e2e_evolution import run_e2e_evolution
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
     StageAResult,
@@ -953,61 +952,6 @@ def test_p1_1_experience_lake_and_e2e_evolution_persist_roofline(tmp_path: Path)
     assert observations[0].min_gm_bytes == pytest.approx(8192.0)
     assert observations[0].compute_floor_us == pytest.approx(1.5)
     assert observations[0].transfer_inflation_ratio == pytest.approx(2.0)
-
-    dsl_src = dedent(
-        """
-        import tilelang.ascend.language as T
-
-        def make_kernel():
-            @T.prim_func
-            def main(
-                X: T.Tensor((128, 128), "bfloat16"),
-                W: T.Tensor((128, 128), "bfloat16"),
-                Y: T.Tensor((128, 128), "float32"),
-            ):
-                with T.Kernel(1):
-                    x_l1 = T.alloc_l1((128, 64), "bfloat16")
-                    w_l1 = T.alloc_l1((128, 64), "bfloat16")
-                    acc = T.alloc_l0c((128, 128), "float32")
-                    T.copy(X[0:128, 0:64], x_l1)
-                    T.copy(W[0:128, 0:64], w_l1)
-                    T.gemm(x_l1, w_l1, acc, transpose_B=True, clear_accum=True)
-                    T.copy(acc, Y[0:128, 0:128])
-            return main
-        """
-    )
-    ar_golden = dedent(
-        """
-        import torch
-
-        def ar_roofline(h, x, w):
-            return torch.matmul(x + h, w)
-        """
-    )
-    funnel = GateFunnel(
-        compile_runner=lambda _dsl: StageBResult(passed=True),
-        device_runner=lambda _dsl, sa: StageCResult(
-            passed=True,
-            accuracy_passed=True,
-            measured_latency_us=25.0,
-            residual=compute_static_dynamic_residual(sa.ledger, {"dur_us": 25.0}),
-            telemetry={"dur_us": 25.0},
-        ),
-    )
-    traj = asyncio.run(
-        run_e2e_evolution(
-            problem_name="ar_roofline",
-            hir_source=ar_golden,
-            shape_contract="make_kernel()",
-            backend=MockLLMBackend(responses={}, default_response=dsl_src),
-            funnel=funnel,
-            initial_dsl_source=dsl_src,
-            anchor_dims={"M": 128, "N": 128, "K": 128},
-            num_rounds=1,
-            k_rule_workers=1,
-        )
-    )
-    assert traj.hir_blueprint_summary["roofline"]["min_gm_bytes"] > 0
 
 
 def test_p1_2_hybrid_and_tracka_cube_dma_aggregate_gate(

@@ -19,14 +19,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
-    extract_reachable_trackb_source,
-    strip_cpp_comments_and_strings,
-)
-from tilefoundry_ascend.agent.orchestrator.residual_beam import (
+from tilefoundry_ascend.agent.specs.latency_algebra import (
     StaticDynamicResidual,
     compute_static_dynamic_residual,
 )
+from tilefoundry_ascend.agent.specs.ops_registry import infer_module_runtime_backend
 from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
     ArtifactStore,
     collect_new_tl_cache_binaries,
@@ -37,6 +34,10 @@ from tilefoundry_ascend.ascend.compile_cache.artifact_store import (
     resolve_unified_tl_cache_dir,
     seed_tl_cache_tree,
     snapshot_tl_cache_binaries,
+)
+from tilefoundry_ascend.ascend.compile_cache.cpp_closure import (
+    extract_reachable_trackb_source,
+    strip_cpp_comments_and_strings,
 )
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     BishengResourceSummary,
@@ -680,10 +681,6 @@ def check_npu_entrypoint_purity(
     funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
     if entrypoint not in funcs:
         return []
-
-    from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: PLC0415
-        infer_module_runtime_backend,
-    )
 
     errors: list[str] = []
     backend, _tb_syms = infer_module_runtime_backend(module_source, entrypoint)

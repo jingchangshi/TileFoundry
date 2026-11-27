@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec, RegimeTargetSpec
-from tilefoundry_ascend.agent.campaign.latency_algebra import (
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec, RegimeTargetSpec
+from tilefoundry_ascend.agent.specs.latency_algebra import (
     AnchorConservationPoint,
     calibrate_dispatch_floor_us,
 )
@@ -50,30 +50,7 @@ class CalibrationSnapshot:
     anchor_t_hw_by_case: dict[int, float]
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Atomically write UTF-8 text to path via a sibling temporary file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            tmp_path = Path(fh.name)
-            fh.write(content)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path is not None and tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
+from tilefoundry_ascend.ascend.json_record import atomic_write_text as _atomic_write_text
 
 
 def _invoke_with_optional_kwargs(

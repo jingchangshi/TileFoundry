@@ -759,7 +759,7 @@ def test_target_operator_full_cannbench_contract() -> None:
             pytest.skip("Scoped to generic CANNBench L3 targets outside AR/MLA.")
         _require_npu_env(recorder)
 
-        from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: PLC0415
+        from tilefoundry_ascend.agent.specs.anchor_specs import (  # noqa: PLC0415
             CannbenchOpsRegistry,
         )
 

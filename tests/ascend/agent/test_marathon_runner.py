@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from tilefoundry_ascend.agent.campaign import cli, marathon
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     RegimeTargetSpec,
     parse_simple_env_file,

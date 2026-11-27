@@ -20,7 +20,7 @@ from tilefoundry_ascend.agent import (
     prescreen_dsl_tile_kwargs,
     prescreen_tile_configs,
 )
-from tilefoundry_ascend.agent.campaign.anchor_specs import build_anchor_var_bindings
+from tilefoundry_ascend.agent.specs.anchor_specs import build_anchor_var_bindings
 from tilefoundry_ascend.agent.kb import load_seed_rules
 from tilefoundry_ascend.agent.orchestrator import (
     StageBResult,

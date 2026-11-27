@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import (
+from tilefoundry_ascend.agent.specs.anchor_specs import (
     RegimeTargetSpec,
     build_semantic_regime_specs,
     discover_module_trackb_symbols,

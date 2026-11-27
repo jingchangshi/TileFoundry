@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from tilefoundry_ascend.agent.campaign import cli, marathon, surrogate_cannbench
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec
 from tilefoundry_ascend.agent.campaign.campaign_runner import CampaignConfig
 from tilefoundry_ascend.agent.orchestrator.llm_client import MockLLMBackend
 

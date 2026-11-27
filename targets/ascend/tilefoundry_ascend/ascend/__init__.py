@@ -1,6 +1,6 @@
 """Ascend target and compiler registrations for TileFoundry."""
 
-from tilefoundry_ascend.ascend import passes, schedule
+from tilefoundry_ascend.ascend import passes
 from tilefoundry_ascend.ascend.passes import (
     HirBlueprintPacket,
     HirRooflineSummary,
@@ -24,5 +24,4 @@ __all__ = [
     "HirRooflineSummary",
     "NodeResourceMask",
     "passes",
-    "schedule",
 ]

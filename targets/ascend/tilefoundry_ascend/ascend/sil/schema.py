@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from tilefoundry_ascend.ascend.json_record import (
+    JsonRecordMixin,
+    atomic_write_text,
+    json_clone as _json_clone,
+)
 from tilefoundry_ascend.ascend.target.facts import AscendSpaceFacts, cube_macs_per_cycle
 
 VALID_BACKEND_TIERS: tuple[str, ...] = (
@@ -55,17 +59,6 @@ VALID_FREEDOM_FACETS: tuple[str, ...] = (
 )
 
 
-def _json_clone(value: Any) -> Any:
-    """Recursively convert tuples/mappings into plain JSON-compatible Python types."""
-    if isinstance(value, Mapping):
-        return {str(k): _json_clone(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_clone(v) for v in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
 def _as_str_tuple(raw: Any, field_name: str) -> tuple[str, ...]:
     if raw is None:
         return ()
@@ -107,7 +100,7 @@ def _as_str_dict(raw: Any, field_name: str) -> dict[str, str]:
 
 
 @dataclass(frozen=True)
-class TopologyAxes:
+class TopologyAxes(JsonRecordMixin):
     """3-axis orthogonal hardware topology specification for Ascend 950 (dav-3510)."""
 
     compute_engine: str
@@ -144,28 +137,6 @@ class TopologyAxes:
     def key(self) -> str:
         """Return compact canonical 3-axis coordinate key."""
         return f"{self.compute_engine}/{self.memory_ring}/{self.iteration_regularity}"
-
-    def to_dict(self) -> dict[str, str]:
-        return {
-            "compute_engine": self.compute_engine,
-            "memory_ring": self.memory_ring,
-            "iteration_regularity": self.iteration_regularity,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> TopologyAxes:
-        return cls(
-            compute_engine=str(payload["compute_engine"]),
-            memory_ring=str(payload["memory_ring"]),
-            iteration_regularity=str(payload["iteration_regularity"]),
-        )
-
-    def to_json(self, *, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
-
-    @classmethod
-    def from_json(cls, raw: str) -> TopologyAxes:
-        return cls.from_dict(json.loads(raw))
 
 
 CasePhysicsKind = Literal["reduction", "matmul", "attention", "elementwise"]
@@ -374,7 +345,7 @@ def _payload_bool(payload: Mapping[str, object], key: str) -> bool:
 
 
 @dataclass(frozen=True, kw_only=True)
-class CasePhysicsRatios:
+class CasePhysicsRatios(JsonRecordMixin):
     """Dimensionless physical ratios and derived phase bands for one operator case."""
 
     case_id: int
@@ -484,20 +455,6 @@ class CasePhysicsRatios:
             memory_ring=memory_ring,
             iteration_regularity=iteration_regularity,
         )
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "case_id": self.case_id,
-            "stride_ratio": self.stride_ratio,
-            "contig_atom_ratio": self.contig_atom_ratio,
-            "is_atom_aligned": self.is_atom_aligned,
-            "working_set_sram_ratio": self.working_set_sram_ratio,
-            "working_set_vreg_ratio": self.working_set_vreg_ratio,
-            "wave_occupancy_ratio": self.wave_occupancy_ratio,
-            "oi_ridge_ratio": self.oi_ridge_ratio,
-            "has_empty_group": self.has_empty_group,
-            "inner_contiguous_bytes": self.inner_contiguous_bytes,
-        }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> CasePhysicsRatios:
@@ -1387,7 +1344,7 @@ def derive_case_physics_input(
 
 
 @dataclass(frozen=True)
-class ConstraintRelaxationMask:
+class ConstraintRelaxationMask(JsonRecordMixin):
     """Provably complete MECE 7-facet target-AST partition relaxation lattice."""
 
     alg_compute_and_monoid: bool = True
@@ -1468,33 +1425,9 @@ class ConstraintRelaxationMask:
             **{f: bool(getattr(self, f) and getattr(other, f)) for f in VALID_FREEDOM_FACETS}
         )
 
-    def to_dict(self) -> dict[str, bool]:
-        """Serialize mask to plain bool dict."""
-        return {f: bool(getattr(self, f)) for f in VALID_FREEDOM_FACETS}
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> ConstraintRelaxationMask:
-        """Reconstruct ConstraintRelaxationMask from a mapping."""
-        return cls(
-            alg_compute_and_monoid=bool(payload.get("alg_compute_and_monoid", True)),
-            tile_and_stage_knobs=bool(payload.get("tile_and_stage_knobs", True)),
-            exec_mode_and_spr=bool(payload.get("exec_mode_and_spr", False)),
-            sram_layout_and_aliasing=bool(payload.get("sram_layout_and_aliasing", False)),
-            dma_and_cache_hierarchy=bool(payload.get("dma_and_cache_hierarchy", False)),
-            pipeline_and_sync_graph=bool(payload.get("pipeline_and_sync_graph", False)),
-            grid_and_workspace_topology=bool(payload.get("grid_and_workspace_topology", False)),
-        )
-
-    def to_json(self, *, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
-
-    @classmethod
-    def from_json(cls, raw: str) -> ConstraintRelaxationMask:
-        return cls.from_dict(json.loads(raw))
-
 
 @dataclass(frozen=True)
-class RegimeSlice:
+class RegimeSlice(JsonRecordMixin):
     """Shape and performance regime slice for one operator."""
 
     regime_tag: str
@@ -1558,61 +1491,22 @@ class RegimeSlice:
             return None
         return self.case_ratios[len(self.case_ratios) // 2]
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "regime_tag": self.regime_tag,
-            "case_nums": list(self.case_nums),
-            "representative_dims": dict(self.representative_dims),
-            "has_unaligned_tail": self.has_unaligned_tail,
-            "has_empty_group": self.has_empty_group,
-            "ref_perf_us": self.ref_perf_us,
-            "t_hw_us": self.t_hw_us,
-            "case_ratios": [ratio.to_dict() for ratio in self.case_ratios],
-            "representative_case_id": self.representative_case_id,
-            "phase_coordinates": list(self.phase_coordinates),
-            "rationale": self.rationale,
-        }
-
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> RegimeSlice:
         raw_ratios = payload.get("case_ratios") or ()
         if isinstance(raw_ratios, (str, bytes)) or not isinstance(raw_ratios, Sequence):
             raise ValueError("RegimeSlice.case_ratios must be a sequence")
-        raw_representative = payload.get("representative_case_id")
-        return cls(
-            regime_tag=str(payload["regime_tag"]),
-            case_nums=tuple(int(x) for x in payload.get("case_nums", ())),
-            representative_dims={
-                str(k): int(v) for k, v in (payload.get("representative_dims") or {}).items()
-            },
-            has_unaligned_tail=bool(payload["has_unaligned_tail"]),
-            has_empty_group=bool(payload.get("has_empty_group", False)),
-            ref_perf_us=float(payload.get("ref_perf_us", 0.0)),
-            t_hw_us=float(payload.get("t_hw_us", 0.0)),
-            case_ratios=tuple(
-                CasePhysicsRatios.from_dict(item)
-                for item in raw_ratios
-                if isinstance(item, Mapping)
-            ),
-            representative_case_id=(
-                int(raw_representative) if raw_representative is not None else None
-            ),
-            phase_coordinates=tuple(
-                str(item) for item in (payload.get("phase_coordinates") or ())
-            ),
-            rationale=str(payload.get("rationale", "")),
+        norm = dict(payload)
+        norm["case_ratios"] = tuple(
+            CasePhysicsRatios.from_dict(item)
+            for item in raw_ratios
+            if isinstance(item, Mapping)
         )
-
-    def to_json(self, *, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
-
-    @classmethod
-    def from_json(cls, raw: str) -> RegimeSlice:
-        return cls.from_dict(json.loads(raw))
+        return super().from_dict(norm)
 
 
 @dataclass(frozen=True)
-class HardwareLegalityBounds:
+class HardwareLegalityBounds(JsonRecordMixin):
     """Ascend 950 (dav-3510) hardware capacity and architectural redlines."""
 
     l1_bytes: int = 524288
@@ -1667,62 +1561,9 @@ class HardwareLegalityBounds:
         )
         object.__setattr__(self, "forbid_cube_int4", bool(self.forbid_cube_int4))
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "l1_bytes": self.l1_bytes,
-            "l1_half_bank_bytes": self.l1_half_bank_bytes,
-            "l0a_bytes": self.l0a_bytes,
-            "l0b_bytes": self.l0b_bytes,
-            "l0c_bytes": self.l0c_bytes,
-            "ub_simdvf_bytes": self.ub_simdvf_bytes,
-            "ub_unreserved_bytes": self.ub_unreserved_bytes,
-            "ub_simtvf_bytes": self.ub_simtvf_bytes,
-            "ssbuf_bytes": self.ssbuf_bytes,
-            "max_mmad_mnk": self.max_mmad_mnk,
-            "max_crosscore_depth": self.max_crosscore_depth,
-            "hardware_mutex_count": self.hardware_mutex_count,
-            "ub_banks": self.ub_banks,
-            "ub_datablock_bytes": self.ub_datablock_bytes,
-            "forbidden_dma_paths": list(self.forbidden_dma_paths),
-            "forbid_cube_int4": self.forbid_cube_int4,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> HardwareLegalityBounds:
-        return cls(
-            l1_bytes=int(payload.get("l1_bytes", 524288)),
-            l1_half_bank_bytes=int(payload.get("l1_half_bank_bytes", 262144)),
-            l0a_bytes=int(payload.get("l0a_bytes", 65536)),
-            l0b_bytes=int(payload.get("l0b_bytes", 65536)),
-            l0c_bytes=int(payload.get("l0c_bytes", 262144)),
-            ub_simdvf_bytes=int(payload.get("ub_simdvf_bytes", 253952)),
-            ub_unreserved_bytes=int(payload.get("ub_unreserved_bytes", 262144)),
-            ub_simtvf_bytes=int(payload.get("ub_simtvf_bytes", 221184)),
-            ssbuf_bytes=int(payload.get("ssbuf_bytes", 3072)),
-            max_mmad_mnk=int(payload.get("max_mmad_mnk", 4095)),
-            max_crosscore_depth=int(payload.get("max_crosscore_depth", 15)),
-            hardware_mutex_count=int(payload.get("hardware_mutex_count", 28)),
-            ub_banks=int(payload.get("ub_banks", 16)),
-            ub_datablock_bytes=int(payload.get("ub_datablock_bytes", 32)),
-            forbidden_dma_paths=tuple(
-                str(x)
-                for x in payload.get(
-                    "forbidden_dma_paths", ("L1->GM", "GM->L0A", "GM->L0B")
-                )
-            ),
-            forbid_cube_int4=bool(payload.get("forbid_cube_int4", True)),
-        )
-
-    def to_json(self, *, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
-
-    @classmethod
-    def from_json(cls, raw: str) -> HardwareLegalityBounds:
-        return cls.from_dict(json.loads(raw))
-
 
 @dataclass(frozen=True)
-class AdvisoryEnvelope:
+class AdvisoryEnvelope(JsonRecordMixin):
     """Compiler & static analysis advisory envelope for one operator."""
 
     op_name: str
@@ -1786,73 +1627,9 @@ class AdvisoryEnvelope:
                 self, "hir_blueprint", _json_clone(self.hir_blueprint)
             )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "op_name": self.op_name,
-            "cannbot_task": self.cannbot_task,
-            "level": self.level,
-            "topology_axes": self.topology_axes.to_dict(),
-            "input_dtypes": list(self.input_dtypes),
-            "output_dtypes": list(self.output_dtypes),
-            "roofline": _json_clone(self.roofline),
-            "structural_features": _json_clone(self.structural_features),
-            "regimes": [r.to_dict() for r in self.regimes],
-            "legality_bounds": self.legality_bounds.to_dict(),
-            "has_nan_inf_cases": self.has_nan_inf_cases,
-            "has_inplace_aliasing": self.has_inplace_aliasing,
-            "precision_thresholds": dict(self.precision_thresholds),
-            "hir_blueprint": (
-                _json_clone(self.hir_blueprint)
-                if self.hir_blueprint is not None
-                else None
-            ),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> AdvisoryEnvelope:
-        raw_bounds = payload.get("legality_bounds")
-        bounds = (
-            HardwareLegalityBounds.from_dict(raw_bounds)
-            if isinstance(raw_bounds, Mapping)
-            else HardwareLegalityBounds()
-        )
-        raw_packet = payload.get("hir_blueprint")
-        raw_axes = payload["topology_axes"]
-        axes = (
-            raw_axes
-            if isinstance(raw_axes, TopologyAxes)
-            else TopologyAxes.from_dict(raw_axes)
-        )
-        return cls(
-            op_name=str(payload["op_name"]),
-            cannbot_task=str(payload["cannbot_task"]),
-            level=int(payload["level"]),
-            topology_axes=axes,
-            input_dtypes=tuple(str(x) for x in payload.get("input_dtypes", ())),
-            output_dtypes=tuple(str(x) for x in payload.get("output_dtypes", ())),
-            roofline=dict(payload.get("roofline") or {}),
-            structural_features=dict(payload.get("structural_features") or {}),
-            regimes=tuple(RegimeSlice.from_dict(r) for r in (payload.get("regimes") or ())),
-            legality_bounds=bounds,
-            has_nan_inf_cases=bool(payload.get("has_nan_inf_cases", False)),
-            has_inplace_aliasing=bool(payload.get("has_inplace_aliasing", False)),
-            precision_thresholds={
-                str(k): float(v)
-                for k, v in (payload.get("precision_thresholds") or {}).items()
-            },
-            hir_blueprint=dict(raw_packet) if isinstance(raw_packet, Mapping) else None,
-        )
-
-    def to_json(self, *, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
-
-    @classmethod
-    def from_json(cls, raw: str) -> AdvisoryEnvelope:
-        return cls.from_dict(json.loads(raw))
-
 
 @dataclass(frozen=True)
-class SchedulePolicy:
+class SchedulePolicy(JsonRecordMixin):
     """Per-regime tactical schedule policy bridging solver, templates, and verifier."""
 
     regime_tag: str
@@ -1977,119 +1754,9 @@ class SchedulePolicy:
                 f"SchedulePolicy.freedom_mask must be ConstraintRelaxationMask or Mapping, got {type(self.freedom_mask).__name__}"
             )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "regime_tag": self.regime_tag,
-            "topology_axes": self.topology_axes.to_dict(),
-            "backend_tier": self.backend_tier,
-            "tile_mnk": list(self.tile_mnk),
-            "row_pack_factor": self.row_pack_factor,
-            "num_kv_splits": self.num_kv_splits,
-            "l1_stages": self.l1_stages,
-            "l1_half_bank_split": self.l1_half_bank_split,
-            "l1_slot_aliasing": dict(self.l1_slot_aliasing),
-            "l0c_buffers": self.l0c_buffers,
-            "ub_256kb_unlock": self.ub_256kb_unlock,
-            "ub_estimated_bytes": self.ub_estimated_bytes,
-            "l1_estimated_bytes": self.l1_estimated_bytes,
-            "ub_bank_pad_datablocks": self.ub_bank_pad_datablocks,
-            "ub_rw_shift_datablocks": self.ub_rw_shift_datablocks,
-            "ub_row_stride_bytes": self.ub_row_stride_bytes,
-            "cv_datapath": self.cv_datapath,
-            "sync_mode": self.sync_mode,
-            "preload_depth": self.preload_depth,
-            "reverse_ack_period": self.reverse_ack_period,
-            "ensure_empty_subblock_sync": self.ensure_empty_subblock_sync,
-            "swizzle_window": self.swizzle_window,
-            "tail_wave_split": self.tail_wave_split,
-            "streamk_mode": self.streamk_mode,
-            "l2_bypass_operands": list(self.l2_bypass_operands),
-            "vector_mode": self.vector_mode,
-            "direct_no_fusion_vf": self.direct_no_fusion_vf,
-            "multi_row_unroll": self.multi_row_unroll,
-            "reduce_accumulators": self.reduce_accumulators,
-            "simt_threads": self.simt_threads,
-            "hf32_allowed": self.hf32_allowed,
-            "fast_unshifted_exp": self.fast_unshifted_exp,
-            "w4_mode": self.w4_mode,
-            "dma_paths_used": list(self.dma_paths_used),
-            "cube_operand_dtype": self.cube_operand_dtype,
-            "freedom_mask": self.freedom_mask.to_dict(),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> SchedulePolicy:
-        raw_tile = payload.get("tile_mnk", (128, 128, 64))
-        tile_mnk = (int(raw_tile[0]), int(raw_tile[1]), int(raw_tile[2]))
-        raw_axes = payload["topology_axes"]
-        axes = (
-            raw_axes
-            if isinstance(raw_axes, TopologyAxes)
-            else TopologyAxes.from_dict(raw_axes)
-        )
-        raw_mask = payload.get("freedom_mask")
-        mask = (
-            raw_mask
-            if isinstance(raw_mask, ConstraintRelaxationMask)
-            else (
-                ConstraintRelaxationMask.from_dict(raw_mask)
-                if isinstance(raw_mask, Mapping)
-                else ConstraintRelaxationMask.bottom()
-            )
-        )
-        return cls(
-            regime_tag=str(payload["regime_tag"]),
-            topology_axes=axes,
-            backend_tier=str(payload.get("backend_tier", "tilelang_dsl")),
-            tile_mnk=tile_mnk,
-            row_pack_factor=int(payload.get("row_pack_factor", 1)),
-            num_kv_splits=int(payload.get("num_kv_splits", 1)),
-            l1_stages=int(payload.get("l1_stages", 2)),
-            l1_half_bank_split=bool(payload.get("l1_half_bank_split", True)),
-            l1_slot_aliasing={
-                str(k): str(v) for k, v in (payload.get("l1_slot_aliasing") or {}).items()
-            },
-            l0c_buffers=int(payload.get("l0c_buffers", 1)),
-            ub_256kb_unlock=bool(payload.get("ub_256kb_unlock", False)),
-            ub_estimated_bytes=int(payload.get("ub_estimated_bytes", 0)),
-            l1_estimated_bytes=int(payload.get("l1_estimated_bytes", 0)),
-            ub_bank_pad_datablocks=int(payload.get("ub_bank_pad_datablocks", 0)),
-            ub_rw_shift_datablocks=int(payload.get("ub_rw_shift_datablocks", 0)),
-            ub_row_stride_bytes=int(payload.get("ub_row_stride_bytes", 0)),
-            cv_datapath=str(payload.get("cv_datapath", "none")),
-            sync_mode=str(payload.get("sync_mode", "mode4_flag")),
-            preload_depth=int(payload.get("preload_depth", 2)),
-            reverse_ack_period=int(payload.get("reverse_ack_period", 14)),
-            ensure_empty_subblock_sync=bool(payload.get("ensure_empty_subblock_sync", True)),
-            swizzle_window=int(payload.get("swizzle_window", 4)),
-            tail_wave_split=bool(payload.get("tail_wave_split", True)),
-            streamk_mode=str(payload.get("streamk_mode", "none")),
-            l2_bypass_operands=tuple(
-                str(x) for x in payload.get("l2_bypass_operands", ())
-            ),
-            vector_mode=str(payload.get("vector_mode", "simdvf")),
-            direct_no_fusion_vf=bool(payload.get("direct_no_fusion_vf", False)),
-            multi_row_unroll=int(payload.get("multi_row_unroll", 1)),
-            reduce_accumulators=int(payload.get("reduce_accumulators", 1)),
-            simt_threads=int(payload.get("simt_threads", 512)),
-            hf32_allowed=bool(payload.get("hf32_allowed", False)),
-            fast_unshifted_exp=bool(payload.get("fast_unshifted_exp", False)),
-            w4_mode=str(payload.get("w4_mode", "none")),
-            dma_paths_used=tuple(str(x) for x in payload.get("dma_paths_used", ())),
-            cube_operand_dtype=str(payload.get("cube_operand_dtype", "")),
-            freedom_mask=mask,
-        )
-
-    def to_json(self, *, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
-
-    @classmethod
-    def from_json(cls, raw: str) -> SchedulePolicy:
-        return cls.from_dict(json.loads(raw))
-
 
 @dataclass(frozen=True)
-class PolicyEnvelope:
+class PolicyEnvelope(JsonRecordMixin):
     """Operator-wide collection of per-regime schedule policies."""
 
     op_name: str
@@ -2118,35 +1785,9 @@ class PolicyEnvelope:
             self, "selected_rules", _as_str_tuple(self.selected_rules, "selected_rules")
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "op_name": self.op_name,
-            "policies": {k: v.to_dict() for k, v in self.policies.items()},
-            "selected_rules": list(self.selected_rules),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> PolicyEnvelope:
-        raw_policies = payload.get("policies") or {}
-        policies = {
-            str(k): SchedulePolicy.from_dict(v) for k, v in raw_policies.items()
-        }
-        return cls(
-            op_name=str(payload["op_name"]),
-            policies=policies,
-            selected_rules=tuple(str(x) for x in payload.get("selected_rules", ())),
-        )
-
-    def to_json(self, *, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
-
-    @classmethod
-    def from_json(cls, raw: str) -> PolicyEnvelope:
-        return cls.from_dict(json.loads(raw))
-
 
 @dataclass(frozen=True)
-class VerificationReport:
+class VerificationReport(JsonRecordMixin):
     """Result of deterministic SIL hardware legality verification."""
 
     passed: bool
@@ -2162,33 +1803,9 @@ class VerificationReport:
             raise ValueError("VerificationReport.suggested_fixes must be a mapping")
         object.__setattr__(self, "suggested_fixes", _json_clone(self.suggested_fixes))
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "passed": self.passed,
-            "errors": list(self.errors),
-            "warnings": list(self.warnings),
-            "suggested_fixes": _json_clone(self.suggested_fixes),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> VerificationReport:
-        return cls(
-            passed=bool(payload["passed"]),
-            errors=tuple(str(x) for x in payload.get("errors", ())),
-            warnings=tuple(str(x) for x in payload.get("warnings", ())),
-            suggested_fixes=dict(payload.get("suggested_fixes") or {}),
-        )
-
-    def to_json(self, *, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
-
-    @classmethod
-    def from_json(cls, raw: str) -> VerificationReport:
-        return cls.from_dict(json.loads(raw))
-
 
 @dataclass(frozen=True)
-class TelemetryFeedback:
+class TelemetryFeedback(JsonRecordMixin):
     """Closed-loop compile/profile telemetry from Stage A/B/C and CANNBench."""
 
     stage_a_passed: bool
@@ -2223,50 +1840,9 @@ class TelemetryFeedback:
         object.__setattr__(self, "bank_conflict_ratio", float(self.bank_conflict_ratio))
         object.__setattr__(self, "l2_hit_rate", float(self.l2_hit_rate))
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "stage_a_passed": self.stage_a_passed,
-            "stage_b_passed": self.stage_b_passed,
-            "stage_c_passed": self.stage_c_passed,
-            "spill_bytes": self.spill_bytes,
-            "vloopv2_hit": self.vloopv2_hit,
-            "measured_latency_us": self.measured_latency_us,
-            "eq3_score": self.eq3_score,
-            "hap_reward": self.hap_reward,
-            "pipe_utilization": dict(self.pipe_utilization),
-            "bank_conflict_ratio": self.bank_conflict_ratio,
-            "l2_hit_rate": self.l2_hit_rate,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> TelemetryFeedback:
-        return cls(
-            stage_a_passed=bool(payload["stage_a_passed"]),
-            stage_b_passed=bool(payload["stage_b_passed"]),
-            stage_c_passed=bool(payload.get("stage_c_passed", False)),
-            spill_bytes=int(payload.get("spill_bytes", 0)),
-            vloopv2_hit=bool(payload.get("vloopv2_hit", True)),
-            measured_latency_us=float(payload.get("measured_latency_us", 0.0)),
-            eq3_score=float(payload.get("eq3_score", 0.0)),
-            hap_reward=float(payload.get("hap_reward", 0.0)),
-            pipe_utilization={
-                str(k): float(v)
-                for k, v in (payload.get("pipe_utilization") or {}).items()
-            },
-            bank_conflict_ratio=float(payload.get("bank_conflict_ratio", 0.0)),
-            l2_hit_rate=float(payload.get("l2_hit_rate", 0.0)),
-        )
-
-    def to_json(self, *, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
-
-    @classmethod
-    def from_json(cls, raw: str) -> TelemetryFeedback:
-        return cls.from_dict(json.loads(raw))
-
 
 @dataclass(frozen=True)
-class SchedulingEnvelope:
+class SchedulingEnvelope(JsonRecordMixin):
     """Top-level SIL artifact bundling advisory, policy, verification, and telemetry."""
 
     advisory: AdvisoryEnvelope
@@ -2286,46 +1862,9 @@ class SchedulingEnvelope:
         if self.telemetry is not None and not isinstance(self.telemetry, TelemetryFeedback):
             raise TypeError("telemetry must be TelemetryFeedback or None")
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "advisory": self.advisory.to_dict(),
-            "policy": self.policy.to_dict(),
-            "verification": (
-                self.verification.to_dict() if self.verification is not None else None
-            ),
-            "telemetry": self.telemetry.to_dict() if self.telemetry is not None else None,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> SchedulingEnvelope:
-        raw_verif = payload.get("verification")
-        raw_telem = payload.get("telemetry")
-        return cls(
-            advisory=AdvisoryEnvelope.from_dict(payload["advisory"]),
-            policy=PolicyEnvelope.from_dict(payload["policy"]),
-            verification=(
-                VerificationReport.from_dict(raw_verif)
-                if isinstance(raw_verif, Mapping)
-                else None
-            ),
-            telemetry=(
-                TelemetryFeedback.from_dict(raw_telem)
-                if isinstance(raw_telem, Mapping)
-                else None
-            ),
-        )
-
-    def to_json(self, *, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
-
-    @classmethod
-    def from_json(cls, raw: str) -> SchedulingEnvelope:
-        return cls.from_dict(json.loads(raw))
-
     def save_json(self, path: str | Path) -> Path:
         target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(self.to_json(indent=2) + "\n", encoding="utf-8")
+        atomic_write_text(target, self.to_json(indent=2) + "\n")
         return target
 
     @classmethod

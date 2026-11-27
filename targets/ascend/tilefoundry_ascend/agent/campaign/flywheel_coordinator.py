@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import RegimeTargetSpec
+from tilefoundry_ascend.agent.specs.anchor_specs import RegimeTargetSpec
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
     FlywheelDistiller,
     should_trigger_flywheel_checkpoint,

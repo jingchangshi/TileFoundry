@@ -210,7 +210,7 @@ def test_ordered_tensor_shapes_extraction_and_l0_callsite_wiring(
     """Wire extracted ordered_tensor_shapes through precheck, campaign runner, and marathon."""
     from tilefoundry_ascend.agent.campaign import campaign_runner as cr_mod  # noqa: PLC0415
     from tilefoundry_ascend.agent.campaign import marathon as marathon_mod  # noqa: PLC0415
-    from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: PLC0415
+    from tilefoundry_ascend.agent.specs.anchor_specs import (  # noqa: PLC0415
         AnchorCaseSpec,
         PerfTargetSpec,
         RegimeTargetSpec,

@@ -85,7 +85,10 @@ def test_live_flywheel_micro_probe_verification_and_kb_admission(tmp_path: Path)
 
     import tilelang  # noqa: PLC0415
 
-    from tilefoundry_ascend.agent.probes import run_msprof_detail  # noqa: PLC0415
+    from tilefoundry_ascend.agent.probes import (  # noqa: PLC0415
+        LocalHardwareProbePort,
+        run_msprof_detail,
+    )
 
     def _npu_eval(_dsl: str, stage_a) -> StageCResult:
         assert stage_a.prim_func is not None and stage_a.ledger is not None
@@ -128,6 +131,7 @@ def test_live_flywheel_micro_probe_verification_and_kb_admission(tmp_path: Path)
         funnel=funnel,
         tracker=tracker,
         probe_runner=None,
+        probe_port=LocalHardwareProbePort(),
     )
     report = distiller.distill_from_pair(
         baseline_dsl=_AR_BASE,

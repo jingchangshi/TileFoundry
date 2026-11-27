@@ -8,7 +8,6 @@ import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
-import tilefoundry_ascend.agent.orchestrator.e2e_evolution as e2e_mod
 import tilefoundry_ascend.agent.orchestrator.portfolio_runner as portfolio_mod
 from tilefoundry_ascend.agent import (
     BayesianRuleTracker,
@@ -23,6 +22,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     _extract_lowered_compiler_excerpt,
     run_l0_l1_round_filter,
 )
+from tilefoundry_ascend.agent.contracts import EvolutionTrajectory
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     build_trackb_context_view,
     render_active_symbol_closure_view,
@@ -31,7 +31,6 @@ from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistill
 from tilefoundry_ascend.agent.kb.schema import build_predicate_context
 from tilefoundry_ascend.agent.orchestrator import (
     BeamCandidate,
-    EvolutionTrajectory,
     StageBResult,
     StageCResult,
     compute_static_dynamic_residual,
@@ -483,46 +482,6 @@ def test_ordered_tensor_shapes_and_prev_residual_wiring(tmp_path: Path) -> None:
         ordered_tensor_shapes=((16, 64), (16, 64)),
     )
     assert ((16, 64), (16, 64)) in seen_shapes
-
-    e2e_seen: list[object] = []
-    golden_src = (
-        "import torch\n"
-        "def forward(x: torch.Tensor) -> torch.Tensor:\n"
-        "    return x * 2.0\n"
-    )
-
-    class _E2ESpyFunnel(GateFunnel):
-        def evaluate(self, dsl_source: str, **kwargs: object):
-            e2e_seen.append(kwargs.get("ordered_tensor_shapes"))
-            return super().evaluate(dsl_source, **kwargs)
-
-    e2e_funnel = _E2ESpyFunnel(
-        compile_runner=lambda _dsl: StageBResult(passed=True),
-        device_runner=lambda _dsl, st: StageCResult(
-            passed=True,
-            accuracy_passed=True,
-            measured_latency_us=6.0,
-            residual=compute_static_dynamic_residual(st.ledger, {"dur_us": 6.0}),
-            telemetry={"dur_us": 6.0},
-        ),
-    )
-    e2e_res = asyncio.run(
-        e2e_mod.run_e2e_evolution(
-            problem_name="forward",
-            hir_source=golden_src,
-            shape_contract="x: (16, 64)",
-            backend=MockLLMBackend(default_response=_sample_dsl_source()),
-            funnel=e2e_funnel,
-            initial_dsl_source=_sample_dsl_source(),
-            factory_name="make_kernel",
-            num_rounds=1,
-            k_rule_workers=1,
-            anchor_dims={"M": 16, "N": 64},
-            ordered_tensor_shapes=((16, 64), (16, 64)),
-        )
-    )
-    assert e2e_res is not None
-    assert ((16, 64), (16, 64)) in e2e_seen
 
 
 def test_run_l0_l1_passes_lowered_excerpt_lang_to_repair() -> None:

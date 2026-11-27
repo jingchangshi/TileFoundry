@@ -18,7 +18,7 @@ from tilefoundry_ascend.agent.campaign import (
     PerfTargetSpec,
     RegimeTargetSpec,
 )
-from tilefoundry_ascend.agent.campaign.fault_types import L3Resolution
+from tilefoundry_ascend.agent.specs.fault_types import L3Resolution
 from tilefoundry_ascend.agent.campaign.flywheel_coordinator import FlywheelCoordinator
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import (
     PromotionCoordinator,

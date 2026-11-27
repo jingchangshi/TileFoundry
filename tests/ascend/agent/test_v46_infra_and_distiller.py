@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from tilefoundry_ascend.agent.campaign import marathon, surrogate_cannbench
-from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
+from tilefoundry_ascend.agent.specs.anchor_specs import CannbenchOpsRegistry
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     L3AcceptanceResult,
     _resolve_agent_gates_bin,

@@ -60,25 +60,6 @@ from tilefoundry_ascend.ascend.cost_model.pipe_schedule_eval import (
     normalize_ns_to_z3_ticks,
 )
 
-_BACKTEST_EXPORTS = frozenset(
-    {
-        "BacktestSummary",
-        "OfficialCaseRecord",
-        "load_official_reports",
-        "run_cost_model_backtest",
-        "run_p2_prescreen_ablation",
-    }
-)
-
-
-def __getattr__(name: str) -> object:
-    if name in _BACKTEST_EXPORTS:
-        from tilefoundry_ascend.ascend.cost_model import calibration_backtest  # noqa: PLC0415
-
-        return getattr(calibration_backtest, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 __all__ = [
     "CUBE_MACS_PER_CYCLE",
     "DEFAULT_COMPILER_BEHAVIOR_REGISTRY",
@@ -91,7 +72,6 @@ __all__ = [
     "MS_PIPE_SLOPE_US_PER_BYTE",
     "Ascend950PipeScheduleEvaluator",
     "Ascend950PipeScheduleResult",
-    "BacktestSummary",
     "BishengResourceSummary",
     "CalibrationSample",
     "CandidateArtifactRecord",
@@ -107,7 +87,6 @@ __all__ = [
     "ExperienceLake",
     "HybridAscendCostModel",
     "MicroarchProfile",
-    "OfficialCaseRecord",
     "ResidualBasisContext",
     "ResidualBasisRegistry",
     "ResidualBasisSpec",
@@ -120,7 +99,6 @@ __all__ = [
     "extract_microarch_profile_from_cce",
     "extract_microarch_profile_from_tirx",
     "is_paradigm_shift_exempt",
-    "load_official_reports",
     "merge_microarch_profiles",
     "normalize_ns_to_z3_ticks",
     "parse_bisheng_res_usage",
@@ -129,7 +107,5 @@ __all__ = [
     "project_case_workload",
     "register_compiler_detector",
     "resolve_default_experience_lake_dir",
-    "run_cost_model_backtest",
-    "run_p2_prescreen_ablation",
     "topology_bucket_for_axes",
 ]

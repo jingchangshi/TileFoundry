@@ -14,7 +14,7 @@ from textwrap import dedent
 import pytest
 import yaml
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import extract_schema_driven_case_dims
+from tilefoundry_ascend.agent.specs.anchor_specs import extract_schema_driven_case_dims
 from tilefoundry_ascend.ascend.schedule.regime_solver import RegimePiecewiseSolver
 from tilefoundry_ascend.ascend.sil import (
     DEFAULT_OPS_ROOT,
