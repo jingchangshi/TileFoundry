@@ -28,14 +28,14 @@ from tilefoundry_ascend.agent.npu.ag_transport import (
     _NON_AGENT_GATES_ENV_KEYS, _REF_CACHE_THREAD_ENV_KEYS, FAST_REQUEST_SCHEMA,
     AgentGatesDeviceFaultError, _agent_gates_workspace_name,
     _fast_cache_roots, _fast_held_seconds, _fast_request_root, _fast_response_mapping,
-    _fast_wire_operator_name, _hook, _inspect_v2_device_fault, _resolve_agent_gates_bin,
+    _fast_wire_operator_name, _inspect_v2_device_fault, _resolve_agent_gates_bin,
     _resolve_env_file_path, _resolve_env_values, _sha256_file, _stage_fast_candidate,
     _submit_fast_gate, _verify_fast_bindings, _verify_fast_coverage, _write_fast_request,
 )
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+from tilefoundry_ascend.agent.gates.gate_funnel import (
     StageAResult, StageBResult, extract_ordered_tensor_shapes, run_stage_a_static,
 )
-from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (
+from tilefoundry_ascend.agent.gates.stage_b_gate import (
     ModuleSelectorPlanExtractor, build_post_selector_regime_plan, run_l1_compile_check,
     validate_prewarm_manifest_v1,
 )
@@ -525,7 +525,7 @@ def compare_case_result(*, case_id: str, actual: object, golden: object, inputs:
 
 def ensure_npu_compare_shim_dir(target_dir: str | Path, cannbench_repo: str | Path | None = None, env_file: str | Path | None = None) -> Path:
     """Create a runtime npu_compare.py shim delegating to CANNBench compare_tensors."""
-    repo = _hook("resolve_cannbench_repo", resolve_cannbench_repo)(cannbench_repo=cannbench_repo, env_file=env_file)
+    repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
     out_dir = Path(target_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "npu_compare.py").write_text(_NPU_COMPARE_SHIM_SOURCE.format(cann_repo=str(repo)), encoding="utf-8")
@@ -581,11 +581,11 @@ def prewarm_anchor_reference_cache(
 ) -> Path:
     """Populate CANNBench oracle and native reference cache on Host CPU without NPU locks."""
     root = Path(source_root).resolve() if source_root is not None else default_source_root()
-    repo = _hook("resolve_cannbench_repo", resolve_cannbench_repo)(cannbench_repo=cannbench_repo, env_file=env_file)
-    resolved_cache = Path(cache_dir) if cache_dir is not None else _hook("_default_surrogate_cache_dir", _default_surrogate_cache_dir)()
+    repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
+    resolved_cache = Path(cache_dir) if cache_dir is not None else _default_surrogate_cache_dir()
     resolved_cache.mkdir(parents=True, exist_ok=True)
     try:
-        task = _hook("get_operator_task", get_operator_task)(operator_name)
+        task = get_operator_task(operator_name)
     except (KeyError, ValueError):
         task = ""
     sorted_ids = sorted({int(a.case_num) for a in anchors})
@@ -628,7 +628,7 @@ def prewarm_anchor_reference_cache(
 
 def _resolve_cases_yaml_sha256(repo: Path, operator_name: str) -> str:
     try:
-        cases_path = resolve_cannbench_tasks_root(repo) / _hook("get_operator_task", get_operator_task)(operator_name) / "cases.yaml"
+        cases_path = resolve_cannbench_tasks_root(repo) / get_operator_task(operator_name) / "cases.yaml"
         return _sha256_file(cases_path) if cases_path.is_file() else ""
     except (OSError, ValueError, KeyError, RuntimeError):
         return ""
@@ -643,7 +643,7 @@ def _resolve_l1_cache_store(
         resolved = Path(tl_cache_dir).expanduser().resolve()
         return resolved, ArtifactStore(resolved)
     has_env = any(str(env_vals.get(k, "") or os.environ.get(k, "")).strip() for k in ("TILELANG_CACHE_DIR", "TF_SURROGATE_TL_CACHE_DIR", "TILEFOUNDRY_NPU_ARTIFACT_STORE", "TILEFOUNDRY_NPU_WORK_ROOT"))
-    resolved = resolve_unified_tl_cache_dir(None, env_vals=env_vals, source_root=source_root) if has_env else _hook("_default_surrogate_tl_cache_dir", _default_surrogate_tl_cache_dir)().resolve()
+    resolved = resolve_unified_tl_cache_dir(None, env_vals=env_vals, source_root=source_root) if has_env else _default_surrogate_tl_cache_dir().resolve()
     return resolved, ArtifactStore(resolved)
 
 
@@ -651,8 +651,8 @@ def lookup_case_static_spec(
     operator_name: str, case_num: int, *, cannbench_repo: str | Path | None = None, env_file: str | Path | None = None
 ) -> dict[str, object]:
     """Read static dims, tl_dtype, and attributes directly from cases.yaml."""
-    repo = _hook("resolve_cannbench_repo", resolve_cannbench_repo)(cannbench_repo=cannbench_repo, env_file=env_file)
-    task = _hook("get_operator_task", get_operator_task)(operator_name)
+    repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
+    task = get_operator_task(operator_name)
     cases_path = resolve_cannbench_tasks_root(repo) / task / "cases.yaml"
     if not cases_path.is_file():
         raise FileNotFoundError(f"cases.yaml not found at {cases_path}")
@@ -684,7 +684,7 @@ def prewarm_surrogate_tilelang_cache_with_stats(
     _ = (cache_dir, timeout_sec)
     t0 = time.monotonic()
     root = Path(source_root).resolve() if source_root is not None else default_source_root()
-    repo = _hook("resolve_cannbench_repo", resolve_cannbench_repo)(cannbench_repo=cannbench_repo, env_file=env_file)
+    repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
     env_vals = _resolve_env_values(env_file)
     tl_c, _ = _resolve_l1_cache_store(env_vals, tl_cache_dir, None, root)
     tl_c.mkdir(parents=True, exist_ok=True)
@@ -758,7 +758,7 @@ def prewarm_surrogate_tilelang_cache(
     source_root: str | Path | None = None, timeout_sec: int = 300,
 ) -> Path:
     """Pre-compile deduplicated candidate anchor kernels into TileLang disk cache on Host CPU."""
-    return _hook("prewarm_surrogate_tilelang_cache_with_stats", prewarm_surrogate_tilelang_cache_with_stats)(
+    return prewarm_surrogate_tilelang_cache_with_stats(
         operator_name, candidates, anchors, cannbench_repo=cannbench_repo, env_file=env_file,
         cache_dir=cache_dir, tl_cache_dir=tl_cache_dir, source_root=source_root, timeout_sec=timeout_sec, isolate_non_incumbent=False,
     ).tl_cache_dir
@@ -836,27 +836,26 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
 ) -> tuple[dict[str, dict[str, CandidateSurrogateResult]], str, str, float]:
     """Evaluate candidate batches across operators inside one AgentGates device lease."""
     root = Path(source_root).resolve() if source_root is not None else default_source_root()
-    resolved_env = _hook("_resolve_env_file_path", _resolve_env_file_path)(env_file)
-    ag_bin = _hook("_resolve_agent_gates_bin", _resolve_agent_gates_bin)(root)
+    resolved_env = _resolve_env_file_path(env_file)
+    ag_bin = _resolve_agent_gates_bin(root)
     env_vals = parse_simple_env_file(resolved_env)
-    cann_repo = _hook("resolve_cannbench_repo", resolve_cannbench_repo)(cannbench_repo=env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"), env_file=resolved_env)
+    cann_repo = resolve_cannbench_repo(cannbench_repo=env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"), env_file=resolved_env)
     cache_dir, tl_cache_dir = _fast_cache_roots(root, env_vals)
     pw_stats = {"total_tasks": 0, "cache_hits": 0, "compiled_tasks": 0, "failed_candidates": 0}
     failed_by_op: dict[str, dict[str, str]] = {}
     t_pw0 = time.monotonic()
     if prewarm_cache:
-        pw_tl, pw_s, pw_ref = _hook("prewarm_surrogate_tilelang_cache", prewarm_surrogate_tilelang_cache), _hook("prewarm_surrogate_tilelang_cache_with_stats", prewarm_surrogate_tilelang_cache_with_stats), _hook("prewarm_anchor_reference_cache", prewarm_anchor_reference_cache)
-        use_stats = pw_tl is _ORIG_PREWARM_SURROGATE_TILELANG_CACHE
+        use_stats = prewarm_surrogate_tilelang_cache is _ORIG_PREWARM_SURROGATE_TILELANG_CACHE
         for op_name, cands, op_anchors in batches:
-            pw_ref(op_name, op_anchors, cannbench_repo=cann_repo, env_file=resolved_env, cache_dir=cache_dir, source_root=root)
+            prewarm_anchor_reference_cache(op_name, op_anchors, cannbench_repo=cann_repo, env_file=resolved_env, cache_dir=cache_dir, source_root=root)
             if use_stats:
-                res = pw_s(op_name, cands, op_anchors, cannbench_repo=cann_repo, env_file=resolved_env, cache_dir=cache_dir, tl_cache_dir=tl_cache_dir, source_root=root, isolate_non_incumbent=True)
+                res = prewarm_surrogate_tilelang_cache_with_stats(op_name, cands, op_anchors, cannbench_repo=cann_repo, env_file=resolved_env, cache_dir=cache_dir, tl_cache_dir=tl_cache_dir, source_root=root, isolate_non_incumbent=True)
                 for k in pw_stats:
                     pw_stats[k] += int(res.prewarm_stats.get(k, 0))
                 if res.failed_by_cid:
                     failed_by_op[op_name] = dict(res.failed_by_cid)
             else:
-                pw_tl(op_name, cands, op_anchors, cannbench_repo=cann_repo, env_file=resolved_env, cache_dir=cache_dir, tl_cache_dir=tl_cache_dir, source_root=root)
+                prewarm_surrogate_tilelang_cache(op_name, cands, op_anchors, cannbench_repo=cann_repo, env_file=resolved_env, cache_dir=cache_dir, tl_cache_dir=tl_cache_dir, source_root=root)
     l2_pw_sec = time.monotonic() - t_pw0
 
     req_root, req_id = _fast_request_root(root, env_vals), uuid.uuid4().hex
@@ -902,8 +901,8 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
 
     payload: dict[str, object] = {"schema": FAST_REQUEST_SCHEMA, "request_id": req_id, "mode": "batch", "warmup": int(warmup), "repeat": int(repeat), "require_all_passed": bool(require_all_passed), "response_path": resp_path.relative_to(root).as_posix(), "batches": req_batches, "msprof_targets": []}
     t_npu0 = time.monotonic()
-    raw_resp, execution = _hook("_submit_fast_gate", _submit_fast_gate)(
-        agent_gates_bin=ag_bin, root=root, workspace=_hook("_agent_gates_workspace_name", _agent_gates_workspace_name)(root),
+    raw_resp, execution = _submit_fast_gate(
+        agent_gates_bin=ag_bin, root=root, workspace=_agent_gates_workspace_name(root),
         request_id=req_id, request_relative_path=req_path.relative_to(root).as_posix(), request_path=req_path, response_path=resp_path,
         request_sha256=_write_fast_request(req_path, payload), mode="batch", timeout_sec=float(timeout_sec), device_id=str(device_id), device_pool=device_pool, env_vals=env_vals,
     )

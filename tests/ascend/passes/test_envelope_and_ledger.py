@@ -30,20 +30,18 @@ from tilefoundry.vendor.tilelang_z3 import Buffer, Capacity, Edge, Problem, Reso
 from tilefoundry_ascend.agent.campaign import campaign_runner as cr_mod
 from tilefoundry_ascend.agent.campaign import helpers as helpers_mod
 from tilefoundry_ascend.agent.campaign import stage_gate_coordinator as sgc_mod
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    extract_ordered_tensor_shapes,
-    run_l0_static_precheck,
-)
-from tilefoundry_ascend.agent.kb import build_predicate_context, load_seed_rules
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+from tilefoundry_ascend.agent.gates.gate_funnel import (
     StageAResult,
     StageBResult,
     _build_ascendc_static_ledger,
     _safe_eval_cpp_int,
     build_stage_b_driver_source,
+    extract_ordered_tensor_shapes,
     run_stage_a_static,
 )
-from tilefoundry_ascend.agent.orchestrator.stage_b_gate import run_stage_b_ascendc_compile
+from tilefoundry_ascend.agent.gates.stage_b_gate import run_stage_b_ascendc_compile
+from tilefoundry_ascend.agent.kb import build_predicate_context, load_seed_rules
+from tilefoundry_ascend.agent.npu import run_l0_static_precheck
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,

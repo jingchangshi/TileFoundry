@@ -16,12 +16,10 @@ import tomllib
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypeVar
 
 from tilefoundry_ascend.agent.specs.anchor_specs import parse_simple_env_file
 
 logger = logging.getLogger(__name__)
-_T = TypeVar("_T")
 
 DEFAULT_AGENT_GATES_MAX_ATTEMPTS = 5
 DEFAULT_AGENT_GATES_BACKOFF_SEC = 3.0
@@ -55,22 +53,6 @@ _REF_CACHE_THREAD_ENV_KEYS = frozenset(
     {"OMP_NUM_THREADS", "MKL_NUM_THREADS", "ATEN_CPU_CAPABILITY", "TORCH_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"}
 )
 _STRIPPED_HOST_CPU_ENV_KEYS = frozenset({"ASCEND_RT_VISIBLE_DEVICES", "TILELANG_DISABLE_CACHE", "TORCH_DEVICE_BACKEND_AUTOLOAD", "USE_CUDA"})
-_FACADE_NS: Mapping[str, object] = {}
-_FACADE_DEFAULTS: dict[str, object] = {}
-
-
-def _bind_facade_globals(namespace: Mapping[str, object]) -> None:
-    """Register thin facade namespace so test monkeypatches on it apply transparently."""
-    global _FACADE_NS
-    _FACADE_NS = namespace
-    _FACADE_DEFAULTS.clear()
-    _FACADE_DEFAULTS.update(namespace)
-
-
-def _hook(name: str, local_val: _T) -> _T:
-    if name in _FACADE_NS and _FACADE_NS[name] is not _FACADE_DEFAULTS.get(name):
-        return _FACADE_NS[name]  # type: ignore[return-value]
-    return local_val
 
 
 class AgentGatesDeviceFaultError(RuntimeError):
@@ -179,9 +161,9 @@ def _resolve_agent_gates_bin(source_root: Path | None = None) -> str:
     if source_root is not None:
         rsrc = Path(source_root).expanduser().resolve()
         candidates.append(rsrc.parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
-        if (cdir := _hook("_git_common_dir", _git_common_dir)(rsrc)) is not None:
+        if (cdir := _git_common_dir(rsrc)) is not None:
             candidates.append(cdir.parent.parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
-    candidates.append(Path(str(_hook("__file__", __file__))).resolve().parents[5].parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
+    candidates.append(Path(__file__).resolve().parents[5].parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
     for cand in candidates:
         if cand.is_file():
             return str(cand)
@@ -277,10 +259,9 @@ def _agent_gates_workspace_name(source_root: Path) -> str:
     for name, entry in workspaces.items():
         if isinstance(entry, Mapping) and isinstance(cfg := entry.get("source_root"), str) and Path(cfg).expanduser().resolve() == wanted:
             return str(name)
-    git_common = _hook("_git_common_dir", _git_common_dir)
-    if (wanted_common := git_common(wanted)) is not None:
+    if (wanted_common := _git_common_dir(wanted)) is not None:
         for name, entry in workspaces.items():
-            if isinstance(entry, Mapping) and entry.get("allow_worktrees") is not False and isinstance(cfg := entry.get("source_root"), str) and cfg.strip() and git_common(Path(cfg).expanduser().resolve()) == wanted_common:
+            if isinstance(entry, Mapping) and entry.get("allow_worktrees") is not False and isinstance(cfg := entry.get("source_root"), str) and cfg.strip() and _git_common_dir(Path(cfg).expanduser().resolve()) == wanted_common:
                 return str(name)
     raise ValueError(f"No AgentGates workspace is configured for source root {wanted}")
 
@@ -456,7 +437,7 @@ def _probe_host_card_load(device_id: str, *, max_quiet_hbm_mb: int | None = None
 
 def _probe_host_card_idle(device_id: str) -> bool | None:
     """Return True if card has 0 compute processes, False if busy/locked, None if unknown."""
-    load = _hook("_probe_host_card_load", _probe_host_card_load)(device_id)
+    load = _probe_host_card_load(device_id)
     return None if load is None else (load[0] == 0)
 
 
@@ -467,10 +448,9 @@ def order_candidates_by_idle_preflight(
     candidates = _normalize_device_pool(device_id, device_pool, excluded=excluded)
     if len(candidates) <= 1:
         return candidates
-    probe_fn = _hook("_probe_host_card_load", _probe_host_card_load)
     tier0, unknown, tier1, tier2, tier3 = [], [], [], [], []
     for idx, card in enumerate(candidates):
-        if (load := probe_fn(card, env_vals=env_vals)) is None:
+        if (load := _probe_host_card_load(card, env_vals=env_vals)) is None:
             unknown.append(card)
         elif load[0] == 0:
             tier0.append(card)
@@ -486,13 +466,12 @@ def _call_order_candidates_by_idle_preflight(
     device_id: str, device_pool: Sequence[str], *, excluded: Collection[str], env_vals: Mapping[str, str] | None
 ) -> tuple[str, ...]:
     """Forward env_vals to order_candidates_by_idle_preflight when supported."""
-    order_fn = _hook("order_candidates_by_idle_preflight", order_candidates_by_idle_preflight)
     if env_vals is not None:
         try:
-            return order_fn(device_id, device_pool, excluded=excluded, env_vals=env_vals)
+            return order_candidates_by_idle_preflight(device_id, device_pool, excluded=excluded, env_vals=env_vals)
         except TypeError:
             pass
-    return order_fn(device_id, device_pool, excluded=excluded)
+    return order_candidates_by_idle_preflight(device_id, device_pool, excluded=excluded)
 
 
 def select_idle_campaign_device(
@@ -555,8 +534,8 @@ def _run_v2_gate(
     """Run one managed gate with a single monotonic deadline and one execution identity."""
     started = time.monotonic()
     deadline, requested_device = started + max(1.0, float(timeout_sec)), str(device_id or "").strip()
-    source_override = _hook("_agent_gates_source_override", _agent_gates_source_override)(workspace, root)
-    run_cmd = _hook("_run_agent_gates_v2_cmd", _run_agent_gates_v2_cmd)
+    source_override = _agent_gates_source_override(workspace, root)
+    run_cmd = _run_agent_gates_v2_cmd
 
     def _failed(eid: str, msg: str, *, run_id: str = "", receipt: str = "", dev: str = "", state: str = "", terminal: bool = True, rejected: bool = False) -> _V2GateExecution:
         return _V2GateExecution(
@@ -627,7 +606,7 @@ def _run_v2_gate(
     if not run_id:
         return _failed(execution_id, f"{gate_id} execution {execution_id} finished without run_id", dev=resolved_device, state=last_state or "FINISHED")
     try:
-        evidence_root = _hook("_agent_gates_evidence_root", _agent_gates_evidence_root)()
+        evidence_root = _agent_gates_evidence_root()
     except (OSError, ValueError) as exc:
         return _failed(execution_id, f"{gate_id} evidence root unavailable: {exc}", run_id=run_id, dev=resolved_device, state=last_state or "FINISHED")
     res, err = _step([agent_gates_bin, "report", "--run-id", run_id, "--evidence-root", str(evidence_root), "--json"], execution_id, f"{gate_id} report", timeout=min(_V2_POST_WAIT_TIMEOUT_SEC, max(1.0, deadline - time.monotonic())), run_id=run_id, dev=resolved_device, state=last_state or "FINISHED")
@@ -801,7 +780,6 @@ def _submit_fast_gate(
     """Submit the device-fast target with idle card selection and contamination retest."""
     if _sha256_file(request_path) != request_sha256:
         raise RuntimeError("fast request file changed after it was written")
-    run_v2 = _hook("_run_v2_gate", _run_v2_gate)
     backoff, occ_backoff = (8.0, 12.0, 16.0, 20.0, 25.0, 30.0), (4.0, 6.0, 8.0, 10.0, 15.0)
     occ_budget, total_occ_sleep = min(max(float(timeout_sec), 10.0), 240.0), 0.0
     rejected_cards, selected_card, saw_df, occ_attempts, occ_reasons = set(), "", False, 0, []
@@ -817,7 +795,7 @@ def _submit_fast_gate(
         for idx, card in enumerate(candidates):
             attempt_exec: _V2GateExecution | None = None
             for retry_idx in range(15):
-                attempt_exec = run_v2(
+                attempt_exec = _run_v2_gate(
                     agent_gates_bin=agent_gates_bin, root=root, workspace=workspace, gate_id=AGENT_GATES_DEVICE_FAST_GATE,
                     target=f"fast/{request_id}", candidate_path=request_relative_path, timeout_sec=timeout_sec, device_id=card,
                 )
@@ -876,7 +854,7 @@ def _submit_fast_gate(
             if isinstance(fraw, Mapping) and (st := str(fraw.get("status", "")).strip()):
                 resp_detail = f"; response status {st}: {str(fraw.get('error', '')).strip() or 'no detail'}"
         raise RuntimeError(f"AgentGates device-fast receipt did not verify: {execution.verification.get('failures') or 'unsatisfied'}{resp_detail}")
-    if not _hook("_source_identity_matches", _source_identity_matches)(execution.verification, root):
+    if not _source_identity_matches(execution.verification, root):
         raise RuntimeError("AgentGates device-fast verified source identity does not match requested source")
     if not response_path.is_file():
         row, _ = _gate_observation(execution.report, AGENT_GATES_DEVICE_FAST_GATE)
@@ -886,7 +864,7 @@ def _submit_fast_gate(
         raise RuntimeError("AgentGates device-fast response must be a JSON object")
     _raise_for_fast_status(_require_fast_envelope(raw, request_id=request_id, request_sha256=request_sha256, mode=mode), raw)
     probe_card = selected_card or execution.device_id or str(device_id or "").strip()
-    load = _hook("_probe_host_card_load", _probe_host_card_load)(probe_card, env_vals=env_vals) if probe_card else None
+    load = _probe_host_card_load(probe_card, env_vals=env_vals) if probe_card else None
     if load is not None and load[0] < 3 and int(load[1]) > 0:
         raw.setdefault("_selected_card_ext_hbm_mb", int(load[1]))
     return raw, execution

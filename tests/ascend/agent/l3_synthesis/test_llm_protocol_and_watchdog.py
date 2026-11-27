@@ -27,11 +27,13 @@ from tilefoundry_ascend.agent import (
     StreamWatchdogConfig,
     TwoLaneBeamSearch,
 )
+from tilefoundry_ascend.agent.gates import (
+    StageBResult,
+    StageCResult,
+)
 from tilefoundry_ascend.agent.orchestrator import (
     OpenAICompatHTTPBackend,
     RoleRoutingConfig,
-    StageBResult,
-    StageCResult,
     SubprocessCliTemplateBackend,
     compute_static_dynamic_residual,
     create_llm_backend_from_env,

@@ -25,16 +25,16 @@ from tilefoundry_ascend.agent.campaign.helpers import (
 )
 from tilefoundry_ascend.agent.campaign.l3_l4_recovery import PendingL4
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import PendingPromotion
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    AnchorEvalMetrics, CandidateSurrogateResult, L0L1CandidateCheck, L4CannbenchResult,
-    aggregate_surrogate_result, bottleneck_anchor_for_regime, extract_ordered_tensor_shapes,
-)
 from tilefoundry_ascend.agent.contracts import CampaignRoundRecord, CampaignStateSnapshot
 from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
+from tilefoundry_ascend.agent.gates.gate_funnel import StageAResult, extract_ordered_tensor_shapes
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker, append_kb_event_shard
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, build_predicate_context, load_seed_rules
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult
+from tilefoundry_ascend.agent.npu import (
+    AnchorEvalMetrics, CandidateSurrogateResult, L0L1CandidateCheck, L4CannbenchResult,
+    aggregate_surrogate_result, bottleneck_anchor_for_regime,
+)
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     StaticDynamicResidual, TwoLaneBeamSearch, compiler_summary_from_residual,
 )

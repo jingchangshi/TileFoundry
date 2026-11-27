@@ -19,12 +19,12 @@ from tilefoundry_ascend.agent.campaign.helpers import (
     source_sha256, write_source_and_verify,
 )
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import PendingPromotion
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+from tilefoundry_ascend.agent.contracts import NpuExecutionPort
+from tilefoundry_ascend.agent.npu import (
     FAILURE_KIND_CANDIDATE, FAILURE_KIND_INFRASTRUCTURE, AnchorEvalMetrics,
     CandidateSurrogateResult, L3AcceptanceResult, L4CannbenchResult,
     run_l3_full_contract_via_agent_gates, run_l4_official_cannbench_via_agent_gates,
 )
-from tilefoundry_ascend.agent.contracts import NpuExecutionPort
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec, GuardrailCaseSpec, RegimeTargetSpec, get_operator_task,
     lookup_case_dims, lookup_case_metadata, resolve_regime_for_case,

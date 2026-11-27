@@ -14,7 +14,7 @@ from tilefoundry_ascend.agent.npu.ag_transport import (
     FAILURE_KIND_CANDIDATE, FAILURE_KIND_INFRASTRUCTURE,
     _agent_gates_workspace_name, _as_positive_int, _blocked_env_category,
     _call_order_candidates_by_idle_preflight, _gate_observation, _gate_recorded_status,
-    _hook, _is_fast_transient_build_lock, _resolve_agent_gates_bin, _resolve_env_file_path,
+    _is_fast_transient_build_lock, _resolve_agent_gates_bin, _resolve_env_file_path,
     _run_v2_gate, _sha256_file, _source_identity_matches, _V2GateExecution,
     _workspace_relative_candidate,
 )
@@ -334,7 +334,7 @@ def run_l3_full_contract_via_agent_gates(
     """Run the L3 promotion gate through AgentGates and validate its signed promotion evidence."""
     env_vals: dict[str, str] | None = None
     try:
-        env_vals = parse_simple_env_file(_hook("_resolve_env_file_path", _resolve_env_file_path)(env_file))
+        env_vals = parse_simple_env_file(_resolve_env_file_path(env_file))
     except FileNotFoundError:
         pass
     result_device, started = str(device_id or ""), time.monotonic()
@@ -350,7 +350,7 @@ def run_l3_full_contract_via_agent_gates(
     if operator_name is None or candidate_module_path is None:
         return _fail("L3 promotion requires an operator name and candidate module path")
     try:
-        target_task = _hook("get_operator_task", get_operator_task)(operator_name)
+        target_task = get_operator_task(operator_name)
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         return _fail(f"L3 promotion target resolution failed: {exc}")
     root, candidate = (Path(source_root).resolve() if source_root is not None else default_source_root()), Path(candidate_module_path).resolve()
@@ -360,15 +360,15 @@ def run_l3_full_contract_via_agent_gates(
         return _fail(f"L3 candidate module {candidate} does not exist")
     candidate_digest, target_path = _sha256_file(candidate), str(candidate)
     try:
-        ag_bin = _hook("_resolve_agent_gates_bin", _resolve_agent_gates_bin)(root)
-        workspace = _hook("_agent_gates_workspace_name", _agent_gates_workspace_name)(root)
+        ag_bin = _resolve_agent_gates_bin(root)
+        workspace = _agent_gates_workspace_name(root)
     except FileNotFoundError:
         raise
     except (OSError, ValueError) as exc:
         return _fail(str(exc))
 
-    run_v2 = _hook("_run_v2_gate", _run_v2_gate)
-    order_fn = _hook("_call_order_candidates_by_idle_preflight", _call_order_candidates_by_idle_preflight)
+    run_v2 = _run_v2_gate
+    order_fn = _call_order_candidates_by_idle_preflight
     blocked_env_category = ""
     if resume_execution_id or resume_run_id:
         execution = run_v2(
@@ -439,7 +439,7 @@ def run_l3_full_contract_via_agent_gates(
         return _reject(f"L3 gate recorded status {recorded_status or 'missing'}: {_format_l3_failure_detail(row, observation, evidence)}", _l3_failure_kind(observation, evidence, coverage))
     if not execution.verified:
         return _reject(f"L3 receipt did not verify: {execution.verification.get('failures') or 'unsatisfied'}", FAILURE_KIND_INFRASTRUCTURE)
-    if not _hook("_source_identity_matches", _source_identity_matches)(execution.verification, root):
+    if not _source_identity_matches(execution.verification, root):
         return _reject("L3 verified source identity does not match requested source", FAILURE_KIND_INFRASTRUCTURE)
     schema, profile = str(evidence.get("schema", "")), str(evidence.get("profile", ""))
     if schema != "tilefoundry-l3-evidence/v1" or profile != "l3-promotion":
@@ -534,7 +534,7 @@ def _validate_l4_report(execution: _V2GateExecution, *, root: Path, target_task:
     """Validate signed L4 evidence; return ``(error_message, failure_kind)``."""
     if not execution.verified:
         return (f"L4 receipt did not verify: {execution.verification.get('failures') or 'unsatisfied'}", FAILURE_KIND_INFRASTRUCTURE)
-    if not _hook("_source_identity_matches", _source_identity_matches)(execution.verification, root):
+    if not _source_identity_matches(execution.verification, root):
         return ("L4 verified source identity does not match requested source", FAILURE_KIND_INFRASTRUCTURE)
     row, obs = _gate_observation(execution.report, AGENT_GATES_L4_CANNBENCH_GATE)
     if row is None:
@@ -585,7 +585,7 @@ def run_l4_official_cannbench_via_agent_gates(
     if operator_name is None:
         return _l4_failure("L4 cannbench requires a canonical operator name", device_id=result_device)
     try:
-        target_task = _hook("get_operator_task", get_operator_task)(operator_name)
+        target_task = get_operator_task(operator_name)
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         return _l4_failure(f"L4 cannbench target resolution failed: {exc}", device_id=result_device)
     root = Path(source_root).resolve() if source_root is not None else default_source_root()
@@ -597,12 +597,12 @@ def run_l4_official_cannbench_via_agent_gates(
     except OSError as exc:
         return _l4_failure(f"L4 candidate module {expected_path} cannot be read: {exc}", device_id=result_device, target_path=str(expected_path))
     try:
-        ag_bin = _hook("_resolve_agent_gates_bin", _resolve_agent_gates_bin)(root)
-        resolved_workspace = workspace or _hook("_agent_gates_workspace_name", _agent_gates_workspace_name)(root)
+        ag_bin = _resolve_agent_gates_bin(root)
+        resolved_workspace = workspace or _agent_gates_workspace_name(root)
     except (OSError, ValueError) as exc:
         return _l4_failure(str(exc), device_id=result_device)
 
-    run_v2, backoff = _hook("_run_v2_gate", _run_v2_gate), (10.0, 15.0, 20.0, 25.0, 30.0)
+    run_v2, backoff = _run_v2_gate, (10.0, 15.0, 20.0, 25.0, 30.0)
     max_attempts, execution_opt = (1 if (resume_execution_id or resume_run_id) else 13), None
     for retry_idx in range(max_attempts):
         execution_opt = run_v2(

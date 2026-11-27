@@ -10,7 +10,7 @@ from tilefoundry_ascend.agent.campaign.marathon import (
     discover_marathon_environment, ensure_marathon_env_file, run_operator_marathon,
     run_operators_marathon,
 )
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+from tilefoundry_ascend.agent.npu import (
     AnchorEvalMetrics, CandidateSurrogateResult, L0L1CandidateCheck, L3AcceptanceResult,
     L4CannbenchResult, aggregate_surrogate_result, bottleneck_anchor_for_regime,
     classify_l3_observation_failure, compute_ring_burst_k,

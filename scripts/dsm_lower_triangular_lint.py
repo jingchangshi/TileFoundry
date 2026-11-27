@@ -20,6 +20,9 @@ BANNED_REFLECTION_NAMES = frozenset(
         "_PROPAGATED_HOOKS",
         "_owner_override",
         "_resolve_hook",
+        "_bind_facade_globals",
+        "_FACADE_NS",
+        "_hook",
     }
 )
 
@@ -49,26 +52,11 @@ _L1_EXACT = frozenset(
     }
 )
 
-_L2_PREFIXES = ("ascend.schedule.", "agent.router.")
-_L2_EXACT = frozenset(
-    {
-        "agent.orchestrator.cpp_slice_protocol",
-        "agent.orchestrator.gate_funnel",
-        "agent.orchestrator.stage_b_gate",
-    }
-)
+_L2_PREFIXES = ("ascend.schedule.", "agent.router.", "agent.gates.")
 
-_L3_PREFIXES = ("agent.synthesis.", "agent.flywheel.")
+_L3_PREFIXES = ("agent.orchestrator.", "agent.synthesis.", "agent.flywheel.")
 _L3_EXACT = frozenset(
     {
-        "agent.orchestrator.llm_client",
-        "agent.orchestrator.llm_constraints",
-        "agent.orchestrator.portfolio_runner",
-        "agent.orchestrator.residual_beam",
-        "agent.orchestrator.tilesize_prescreen",
-        "agent.orchestrator.__init__",
-        "agent.campaign.regime_slice_patcher",
-        "agent.campaign.seed_synthesizer",
         "agent.cost_advisor",
         "ascend.cost_model.hybrid_cost_model",
         "ascend.cost_model.pipe_schedule_eval",
@@ -77,34 +65,17 @@ _L3_EXACT = frozenset(
 )
 
 _L4_PREFIXES = ("agent.probes.", "agent.npu.")
-_L4_EXACT = frozenset({"agent.campaign.surrogate_cannbench"})
 
-_L5_EXACT = frozenset(
-    {
-        "agent.__init__",
-        "agent.campaign.campaign_runner",
-        "agent.campaign.stage_gate_coordinator",
-        "agent.campaign.round_context_builder",
-        "agent.campaign.telemetry_ledger_writer",
-        "agent.campaign.l3_l4_recovery",
-        "agent.campaign.calibration_service",
-        "agent.campaign.promotion_coordinator",
-        "agent.campaign.flywheel_coordinator",
-        "agent.campaign.funnel_telemetry",
-        "agent.campaign.helpers",
-        "agent.campaign.marathon",
-        "agent.campaign.cli",
-        "agent.campaign.__init__",
-    }
-)
+_L5_PREFIXES = ("agent.campaign.",)
+_L5_EXACT = frozenset({"agent.__init__"})
 
 _LAYER_RULES: tuple[tuple[int, tuple[str, ...], frozenset[str]], ...] = (
     (0, _L0_PREFIXES, _L0_EXACT),
     (1, _L1_PREFIXES, _L1_EXACT),
-    (2, _L2_PREFIXES, _L2_EXACT),
+    (2, _L2_PREFIXES, frozenset()),
     (3, _L3_PREFIXES, _L3_EXACT),
-    (4, _L4_PREFIXES, _L4_EXACT),
-    (5, (), _L5_EXACT),
+    (4, _L4_PREFIXES, frozenset()),
+    (5, _L5_PREFIXES, _L5_EXACT),
 )
 
 
@@ -188,6 +159,9 @@ _BASE_SCAN_TOKENS = (
     "_PROPAGATED_HOOKS",
     "_owner_override",
     "_resolve_hook",
+    "_bind_facade_globals",
+    "_FACADE_NS",
+    "_hook",
 )
 
 

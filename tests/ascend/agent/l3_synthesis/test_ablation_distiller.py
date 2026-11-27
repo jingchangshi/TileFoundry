@@ -37,11 +37,13 @@ from tilefoundry_ascend.agent.kb import (
     safe_eval_predicate,
     validate_rule_predicate,
 )
-from tilefoundry_ascend.agent.orchestrator import (
+from tilefoundry_ascend.agent.gates import (
     StageBResult,
     StageCResult,
-    compute_static_dynamic_residual,
     run_stage_a_static,
+)
+from tilefoundry_ascend.agent.orchestrator import (
+    compute_static_dynamic_residual,
 )
 from tilefoundry_ascend.agent.specs.anchor_specs import CannbenchOpsRegistry
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes

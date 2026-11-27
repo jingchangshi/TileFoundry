@@ -37,7 +37,11 @@ from tilefoundry_ascend.agent.campaign.round_context_builder import (
     RoundContextBuilder,
     RoundSynthesisBundle,
 )
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+from tilefoundry_ascend.agent.cost_advisor import create_cost_advisor
+from tilefoundry_ascend.agent.gates.gate_funnel import StageAResult
+from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
+from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, SymptomFamily
+from tilefoundry_ascend.agent.npu import (
     FAILURE_KIND_CANDIDATE,
     FAILURE_KIND_INFRASTRUCTURE,
     AnchorEvalMetrics,
@@ -46,10 +50,6 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     L4CannbenchResult,
     aggregate_surrogate_result,
 )
-from tilefoundry_ascend.agent.cost_advisor import create_cost_advisor
-from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
-from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, SymptomFamily
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
     TwoLaneBeamSearch,

@@ -25,7 +25,9 @@ from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import (
     StageGateOutcome,
     run_l0_l1_round_filter,
 )
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+from tilefoundry_ascend.agent.contracts import CampaignStateSnapshot, NpuExecutionPort
+from tilefoundry_ascend.agent.gates.gate_funnel import StageAResult, StageBResult
+from tilefoundry_ascend.agent.npu import (
     FAILURE_KIND_CANDIDATE,
     FAILURE_KIND_INFRASTRUCTURE,
     AgentGatesDeviceFaultError,
@@ -36,8 +38,6 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     L4CannbenchResult,
     aggregate_surrogate_result,
 )
-from tilefoundry_ascend.agent.contracts import CampaignStateSnapshot, NpuExecutionPort
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult, StageBResult
 from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,

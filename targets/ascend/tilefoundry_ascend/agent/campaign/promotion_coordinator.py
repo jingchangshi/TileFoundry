@@ -9,7 +9,7 @@ from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.funnel_telemetry import MAX_CLEAN_CALIBRATION_BURST_CV
 from tilefoundry_ascend.agent.campaign.helpers import to_conservation_point
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+from tilefoundry_ascend.agent.npu import (
     FAILURE_KIND_CANDIDATE,
     AnchorEvalMetrics,
     CandidateSurrogateResult,

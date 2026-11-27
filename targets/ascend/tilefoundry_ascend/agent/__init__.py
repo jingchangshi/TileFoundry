@@ -3,14 +3,9 @@
 from __future__ import annotations
 
 from tilefoundry_ascend.agent.campaign import (
-    AnchorEvalMetrics,
     CampaignConfig,
     CampaignReport,
-    CandidateSurrogateResult,
-    L3AcceptanceResult,
-    L4CannbenchResult,
     PerfTargetCampaignRunner,
-    run_surrogate_batch_via_agent_gates,
 )
 from tilefoundry_ascend.agent.contracts import (
     CampaignRoundRecord,
@@ -21,6 +16,11 @@ from tilefoundry_ascend.agent.contracts import (
 from tilefoundry_ascend.agent.flywheel import (
     FlywheelDistillationReport,
     FlywheelDistiller,
+)
+from tilefoundry_ascend.agent.gates import (
+    GateFunnel,
+    extract_ordered_tensor_shapes,
+    prescreen_dsl_tile_kwargs,
 )
 from tilefoundry_ascend.agent.kb import (
     AscendCausalRule,
@@ -34,10 +34,16 @@ from tilefoundry_ascend.agent.kb import (
     save_rules_yaml,
     validate_rule_predicate,
 )
+from tilefoundry_ascend.agent.npu import (
+    AnchorEvalMetrics,
+    CandidateSurrogateResult,
+    L3AcceptanceResult,
+    L4CannbenchResult,
+    run_surrogate_batch_via_agent_gates,
+)
 from tilefoundry_ascend.agent.orchestrator import (
     AgyCliLLMBackend,
     BeamCandidate,
-    GateFunnel,
     GenerationRequest,
     MockLLMBackend,
     PortfolioRunner,
@@ -45,13 +51,11 @@ from tilefoundry_ascend.agent.orchestrator import (
     TileConfigCandidate,
     TwoLaneBeamSearch,
     build_progressive_llm_constraints,
-    extract_ordered_tensor_shapes,
     format_blueprint_delta_section,
     format_hardware_and_sil_layer,
     format_prescreen_summary,
     format_target_dialect_layer,
     generate_aligned_neighborhood,
-    prescreen_dsl_tile_kwargs,
     prescreen_tile_configs,
 )
 from tilefoundry_ascend.agent.router import (

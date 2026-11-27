@@ -12,8 +12,8 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tilefoundry_ascend.agent.orchestrator import cpp_slice_protocol as _cpp_slice_protocol_mod
-from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+from tilefoundry_ascend.agent.gates import cpp_slice_protocol as _cpp_slice_protocol_mod
+from tilefoundry_ascend.agent.gates.cpp_slice_protocol import (
     DEFAULT_PROTECTED_EXPORTS, _SEARCH_REPLACE_PATTERNS, TopLevelSymbol as _TopLevelSymbol,
     _char_span_to_line_span, _disambiguate_matches_by_line_window, _find_all_substring_spans,
     _is_bare_cpp_symbol_patch as _looks_like_bare_trackb_cpp, _parse_scoped_search_replace_hunks,

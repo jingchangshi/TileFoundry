@@ -37,18 +37,35 @@ from tilefoundry_ascend.agent.campaign.helpers import (
     source_sha256,
 )
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import evaluate_promotion_gate
-from tilefoundry_ascend.agent.campaign.regime_slice_patcher import (
-    _compact_trackb_snippet_source,
-    _detect_trackb_dead_code_edit,
-    _extract_p2_focus_lines_and_diag,
-    _has_prim_func_builder,
-    _render_trackb_tu_from_module,
-    _resolve_selector_compile_flags,
-    extract_regime_snippet,
-    patch_regime_into_module,
-    resolve_regime_config,
+from tilefoundry_ascend.agent.contracts import (
+    CampaignStateSnapshot,
+    CompileTaskSpec,
+    NpuExecutionPort,
+    RegimeCompilePlan,
 )
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor, create_cost_advisor
+from tilefoundry_ascend.agent.gates.gate_funnel import (
+    StageAResult,
+    StageBResult,
+    _normalize_trackb_unit_source,
+    compile_trackb_shared_so,
+    compute_trackb_shared_so_filename,
+    evaluate_ascendc_candidate,
+    extract_ordered_tensor_shapes,
+    resolve_trackb_compile_flags,
+    run_stage_a_static,
+    run_stage_b_ascendc_compile,
+)
+from tilefoundry_ascend.agent.gates.stage_b_gate import (
+    ModuleSelectorPlanExtractor,
+    StageBCompileGate,
+    build_post_selector_regime_plan,
+    has_unreserved_vf_stack_overflow,
+    run_l1_compile_check,
+)
+from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker, append_kb_event_shard
+from tilefoundry_ascend.agent.kb.schema import AscendCausalRule
+from tilefoundry_ascend.agent.npu import (
     AgentGatesDeviceFaultError,
     AnchorEvalMetrics,
     CandidateSurrogateResult,
@@ -58,29 +75,8 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     OccupancyExhaustedError,
     _normalized_module_ast_signature,
     aggregate_surrogate_result,
-    extract_ordered_tensor_shapes,
     lookup_case_static_spec,
     run_surrogate_batch_via_agent_gates,
-)
-from tilefoundry_ascend.agent.contracts import (
-    CampaignStateSnapshot,
-    CompileTaskSpec,
-    NpuExecutionPort,
-    RegimeCompilePlan,
-)
-from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor, create_cost_advisor
-from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker, append_kb_event_shard
-from tilefoundry_ascend.agent.kb.schema import AscendCausalRule
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
-    StageAResult,
-    StageBResult,
-    _normalize_trackb_unit_source,
-    compile_trackb_shared_so,
-    compute_trackb_shared_so_filename,
-    evaluate_ascendc_candidate,
-    resolve_trackb_compile_flags,
-    run_stage_a_static,
-    run_stage_b_ascendc_compile,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     GenerationRequest,
@@ -96,12 +92,16 @@ from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     extract_lowered_compiler_excerpt_with_lang,
     parse_scoped_search_replace_blocks,
 )
-from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (
-    ModuleSelectorPlanExtractor,
-    StageBCompileGate,
-    build_post_selector_regime_plan,
-    has_unreserved_vf_stack_overflow,
-    run_l1_compile_check,
+from tilefoundry_ascend.agent.orchestrator.regime_slice_patcher import (
+    _compact_trackb_snippet_source,
+    _detect_trackb_dead_code_edit,
+    _extract_p2_focus_lines_and_diag,
+    _has_prim_func_builder,
+    _render_trackb_tu_from_module,
+    _resolve_selector_compile_flags,
+    extract_regime_snippet,
+    patch_regime_into_module,
+    resolve_regime_config,
 )
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     rank_stage_a_candidates_with_cost_model,

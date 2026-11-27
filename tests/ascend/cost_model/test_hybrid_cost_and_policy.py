@@ -15,20 +15,20 @@ from examples.ascend950pr_ops.rms_norm.kernels import (
     _select_rms_norm_config,
 )
 from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import run_l0_l1_round_filter
+from tilefoundry_ascend.agent.gates import gate_funnel as gf
+from tilefoundry_ascend.agent.gates.gate_funnel import (
+    StageAResult,
+    StageBResult,
+    _parse_cce_res_usage_with_summary,
+    build_stage_b_driver_source,
+)
 from tilefoundry_ascend.agent.kb import (
     SymptomFamily,
     build_predicate_context,
     load_seed_rules,
     rank_symptom_families,
 )
-from tilefoundry_ascend.agent.orchestrator import gate_funnel as gf
 from tilefoundry_ascend.agent.orchestrator import tilesize_prescreen as tp
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
-    StageAResult,
-    StageBResult,
-    _parse_cce_res_usage_with_summary,
-    build_stage_b_driver_source,
-)
 from tilefoundry_ascend.agent.orchestrator.residual_beam import compute_static_dynamic_residual
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     rank_stage_a_candidates_with_cost_model,

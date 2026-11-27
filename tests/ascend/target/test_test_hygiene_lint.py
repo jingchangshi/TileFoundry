@@ -104,7 +104,7 @@ def test_private_monkeypatch_rejects_production_targets(tmp_path: Path) -> None:
             "test_bad_patches.py": """
                 import unittest.mock
                 from unittest.mock import patch
-                import tilefoundry_ascend.agent.orchestrator.gate_funnel as gf
+                import tilefoundry_ascend.agent.gates.gate_funnel as gf
                 from tilefoundry_ascend.agent.campaign.campaign_runner import Runner
 
                 def test_bad(monkeypatch):

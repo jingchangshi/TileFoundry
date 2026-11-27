@@ -19,37 +19,35 @@ from tilefoundry_ascend.agent.campaign.helpers import (
     resolve_trackb_freedom_mask, run_l0_gate, select_active_regime,
     slice_contract_instruction, source_sha256,
 )
-from tilefoundry_ascend.agent.campaign.regime_slice_patcher import (
-    DEFAULT_READONLY_HOST_EXPORTS, _active_trackb_kernel, _case_ratio_predicate_entries,
-    _compact_trackb_snippet_source, _extract_p2_focus_lines_and_diag,
-    _extract_regime_abi_context, _is_real_tir_primfunc, extract_regime_snippet,
-    patch_regime_into_module, resolve_regime_config, split_readonly_host_tail,
-)
-from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
-    extract_golden_entrypoint_contract, format_golden_entrypoint_prompt_block,
-)
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    CandidateSurrogateResult, bottleneck_anchor_for_regime, extract_ordered_tensor_shapes,
-)
 from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor
+from tilefoundry_ascend.agent.gates.cpp_slice_protocol import (
+    build_trackb_context_view, escalate_primfunc_to_trackb_tu,
+)
+from tilefoundry_ascend.agent.gates.gate_funnel import StageAResult, extract_ordered_tensor_shapes
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import (
     SYMPTOM_FAMILY_TO_FACETS, AscendCausalRule, SymptomFamily,
     build_predicate_context, normalize_runtime_backend,
     rank_symptom_families, should_escalate_diagnostic_or_creative,
 )
-from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
-    build_trackb_context_view, escalate_primfunc_to_trackb_tu,
-)
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult
+from tilefoundry_ascend.agent.npu import CandidateSurrogateResult, bottleneck_anchor_for_regime
 from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest, sanitize_effort
 from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     CREATIVE_FOCUS_HINTS, build_prescreen_summary_from_kwargs, summarize_excluded_mechanisms,
 )
+from tilefoundry_ascend.agent.orchestrator.regime_slice_patcher import (
+    DEFAULT_READONLY_HOST_EXPORTS, _active_trackb_kernel, _case_ratio_predicate_entries,
+    _compact_trackb_snippet_source, _extract_p2_focus_lines_and_diag,
+    _extract_regime_abi_context, _is_real_tir_primfunc, extract_regime_snippet,
+    patch_regime_into_module, resolve_regime_config, split_readonly_host_tail,
+)
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate, StaticDynamicResidual, TwoLaneBeamSearch,
     compiler_summary_from_residual, compute_static_dynamic_residual,
+)
+from tilefoundry_ascend.agent.orchestrator.seed_synthesizer import (
+    extract_golden_entrypoint_contract, format_golden_entrypoint_prompt_block,
 )
 from tilefoundry_ascend.agent.router.capability_gate import evaluate_track_escalation
 from tilefoundry_ascend.agent.router.isa_gap_scanner import scan_tilelang_pipe_gaps

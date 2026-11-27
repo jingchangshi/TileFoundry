@@ -14,17 +14,17 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     discover_marathon_environment, ensure_marathon_env_file, parse_device_ids, prepare_marathon_seed,
     resolve_campaign_device_plan, short_operator_tag,
 )
-from tilefoundry_ascend.agent.campaign.seed_synthesizer import SeedSynthesisOutcome
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
+from tilefoundry_ascend.agent.gates.gate_funnel import GateFunnel
+from tilefoundry_ascend.agent.gates.stage_b_gate import _ensure_tilelang_on_sys_path
+from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
+from tilefoundry_ascend.agent.npu import (
     DEFAULT_L4_CANNBENCH_WAIT_SEC, CandidateSurrogateResult, L2BatchResults, L3AcceptanceResult,
     collect_bottleneck_msprof_via_agent_gates, run_l3_full_contract_via_agent_gates,
     run_l4_official_cannbench_via_agent_gates, run_micro_probe_via_agent_gates,
 )
-from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
-from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import GateFunnel
 from tilefoundry_ascend.agent.orchestrator.llm_client import AgyCliLLMBackend, create_llm_backend_from_env
-from tilefoundry_ascend.agent.orchestrator.stage_b_gate import _ensure_tilelang_on_sys_path
+from tilefoundry_ascend.agent.orchestrator.seed_synthesizer import SeedSynthesisOutcome
 from tilefoundry_ascend.agent.probes import LocalHardwareProbePort
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     CannbenchOpsRegistry, PerfTargetSpec, RegimeTargetSpec, default_source_root,

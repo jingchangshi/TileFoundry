@@ -13,7 +13,6 @@ from pathlib import Path
 import pytest
 
 from tilefoundry_ascend.agent import npu as npu_pkg
-from tilefoundry_ascend.agent.campaign import surrogate_cannbench
 from tilefoundry_ascend.agent.npu import ag_transport, msprof_probe
 from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec
 
@@ -122,10 +121,10 @@ def test_local_hardware_probe_port_cann_cpath_and_msprof_detail(
 
 def test_bottleneck_anchor_for_regime_selection() -> None:
     """Select the lowest Eq.3 score anchor matching regime_tag, breaking ties by latency."""
-    a1 = surrogate_cannbench.AnchorEvalMetrics(2, "reg_a", True, 10.0, 20.0, 2.0, 2.0, 0.2, 0.4)
-    a2 = surrogate_cannbench.AnchorEvalMetrics(3, "reg_a", True, 12.0, 20.0, 2.0, 1.6, 0.16, 0.2)
-    a3 = surrogate_cannbench.AnchorEvalMetrics(4, "reg_b", True, 5.0, 20.0, 2.0, 4.0, 0.4, 0.1)
-    res = surrogate_cannbench.CandidateSurrogateResult("c1", "op", True, 2.0, 1.6, 0.25, 60.0, (a1, a2, a3))
+    a1 = npu_pkg.AnchorEvalMetrics(2, "reg_a", True, 10.0, 20.0, 2.0, 2.0, 0.2, 0.4)
+    a2 = npu_pkg.AnchorEvalMetrics(3, "reg_a", True, 12.0, 20.0, 2.0, 1.6, 0.16, 0.2)
+    a3 = npu_pkg.AnchorEvalMetrics(4, "reg_b", True, 5.0, 20.0, 2.0, 4.0, 0.4, 0.1)
+    res = npu_pkg.CandidateSurrogateResult("c1", "op", True, 2.0, 1.6, 0.25, 60.0, (a1, a2, a3))
     assert msprof_probe.bottleneck_anchor_for_regime(res, "reg_a") == a2
     assert msprof_probe.bottleneck_anchor_for_regime(res, "reg_b") == a3
     assert msprof_probe.bottleneck_anchor_for_regime(res, "missing") is None
@@ -335,13 +334,14 @@ def test_run_micro_probe_via_agent_gates_stages_prewarms_and_validates(
         )
 
 
-def test_surrogate_cannbench_thin_facade_parity_and_zero_l3_imports(
+def test_npu_package_zero_l3_imports_and_facade_removed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep surrogate_cannbench and npu package free of L3 imports while preserving facade hooks."""
+    """Keep npu package free of L3 imports, facade module deleted, and direct transport active."""
     repo_root = Path(__file__).resolve().parents[4]
     facade_path = repo_root / "targets/ascend/tilefoundry_ascend/agent/campaign/surrogate_cannbench.py"
     npu_dir = repo_root / "targets/ascend/tilefoundry_ascend/agent/npu"
+    assert not facade_path.exists()
     forbidden_l3_tokens = (
         "llm_client",
         "portfolio_runner",
@@ -353,7 +353,7 @@ def test_surrogate_cannbench_thin_facade_parity_and_zero_l3_imports(
         "test_npu_acceptance",
     )
 
-    for py_path in (facade_path, *sorted(npu_dir.glob("*.py"))):
+    for py_path in sorted(npu_dir.glob("*.py")):
         tree = ast.parse(py_path.read_text(encoding="utf-8"))
         imported: list[str] = []
         for node in ast.walk(tree):
@@ -364,21 +364,11 @@ def test_surrogate_cannbench_thin_facade_parity_and_zero_l3_imports(
         for mod_name in imported:
             assert not any(tok in mod_name for tok in forbidden_l3_tokens), (py_path.name, mod_name)
 
-    expected_exports = {
-        *npu_pkg.__all__,
-        "extract_ordered_tensor_shapes",
-        "get_operator_task",
-        "resolve_cannbench_repo",
-        "run_l1_compile_check",
-        "validate_prewarm_manifest_v1",
-    }
-    public_expected = {name for name in expected_exports if not name.startswith("_")}
-    assert public_expected.issubset(set(surrogate_cannbench.__all__))
-    for name in public_expected:
-        assert hasattr(surrogate_cannbench, name)
-
+    assert not hasattr(ag_transport, "_bind_facade_globals")
+    assert not hasattr(ag_transport, "_FACADE_NS")
+    assert not hasattr(ag_transport, "_hook")
     monkeypatch.setattr(
-        surrogate_cannbench,
+        ag_transport,
         "order_candidates_by_idle_preflight",
         lambda device_id, pool=(), excluded=(): ("2", "1"),
     )

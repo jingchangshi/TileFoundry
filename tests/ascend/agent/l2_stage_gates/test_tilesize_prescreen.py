@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from tilefoundry_ascend.agent.orchestrator import gate_funnel as gf
-from tilefoundry_ascend.agent.orchestrator import tilesize_prescreen as tp
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+from tilefoundry_ascend.agent.gates import gate_funnel as gf
+from tilefoundry_ascend.agent.gates.gate_funnel import (
     StageAResult,
     prescreen_dsl_tile_kwargs,
 )
+from tilefoundry_ascend.agent.orchestrator import tilesize_prescreen as tp
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     LatticeSweepCandidate,
     PrescreenScore,

@@ -31,7 +31,7 @@ from examples.ascend950pr_ops.mla.kernels import (
 from examples.ascend950pr_ops.rms_norm.kernels import _build_rms_norm_prim_func
 from examples.ascend950pr_ops.softmax.kernels import _build_softmax_prim_func
 from examples.ascend950pr_ops.swi_glu.kernels import _build_swi_glu_prim_func
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+from tilefoundry_ascend.agent.gates.gate_funnel import (
     _detect_cann_include_dirs,
     _detect_tilelang_include_dir,
     build_stage_b_driver_source,

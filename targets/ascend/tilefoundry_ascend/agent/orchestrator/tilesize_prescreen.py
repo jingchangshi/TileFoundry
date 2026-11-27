@@ -7,8 +7,8 @@ import math
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import product
-from typing import TYPE_CHECKING
 
+from tilefoundry_ascend.agent.gates.gate_funnel import StageAResult
 from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import is_paradigm_shift_exempt
 from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
     CostFeatures, CostPrediction, HybridAscendCostModel, build_cost_features_from_ledger,
@@ -18,9 +18,6 @@ from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 from tilefoundry_ascend.ascend.target.facts import (
     ascend_space_facts, cube_macs_per_cycle as _default_cube_macs_per_cycle,
 )
-
-if TYPE_CHECKING:
-    from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult
 
 
 def _align512(nbytes: int) -> int:
@@ -441,7 +438,7 @@ def prescreen_live_ir_neighborhood(
         return ""
     pure_vec = count_dsl_gemm_calls(dsl_source) == 0 and any(k in params for k in ("tile_m", "tile_rows", "row_tile")) and "bm" not in params and "block_m" not in params
 
-    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (  # noqa: PLC0415
+    from tilefoundry_ascend.agent.gates.gate_funnel import (  # noqa: PLC0415
         _merge_pass_configs_and_flags, _resolve_prim_func_and_configs_from_dsl, run_stage_a_static,
     )
 
@@ -562,7 +559,7 @@ def _extract_selector_base_config(
     module_source: str, selector_fn_name: str, sample_builder_kwargs: Mapping[str, object], dims: Mapping[str, int] | None
 ) -> dict[str, object]:
     tree = ast.parse(module_source)
-    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (  # noqa: PLC0415
+    from tilefoundry_ascend.agent.gates.gate_funnel import (  # noqa: PLC0415
         _filter_kwargs_for_callable, _merge_dims_into_kwargs,
     )
     merged_kwargs = _merge_dims_into_kwargs(sample_builder_kwargs, dims)
@@ -677,7 +674,7 @@ def sweep_executable_lattice_zero_llm(
     if not (override_grid := _generate_lattice_override_grid(base_cfg, eff_facts, max_points)):
         return []
 
-    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (  # noqa: PLC0415
+    from tilefoundry_ascend.agent.gates.gate_funnel import (  # noqa: PLC0415
         run_stage_a_static,
     )
 

@@ -18,7 +18,11 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     PerfTargetCampaignRunner,
     build_resilient_l2_evaluator,
 )
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+from tilefoundry_ascend.agent.contracts import CampaignRoundRecord, CampaignStateSnapshot
+from tilefoundry_ascend.agent.gates.gate_funnel import StageAResult, StageBResult
+from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
+from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, SymptomFamily
+from tilefoundry_ascend.agent.npu import (
     AgentGatesDeviceFaultError,
     AnchorEvalMetrics,
     CandidateSurrogateResult,
@@ -28,10 +32,6 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     aggregate_surrogate_result,
     build_anchor_metrics,
 )
-from tilefoundry_ascend.agent.contracts import CampaignRoundRecord, CampaignStateSnapshot
-from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
-from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, SymptomFamily
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult, StageBResult
 from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest, MockLLMBackend
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec,

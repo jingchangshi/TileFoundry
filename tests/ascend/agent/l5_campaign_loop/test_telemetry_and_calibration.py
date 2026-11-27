@@ -25,14 +25,6 @@ from tilefoundry_ascend.agent.campaign.funnel_telemetry import (
 )
 from tilefoundry_ascend.agent.campaign.l3_l4_recovery import PendingL4
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import PendingPromotion
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    AnchorEvalMetrics,
-    CandidateSurrogateResult,
-    L0L1CandidateCheck,
-    L2BatchResults,
-    L3AcceptanceResult,
-    L4CannbenchResult,
-)
 from tilefoundry_ascend.agent.campaign.telemetry_ledger_writer import (
     RoundReceipt,
     TelemetryLedgerWriter,
@@ -40,9 +32,17 @@ from tilefoundry_ascend.agent.campaign.telemetry_ledger_writer import (
 )
 from tilefoundry_ascend.agent.contracts import CampaignRoundRecord
 from tilefoundry_ascend.agent.cost_advisor import create_cost_advisor
+from tilefoundry_ascend.agent.gates.gate_funnel import StageAResult, StageBResult
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult, StageBResult
+from tilefoundry_ascend.agent.npu import (
+    AnchorEvalMetrics,
+    CandidateSurrogateResult,
+    L0L1CandidateCheck,
+    L2BatchResults,
+    L3AcceptanceResult,
+    L4CannbenchResult,
+)
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     TwoLaneBeamSearch,
     compute_static_dynamic_residual,

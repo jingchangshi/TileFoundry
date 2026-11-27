@@ -25,7 +25,7 @@ from tilefoundry_ascend.agent.kb.schema import (
     save_rules_yaml,
     validate_rule_predicate,
 )
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+from tilefoundry_ascend.agent.gates.gate_funnel import (
     GateFunnel,
     StageAResult,
     extract_ordered_tensor_shapes,

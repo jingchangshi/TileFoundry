@@ -19,24 +19,14 @@ from tilefoundry_ascend.agent import (
     PortfolioRunner,
     TwoLaneBeamSearch,
 )
-from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
-    OracleAccuracyResult,
-    extract_golden_entrypoint_contract,
-    format_golden_entrypoint_prompt_block,
-    prepare_operator_seed_or_takeover,
-    select_fallback_track_from_semantics,
-    select_initial_track_from_semantics,
-    validate_entrypoint_signature_compatibility,
-)
+from tilefoundry_ascend.agent.gates import StageBResult, StageCResult
+from tilefoundry_ascend.agent.gates.gate_funnel import check_repair_monotonicity
 from tilefoundry_ascend.agent.kb import load_seed_rules
 from tilefoundry_ascend.agent.orchestrator import (
     GenerationRequest,
-    StageBResult,
-    StageCResult,
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import check_repair_monotonicity
 from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
     build_progressive_llm_constraints,
     format_blueprint_delta_section,
@@ -53,6 +43,15 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     compiler_summary_from_residual,
     compute_eq3_hap_objective,
     extract_cpp_trackb_signature_tags,
+)
+from tilefoundry_ascend.agent.orchestrator.seed_synthesizer import (
+    OracleAccuracyResult,
+    extract_golden_entrypoint_contract,
+    format_golden_entrypoint_prompt_block,
+    prepare_operator_seed_or_takeover,
+    select_fallback_track_from_semantics,
+    select_initial_track_from_semantics,
+    validate_entrypoint_signature_compatibility,
 )
 from tilefoundry_ascend.agent.specs.anchor_specs import RegimeTargetSpec
 from tilefoundry_ascend.ascend.passes import (

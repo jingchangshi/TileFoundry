@@ -40,8 +40,8 @@ from tilefoundry_ascend.agent.kb.schema import (
     load_seed_rules,
     normalize_runtime_backend,
 )
-from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import apply_scoped_trackb_patch
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import _check_custom_kernel_redlines
+from tilefoundry_ascend.agent.gates.cpp_slice_protocol import apply_scoped_trackb_patch
+from tilefoundry_ascend.agent.gates.gate_funnel import _check_custom_kernel_redlines
 from tilefoundry_ascend.agent.orchestrator.llm_constraints import format_target_dialect_layer
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import build_syntax_repair_request
 from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask, TopologyAxes

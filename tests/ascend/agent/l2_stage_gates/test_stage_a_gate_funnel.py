@@ -7,7 +7,7 @@ from textwrap import dedent
 
 import pytest
 
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+from tilefoundry_ascend.agent.gates.gate_funnel import (
     GateFunnel,
     StageAResult,
     StageBResult,

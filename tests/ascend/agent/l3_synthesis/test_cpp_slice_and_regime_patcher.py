@@ -13,7 +13,7 @@ from tilefoundry_ascend.agent import (
     BeamCandidate,
 )
 from tilefoundry_ascend.agent.orchestrator import compute_static_dynamic_residual
-from tilefoundry_ascend.agent.campaign.regime_slice_patcher import (
+from tilefoundry_ascend.agent.orchestrator.regime_slice_patcher import (
     DEFAULT_READONLY_HOST_EXPORTS,
     apply_ast_patch,
     extract_regime_snippet,
@@ -21,7 +21,7 @@ from tilefoundry_ascend.agent.campaign.regime_slice_patcher import (
     resolve_regime_config,
     split_readonly_host_tail,
 )
-from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+from tilefoundry_ascend.agent.gates.cpp_slice_protocol import (
     DEFAULT_PROTECTED_EXPORTS,
     TRACKB_REPLY_CONTRACT_PROMPT,
     AmbiguousPatchAnchorError,

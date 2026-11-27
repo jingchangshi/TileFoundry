@@ -25,17 +25,18 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     PerfTargetCampaignRunner,
 )
 from tilefoundry_ascend.agent.campaign.marathon import MarathonConfig
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    AnchorEvalMetrics,
-    CandidateSurrogateResult,
-    L3AcceptanceResult,
-    L4CannbenchResult,
-)
 from tilefoundry_ascend.agent.campaign.telemetry_ledger_writer import TelemetryLedgerWriter
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
     AstEditChunk,
     FlywheelDistiller,
     distill_causal_rule,
+)
+from tilefoundry_ascend.agent.gates.gate_funnel import (
+    GateFunnel,
+    StageAResult,
+    StageBResult,
+    evaluate_ascendc_candidate,
+    run_stage_a_static,
 )
 from tilefoundry_ascend.agent.kb.bayesian_tracker import (
     BayesianRuleTracker,
@@ -43,12 +44,11 @@ from tilefoundry_ascend.agent.kb.bayesian_tracker import (
     save_distilled_rule_file,
 )
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, build_predicate_context
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
-    GateFunnel,
-    StageAResult,
-    StageBResult,
-    evaluate_ascendc_candidate,
-    run_stage_a_static,
+from tilefoundry_ascend.agent.npu import (
+    AnchorEvalMetrics,
+    CandidateSurrogateResult,
+    L3AcceptanceResult,
+    L4CannbenchResult,
 )
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     StaticDynamicResidual,

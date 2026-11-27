@@ -19,7 +19,7 @@ from tilefoundry_ascend.agent.campaign.helpers import (
     surrogate_rank_key,
     to_conservation_point,
 )
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+from tilefoundry_ascend.agent.npu import (
     CandidateSurrogateResult,
     L3AcceptanceResult,
     bottleneck_anchor_for_regime,

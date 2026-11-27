@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tilefoundry_ascend.agent.gates import stage_b_gate
 from tilefoundry_ascend.agent.npu import l2_paired_eval
-from tilefoundry_ascend.agent.orchestrator import stage_b_gate
 from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec, PerfTargetSpec, get_default_regime_specs
 from tilefoundry_ascend.ascend.compile_cache.artifact_store import ArtifactStore
 

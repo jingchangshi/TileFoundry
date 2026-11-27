@@ -24,47 +24,48 @@ from tilefoundry_ascend.agent.campaign.l3_l4_recovery import (
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import (
     PendingPromotion, PromotionCoordinator, RankedL2Candidate, RankedL2Survivors, select_top_two_l2_survivors,
 )
-from tilefoundry_ascend.agent.campaign.regime_slice_patcher import (
-    ResolvedRegimeConfig, _collect_top_level_symbols, _has_prim_func_builder, _looks_like_bare_trackb_cpp,
-    _parses_as_python, _render_trackb_tu_from_module, _resolve_selector_compile_flags,
-    _trackb_python_residual, apply_ast_patch, extract_regime_snippet, patch_regime_into_module,
-    resolve_regime_config, split_readonly_host_tail,
-)
 from tilefoundry_ascend.agent.campaign.round_context_builder import ChampionState, RoundContextBuilder
-from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
-    GoldenEntrypointContract, OracleAccuracyResult, SeedSynthesisOutcome,
-    extract_golden_entrypoint_contract, prepare_operator_seed_or_takeover,
-    validate_entrypoint_signature_compatibility,
-)
 from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import (
     CandidateBatch, StageGateCoordinator, run_l0_l1_round_filter,
-)
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    FAILURE_KIND_CANDIDATE, _LLM_API_KEY_ENV, _NON_AGENT_GATES_ENV_KEYS, AnchorEvalMetrics,
-    CandidateSurrogateResult, L0L1CandidateCheck, L2BatchResults, L3AcceptanceResult,
-    L4CannbenchResult, _format_env_line, _validate_llm_api_key_env, bottleneck_anchor_for_regime,
-    collect_bottleneck_msprof_via_agent_gates, collect_p2_deep_dive_via_agent_gates,
-    extract_ordered_tensor_shapes, run_l3_full_contract_via_agent_gates,
-    run_micro_probe_via_agent_gates, run_surrogate_batch_via_agent_gates,
 )
 from tilefoundry_ascend.agent.campaign.telemetry_ledger_writer import TelemetryLedgerWriter
 from tilefoundry_ascend.agent.contracts import CampaignRoundRecord, CampaignStateSnapshot
 from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor, create_cost_advisor
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
+from tilefoundry_ascend.agent.gates.gate_funnel import (
+    StageAResult, check_npu_entrypoint_purity, evaluate_ascendc_candidate,
+    extract_ordered_tensor_shapes, resolve_trackb_compile_flags, run_stage_a_static,
+    run_stage_b_ascendc_compile,
+)
+from tilefoundry_ascend.agent.gates.stage_b_gate import run_l1_compile_check
 from tilefoundry_ascend.agent.kb.bayesian_tracker import (
     BayesianRuleTracker, append_rule_misapplication, append_winning_edge,
 )
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, build_predicate_context
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
-    StageAResult, check_npu_entrypoint_purity, evaluate_ascendc_candidate,
-    resolve_trackb_compile_flags, run_stage_a_static, run_stage_b_ascendc_compile,
+from tilefoundry_ascend.agent.npu import (
+    FAILURE_KIND_CANDIDATE, _LLM_API_KEY_ENV, _NON_AGENT_GATES_ENV_KEYS, AnchorEvalMetrics,
+    CandidateSurrogateResult, L0L1CandidateCheck, L2BatchResults, L3AcceptanceResult,
+    L4CannbenchResult, _format_env_line, _validate_llm_api_key_env, bottleneck_anchor_for_regime,
+    collect_bottleneck_msprof_via_agent_gates, collect_p2_deep_dive_via_agent_gates,
+    run_l3_full_contract_via_agent_gates, run_micro_probe_via_agent_gates,
+    run_surrogate_batch_via_agent_gates,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import KernelLLMBackend
+from tilefoundry_ascend.agent.orchestrator.regime_slice_patcher import (
+    ResolvedRegimeConfig, _collect_top_level_symbols, _has_prim_func_builder, _looks_like_bare_trackb_cpp,
+    _parses_as_python, _render_trackb_tu_from_module, _resolve_selector_compile_flags,
+    _trackb_python_residual, apply_ast_patch, extract_regime_snippet, patch_regime_into_module,
+    resolve_regime_config, split_readonly_host_tail,
+)
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate, TwoLaneBeamSearch, compiler_summary_from_residual,
     compute_static_dynamic_residual, extract_structural_signature,
 )
-from tilefoundry_ascend.agent.orchestrator.stage_b_gate import run_l1_compile_check
+from tilefoundry_ascend.agent.orchestrator.seed_synthesizer import (
+    GoldenEntrypointContract, OracleAccuracyResult, SeedSynthesisOutcome,
+    extract_golden_entrypoint_contract, prepare_operator_seed_or_takeover,
+    validate_entrypoint_signature_compatibility,
+)
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import rank_stage_a_candidates_with_cost_model
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec, CannbenchOpsRegistry, GuardrailCaseSpec, PerfTargetSpec, RegimeTargetSpec,

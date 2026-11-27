@@ -7,15 +7,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import fields
 from pathlib import Path
 
-from tilefoundry_ascend.agent.campaign.regime_slice_patcher import (
+from tilefoundry_ascend.agent.gates.cpp_slice_protocol import select_active_trackb_kernel
+from tilefoundry_ascend.agent.gates.gate_funnel import (
+    StageAResult, evaluate_ascendc_candidate, extract_ordered_tensor_shapes, run_stage_a_static,
+)
+from tilefoundry_ascend.agent.npu import AnchorEvalMetrics, CandidateSurrogateResult
+from tilefoundry_ascend.agent.orchestrator.regime_slice_patcher import (
     _active_trackb_kernel, _ordered_top_level_trackb_kernels,
     _render_trackb_tu_from_module, _trackb_kernel_names, resolve_regime_config,
 )
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    AnchorEvalMetrics, CandidateSurrogateResult, extract_ordered_tensor_shapes,
-)
-from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import select_active_trackb_kernel
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult, evaluate_ascendc_candidate, run_stage_a_static
 from tilefoundry_ascend.agent.specs.anchor_specs import (
     AnchorCaseSpec, CannbenchOpsRegistry, PerfTargetSpec, RegimeTargetSpec,
     _has_flat_operator_layout, build_anchor_var_bindings, extract_trackb_cpp_source,

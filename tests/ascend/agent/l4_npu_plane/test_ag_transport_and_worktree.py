@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pytest
 
-from tilefoundry_ascend.agent.campaign import surrogate_cannbench
 from tilefoundry_ascend.agent.npu import ag_transport
 from tilefoundry_ascend.agent.specs.anchor_specs import parse_simple_env_file
 

@@ -35,7 +35,7 @@ from tilefoundry_ascend.agent.specs.anchor_specs import (
     load_cannbench_contract_module,
     resolve_cannbench_repo,
 )
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+from tilefoundry_ascend.agent.npu import (
     FAST_REQUEST_ENV,
     FAST_REQUEST_SCHEMA,
     FAST_RESPONSE_SCHEMA,

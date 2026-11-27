@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (
+from tilefoundry_ascend.agent.gates.stage_b_gate import (
     StageBResult, _bounded_compile_diagnostic, _classify_stage_b_overflow_fault_code,
     _detect_cann_include_dirs, _detect_tilelang_include_dir, _disassemble_object,
     _filter_kwargs_for_callable, _inject_cann_cpath_env, _merge_dims_into_kwargs,

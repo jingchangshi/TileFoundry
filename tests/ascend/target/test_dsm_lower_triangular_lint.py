@@ -45,15 +45,16 @@ def _base_packages() -> dict[str, str]:
         "agent/router/capability_gate.py": (
             "from tilefoundry_ascend.agent.kb.schema import DEVICE\n"
         ),
-        "agent/orchestrator/__init__.py": "",
-        "agent/orchestrator/gate_funnel.py": (
+        "agent/gates/__init__.py": "",
+        "agent/gates/gate_funnel.py": (
             "import inspect\n"
             "from tilefoundry_ascend.agent.router.capability_gate import DEVICE\n"
             "def sig(fn):\n"
             "    return inspect.signature(fn)\n"
         ),
+        "agent/orchestrator/__init__.py": "",
         "agent/orchestrator/llm_client.py": (
-            "from tilefoundry_ascend.agent.orchestrator.gate_funnel import DEVICE\n"
+            "from tilefoundry_ascend.agent.gates.gate_funnel import DEVICE\n"
         ),
         "agent/flywheel/__init__.py": "",
         "agent/flywheel/ablation_distiller.py": (
@@ -63,19 +64,20 @@ def _base_packages() -> dict[str, str]:
         "agent/probes/probe_hbm_bw.py": (
             "from tilefoundry_ascend.agent.kb.schema import DEVICE\n"
         ),
-        "agent/campaign/__init__.py": "",
-        "agent/campaign/surrogate_cannbench.py": (
+        "agent/npu/__init__.py": "",
+        "agent/npu/ag_transport.py": (
             "import sys\n"
-            "from tilefoundry_ascend.agent.orchestrator.gate_funnel import DEVICE\n"
+            "from tilefoundry_ascend.agent.gates.gate_funnel import DEVICE\n"
             "def has_tl():\n"
             "    return sys.modules.get('tilelang') is not None\n"
         ),
+        "agent/campaign/__init__.py": "",
         "agent/campaign/telemetry_ledger_writer.py": (
             "from tilefoundry_ascend.agent.contracts import DEVICE\n"
         ),
         "agent/campaign/campaign_runner.py": (
             "from tilefoundry_ascend.agent.flywheel.ablation_distiller import DEVICE\n"
-            "from tilefoundry_ascend.agent.campaign.surrogate_cannbench import has_tl\n"
+            "from tilefoundry_ascend.agent.npu.ag_transport import has_tl\n"
             "from tilefoundry_ascend.agent.campaign.telemetry_ledger_writer import (\n"
             "    DEVICE as LEDGER_DEV,\n"
             ")\n"
@@ -104,7 +106,7 @@ def test_upper_triangular_and_lazy_relative_imports_flagged(tmp_path: Path) -> N
     )
     files["ascend/schedule/__init__.py"] = ""
     files["ascend/schedule/regime_solver.py"] = "SOLVER = 1\n"
-    files["agent/orchestrator/gate_funnel.py"] = (
+    files["agent/gates/gate_funnel.py"] = (
         "from tilefoundry_ascend.agent.orchestrator.llm_client import DEVICE\n"
     )
     root = _write_tree(tmp_path / "tilefoundry_ascend", files)
@@ -135,7 +137,7 @@ def test_l3_l4_orthogonality_violations(tmp_path: Path) -> None:
         "    from tilefoundry_ascend.agent.probes import probe_hbm_bw\n"
         "    return probe_hbm_bw\n"
     )
-    files["agent/campaign/surrogate_cannbench.py"] = (
+    files["agent/npu/ag_transport.py"] = (
         "from tilefoundry_ascend.agent.orchestrator.llm_client import DEVICE\n"
     )
     root = _write_tree(tmp_path / "tilefoundry_ascend", files)
@@ -227,7 +229,7 @@ def test_banned_reflection_symbols_and_campaign_inspect_signature(tmp_path: Path
         for p, _, m in lines
     )
     assert not any(
-        p == "agent/orchestrator/gate_funnel.py" for p, _, _ in lines
+        p == "agent/gates/gate_funnel.py" for p, _, _ in lines
     )
 
 
@@ -236,7 +238,7 @@ def test_cli_only_json_and_error_handling(
 ) -> None:
     """Verify --only filtering, --json schema, and invalid CLI argument exit codes."""
     files = _base_packages()
-    files["agent/orchestrator/gate_funnel.py"] = (
+    files["agent/gates/gate_funnel.py"] = (
         "from tilefoundry_ascend.agent.orchestrator.llm_client import DEVICE\n"
     )
     root = _write_tree(tmp_path / "tilefoundry_ascend", files)

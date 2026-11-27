@@ -11,8 +11,8 @@ from typing import Any
 import pytest
 
 from tilefoundry_ascend.agent.contracts import CasePlanExtractor, CompileTaskSpec
-from tilefoundry_ascend.agent.orchestrator import gate_funnel as gf
-from tilefoundry_ascend.agent.orchestrator.stage_b_gate import (
+from tilefoundry_ascend.agent.gates import gate_funnel as gf
+from tilefoundry_ascend.agent.gates.stage_b_gate import (
     ModuleSelectorPlanExtractor,
     StageBCompileGate,
     build_post_selector_regime_plan,
@@ -730,7 +730,7 @@ def test_load_plan_module_resolves_tilelang_source_without_pythonpath(tmp_path: 
     script = (
         "import os, sys\n"
         "from pathlib import Path\n"
-        "from tilefoundry_ascend.agent.orchestrator.stage_b_gate import ModuleSelectorPlanExtractor, build_post_selector_regime_plan\n"
+        "from tilefoundry_ascend.agent.gates.stage_b_gate import ModuleSelectorPlanExtractor, build_post_selector_regime_plan\n"
         f"src = {(_SYNTHETIC_SELECTOR_MODULE)!r}\n"
         "cases = {'c0': {'m_rows': 16, 'd_dim': 2048, 'tl_dtype': 'bfloat16'}}\n"
         "ext = ModuleSelectorPlanExtractor(target='dav-3510', builder_name='_build_synth_prim_func', config_selector_name='_select_synth_config')\n"
@@ -753,7 +753,7 @@ def test_load_plan_module_resolves_tilelang_source_without_pythonpath(tmp_path: 
     script_sib = (
         "import os, sys\n"
         "from pathlib import Path\n"
-        "from tilefoundry_ascend.agent.orchestrator.stage_b_gate import ModuleSelectorPlanExtractor, build_post_selector_regime_plan\n"
+        "from tilefoundry_ascend.agent.gates.stage_b_gate import ModuleSelectorPlanExtractor, build_post_selector_regime_plan\n"
         f"src = {(_SYNTHETIC_SELECTOR_MODULE)!r}\n"
         "cases = {'c0': {'m_rows': 16, 'd_dim': 2048, 'tl_dtype': 'bfloat16'}}\n"
         "ext = ModuleSelectorPlanExtractor(target='dav-3510', builder_name='_build_synth_prim_func', config_selector_name='_select_synth_config')\n"
@@ -778,7 +778,7 @@ def test_stage_b_compile_gate_routes_render_trackb_tu_to_ascendc_compile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """StageBCompileGate routes _render_trackb_tu specs to AscendC compile, never tilelang."""
-    from tilefoundry_ascend.agent.orchestrator import stage_b_gate
+    from tilefoundry_ascend.agent.gates import stage_b_gate
     from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
 
     hybrid_src = _sample_hybrid_mla_module(trackb_val="2.5f")

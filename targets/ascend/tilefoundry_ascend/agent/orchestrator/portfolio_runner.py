@@ -11,11 +11,11 @@ from dataclasses import dataclass, field
 
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, build_predicate_context, rank_symptom_families
-from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+from tilefoundry_ascend.agent.gates.cpp_slice_protocol import (
     _looks_like_python_primfunc_slice, classify_stage_failure_for_repair, compact_creative_source_slice,
     extract_repair_closure_slice, parse_scoped_search_replace_blocks, split_tracka_editable_and_readonly_tail,
 )
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+from tilefoundry_ascend.agent.gates.gate_funnel import (
     FunnelEvaluation, GateFunnel, check_repair_monotonicity, extract_ordered_tensor_shapes,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (

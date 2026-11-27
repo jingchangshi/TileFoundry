@@ -16,7 +16,7 @@ from typing import Protocol
 
 from tilefoundry_ascend.agent.npu.ag_transport import (
     FAST_REQUEST_SCHEMA, _agent_gates_workspace_name, _build_py_exec_argv, _fast_cache_roots,
-    _fast_request_root, _fast_response_mapping, _fast_wire_operator_name, _hook,
+    _fast_request_root, _fast_response_mapping, _fast_wire_operator_name,
     _resolve_agent_gates_bin, _resolve_env_file_path, _sha256_file, _stage_fast_candidate,
     _submit_fast_gate, _verify_fast_bindings, _verify_fast_coverage, _write_fast_request,
 )
@@ -71,19 +71,19 @@ def _collect_profile_via_agent_gates(
         return {}
     unique_cnums = list(dict.fromkeys(int(s.case_num) for _t, s in regime_items))
     root = Path(source_root).resolve() if source_root is not None else default_source_root()
-    resolved_env = _hook("_resolve_env_file_path", _resolve_env_file_path)(env_file)
-    ag_bin = _hook("_resolve_agent_gates_bin", _resolve_agent_gates_bin)(root)
+    resolved_env = _resolve_env_file_path(env_file)
+    ag_bin = _resolve_agent_gates_bin(root)
     env_vals = parse_simple_env_file(resolved_env)
-    cann_repo = _hook("resolve_cannbench_repo", resolve_cannbench_repo)(
+    cann_repo = resolve_cannbench_repo(
         cannbench_repo=env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"), env_file=resolved_env,
     )
     cache_dir, tl_cache_dir = _fast_cache_roots(root, env_vals)
     cand_resolved = Path(candidate_path).resolve()
     unique_specs = [next(s for _t, s in regime_items if int(s.case_num) == cn) for cn in unique_cnums]
-    _hook("prewarm_anchor_reference_cache", prewarm_anchor_reference_cache)(
+    prewarm_anchor_reference_cache(
         operator_name, unique_specs, cannbench_repo=cann_repo, env_file=resolved_env, cache_dir=cache_dir, source_root=root,
     )
-    _hook("prewarm_surrogate_tilelang_cache", prewarm_surrogate_tilelang_cache)(
+    prewarm_surrogate_tilelang_cache(
         operator_name, [(candidate_id, cand_resolved)], unique_specs, cannbench_repo=cann_repo,
         env_file=resolved_env, cache_dir=cache_dir, tl_cache_dir=tl_cache_dir, source_root=root,
     )
@@ -100,8 +100,8 @@ def _collect_profile_via_agent_gates(
             for c in unique_cnums
         ],
     }
-    raw_resp, _ = _hook("_submit_fast_gate", _submit_fast_gate)(
-        agent_gates_bin=ag_bin, root=root, workspace=_hook("_agent_gates_workspace_name", _agent_gates_workspace_name)(root),
+    raw_resp, _ = _submit_fast_gate(
+        agent_gates_bin=ag_bin, root=root, workspace=_agent_gates_workspace_name(root),
         request_id=req_id, request_relative_path=req_path.relative_to(root).as_posix(), request_path=req_path,
         response_path=resp_path, request_sha256=_write_fast_request(req_path, payload), mode="profile",
         timeout_sec=float(timeout_sec), device_id=str(device_id), device_pool=device_pool, env_vals=env_vals,
@@ -195,12 +195,12 @@ def run_micro_probe_via_agent_gates(
 ) -> dict[str, float]:
     """Run hardware micro-probe verification through a typed AgentGates fast request."""
     root = Path(source_root).resolve() if source_root is not None else default_source_root()
-    resolved_env = _hook("_resolve_env_file_path", _resolve_env_file_path)(env_file)
-    ag_bin = _hook("_resolve_agent_gates_bin", _resolve_agent_gates_bin)(root)
+    resolved_env = _resolve_env_file_path(env_file)
+    ag_bin = _resolve_agent_gates_bin(root)
     env_vals = parse_simple_env_file(resolved_env)
     _ref_cache_dir, tl_cache_dir = _fast_cache_roots(root, env_vals)
     if prewarm_cache:
-        _hook("_prewarm_micro_probe_cache", _prewarm_micro_probe_cache)(spec, source_root=root, env_file=resolved_env, tl_cache_dir=tl_cache_dir)
+        _prewarm_micro_probe_cache(spec, source_root=root, env_file=resolved_env, tl_cache_dir=tl_cache_dir)
     req_root, req_id = _fast_request_root(root, env_vals), uuid.uuid4().hex
     req_dir, req_path, resp_path = req_root / req_id, req_root / f"{req_id}.request.json", req_root / f"{req_id}.response.json"
     staged: dict[str, dict[str, dict[str, str]]] = {"micro_probe": {}}
@@ -222,8 +222,8 @@ def run_micro_probe_via_agent_gates(
             "tensor_shape": [int(d) for d in spec.tensor_shape], "tensor_dtype": spec.tensor_dtype, "min_speedup": float(min_speedup),
         },
     }
-    raw_resp, _ = _hook("_submit_fast_gate", _submit_fast_gate)(
-        agent_gates_bin=ag_bin, root=root, workspace=_hook("_agent_gates_workspace_name", _agent_gates_workspace_name)(root),
+    raw_resp, _ = _submit_fast_gate(
+        agent_gates_bin=ag_bin, root=root, workspace=_agent_gates_workspace_name(root),
         request_id=req_id, request_relative_path=req_path.relative_to(root).as_posix(), request_path=req_path,
         response_path=resp_path, request_sha256=_write_fast_request(req_path, payload), mode="micro_probe",
         timeout_sec=float(timeout_sec), device_id=str(device_id), device_pool=device_pool, env_vals=env_vals,

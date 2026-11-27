@@ -12,12 +12,12 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     resolve_campaign_device_plan,
 )
 from tilefoundry_ascend.agent.campaign.marathon import MarathonConfig, run_operator_marathon, run_operators_marathon
-from tilefoundry_ascend.agent.campaign.surrogate_cannbench import run_micro_probe_via_agent_gates
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
+from tilefoundry_ascend.agent.gates.gate_funnel import GateFunnel
+from tilefoundry_ascend.agent.gates.stage_b_gate import _ensure_tilelang_on_sys_path
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import GateFunnel
+from tilefoundry_ascend.agent.npu import run_micro_probe_via_agent_gates
 from tilefoundry_ascend.agent.orchestrator.llm_client import create_llm_backend_from_env
-from tilefoundry_ascend.agent.orchestrator.stage_b_gate import _ensure_tilelang_on_sys_path
 from tilefoundry_ascend.agent.probes import LocalHardwareProbePort
 from tilefoundry_ascend.agent.specs.anchor_specs import parse_simple_env_file
 
