@@ -64,3 +64,15 @@ repos:
         entry: python scripts/no_machine_paths_lint.py
         language: system
         exclude_types: [binary]
+      - id: dsm-lower-triangular-lint
+        name: dsm-lower-triangular-lint
+        entry: python scripts/dsm_lower_triangular_lint.py
+        language: system
+        pass_filenames: false
+        files: ^targets/ascend/tilefoundry_ascend/.*\.py$
+      - id: test-hygiene-lint
+        name: test-hygiene-lint
+        entry: python scripts/test_hygiene_lint.py
+        language: system
+        pass_filenames: false
+        files: ^tests/ascend/.*\.py$
