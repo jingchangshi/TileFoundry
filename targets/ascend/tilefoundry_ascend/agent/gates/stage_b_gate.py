@@ -613,6 +613,7 @@ class ModuleSelectorPlanExtractor:
             pass_configs=merged_pc,
             compile_flags=cf_t,
             static_spec_signature=_static_spec_signature(builder_name, static_kwargs),
+            unit_kind=unit_kind,
         )
         spec = CompileTaskSpec(task_key, builder_name, static_kwargs, pc_t, cf_t, unit_kind=unit_kind, unit_source=clean_src)
         loaded.spec_cache[ckey] = spec

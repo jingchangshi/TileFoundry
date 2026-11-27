@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -14,7 +16,7 @@ import yaml
 from tilefoundry_ascend.agent.gates import stage_b_gate
 from tilefoundry_ascend.agent.npu import l2_paired_eval
 from tilefoundry_ascend.agent.specs.anchor_specs import AnchorCaseSpec, PerfTargetSpec, get_default_regime_specs
-from tilefoundry_ascend.ascend.compile_cache.artifact_store import ArtifactStore
+from tilefoundry_ascend.ascend.compile_cache.artifact_store import ArtifactStore, compute_compile_task_key
 
 
 class _ClockEvent:
@@ -777,3 +779,149 @@ def test_prewarm_allows_unwarmed_baseline_and_multi_regime_but_rejects_explicit_
     assert "c_bad" in res_multi.failed_by_cid
     assert res_multi.prewarm_stats["failed_candidates"] == 1
     assert res_multi.prewarm_stats["cache_hits"] >= 1
+
+
+@pytest.mark.parametrize(
+    ("use_pill", "phase_a_ok", "expected_ids"),
+    [
+        (False, frozenset(), ["incumbent_slot", "cand_pass", "cand_fail"]),
+        (True, frozenset({"cand_pass"}), ["incumbent_slot", "cand_pass"]),
+    ],
+    ids=["accept_use_pill_false_binds_cid", "reject_use_pill_true_filters_unpassed"],
+)
+def test_surrogate_batch_harness_candidate_selection_reject_and_accept(
+    tmp_path: Path,
+    use_pill: bool,
+    phase_a_ok: frozenset[str],
+    expected_ids: list[str],
+) -> None:
+    """Bind cid when use_pill=False and exclude unpassed non-incumbents when use_pill=True."""
+    repo_root = Path(__file__).resolve().parents[4]
+    harness_path = repo_root / "tests" / "ascend" / "agent" / "surrogate_batch_harness.py"
+    spec = importlib.util.spec_from_file_location("surrogate_batch_harness_test_mod", harness_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+
+    seen_tags: list[str] = []
+
+    class _StubLoader:
+        def __call__(self, path: Path, ep: str, tag: str) -> tuple[object, object]:
+            seen_tags.append(f"{path.name}:{ep}:{tag}")
+            return (lambda **_kw: None), {"module": path.name}
+
+    candidates = [
+        {"candidate_id": "incumbent_slot", "module_path": str(tmp_path / "inc.py")},
+        {"candidate_id": "cand_pass", "module_path": str(tmp_path / "pass.py")},
+        {"candidate_id": "cand_fail", "module_path": str(tmp_path / "fail.py")},
+    ]
+    loaded = mod.load_selected_candidates(
+        candidates,
+        entrypoint="mla_forward",
+        op_name="mla",
+        use_pill=use_pill,
+        phase_a_ok=phase_a_ok,
+        loader=_StubLoader(),
+    )
+    assert [cid for cid, _fn, _m in loaded] == expected_ids
+    assert len(seen_tags) == len(expected_ids)
+
+
+@pytest.mark.parametrize("fail_compile", [False, True], ids=["accept_normal_exit", "reject_compile_error"])
+def test_mla_trackb_temp_dir_cleanup_reject_and_accept(tmp_path: Path, fail_compile: bool) -> None:
+    """Clean up mla_trackb_* temp directories deterministically on normal and error exits."""
+    repo_root = Path(__file__).resolve().parents[4]
+    tl_stub = tmp_path / "tl_stub"
+    (tl_stub / "tilelang" / "ascend").mkdir(parents=True, exist_ok=True)
+    (tl_stub / "tilelang" / "contrib").mkdir(parents=True, exist_ok=True)
+    (tl_stub / "tilelang" / "__init__.py").write_text("", encoding="utf-8")
+    (tl_stub / "tilelang" / "ascend" / "__init__.py").write_text("", encoding="utf-8")
+    (tl_stub / "tilelang" / "ascend" / "language.py").write_text("", encoding="utf-8")
+    (tl_stub / "tilelang" / "contrib" / "__init__.py").write_text("", encoding="utf-8")
+    (tl_stub / "tilelang" / "contrib" / "bisheng.py").write_text(
+        "def compile_ascend(*_a, **_kw): return None\n", encoding="utf-8"
+    )
+    isolated_tmp = tmp_path / "isolated_tmp"
+    isolated_tmp.mkdir(parents=True, exist_ok=True)
+    driver = (
+        "import importlib.util, os, sys\n"
+        "from pathlib import Path\n"
+        f"kpath = Path({str(repo_root / 'examples' / 'ascend950pr_ops' / 'mla' / 'kernels.py')!r})\n"
+        "spec = importlib.util.spec_from_file_location('mla_kernels_ut', kpath)\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "sys.modules[spec.name] = mod\n"
+        "spec.loader.exec_module(mod)\n"
+        "created_paths = []\n"
+        "class _CompileStub:\n"
+        "    def __call__(self, _src, *, target_format, npu_arch, options, path_target):\n"
+        "        created_paths.append(Path(path_target).parent)\n"
+        f"        if {fail_compile!r}:\n"
+        "            raise RuntimeError('simulated_trackb_compile_failure')\n"
+        "        Path(path_target).write_bytes(b'ELF')\n"
+        "class _LoadStub:\n"
+        "    def __call__(self, path):\n"
+        "        assert Path(path).is_file()\n"
+        "        return {'loaded': Path(path).name}\n"
+        "try:\n"
+        "    res = mod._load_uncached_trackb_so('src', [], compile_fn=_CompileStub(), load_cdll=_LoadStub())\n"
+        f"    assert not {fail_compile!r} and res == {{'loaded': 'mla_trackb.so'}}\n"
+        "except RuntimeError as exc:\n"
+        f"    assert {fail_compile!r} and 'simulated_trackb_compile_failure' in str(exc)\n"
+        "assert len(created_paths) == 1 and not created_paths[0].exists()\n"
+    )
+    env = dict(os.environ)
+    env["TMPDIR"] = str(isolated_tmp)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(tl_stub), str(repo_root / "src"), str(repo_root / "targets" / "ascend")]
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", driver],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert list(isolated_tmp.glob("mla_trackb_*")) == []
+
+
+def test_stage_b_gate_forwards_unit_kind_to_compile_task_key() -> None:
+    """Forward unit_kind from Stage-B capture extraction so Track-A/B keys stay distinct."""
+    src = (
+        "def _select_tb(m_rows: int = 1):\n"
+        "    return {'use_trackb': True, 'bm': 16}\n"
+        "def _render_trackb_tu(bm: int = 16):\n"
+        "    return '__global__ __aicore__ void k_tb(GM_ADDR x) {}\\n'\n"
+    )
+    ext = stage_b_gate.ModuleSelectorPlanExtractor(target="dav-3510")
+    specs = ext.extract_case_tasks(src, "tb_case", {"m_rows": 1})
+    assert len(specs) == 1
+    tb_spec = specs[0]
+    assert tb_spec.unit_kind == "cce_cpp20"
+    static_sig = json.dumps(
+        {
+            "builder_name": tb_spec.builder_name,
+            "static_kwargs": [[k, v] for k, v in tb_spec.static_kwargs],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cpp_key = compute_compile_task_key(
+        normalized_kernel_unit_src=tb_spec.unit_source,
+        cann_target="dav-3510",
+        pass_configs=tb_spec.pass_configs,
+        compile_flags=tb_spec.compile_flags,
+        static_spec_signature=static_sig,
+        unit_kind="cce_cpp20",
+    )
+    dsl_key = compute_compile_task_key(
+        normalized_kernel_unit_src=tb_spec.unit_source,
+        cann_target="dav-3510",
+        pass_configs=tb_spec.pass_configs,
+        compile_flags=tb_spec.compile_flags,
+        static_spec_signature=static_sig,
+        unit_kind="tilelang_dsl",
+    )
+    assert tb_spec.task_key == cpp_key
+    assert tb_spec.task_key != dsl_key

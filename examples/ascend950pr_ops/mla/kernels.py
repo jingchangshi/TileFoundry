@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+from typing import Protocol
 import uuid
 
 import tilelang
@@ -4102,6 +4103,44 @@ def _render_trackb_tu(**dims: object) -> str:
     )
 
 
+class _TrackBCompilePort(Protocol):
+    def __call__(
+        self,
+        source: str,
+        *,
+        target_format: str,
+        npu_arch: str,
+        options: list[str],
+        path_target: str,
+    ) -> object: ...
+
+
+class _TrackBSoLoadPort(Protocol):
+    def __call__(self, path: str) -> object: ...
+
+
+def _load_uncached_trackb_so(
+    launcher_src: str,
+    opts: list[str],
+    *,
+    compile_fn: _TrackBCompilePort | None = None,
+    load_cdll: _TrackBSoLoadPort | None = None,
+) -> object:
+    """Compile and load an uncached Track-B shared object inside a cleaned temp dir."""
+    eff_compile = compile_ascend if compile_fn is None else compile_fn
+    eff_load = ctypes.CDLL if load_cdll is None else load_cdll
+    with tempfile.TemporaryDirectory(prefix="mla_trackb_") as so_dir:
+        so_path = os.path.join(so_dir, "mla_trackb.so")
+        eff_compile(
+            launcher_src,
+            target_format="so",
+            npu_arch="dav-3510",
+            options=opts,
+            path_target=so_path,
+        )
+        return eff_load(so_path)
+
+
 def _build_mla_trackb_callable(
     n_q: int,
     d_nope: int,
@@ -4144,20 +4183,16 @@ def _build_mla_trackb_callable(
                 with contextlib.suppress(OSError):
                     if os.path.exists(tmp_so):
                         os.remove(tmp_so)
+        lib = _TRACKB_SO_CACHE.get(so_path)
+        if lib is None:
+            lib = ctypes.CDLL(so_path)
+            _TRACKB_SO_CACHE[so_path] = lib
     else:
-        so_dir = tempfile.mkdtemp(prefix="mla_trackb_")
-        so_path = os.path.join(so_dir, "mla_trackb.so")
-        compile_ascend(
-            launcher_src,
-            target_format="so",
-            npu_arch="dav-3510",
-            options=opts,
-            path_target=so_path,
-        )
-    lib = _TRACKB_SO_CACHE.get(so_path)
-    if lib is None:
-        lib = ctypes.CDLL(so_path)
-        _TRACKB_SO_CACHE[so_path] = lib
+        uncached_key = f"uncached:{trackb_sig}"
+        lib = _TRACKB_SO_CACHE.get(uncached_key)
+        if lib is None:
+            lib = _load_uncached_trackb_so(launcher_src, opts)
+            _TRACKB_SO_CACHE[uncached_key] = lib
     fn = lib.launch_mla_trackb
     fn.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 7 + [ctypes.c_float]
     is_bnsd = 1 if input_layout == "BNSD" else 0

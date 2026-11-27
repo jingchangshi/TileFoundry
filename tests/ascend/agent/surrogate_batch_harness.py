@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import hashlib
 import importlib
@@ -14,9 +15,10 @@ import statistics
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence, Set as AbstractSet
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import pytest
 import torch
@@ -35,7 +37,8 @@ _SKIP_PILL_IDS = frozenset({"incumbent_slot", "__incumbent__"})
 _FAST_SHA256 = re.compile(r"[0-9a-f]{64}")
 _MSP_KEYS = (
     *((k, (k,)) for k in ("aic_scalar", "aic_mte1", "aic_mte3", "aic_fixpipe", "aiv_scalar",
-                          "aiv_mte3", "aic_mte2", "aiv_mte2", "sync_stall_ratio")),
+                          "aiv_mte3", "aic_mte2", "aiv_mte2", "sync_stall_ratio",
+                          "mte2_wait_ratio")),
     ("aic_mac_ratio", ("aic_mad", "aic_mac_ratio")),
     ("aiv_vec_ratio", ("aiv_vec", "aiv_vec_ratio")),
     *((f"{k}_ratio", (f"{k}_ratio", k)) for k in ("aiv0_vec", "aiv1_vec")),
@@ -47,10 +50,8 @@ _MSP_KEYS = (
 
 def _ensure_npu(*, require: bool = False) -> None:
     if not hasattr(torch, "npu"):
-        try:
+        with contextlib.suppress(ImportError):
             importlib.import_module("torch_npu")
-        except ImportError:
-            pass
     if not require or (hasattr(torch, "npu") and torch.npu.is_available()):
         return
     if os.environ.get(ag_npu.FAST_REQUEST_ENV, "").strip() or os.environ.get(
@@ -165,15 +166,13 @@ def _measure_msprof(
             ok: max(0.0, min(1.0, (v := float(raw)) / 100.0 if v > 1.05 else v))
             for ok, names in _MSP_KEYS if (raw := _num(*names)) is not None
         }
-        for dst, src in (("aic_mad", "aic_mac_ratio"), ("aiv_vec", "aiv_vec_ratio")):
-            if src in m:
-                m[dst] = m[src]
+        m.update({d: m[s] for d, s in (("aic_mad", "aic_mac_ratio"), ("aiv_vec", "aiv_vec_ratio"))
+                  if s in m})
         if "mte2_wait_ratio" not in m and ("aiv_mte2" in m or "aic_mte2" in m):
             m["mte2_wait_ratio"] = max(float(m[k]) for k in ("aiv_mte2", "aic_mte2") if k in m)
-        for k in ("aic_total_cycles", "aiv_total_cycles", "hbm_read_bytes", "hbm_write_bytes",
-                  "actual_gm_bytes"):
-            if (raw := _num(k)) is not None:
-                m[k] = int(raw)
+        m.update({k: int(raw) for k in ("aic_total_cycles", "aiv_total_cycles", "hbm_read_bytes",
+                                        "hbm_write_bytes", "actual_gm_bytes")
+                  if (raw := _num(k)) is not None})
         if "actual_gm_bytes" not in m and ("hbm_read_bytes" in m or "hbm_write_bytes" in m):
             m["actual_gm_bytes"] = int(m.get("hbm_read_bytes", 0)) + int(
                 m.get("hbm_write_bytes", 0))
@@ -236,9 +235,8 @@ def _run_case_acc(
 
 
 def _fail_m(spec: aspecs.AnchorCaseSpec, err: str) -> ag_npu.AnchorEvalMetrics:
-    return ag_npu.build_anchor_metrics(
-        spec, accuracy_passed=False, cand_us=0.0, error_message=err[:300]
-    )
+    return ag_npu.build_anchor_metrics(spec, accuracy_passed=False, cand_us=0.0,
+                                       error_message=err[:300])
 
 
 def _poison_pill_worker_main(req_path: Path, out_path: Path) -> None:
@@ -253,10 +251,8 @@ def _poison_pill_worker_main(req_path: Path, out_path: Path) -> None:
         _setup_env(None, None, tl_c)
     cmod, harness, by_num = _load_harness(op, anchors, sroot, crepo)
     if (rfd := os.environ.get("TF_POISON_PILL_READY_FD", "").strip()).isdigit():
-        try:
+        with contextlib.suppress(OSError):
             os.write(int(rfd), b"READY\n")
-        except OSError:
-            pass
     results, loaded = {}, []
     for idx, item in enumerate(p["candidates"]):
         cid = str(item["candidate_id"])
@@ -375,6 +371,22 @@ def _measure_passed(
     return out
 
 
+class CandidateLoaderPort(Protocol):
+    def __call__(self, path: Path, ep: str, tag: str) -> tuple[Callable[..., object], object]: ...
+
+
+def load_selected_candidates(
+    candidates: Sequence[Mapping[str, object]], *, entrypoint: str, op_name: str, use_pill: bool,
+    phase_a_ok: AbstractSet[str] = frozenset(), loader: CandidateLoaderPort = _load_cand,
+) -> list[tuple[str, Callable[..., object], object]]:
+    return [
+        (cid, *loader(Path(str(c["module_path"])), entrypoint,
+                       f"{op_name}_{i}_{time.monotonic_ns()}"))
+        for i, c in enumerate(candidates) for cid in (str(c["candidate_id"]),)
+        if not (use_pill and cid not in _INCUMBENT_IDS and cid not in phase_a_ok)
+    ]
+
+
 def _evaluate_operator_batch(
     batch: Mapping[str, object], *, source_root: Path, cann_repo: Path, warmup: int, repeat: int,
     collect_msprof_detail: bool = False,
@@ -416,12 +428,8 @@ def _evaluate_operator_batch(
                 per_cand[cid] = [_fail_m(
                     s, ce[1] if (ce := pcase.get(int(s.case_num))) and not ce[0] and ce[1] else fb
                 ) for s in anchors]
-    loaded = [
-        (cid, *_load_cand(Path(str(c["module_path"])), ep, f"{op_name}_{i}_{time.monotonic_ns()}"))
-        for i, c in enumerate(candidates)
-        if not (use_pill and (cid := str(c["candidate_id"])) not in _INCUMBENT_IDS
-                and cid not in phase_a_ok)
-    ]
+    loaded = load_selected_candidates(
+        candidates, entrypoint=ep, op_name=op_name, use_pill=use_pill, phase_a_ok=phase_a_ok)
     with cmod.ReferenceCache(harness) as cache:
         for spec in anchors:
             case = by_num[int(spec.case_num)]
@@ -784,8 +792,8 @@ def run_surrogate_anchor_batch_npu() -> None:
         if bool(req.get("require_all_passed", False)):
             for op, op_res in parsed_by_op.items():
                 for cid, res in op_res.items():
-                    assert res.all_passed, f"{op}/{cid} failed"
-                    assert all(a.cand_us > 0.0 for a in res.anchors), f"{op}/{cid} invalid time"
+                    assert res.all_passed and all(a.cand_us > 0.0 for a in res.anchors), (
+                        f"{op}/{cid} failed")
 
 
 if __name__ == "__main__" and len(sys.argv) == 4 and sys.argv[1] == "--poison-pill":
