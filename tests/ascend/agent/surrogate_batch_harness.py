@@ -38,8 +38,7 @@ _MSP_KEYS = (
                           "aiv_mte3", "aic_mte2", "aiv_mte2", "sync_stall_ratio")),
     ("aic_mac_ratio", ("aic_mad", "aic_mac_ratio")),
     ("aiv_vec_ratio", ("aiv_vec", "aiv_vec_ratio")),
-    ("aiv0_vec_ratio", ("aiv0_vec_ratio", "aiv0_vec")),
-    ("aiv1_vec_ratio", ("aiv1_vec_ratio", "aiv1_vec")),
+    *((f"{k}_ratio", (f"{k}_ratio", k)) for k in ("aiv0_vec", "aiv1_vec")),
     ("l2_hit_rate", ("l2_hit_rate", "l2_cache_hit_rate")),
     ("bank_conflict_ratio", ("bank_conflict_ratio", "ub_bank_conflict_ratio",
                              "resource_conflict_ratio")),
@@ -571,29 +570,6 @@ def _fast_bindings(candidates: Sequence[_FastCand]) -> dict[str, dict[str, dict[
     return bindings
 
 
-def _write_fast_resp(
-    resp_path: Path, *, req_id: str, req_sha: str, mode: str, status: str, error: str = "",
-    ops: Mapping[str, object] | None = None, msp: Mapping[str, object] | None = None,
-    cands: Mapping[str, object] | None = None, cov: tuple[int, int, int, int] = (0, 0, 0, 0),
-    probe: Mapping[str, object] | None = None, null_us: float | None = None, stdout: bool = True,
-) -> None:
-    ec, vc, em, om = cov
-    payload: dict[str, object] = {
-        "schema": ag_npu.FAST_RESPONSE_SCHEMA, "request_id": req_id, "request_sha256": req_sha,
-        "mode": mode, "status": status, "error": error[-1000:], "operators": dict(ops or {}),
-        "msprof_telemetry": dict(msp or {}), "candidates": dict(cands or {}),
-        "coverage": {"expected_candidates": ec, "evaluated_candidates": vc,
-                     "expected_msprof_targets": em, "observed_msprof_targets": om},
-    }
-    if probe is not None:
-        payload["micro_probe"] = dict(probe)
-    if mode == "batch" and null_us is not None and math.isfinite(float(null_us)) and null_us > 0.0:
-        payload["null_launch_us"] = float(null_us)
-    atomic_write_text(resp_path, json.dumps(payload, indent=2) + "\n")
-    if stdout:
-        print(json.dumps(payload, sort_keys=True), flush=True)
-
-
 def _exec_batches(
     batches: Sequence[Mapping[str, object]], *, source_root: Path, cann_repo: Path,
     warmup: int, repeat: int, collect_msprof: bool = False,
@@ -624,8 +600,27 @@ def _handle_fast_request(request_path_raw: str, source_root_raw: str, shim_dir: 
     resp_p = _fast_path(sroot, req.get("response_path"), "response_path")
     req_id, mode = str(req.get("request_id", "")).strip(), str(req.get("mode", "")).strip()
 
-    def _resp(status: str, **kw: object) -> None:
-        _write_fast_resp(resp_p, req_id=req_id, req_sha=req_sha, mode=mode, status=status, **kw)
+    def _resp(
+        status: str, *, error: str = "", ops: Mapping[str, object] | None = None,
+        msp: Mapping[str, object] | None = None, cands: Mapping[str, object] | None = None,
+        cov: tuple[int, int, int, int] = (0, 0, 0, 0), probe: Mapping[str, object] | None = None,
+        null_us: float | None = None, stdout: bool = True,
+    ) -> None:
+        payload: dict[str, object] = {
+            "schema": ag_npu.FAST_RESPONSE_SCHEMA, "request_id": req_id,
+            "request_sha256": req_sha, "mode": mode, "status": status, "error": error[-1000:],
+            "operators": dict(ops or {}), "msprof_telemetry": dict(msp or {}),
+            "candidates": dict(cands or {}), "coverage": dict(zip(
+                ("expected_candidates", "evaluated_candidates",
+                 "expected_msprof_targets", "observed_msprof_targets"), cov, strict=True)),
+        }
+        if probe is not None:
+            payload["micro_probe"] = dict(probe)
+        if mode == "batch" and null_us is not None and math.isfinite(null_us) and null_us > 0.0:
+            payload["null_launch_us"] = float(null_us)
+        atomic_write_text(resp_p, json.dumps(payload, indent=2) + "\n")
+        if stdout:
+            print(json.dumps(payload, sort_keys=True), flush=True)
 
     try:
         _req(req.get("schema") == ag_npu.FAST_REQUEST_SCHEMA and bool(req_id)
