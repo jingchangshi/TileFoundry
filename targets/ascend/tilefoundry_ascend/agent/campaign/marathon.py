@@ -204,7 +204,8 @@ def run_operator_marathon(
         pure_golden=cfg.pure_golden, **{k: getattr(cfg, k) for k in ("cost_model_mode", "allow_unreviewed_distilled_rules") if k in cf_names},
     )
     tracker = BayesianRuleTracker.from_experience_lake(ldir, allow_unreviewed_distilled_rules=cfg.allow_unreviewed_distilled_rules)
-    fly = FlywheelDistiller(funnel=GateFunnel(skip_stage_b=True), tracker=tracker, probe_port=LocalHardwareProbePort(), probe_runner=lambda sp: run_micro_probe_via_agent_gates(sp, source_root=worktree, env_file=env_file, device_id=pdev, min_speedup=1.08, timeout_sec=360, **({"device_pool": dpool} if dpool else {})))
+    fly_tracker = tracker if cfg.allow_unreviewed_distilled_rules else BayesianRuleTracker.from_rules(tracker.rules.values())
+    fly = FlywheelDistiller(funnel=GateFunnel(skip_stage_b=True), tracker=fly_tracker, probe_port=LocalHardwareProbePort(), probe_runner=lambda sp: run_micro_probe_via_agent_gates(sp, source_root=worktree, env_file=env_file, device_id=pdev, min_speedup=1.08, timeout_sec=360, **({"device_pool": dpool} if dpool else {})))
     p_anc = None
     if cfg.pure_golden:
         preg = CannbenchOpsRegistry(tasks_root=crepo, source_root=worktree, pure_golden=True)

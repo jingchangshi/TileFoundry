@@ -140,8 +140,16 @@ class CalibrationService:
         self._sil_advisory = sil_advisory
         self._enable_phase0_lattice_sweep = bool(enable_phase0_lattice_sweep)
         self._regime_specs = tuple(regime_specs)
-        self._msprof_by_case: dict[tuple[str, int], dict[str, float]] = msprof_by_case if msprof_by_case is not None else {}
-        self._p2_cache: dict[tuple[str, str], dict[str, object]] = p2_cache if p2_cache is not None else {}
+        self._msprof_by_case: dict[tuple[str, int], dict[str, float]] = (
+            {(str(k[0]), int(k[1])): dict(v) for k, v in msprof_by_case.items()}
+            if msprof_by_case is not None
+            else {}
+        )
+        self._p2_cache: dict[tuple[str, str], dict[str, object]] = (
+            {(str(k[0]), str(k[1])): dict(v) for k, v in p2_cache.items()}
+            if p2_cache is not None
+            else {}
+        )
 
     @property
     def msprof_by_case(self) -> dict[tuple[str, int], dict[str, float]]:
@@ -263,7 +271,7 @@ class CalibrationService:
         """Collect deep-dive profiling payload for the bottleneck anchor of regime_spec."""
         cache_key = (source_sha256(source), regime_spec.regime_tag)
         if cache_key in self._p2_cache:
-            return self._p2_cache[cache_key]
+            return dict(self._p2_cache[cache_key])
         if self._p2_deep_dive_collector is None:
             return None
         spec = _resolve_anchor_for_regime(result, active_anchors, regime_spec, allow_fallback_anchor=True)
@@ -286,7 +294,7 @@ class CalibrationService:
             return None
         clean = {str(k): v for k, v in raw.items()}
         self._p2_cache[cache_key] = clean
-        return clean
+        return dict(clean)
 
     def run_phase0_lattice_warmstart(
         self,

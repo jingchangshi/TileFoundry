@@ -125,25 +125,19 @@ class FlywheelCoordinator:
             should_trigger_flywheel_checkpoint(eff_base_lat, winner_latency_us, sigma_paired_us=eff_sigma)
             and has_l2_executor
         )
-        orig_tracker = self._flywheel._tracker
-        self._flywheel._tracker = (
-            orig_tracker if allow_unreviewed else BayesianRuleTracker.from_rules(tracker.rules.values())
+        _ = (tracker, allow_unreviewed)
+        distill_rep = self._flywheel.distill_from_pair(
+            baseline_dsl=eff_base_src, winner_dsl=winner_source,
+            baseline_latency_us=eff_base_lat, winner_latency_us=winner_latency_us,
+            factory_name=func_name, factory_kwargs=regime_spec.sample_builder_kwargs,
+            config_selector_name=regime_spec.config_selector_fn or None, dims=proto_dims,
+            batch_latency_evaluator=batch_latency_evaluator, topology_axes=topology_axes,
+            kb_output_path=campaign_kb_path, rule_id_prefix="R_FLYWHEEL",
+            verify_on_candidate=verify_on_cand, max_loo_chunks=3,
+            operator_name=operator_name, rule_scope="operator_local",
+            active_symptom_family=symptom_family, ordered_tensor_shapes=distill_shapes,
+            sigma_paired_us=eff_sigma,
         )
-        try:
-            distill_rep = self._flywheel.distill_from_pair(
-                baseline_dsl=eff_base_src, winner_dsl=winner_source,
-                baseline_latency_us=eff_base_lat, winner_latency_us=winner_latency_us,
-                factory_name=func_name, factory_kwargs=regime_spec.sample_builder_kwargs,
-                config_selector_name=regime_spec.config_selector_fn or None, dims=proto_dims,
-                batch_latency_evaluator=batch_latency_evaluator, topology_axes=topology_axes,
-                kb_output_path=campaign_kb_path, rule_id_prefix="R_FLYWHEEL",
-                verify_on_candidate=verify_on_cand, max_loo_chunks=3,
-                operator_name=operator_name, rule_scope="operator_local",
-                active_symptom_family=symptom_family, ordered_tensor_shapes=distill_shapes,
-                sigma_paired_us=eff_sigma,
-            )
-        finally:
-            self._flywheel._tracker = orig_tracker
 
         if experience_lake_dir is not None:
             origin_ts = time.time()

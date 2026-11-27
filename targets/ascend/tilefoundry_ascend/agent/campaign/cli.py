@@ -92,9 +92,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         round_regime_tags=tuple(args.round_regime or ()), pure_golden=bool(args.pure_golden),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
+    fly_tracker = tracker if cfg_c.allow_unreviewed_distilled_rules else BayesianRuleTracker.from_rules(tracker.rules.values())
+    has_env = bool(args.env_file or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip())
     fly = FlywheelDistiller(
-        funnel=GateFunnel(skip_stage_b=True), tracker=tracker, probe_port=LocalHardwareProbePort(),
-        probe_runner=(lambda sp: run_micro_probe_via_agent_gates(sp, source_root=args.source_root, env_file=args.env_file, device_id=pdev, device_pool=pool)) if args.env_file else None,
+        funnel=GateFunnel(skip_stage_b=True), tracker=fly_tracker, probe_port=LocalHardwareProbePort(),
+        probe_runner=(lambda sp: run_micro_probe_via_agent_gates(sp, source_root=args.source_root, env_file=args.env_file, device_id=pdev, device_pool=pool)) if has_env else None,
     )
     runner = PerfTargetCampaignRunner(
         config=cfg_c, target_module_path=args.target_file, llm_backend=llm, tracker=tracker,

@@ -19,6 +19,7 @@ from tilefoundry_ascend.agent.campaign.helpers import (
     resolve_operator_semantics_for_gates, resolve_trackb_freedom_mask, run_l0_gate,
     select_active_regime, slice_contract_instruction, source_sha256,
 )
+from tilefoundry_ascend.agent.contracts import CampaignStateSnapshot, RoundContextReceipt
 from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor
 from tilefoundry_ascend.agent.gates.cpp_slice_protocol import (
     build_trackb_context_view, escalate_primfunc_to_trackb_tu,
@@ -186,6 +187,8 @@ class RoundSynthesisBundle:
     local_best: CandidateSurrogateResult | None = None
     creative_effort: str = "high"
     stagnation_rounds: int = 0
+    receipt: RoundContextReceipt | None = None
+    collected_msprof_by_case: Mapping[tuple[str, int], Mapping[str, float]] = field(default_factory=dict)
 
 
 class RoundContextBuilder:
@@ -221,7 +224,7 @@ class RoundContextBuilder:
         self._experience_lake, self._experience_lake_dir = experience_lake, experience_lake_dir
         self._sil_advisory, self._topology_axes = sil_advisory, topology_axes
         self._semantic_topology_axes: TopologyAxes | None = None
-        self._freedom_masks: dict[str, ConstraintRelaxationMask] = freedom_masks if isinstance(freedom_masks, dict) else dict(freedom_masks or {})
+        self._freedom_masks: dict[str, ConstraintRelaxationMask] = dict(freedom_masks or {})
         self._boundary_ledger = boundary_ledger or DeterministicSearchBoundaryLedger()
         self._run_l0_fn, self._l1_summary_fn = run_l0_fn, l1_summary_fn
         self._collect_msprof_fn, self._collect_p2_fn = collect_msprof_fn, collect_p2_fn
@@ -236,7 +239,27 @@ class RoundContextBuilder:
         self._active_kernel_cache: dict[tuple[str, str], str | None] = {}
         self._semantics_cache = OperatorSemanticsCache()
         self._update_blueprint_provenance(None)
-        self._regime_blueprints: dict[str, HirBlueprintPacket] = dict(regime_blueprints) if regime_blueprints is not None else {}
+        self._regime_blueprints: dict[str, HirBlueprintPacket] = self._validated_regime_blueprints(regime_blueprints)
+
+    @property
+    def regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
+        """Return defensive copy of validated per-regime HIR blueprint packets."""
+        return dict(self._regime_blueprints)
+
+    @property
+    def blueprint_provenance(self) -> dict[str, object]:
+        """Return defensive copy of golden blueprint provenance metadata."""
+        return dict(self._blueprint_provenance)
+
+    @property
+    def semantic_topology_axes(self) -> TopologyAxes | None:
+        """Return semantic topology axes inferred from golden reference."""
+        return self._semantic_topology_axes
+
+    @property
+    def freedom_masks(self) -> dict[str, ConstraintRelaxationMask]:
+        """Return defensive copy of per-regime Track-B constraint relaxation masks."""
+        return dict(self._freedom_masks)
 
     def _resolve_cannbench_tasks_root(self) -> Path | None:
         if self._resolve_cannbench_tasks_root_fn is not None:
@@ -668,9 +691,19 @@ class RoundContextBuilder:
     def build_round_bundle(
         self, state: ChampionState, *, round_idx: int, regime_spec: RegimeTargetSpec | None = None,
         working_anchors: Sequence[AnchorCaseSpec] | None = None, exclude_regime: str | None = None,
-        creative_effort: str = "high",
+        creative_effort: str = "high", snapshot: CampaignStateSnapshot | None = None,
     ) -> RoundSynthesisBundle:
-        """Assemble the complete RoundSynthesisBundle from an immutable ChampionState."""
+        """Assemble the complete RoundSynthesisBundle from an immutable CampaignStateSnapshot."""
+        eff_round = int(snapshot.round_index) if snapshot is not None else int(round_idx)
+        eff_inc = snapshot.incumbent_source if snapshot is not None else state.incumbent_source
+        eff_creg = (snapshot.active_regime_tag or None) if snapshot is not None else state.current_regime
+        eff_frozen = set(snapshot.frozen_regimes) if snapshot is not None else set(state.frozen_regimes)
+        eff_stag_map = snapshot.stagnation_by_regime if snapshot is not None else state.stagnation_by_regime
+        eff_cwall = dict(snapshot.compile_wall_streak_by_regime) if snapshot is not None else state.compile_wall_streak_by_regime
+        eff_prom_map = dict(snapshot.last_round_promoted_by_regime) if snapshot is not None else state.last_round_promoted_by_regime
+        eff_last_prom = snapshot.last_round_promoted if snapshot is not None else state.last_round_promoted
+        eff_gain_map = dict(snapshot.last_local_rel_gain_by_regime) if snapshot is not None else state.last_local_rel_gain_by_regime
+        eff_floor = float(snapshot.dispatch_floor_us) if snapshot is not None else state.calibrated_dispatch_floor_us
         if state.boundary_ledger is not None:
             self._boundary_ledger = state.boundary_ledger
         if state.sil_advisory is not None:
@@ -683,31 +716,34 @@ class RoundContextBuilder:
             self._semantics_cache.proto = state.operator_proto_cache
         if state.regime_blueprints:
             self._regime_blueprints = dict(state.regime_blueprints)
+        local_masks = dict(self._freedom_masks)
         for k, v in state.freedom_masks.items():
-            self._freedom_masks.setdefault(k, v)
+            local_masks.setdefault(k, v)
+        if snapshot is None:
+            self._freedom_masks = local_masks
         self._active_kernel_cache.update(state.active_kernel_cache)
         eff_specs = state.regime_specs or self._regime_specs
         eff_anchors = tuple(working_anchors if working_anchors is not None else state.active_anchors)
         selected_spec = regime_spec or select_active_regime(
-            eff_specs, self._perf_target, state.current_regime, set(state.frozen_regimes),
+            eff_specs, self._perf_target, eff_creg, eff_frozen,
             state.best_result, eff_anchors, allow_satisfied_fallback=True, exclude_regime=exclude_regime,
-            stagnation_by_regime=state.stagnation_by_regime, compile_wall_streak_by_regime=state.compile_wall_streak_by_regime,
-            last_round_promoted_by_regime=state.last_round_promoted_by_regime,
-            last_round_promoted=state.last_round_promoted, dispatch_floor_us=state.calibrated_dispatch_floor_us,
+            stagnation_by_regime=eff_stag_map, compile_wall_streak_by_regime=eff_cwall,
+            last_round_promoted_by_regime=eff_prom_map,
+            last_round_promoted=eff_last_prom, dispatch_floor_us=eff_floor,
         )
         if selected_spec is None:
             raise RuntimeError("No active unfrozen regime available for round synthesis.")
         op_entry = resolve_operator_entrypoint_safe(self._config.operator_name)
-        func_name, _ = extract_regime_snippet(state.incumbent_source, selected_spec, operator_entrypoint=op_entry, sibling_specs=eff_specs)
+        func_name, _ = extract_regime_snippet(eff_inc, selected_spec, operator_entrypoint=op_entry, sibling_specs=eff_specs)
         rbeam = state.beams.get(selected_spec.regime_tag) or TwoLaneBeamSearch()
-        stag = int(state.stagnation_by_regime.get(selected_spec.regime_tag, state.stagnation_rounds))
+        stag = int(eff_stag_map.get(selected_spec.regime_tag, state.stagnation_rounds))
         escalated = stag >= int(self._config.stagnation_escalate_rounds)
         parent_src, parent_snip, parent_lane, stone, stone_hyp = self._resolve_round_parent(
-            incumbent_source=state.incumbent_source, regime_spec=selected_spec,
+            incumbent_source=eff_inc, regime_spec=selected_spec,
             regime_beam=rbeam, escalated=escalated, sibling_specs=eff_specs,
         )
         stone_id = stone.candidate_id if stone is not None else None
-        active_pid = stone_id or (rbeam.exploit_beam[0].candidate_id if rbeam.exploit_beam else f"incumbent_r{max(0, round_idx - 1)}")
+        active_pid = stone_id or (rbeam.exploit_beam[0].candidate_id if rbeam.exploit_beam else f"incumbent_r{max(0, eff_round - 1)}")
         bn_anchor = bottleneck_anchor_for_regime(state.best_result, selected_spec.regime_tag)
         bn_dims = None
         if bn_anchor is not None:
@@ -726,8 +762,8 @@ class RoundContextBuilder:
         pfeat = base_sa.features if self._enable_track_router else None
         rbest = state.best_result.for_regime(selected_spec.regime_tag)
         local_best = rbest if rbest.anchors else state.best_result
-        prev_rel = state.last_local_rel_gain_by_regime.get(selected_spec.regime_tag)
-        mean_rec = regime_mean_recoverable_excess_us(state.best_result, selected_spec, dispatch_floor_us=state.calibrated_dispatch_floor_us)
+        prev_rel = eff_gain_map.get(selected_spec.regime_tag)
+        mean_rec = regime_mean_recoverable_excess_us(state.best_result, selected_spec, dispatch_floor_us=eff_floor)
         paxes = self._axes(pledger, features=pfeat, route=base_sa.route)
         bkey = f"{selected_spec.regime_tag}:{paxes.key()}"
         shist = self._boundary_ledger.spearman_history.get(bkey) or []
@@ -761,12 +797,15 @@ class RoundContextBuilder:
             has_recurrence=(paxes.memory_ring in ("persistent_onchip_state", "bidirectional_cv_ring")), uses_cube=paxes.uses_cube,
         )
         msprof_by_case = {(str(s), int(c)): dict(m) for (s, c), m in state.msprof_by_case.items()}
+        collected_mp: dict[tuple[str, int], dict[str, float]] = {}
         if stag >= 1 and self._collect_msprof_fn is not None:
             extra_mp = self._collect_msprof_fn(parent_src, state.best_result, eff_anchors, [selected_spec])
             if isinstance(extra_mp, Mapping):
                 for k, m in extra_mp.items():
                     if isinstance(k, tuple) and len(k) == 2 and isinstance(m, Mapping):
-                        msprof_by_case[(str(k[0]), int(k[1]))] = {str(mk): float(mv) for mk, mv in m.items() if isinstance(mv, (int, float)) and not isinstance(mv, bool)}
+                        clean_m = {str(mk): float(mv) for mk, mv in m.items() if isinstance(mv, (int, float)) and not isinstance(mv, bool)}
+                        msprof_by_case[(str(k[0]), int(k[1]))] = clean_m
+                        collected_mp[(str(k[0]), int(k[1]))] = dict(clean_m)
         psha = source_sha256(parent_src)
         cached_mp = msprof_by_case.get((psha, int(bn_anchor.case_num))) if bn_anchor is not None else None
         plat = stone.latency_us if (stone is not None and stone.latency_us > 0.0) else local_best.mean_latency_us()
@@ -835,17 +874,17 @@ class RoundContextBuilder:
         amask = (
             self._resolve_trackb_freedom_mask_fn(selected_spec)
             if self._resolve_trackb_freedom_mask_fn is not None
-            else resolve_trackb_freedom_mask(selected_spec, freedom_masks=self._freedom_masks, baseline_source=state.incumbent_source)
+            else resolve_trackb_freedom_mask(selected_spec, freedom_masks=local_masks, baseline_source=eff_inc)
         )
         esc_dec, pgaps, esc_tu = None, None, ""
         if escalated:
             amask = relax_facets_for_bottleneck(amask, dominant_bound=pbound, residual=pres, compiler_summary=pcomp, l1_overflow=l1_ov, ub_overflow=ub_ov)
             for fam, _ in rfams:
-                if not self._tracker.is_family_tabued(regime_tag=selected_spec.regime_tag, symptom_family=fam, parent_sha=psha, current_round=round_idx):
+                if not self._tracker.is_family_tabued(regime_tag=selected_spec.regime_tag, symptom_family=fam, parent_sha=psha, current_round=eff_round):
                     if SYMPTOM_FAMILY_TO_FACETS.get(fam):
                         amask = amask.unlock(*SYMPTOM_FAMILY_TO_FACETS[fam])
                     break
-            self._freedom_masks[selected_spec.regime_tag] = amask
+            local_masks[selected_spec.regime_tag] = amask
             ctier = "ascendc_template" if normalize_runtime_backend(selected_spec.runtime_backend) in ("ascendc_trackb", "hybrid_trackb") else normalize_runtime_backend(str(live_plan.policy.get("backend_tier", "tilelang_dsl")))
             ctier = "ascendc_template" if ctier in ("ascendc_trackb", "hybrid_trackb") else (ctier if ctier == "tilelang_dsl" else "tilelang_dsl")
             sf = dict(pfeat) if isinstance(pfeat, Mapping) else {}
@@ -867,10 +906,12 @@ class RoundContextBuilder:
                 except (ImportError, OSError, RuntimeError, ValueError) as exc:
                     logger.warning("Track-B PrimFunc escalation lowering skipped: %s", exc)
         else:
-            self._freedom_masks.setdefault(selected_spec.regime_tag, amask)
+            local_masks.setdefault(selected_spec.regime_tag, amask)
         if pshift:
             amask = unlock_cross_topology_paradigm_shift(amask)
-            self._freedom_masks[selected_spec.regime_tag] = amask
+            local_masks[selected_spec.regime_tag] = amask
+        if snapshot is None:
+            self._freedom_masks = local_masks
         sil_sec = self._format_sil_live_policy_section(
             live_plan=live_plan, active_mask=amask, escalation=esc_dec, pipe_gaps=pgaps,
             cost_pred=pcost, escalated_trackb_tu=esc_tu, parent_ledger=pledger, parent_residual=pres,
@@ -878,11 +919,11 @@ class RoundContextBuilder:
         rrules = tuple(self._tracker.rank_applicable_rules(
             ctx, top_k=self._config.k_rule_workers, topology_axes=paxes,
             operator_name=self._config.operator_name, runtime_backend=selected_spec.runtime_backend,
-            regime_tag=selected_spec.regime_tag, parent_sha=psha, current_round=round_idx, symptom_ranking=list(rfams),
+            regime_tag=selected_spec.regime_tag, parent_sha=psha, current_round=eff_round, symptom_ranking=list(rfams),
         ))
         wspecs: list[tuple[str, str, AscendCausalRule | None, GenerationRequest]] = [
             (
-                f"r{round_idx}_rule_{idx}", "rule_exploit", rule,
+                f"r{eff_round}_rule_{idx}", "rule_exploit", rule,
                 self._build_exploit_regime_request(
                     snippet_source=parent_snip, func_name=func_name, regime_spec=selected_spec, rule=rule,
                     best_result=local_best, blueprint=bp, parent_ledger=pledger, parent_residual=pres,
@@ -914,7 +955,7 @@ class RoundContextBuilder:
         tot_cr = max(2, 1 + deficit) if (pshift or p2_esc) else (1 + deficit)
         for ci in range(tot_cr):
             wspecs.append((
-                f"r{round_idx}_creative" if ci == 0 else f"r{round_idx}_creative_{ci}", "creative_explore", None,
+                f"r{eff_round}_creative" if ci == 0 else f"r{eff_round}_creative_{ci}", "creative_explore", None,
                 self._build_creative_regime_request(
                     snippet_source=parent_snip, func_name=func_name, regime_spec=selected_spec, best_result=local_best,
                     effort=creative_effort, excluded_mechanisms=excl,
@@ -924,6 +965,13 @@ class RoundContextBuilder:
                     sil_policy_section=sil_sec, p2_diag=p2_diag, paradigm_shift=pshift,
                 ),
             ))
+        receipt = RoundContextReceipt(
+            round_idx=eff_round, regime_tag=selected_spec.regime_tag, func_name=func_name,
+            parent_lane=parent_lane, parent_sha256=psha, track=ptrack, creative_effort=creative_effort,
+            stagnation_rounds=stag, worker_count=len(wspecs), escalated=escalated,
+            paradigm_shift_active=pshift, p2_escalated=p2_esc, active_parent_id=active_pid,
+            parent_lat_us=float(plat), parent_obj_score=float(pscore), parent_dominant_bound=pbound,
+        )
         return RoundSynthesisBundle(
             regime_spec=selected_spec, func_name=func_name, parent_module_source=parent_src, parent_snippet=parent_snip,
             parent_lane=parent_lane, selected_stone_id=stone_id, selected_stone_hypothesis=stone_hyp,
@@ -935,6 +983,7 @@ class RoundContextBuilder:
             parent_cost_pred=pcost, parent_dominant_bound=pbound, active_mask=amask, escalated=escalated,
             paradigm_shift_active=pshift, p2_escalated=p2_esc, mean_recoverable_excess_us=mean_rec,
             prev_local_rel_gain=prev_rel, local_best=local_best, creative_effort=creative_effort, stagnation_rounds=stag,
+            receipt=receipt, collected_msprof_by_case=collected_mp,
         )
 
 

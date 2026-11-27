@@ -25,16 +25,18 @@ from tilefoundry_ascend.agent.campaign.promotion_coordinator import (
 from tilefoundry_ascend.agent.campaign.round_context_builder import ChampionState, RoundContextBuilder
 from tilefoundry_ascend.agent.campaign.stage0_env import (
     _LEGACY_AGY_ENV_KEYS, _LLM_ENV_PREFIX, build_stage0_oracle_validator,
-    build_stage0_static_validator, configure_marathon_process_env,
+    build_stage0_static_validator as _stage0_build_static_validator, configure_marathon_process_env,
     discover_marathon_environment, ensure_marathon_env_file,
     prepare_marathon_seed, short_operator_tag,
 )
 from tilefoundry_ascend.agent.campaign.stage_gate_coordinator import CandidateBatch, StageGateCoordinator
 from tilefoundry_ascend.agent.campaign.telemetry_ledger_writer import TelemetryLedgerWriter
-from tilefoundry_ascend.agent.contracts import CampaignRoundRecord, CampaignStateSnapshot
+from tilefoundry_ascend.agent.contracts import (
+    CampaignRoundRecord, CampaignStateSnapshot, RecoveryReceipt, RoundContextReceipt, StageGateRoundReceipt,
+)
 from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor, create_cost_advisor
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
-from tilefoundry_ascend.agent.gates.gate_funnel import StageAResult, StageBResult
+from tilefoundry_ascend.agent.gates.gate_funnel import StageAResult, StageBResult, run_stage_a_static
 from tilefoundry_ascend.agent.gates.stage_b_gate import run_l1_compile_check
 from tilefoundry_ascend.agent.kb.bayesian_tracker import (
     BayesianRuleTracker, append_rule_misapplication, append_winning_edge,
@@ -256,14 +258,13 @@ class PerfTargetCampaignRunner:
                 logger.debug("ExperienceLake startup replay skipped: %s", exc)
         self._freedom_masks: dict[str, ConstraintRelaxationMask] = {}
         self._live_regime_plans: dict[str, RegimePlanResult] = {}
-        self._regime_diag_stats: dict[str, dict[str, object]] = {}
         self._clock, self._sil_advisory = clock, sil_advisory
         self._semantic_topology_axes: TopologyAxes | None = None
         self._topology_axes: TopologyAxes | None = topology_axes if isinstance(topology_axes, TopologyAxes) else (TopologyAxes.from_dict(topology_axes) if isinstance(topology_axes, Mapping) else None)
         self._boundary_ledger = DeterministicSearchBoundaryLedger()
         self._scoreboard_anchors: tuple[AnchorCaseSpec, ...] = tuple(self._initial_anchors)
         self._active_anchors: list[AnchorCaseSpec] = list(self._scoreboard_anchors)
-        self._guardrail_cases: list[GuardrailCaseSpec] = []
+        self._guardrail_cases: tuple[GuardrailCaseSpec, ...] = ()
         self._last_guardrail_metrics_by_cid: dict[str, dict[int, AnchorEvalMetrics]] = {}
         self._calibrated_dispatch_floor_us: float = 0.0
         self._null_launch_us: float | None = None
@@ -284,41 +285,41 @@ class PerfTargetCampaignRunner:
         self._operator_proto_cache: Mapping[str, object] | None = None
         self._live_stag_by_regime: dict[str, int] = {}
         self._stagnation_discount: float = 0.45
-        if self._flywheel and self._flywheel._probe_runner is None and l2_batch_evaluator is None and (self._env_file or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()):
-            self._flywheel._probe_runner = lambda sp: run_micro_probe_via_agent_gates(sp, source_root=self._source_root, env_file=self._env_file, device_id=self._config.device_id, device_pool=self._l4_device_pool)
+        self._last_round_context_receipt: RoundContextReceipt | None = None
+        self._last_stage_gate_receipt: StageGateRoundReceipt | None = None
+        self._last_recovery_receipt: RecoveryReceipt | None = None
 
-        self._stage_gate_coordinator = StageGateCoordinator(
-            operator_name=config.operator_name, target_module_path=self._target_module_path,
-            regime_specs=self._regime_specs, initial_anchors=self._initial_anchors,
-            scoreboard_anchors=self._scoreboard_anchors, guardrail_cases=self._guardrail_cases,
-            backend=self._backend, tracker=self._tracker, cost_advisor=self._cost_advisor,
-            boundary_ledger=self._boundary_ledger, target=self._target, source_root=self._source_root,
-            env_file=self._env_file, cannbench_repo=self._cannbench_repo, checkpoint_path=self._checkpoint_path,
-            experience_lake_dir=self._experience_lake_dir, run_id=self._run_id, device_id=self._config.device_id,
-            l4_device_pool=self._l4_device_pool, warmup=self._config.warmup, repeat=self._config.repeat,
-            max_syntax_repairs=self._config.max_syntax_repairs, cost_prescreen_top_k=self._config.cost_prescreen_top_k,
-            pure_golden=self._config.pure_golden, enable_track_router=self._enable_track_router,
-            sil_advisory=self._sil_advisory, topology_axes=self._topology_axes, semantic_topology_axes=self._semantic_topology_axes,
-            l0_checker=self._l0_checker, l1_compiler=self._l1_compiler, l2_batch_evaluator=self._l2_batch_evaluator,
-            config=self._config, active_incumbent_source=self._active_incumbent_source, freedom_masks=self._freedom_masks,
-        )
         self._round_context_builder = RoundContextBuilder(
             config=self._config, regime_specs=self._regime_specs, target=self._target, tracker=self._tracker,
             cost_advisor=self._cost_advisor, regime_solver=self._regime_solver, source_root=self._source_root,
             perf_target=self._perf_target, env_file=self._env_file, cannbench_repo=self._cannbench_repo,
             enable_track_router=self._enable_track_router, run_id=self._run_id, experience_lake=self._experience_lake,
             experience_lake_dir=self._experience_lake_dir, sil_advisory=self._sil_advisory, topology_axes=self._topology_axes,
-            regime_blueprints=regime_blueprints, freedom_masks=self._freedom_masks, boundary_ledger=self._boundary_ledger,
-            run_l0_fn=self._stage_gate_coordinator._run_l0, l1_summary_fn=self._stage_gate_coordinator._l1_summary_for_first_round,
-            collect_msprof_fn=self._collect_msprof_for_regimes, collect_p2_fn=self._collect_p2_deep_dive_for_regime,
-            resolve_op_semantics_fn=self._stage_gate_coordinator._resolve_operator_semantics_for_gates,
+            regime_blueprints=regime_blueprints, boundary_ledger=self._boundary_ledger,
+            run_l0_fn=lambda ms, rs, **kw: self._stage_gate_coordinator.run_l0(ms, rs, incumbent_source=self._active_incumbent_source, freedom_masks=dict(self._freedom_masks), **kw),
+            l1_summary_fn=lambda ms, rs: self._stage_gate_coordinator.l1_summary_for_round(ms, rs, scoreboard_anchors=self._scoreboard_anchors, guardrail_cases=self._guardrail_cases),
+            collect_msprof_fn=lambda src, res, ancs, regs: self._calibration_service.collect_msprof_by_case(src, res, ancs, regs),
+            collect_p2_fn=lambda src, res, ancs, reg: self._calibration_service.collect_p2_deep_dive_for_regime(src, res, ancs, reg),
+            resolve_op_semantics_fn=lambda: self._stage_gate_coordinator.resolve_operator_semantics(),
         )
-        self._round_context_builder._regime_blueprints = self._round_context_builder._validated_regime_blueprints(regime_blueprints)
-        self._regime_blueprints = self._round_context_builder._regime_blueprints
-        self._blueprint_provenance = self._round_context_builder._blueprint_provenance
-        self._semantic_topology_axes = self._round_context_builder._semantic_topology_axes
-        self._stage_gate_coordinator._semantic_topology_axes = self._semantic_topology_axes
-
+        self._regime_blueprints = self._round_context_builder.regime_blueprints
+        self._blueprint_provenance = self._round_context_builder.blueprint_provenance
+        self._semantic_topology_axes = self._round_context_builder.semantic_topology_axes
+        self._stage_gate_coordinator = StageGateCoordinator(
+            operator_name=config.operator_name, target_module_path=self._target_module_path,
+            regime_specs=self._regime_specs, initial_anchors=self._initial_anchors,
+            scoreboard_anchors=self._scoreboard_anchors, backend=self._backend, tracker=self._tracker,
+            cost_advisor=self._cost_advisor, boundary_ledger=self._boundary_ledger, target=self._target,
+            source_root=self._source_root, env_file=self._env_file, cannbench_repo=self._cannbench_repo,
+            checkpoint_path=self._checkpoint_path, experience_lake_dir=self._experience_lake_dir,
+            run_id=self._run_id, device_id=self._config.device_id, l4_device_pool=self._l4_device_pool,
+            warmup=self._config.warmup, repeat=self._config.repeat, max_syntax_repairs=self._config.max_syntax_repairs,
+            cost_prescreen_top_k=self._config.cost_prescreen_top_k, pure_golden=self._config.pure_golden,
+            enable_track_router=self._enable_track_router, sil_advisory=self._sil_advisory,
+            topology_axes=self._topology_axes, semantic_topology_axes=self._semantic_topology_axes,
+            l0_checker=self._l0_checker, l1_compiler=self._l1_compiler, l2_batch_evaluator=self._l2_batch_evaluator,
+            config=self._config, active_incumbent_source=self._active_incumbent_source,
+        )
         self._telemetry_writer = TelemetryLedgerWriter(
             operator_name=config.operator_name, run_id=self._run_id, device_id=self._config.device_id,
             allow_unreviewed_distilled_rules=self._config.allow_unreviewed_distilled_rules,
@@ -327,14 +328,13 @@ class PerfTargetCampaignRunner:
             experience_lake=self._experience_lake, cost_advisor=self._cost_advisor, target=self._target,
             perf_target=self._perf_target, regime_specs=self._regime_specs, regime_blueprints=self._regime_blueprints,
             tracker=self._tracker, flywheel_coordinator=self._flywheel_coordinator, flywheel=self._flywheel,
-            boundary_ledger=self._boundary_ledger, beams=self._beams, msprof_cache=self._msprof_cache,
-            case_dims_cache=self._case_dims_cache, regime_diag_stats=self._regime_diag_stats,
-            scoreboard_anchors=self._scoreboard_anchors, guardrail_cases=self._guardrail_cases,
+            boundary_ledger=self._boundary_ledger, scoreboard_anchors=self._scoreboard_anchors,
             calibrated_dispatch_floor_us=self._calibrated_dispatch_floor_us, cannbench_repo=self._cannbench_repo,
             env_file=self._env_file, enable_track_router=self._enable_track_router, topology_axes=self._topology_axes,
             sil_advisory=self._sil_advisory, real_npu_path_fn=self._is_real_npu_path,
-            l0_runner=self._stage_gate_coordinator._run_l0, l2_batch_runner=self._stage_gate_coordinator._run_l2_batch,
-            derive_topology_axes_fn=self._stage_gate_coordinator._derive_topology_axes,
+            l0_runner=lambda ms, rs: self._stage_gate_coordinator.run_l0(ms, rs, incumbent_source=self._active_incumbent_source, freedom_masks=dict(self._freedom_masks)),
+            l2_batch_runner=lambda cands, ancs, **kw: self._stage_gate_coordinator.run_l2_batch(cands, ancs, incumbent_source=self._active_incumbent_source, incumbent_anchor_us_by_case=dict(self._incumbent_anchor_us_by_case), guardrail_cases=self._guardrail_cases, **kw),
+            derive_topology_axes_fn=self._stage_gate_coordinator.derive_topology_axes,
             has_l2_executor_fn=lambda: bool(self._l2_batch_evaluator is not None or self._is_real_npu_path()),
             operator_proto=self._operator_proto_cache,
         )
@@ -347,13 +347,10 @@ class PerfTargetCampaignRunner:
             cannbench_repo=self._cannbench_repo, checkpoint_path=self._checkpoint_path,
             experience_lake_dir=self._experience_lake_dir, run_id=self._run_id,
             l3_contract_runner=self._l3_contract_runner, l4_cannbench_runner=self._l4_cannbench_runner,
-            l2_batch_runner=lambda cands, ancs: self._stage_gate_coordinator._run_l2_batch(cands, ancs),
+            l2_batch_runner=lambda cands, ancs: self._stage_gate_coordinator.run_l2_batch(cands, ancs, incumbent_source=self._active_incumbent_source, incumbent_anchor_us_by_case=dict(self._incumbent_anchor_us_by_case), guardrail_cases=self._guardrail_cases),
             resolve_regime_config_fn=lambda mod_src, spec, dims=None: resolve_regime_config(mod_src, spec, dims=dims),
             scoreboard_anchors=self._scoreboard_anchors, regime_specs=self._regime_specs,
             regime_blueprints=self._regime_blueprints, topology_axes=self._topology_axes,
-            guardrail_cases=self._guardrail_cases,
-            last_guardrail_metrics_by_cid=self._stage_gate_coordinator._last_guardrail_metrics_by_cid,
-            case_dims_cache=self._case_dims_cache,
         )
         self._promotion_coordinator = PromotionCoordinator(
             target_module_path=self._target_module_path,
@@ -361,34 +358,44 @@ class PerfTargetCampaignRunner:
         )
         self._calibration_service = CalibrationService(
             operator_name=config.operator_name, target_module_path=self._target_module_path,
-            run_l2_batch_fn=lambda cands, ancs: self._stage_gate_coordinator._run_l2_batch(cands, ancs),
+            run_l2_batch_fn=lambda cands, ancs: self._stage_gate_coordinator.run_l2_batch(cands, ancs, incumbent_source=self._active_incumbent_source, incumbent_anchor_us_by_case=dict(self._incumbent_anchor_us_by_case), guardrail_cases=self._guardrail_cases),
             msprof_collector=self._msprof_collector, p2_deep_dive_collector=self._p2_deep_dive_collector,
-            run_l0_fn=self._stage_gate_coordinator._run_l0,
-            derive_topology_axes_fn=self._stage_gate_coordinator._derive_topology_axes,
+            run_l0_fn=lambda ms, rs: self._stage_gate_coordinator.run_l0(ms, rs, incumbent_source=self._active_incumbent_source, freedom_masks=dict(self._freedom_masks)),
+            derive_topology_axes_fn=self._stage_gate_coordinator.derive_topology_axes,
             predict_candidate_us_fn=lambda feat: self._cost_advisor.predict_candidate_us(feat),
             underlying_cost_model=self._cost_advisor.underlying_cost_model, cost_advisor_target=self._target,
             select_active_regime_fn=self._select_active_regime,
-            evaluate_tail_guard_fn=self._stage_gate_coordinator._evaluate_dual_layer_tail_guard,
+            evaluate_tail_guard_fn=lambda **kw: self._stage_gate_coordinator.evaluate_dual_layer_tail_guard(**kw, guardrail_cases=self._guardrail_cases, incumbent_anchor_us_by_case=dict(self._incumbent_anchor_us_by_case)),
             run_l3_contract_fn=self._l3_l4_recovery.run_l3_contract,
             write_and_verify_fn=lambda p, s: write_source_and_verify(p, s),
-            refresh_guardrail_refs_fn=self._l3_l4_recovery.refresh_guardrail_incumbent_refs,
+            refresh_guardrail_refs_fn=self._refresh_guardrail_refs_on_warmstart,
             on_warmstart_promoted_fn=self._on_warmstart_promoted,
             regime_blueprints=self._regime_blueprints, live_regime_plans=self._live_regime_plans,
             sil_advisory=self._sil_advisory, enable_phase0_lattice_sweep=self._config.enable_phase0_lattice_sweep,
-            regime_specs=self._regime_specs, msprof_by_case=self._msprof_by_case, p2_cache=self._p2_cache,
+            regime_specs=self._regime_specs,
+        )
+
+    def _refresh_guardrail_refs_on_warmstart(self, winner_cid: str) -> None:
+        self._guardrail_cases = tuple(
+            self._l3_l4_recovery.refresh_guardrail_incumbent_refs(
+                winner_cid, guardrail_cases=self._guardrail_cases,
+                guardrail_metrics=self._last_guardrail_metrics_by_cid.get(winner_cid),
+            )
         )
 
     def _build_state_snapshot(
         self, *, round_idx: int = 0, incumbent_source: str = "", active_regime_tag: str | None = None,
-        frozen_regimes: set[str] = frozenset(), last_round_promoted: bool = True,
+        frozen_regimes: set[str] | frozenset[str] = frozenset(), last_round_promoted: bool = True,
+        stagnation_by_regime: Mapping[str, int] | None = None,
     ) -> CampaignStateSnapshot:
+        stag_src = stagnation_by_regime if stagnation_by_regime is not None else self._stagnation_by_regime
         return CampaignStateSnapshot(
             run_id=self._run_id, round_index=int(round_idx), incumbent_source=incumbent_source,
             incumbent_sha256=source_sha256(incumbent_source) if incumbent_source else "",
             dispatch_floor_us=float(self._calibrated_dispatch_floor_us),
-            active_regime_tag=active_regime_tag,
-            guardrail_case_ids=tuple(int(g.case_num) for g in self._l3_l4_recovery.guardrail_cases),
-            stagnation_by_regime=tuple(sorted(self._stagnation_by_regime.items())),
+            active_regime_tag=active_regime_tag or "",
+            guardrail_case_ids=tuple(str(g.case_num) for g in self._guardrail_cases),
+            stagnation_by_regime={str(k): int(v) for k, v in stag_src.items()},
             compile_wall_streak_by_regime=tuple(sorted(self._compile_wall_streak_by_regime.items())),
             last_round_promoted=bool(last_round_promoted),
             last_round_promoted_by_regime=tuple(sorted(self._last_round_promoted_by_regime.items())),
@@ -404,6 +411,26 @@ class PerfTargetCampaignRunner:
             return self._beams[tag]
         return next(iter(self._beams.values())) if self._beams else self._fallback_beam
 
+    @property
+    def guardrail_cases(self) -> tuple[GuardrailCaseSpec, ...]:
+        """Return immutable tuple of monotonic guardrail cases."""
+        return self._guardrail_cases
+
+    @property
+    def last_round_context_receipt(self) -> RoundContextReceipt | None:
+        """Return frozen RoundContextReceipt from the latest round."""
+        return self._last_round_context_receipt
+
+    @property
+    def last_stage_gate_receipt(self) -> StageGateRoundReceipt | None:
+        """Return frozen StageGateRoundReceipt from the latest round."""
+        return self._last_stage_gate_receipt
+
+    @property
+    def last_recovery_receipt(self) -> RecoveryReceipt | None:
+        """Return frozen RecoveryReceipt from the latest L3/L4 recovery or final L4 run."""
+        return self._last_recovery_receipt
+
     def _is_real_npu_path(self) -> bool:
         return bool(
             getattr(self._l2_batch_evaluator, "is_real_npu", False)
@@ -413,29 +440,6 @@ class PerfTargetCampaignRunner:
     def _on_warmstart_promoted(self, src: str, res: CandidateSurrogateResult) -> None:
         self._active_incumbent_source = src
         self._incumbent_anchor_us_by_case = {int(a.case_num): float(a.cand_us) for a in res.anchors if a.cand_us > 0.0}
-        self._stage_gate_coordinator._active_incumbent_source = src
-        self._stage_gate_coordinator._incumbent_anchor_us_by_case = dict(self._incumbent_anchor_us_by_case)
-
-    def _collect_msprof_for_regimes(
-        self, source: str, result: CandidateSurrogateResult, active_anchors: Sequence[AnchorCaseSpec], target_regimes: Sequence[RegimeTargetSpec],
-    ) -> dict[tuple[str, int], dict[str, float]]:
-        collected = self._calibration_service.collect_msprof_by_case(source, result, active_anchors, target_regimes)
-        if collected:
-            sha = source_sha256(source)
-            for (_csha, cnum), metrics in collected.items():
-                self._msprof_by_case[(sha, int(cnum))] = dict(metrics)
-                for anc in active_anchors:
-                    if int(anc.case_num) == int(cnum):
-                        self._msprof_cache[(sha, anc.regime_tag)] = dict(metrics)
-        return collected
-
-    def _collect_p2_deep_dive_for_regime(
-        self, source: str, result: CandidateSurrogateResult, active_anchors: Sequence[AnchorCaseSpec], regime_spec: RegimeTargetSpec,
-    ) -> dict[str, object] | None:
-        res = self._calibration_service.collect_p2_deep_dive_for_regime(source, result, active_anchors, regime_spec)
-        if res is not None:
-            self._p2_cache[(source_sha256(source), regime_spec.regime_tag)] = dict(res)
-        return res
 
     def _select_active_regime(
         self, current_regime: str | None, frozen_regimes: set[str], best_result: CandidateSurrogateResult,
@@ -508,7 +512,6 @@ class PerfTargetCampaignRunner:
             dev = args[3] if len(args) == 4 else (args[1] if len(args) == 2 else "")
             active = replace(stub, execution_id=eid, run_id=rid, receipt_path=rcp, device_id=dev, execution_terminal=False)
             self._active_promotion = self._pending_promotion = active
-            self._telemetry_writer.active_promotion = self._telemetry_writer.pending_promotion = active
             persist_runtime_state(self._checkpoint_path, "active_promotion", active.to_dict())
 
         dev_id = self._l4_device_pool[0] if self._l4_device_pool else self._config.device_id
@@ -523,7 +526,7 @@ class PerfTargetCampaignRunner:
                 time.sleep(bsec)
                 l3_res = self._l3_l4_recovery.run_l3_contract(self._target_module_path, device_id=dev_id, on_execution_started=_on_started)
             if l3_res.execution_terminal:
-                self._active_promotion = self._telemetry_writer.active_promotion = None
+                self._active_promotion = None
             attempts.append(L3L4RecoveryCoordinator.promotion_attempt(l3_res, l3_res.device_id or dev_id, candidate_sha256=cand.candidate_sha256))
             if l3_res.passed or l3_res.failure_kind == FAILURE_KIND_CANDIDATE or not l3_res.execution_terminal:
                 return l3_res
@@ -541,13 +544,14 @@ class PerfTargetCampaignRunner:
         admitted_rule_ids: Sequence[str], stop_reason: str, l4_result: L4CannbenchResult | None,
         stagnation_by_regime: Mapping[str, int] | None = None, last_unpromoted_regime: str | None = None,
     ) -> None:
-        self._telemetry_writer.guardrail_cases = list(self._l3_l4_recovery.guardrail_cases)
-        self._telemetry_writer.scoreboard_anchors = self._l3_l4_recovery.scoreboard_anchors or self._scoreboard_anchors
-        self._telemetry_writer.calibrated_dispatch_floor_us = float(self._calibrated_dispatch_floor_us)
-        self._telemetry_writer.active_regime_tag = self._active_regime_tag
-        self._telemetry_writer.last_round_promoted_by_regime = dict(self._last_round_promoted_by_regime)
-        self._telemetry_writer.compile_wall_streak_by_regime = dict(self._compile_wall_streak_by_regime)
-        self._telemetry_writer.stagnation_by_regime = dict(self._stagnation_by_regime)
+        snap = self._build_state_snapshot(
+            round_idx=(rounds[-1].round_idx if rounds else 0),
+            incumbent_source=incumbent_source,
+            active_regime_tag=self._active_regime_tag or current_regime,
+            frozen_regimes=frozen_regimes,
+            last_round_promoted=self._last_round_promoted,
+            stagnation_by_regime=stagnation_by_regime,
+        )
         self._telemetry_writer.save_checkpoint(
             incumbent_source=incumbent_source, baseline_result=baseline_result, best_result=best_result,
             active_anchors=active_anchors, frozen_regimes=frozen_regimes, current_regime=current_regime,
@@ -556,38 +560,75 @@ class PerfTargetCampaignRunner:
             admitted_rule_ids=admitted_rule_ids, stop_reason=stop_reason, l4_result=l4_result,
             stagnation_by_regime=stagnation_by_regime, last_unpromoted_regime=last_unpromoted_regime,
             pending_promotion=self._pending_promotion, pending_l4=self._pending_l4,
-            active_promotion=self._active_promotion,
+            active_promotion=self._active_promotion, scoreboard_anchors=self._scoreboard_anchors,
+            guardrail_cases=self._guardrail_cases,
+            calibrated_dispatch_floor_us=float(self._calibrated_dispatch_floor_us),
+            last_round_promoted_by_regime=dict(self._last_round_promoted_by_regime),
+            compile_wall_streak_by_regime=dict(self._compile_wall_streak_by_regime),
+            snapshot=snap, beams=self._beams, msprof_cache=self._msprof_cache,
         )
 
     def _restore_from_checkpoint(self):
         restored = self._telemetry_writer.restore_from_checkpoint(pending_l4_from_dict=PendingL4.from_dict)
         self._scoreboard_anchors = self._telemetry_writer.scoreboard_anchors
-        self._l3_l4_recovery.scoreboard_anchors = self._scoreboard_anchors
-        self._l3_l4_recovery.guardrail_cases = list(self._telemetry_writer.guardrail_cases)
-        self._stage_gate_coordinator._scoreboard_anchors = self._scoreboard_anchors
-        self._stage_gate_coordinator._guardrail_cases = self._l3_l4_recovery.guardrail_cases
+        self._guardrail_cases = tuple(self._telemetry_writer.guardrail_cases)
         self._calibrated_dispatch_floor_us = self._telemetry_writer.calibrated_dispatch_floor_us
         self._last_round_promoted_by_regime = dict(self._telemetry_writer.last_round_promoted_by_regime)
         self._last_local_rel_gain_by_regime = dict(self._telemetry_writer.last_local_rel_gain_by_regime)
         self._compile_wall_streak_by_regime = dict(self._telemetry_writer.compile_wall_streak_by_regime)
+        self._beams = dict(self._telemetry_writer.beams)
+        self._msprof_cache = {k: dict(v) for k, v in self._telemetry_writer.msprof_cache.items()}
         self._active_promotion = self._telemetry_writer.active_promotion
         self._pending_promotion = self._telemetry_writer.pending_promotion
         self._pending_l4 = self._telemetry_writer.pending_l4
         self._live_stag_by_regime = dict(restored[12])
         return restored
 
+    def _advance_round_state(
+        self, *, regime_tag: str, new_inc: str, new_best: CandidateSurrogateResult,
+        promoted: bool, lrel_gain: float, active_mask: ConstraintRelaxationMask | None,
+        collected_msprof: Mapping[tuple[str, int], Mapping[str, float]],
+        p2_parent_sha: str, p2_diag: Mapping[str, object] | None,
+        active_anchors: Sequence[AnchorCaseSpec], l2_timing_meta: Mapping[str, object],
+        guardrail_metrics_by_cid: Mapping[str, Mapping[int, AnchorEvalMetrics]],
+        updated_guardrail_cases: Sequence[GuardrailCaseSpec] | None,
+        pending_promotion: PendingPromotion | None, active_promotion: PendingPromotion | None,
+        round_receipt: RoundContextReceipt | None, gate_receipt: StageGateRoundReceipt | None,
+    ) -> None:
+        self._active_regime_tag = regime_tag
+        self._active_incumbent_source = new_inc
+        self._incumbent_anchor_us_by_case = {int(a.case_num): float(a.cand_us) for a in new_best.anchors if a.cand_us > 0.0}
+        if active_mask is not None:
+            self._freedom_masks[regime_tag] = active_mask
+        if collected_msprof:
+            for (sha, cnum), metrics in collected_msprof.items():
+                self._msprof_by_case[(str(sha), int(cnum))] = dict(metrics)
+                for anc in active_anchors:
+                    if int(anc.case_num) == int(cnum):
+                        self._msprof_cache[(str(sha), anc.regime_tag)] = dict(metrics)
+        if p2_diag is not None:
+            self._p2_cache[(p2_parent_sha, regime_tag)] = dict(p2_diag)
+        self._last_l2_timing_meta = dict(l2_timing_meta)
+        self._last_guardrail_metrics_by_cid = {str(k): dict(v) for k, v in guardrail_metrics_by_cid.items()}
+        if updated_guardrail_cases is not None:
+            self._guardrail_cases = tuple(updated_guardrail_cases)
+        if promoted:
+            self._last_local_rel_gain_by_regime[regime_tag] = lrel_gain
+        self._pending_promotion = pending_promotion
+        self._active_promotion = active_promotion
+        self._last_round_context_receipt = round_receipt
+        self._last_stage_gate_receipt = gate_receipt
+
     async def _execute_single_round(
         self, *, round_idx: int, regime_spec: RegimeTargetSpec, incumbent_source: str,
         best_result: CandidateSurrogateResult, active_anchors: Sequence[AnchorCaseSpec],
         stagnation_rounds: int, admitted_rule_ids: list[str], frozen_regimes: set[str] = frozenset(),
     ) -> tuple[CampaignRoundRecord, str, CandidateSurrogateResult, int, bool, bool, bool, bool]:
-        self._active_incumbent_source = incumbent_source
-        self._active_regime_tag = regime_spec.regime_tag
-        self._incumbent_anchor_us_by_case = {int(a.case_num): float(a.cand_us) for a in best_result.anchors if a.cand_us > 0.0}
-        self._stage_gate_coordinator._active_incumbent_source = incumbent_source
-        self._stage_gate_coordinator._incumbent_anchor_us_by_case = dict(self._incumbent_anchor_us_by_case)
-        self._stage_gate_coordinator._guardrail_cases = self._l3_l4_recovery.guardrail_cases
         stag_map = {**self._stagnation_by_regime, regime_spec.regime_tag: stagnation_rounds}
+        snapshot = self._build_state_snapshot(
+            round_idx=round_idx, incumbent_source=incumbent_source, active_regime_tag=regime_spec.regime_tag,
+            frozen_regimes=frozen_regimes, last_round_promoted=self._last_round_promoted, stagnation_by_regime=stag_map,
+        )
         merged_msprof = TelemetryLedgerWriter.fold_regime_msprof_cache(
             self._msprof_by_case, self._msprof_cache, active_anchors,
             active_regime_tag=regime_spec.regime_tag, single_regime=len(self._regime_specs) <= 1,
@@ -595,26 +636,26 @@ class PerfTargetCampaignRunner:
         state = ChampionState(
             incumbent_source=incumbent_source, best_result=best_result, active_anchors=tuple(active_anchors),
             regime_specs=self._regime_specs or (regime_spec,), stagnation_rounds=stagnation_rounds,
-            stagnation_by_regime=stag_map, compile_wall_streak_by_regime=self._compile_wall_streak_by_regime,
-            last_round_promoted_by_regime=self._last_round_promoted_by_regime, last_round_promoted=self._last_round_promoted,
-            last_local_rel_gain_by_regime=self._last_local_rel_gain_by_regime, freedom_masks=self._freedom_masks,
-            msprof_by_case=merged_msprof, p2_cache=self._p2_cache,
+            stagnation_by_regime=dict(snapshot.stagnation_by_regime), compile_wall_streak_by_regime=dict(self._compile_wall_streak_by_regime),
+            last_round_promoted_by_regime=dict(self._last_round_promoted_by_regime), last_round_promoted=self._last_round_promoted,
+            last_local_rel_gain_by_regime=dict(self._last_local_rel_gain_by_regime), freedom_masks=dict(self._freedom_masks),
+            msprof_by_case=merged_msprof, p2_cache={k: dict(v) for k, v in self._p2_cache.items()},
             calibrated_dispatch_floor_us=self._calibrated_dispatch_floor_us, boundary_ledger=self._boundary_ledger,
-            beams=self._beams, current_regime=regime_spec.regime_tag, active_kernel_cache=self._active_kernel_cache,
-            live_regime_plans=self._live_regime_plans, operator_proto_cache=self._operator_proto_cache,
+            beams=dict(self._beams), current_regime=regime_spec.regime_tag, active_kernel_cache=dict(self._active_kernel_cache),
+            live_regime_plans=dict(self._live_regime_plans), operator_proto_cache=self._operator_proto_cache,
             sil_advisory=self._sil_advisory, topology_axes=self._topology_axes,
-            semantic_topology_axes=self._semantic_topology_axes, regime_blueprints=self._regime_blueprints,
+            semantic_topology_axes=self._semantic_topology_axes, regime_blueprints=dict(self._regime_blueprints),
         )
-        bundle = self._round_context_builder.build_round_bundle(state, round_idx=round_idx, regime_spec=regime_spec, working_anchors=active_anchors, creative_effort="high")
-        self._freedom_masks.update(self._round_context_builder._freedom_masks)
-        self._blueprint_provenance = dict(self._round_context_builder._blueprint_provenance)
+        bundle = self._round_context_builder.build_round_bundle(
+            state, round_idx=round_idx, regime_spec=regime_spec, working_anchors=active_anchors,
+            creative_effort="high", snapshot=snapshot,
+        )
         bn_anchor = bottleneck_anchor_for_regime(best_result, regime_spec.regime_tag)
         bn_dims = None
         if bn_anchor is not None:
             rbn = lookup_case_dims_safe(self._config.operator_name, bn_anchor.case_num, regime_tag=regime_spec.regime_tag, regime_specs=self._regime_specs, cache=self._case_dims_cache, cannbench_repo=self._cannbench_repo, env_file=self._env_file)
             if rbn:
                 bn_dims = {str(k): int(v) for k, v in rbn.items() if isinstance(v, int) and not isinstance(v, bool)}
-        snapshot = self._build_state_snapshot(round_idx=round_idx, incumbent_source=incumbent_source, active_regime_tag=regime_spec.regime_tag, frozen_regimes=frozen_regimes, last_round_promoted=self._last_round_promoted)
         batch = CandidateBatch(
             round_idx=round_idx, regime_spec=regime_spec, worker_specs=bundle.worker_specs,
             parent_module_source=bundle.parent_module_source, parent_snippet=bundle.parent_snippet,
@@ -623,9 +664,10 @@ class PerfTargetCampaignRunner:
             gate_decision=bundle.gate_decision, parent_p2_diag=bundle.parent_p2_diag, func_name=bundle.func_name,
         )
         outcome = await self._stage_gate_coordinator.execute_round_gates(
-            batch, active_anchors, backend=self._backend, parent_sha=bundle.parent_sha, parent_workload=bundle.parent_workload, snapshot=snapshot,
+            batch, active_anchors, backend=self._backend, parent_sha=bundle.parent_sha,
+            parent_workload=bundle.parent_workload, snapshot=snapshot, guardrail_cases=self._guardrail_cases,
+            scoreboard_anchors=self._scoreboard_anchors, freedom_masks=dict(self._freedom_masks),
         )
-        self._last_l2_timing_meta = dict(self._stage_gate_coordinator._last_l2_timing_meta)
         op_entry = resolve_operator_entrypoint_safe(self._config.operator_name)
         regime_beam, checks_by_cid = self.beam_for_regime(regime_spec.regime_tag), {c.candidate_id: c for c in outcome.passed_checks}
         local_best = best_result.for_regime(regime_spec.regime_tag)
@@ -638,25 +680,30 @@ class PerfTargetCampaignRunner:
         new_inc, new_best, stag_after, rel_gain, lrel_gain, tg_reason, promo_atts = incumbent_source, best_result, stagnation_rounds, 0.0, 0.0, "", ()
         top_chk, top_res, init_top_cid, l3_sec = None, None, None, 0.0
         l2_results, meta_by_id = dict(outcome.l2_results), dict(outcome.meta_by_id)
+        inc_anchor_map = dict(snapshot.incumbent_anchor_us_by_case)
+        gr_by_cid = {str(k): dict(v) for k, v in outcome.guardrail_metrics_by_cid.items()}
+        next_gr_cases: list[GuardrailCaseSpec] | None = None
+        next_pending_p: PendingPromotion | None = self._pending_promotion
+        next_active_p: PendingPromotion | None = self._active_promotion
+        extra_msprof: dict[tuple[str, int], dict[str, float]] = {k: dict(v) for k, v in bundle.collected_msprof_by_case.items()}
         if outcome.l2_infra_fault is not None and outcome.l2_infra_fault.plane in (FaultPlane.INFRA_OCCUPANCY, FaultPlane.INFRA_DEVICE_FAULT):
             l3_res_str = L3Resolution.INFRA_DEFERRED.value
             promo_blocked = outcome.l2_infra_fault.plane == FaultPlane.INFRA_DEVICE_FAULT
         else:
             rcands, uchg = [], {}
-            gr_by_cid = dict(self._stage_gate_coordinator._last_guardrail_metrics_by_cid)
             for chk in all_pass_l2:
                 cres, (_, _, ceff) = l2_results[chk.candidate_id], meta_by_id.get(chk.candidate_id, ("exploit_rule", None, ""))
-                uchg[chk.candidate_id] = self._stage_gate_coordinator._unchanged_sibling_regimes(incumbent_source, chk.patched_module_source, regime_spec)
+                uchg[chk.candidate_id] = self._stage_gate_coordinator.unchanged_sibling_regimes(incumbent_source, chk.patched_module_source, regime_spec)
                 rc = RankedL2Candidate(
                     candidate_id=chk.candidate_id, candidate_source=chk.patched_module_source, candidate_result=cres,
                     candidate_sha256=source_sha256(chk.patched_module_source), builder_name=bundle.func_name,
                     parent_lane=bundle.parent_lane, creative_effort=ceff or ("high" if meta_by_id.get(chk.candidate_id, ("",))[0] == "creative_explore" else ""),
                 )
                 seval = select_top_two_l2_survivors(
-                    [rc], best_result=best_result, regime_spec=regime_spec, guardrail_cases=self._l3_l4_recovery.guardrail_cases,
+                    [rc], best_result=best_result, regime_spec=regime_spec, guardrail_cases=self._guardrail_cases,
                     guardrail_metrics_by_cid=gr_by_cid, unchanged_siblings_by_cid=uchg, active_anchors=active_anchors,
-                    retest_noisy_fn=lambda d, cr, c=chk.candidate_id, s=chk.patched_module_source: self._stage_gate_coordinator._retest_noisy_tail_anchors(candidate_id=c, candidate_source=s, cur_res=cr, regressed_anchors=d, active_anchors=active_anchors),
-                    recheck_single_sibling_fn=lambda a, c=chk.candidate_id, s=chk.patched_module_source: self._stage_gate_coordinator._retest_single_or_tail(c, s, [a]),
+                    retest_noisy_fn=lambda d, cr, c=chk.candidate_id, s=chk.patched_module_source: self._stage_gate_coordinator.retest_noisy_tail_anchors(candidate_id=c, candidate_source=s, cur_res=cr, regressed_anchors=d, active_anchors=active_anchors, incumbent_source=incumbent_source, incumbent_anchor_us_by_case=inc_anchor_map),
+                    recheck_single_sibling_fn=lambda a, c=chk.candidate_id, s=chk.patched_module_source: self._stage_gate_coordinator.retest_single_or_tail(c, s, [a], incumbent_source=incumbent_source, incumbent_anchor_us_by_case=inc_anchor_map),
                 )
                 if seval.survivors:
                     rcands.append(replace(rc, candidate_result=seval.survivors[0].candidate_result, speedup=seval.survivors[0].speedup))
@@ -682,12 +729,16 @@ class PerfTargetCampaignRunner:
                     if tl.anchors and local_best.anchors:
                         tlat, blat = tl.mean_latency_us(), local_best.mean_latency_us()
                         lrel_gain = max((tl.avg_speedup - local_best.avg_speedup) / max(local_best.avg_speedup, 1e-6), ((blat - tlat) / max(blat, 1e-6)) if (tlat > 0.0 and blat > 0.0) else 0.0)
-                    self._last_local_rel_gain_by_regime[regime_spec.regime_tag] = lrel_gain
-                    self._l3_l4_recovery.refresh_guardrail_incumbent_refs(wc.candidate_id)
-                    self._pending_promotion = self._active_promotion = self._telemetry_writer.pending_promotion = self._telemetry_writer.active_promotion = None
+                    next_gr_cases = self._l3_l4_recovery.refresh_guardrail_incumbent_refs(
+                        wc.candidate_id, guardrail_cases=self._guardrail_cases,
+                        guardrail_metrics=gr_by_cid.get(wc.candidate_id),
+                    )
+                    next_pending_p = next_active_p = None
                     persist_runtime_state(self._checkpoint_path, "active_promotion", None)
                     persist_runtime_state(self._checkpoint_path, "pending_promotion", None)
-                    self._collect_msprof_for_regimes(wc.candidate_source, wres, active_anchors, [regime_spec])
+                    w_mp = self._calibration_service.collect_msprof_by_case(wc.candidate_source, wres, active_anchors, [regime_spec])
+                    for mk, mv in w_mp.items():
+                        extra_msprof[(str(mk[0]), int(mk[1]))] = dict(mv)
                 elif dec.resolution == L3Resolution.INFRA_DEFERRED:
                     l3_res_str, promo_blocked, stag_after = L3Resolution.INFRA_DEFERRED.value, True, stagnation_rounds
                     dcid = dec.pending_promotion.candidate_id if dec.pending_promotion else init_top_cid
@@ -697,28 +748,41 @@ class PerfTargetCampaignRunner:
                         l3_fstage = str(getattr(dec.l3_result, "failure_stage", "") or "")
                     if dec.pending_promotion is not None:
                         pobj = replace(dec.pending_promotion, attempts=tuple(iatts) or dec.pending_promotion.attempts, retry_used=len(iatts) > 1 or dec.pending_promotion.retry_used)
-                        self._pending_promotion = self._telemetry_writer.pending_promotion = pobj
+                        next_pending_p = pobj
                         promo_atts = pobj.attempts
                         persist_runtime_state(self._checkpoint_path, "pending_promotion", pobj.to_dict())
                         if not pobj.execution_terminal:
                             write_source_and_verify(self._target_module_path, pobj.candidate_source)
-                            self._active_promotion = self._telemetry_writer.active_promotion = pobj
+                            next_active_p = pobj
                             persist_runtime_state(self._checkpoint_path, "active_promotion", pobj.to_dict())
                         else:
-                            self._active_promotion = self._telemetry_writer.active_promotion = None
+                            next_active_p = None
                             persist_runtime_state(self._checkpoint_path, "active_promotion", None)
                 else:
                     l3_res_str, stag_after = L3Resolution.CANDIDATE_REJECTED.value, stagnation_rounds + 1
                     rcid = dec.attempts[-1][0] if dec.attempts else init_top_cid
                     top_chk = checks_by_cid.get(rcid) if rcid else None
-                    self._pending_promotion = self._active_promotion = self._telemetry_writer.pending_promotion = self._telemetry_writer.active_promotion = None
+                    next_pending_p = next_active_p = None
                     persist_runtime_state(self._checkpoint_path, "active_promotion", None)
                     persist_runtime_state(self._checkpoint_path, "pending_promotion", None)
                     if dec.l3_result is not None:
                         l3_fstage = str(getattr(dec.l3_result, "failure_stage", "") or "")
-                        self._l3_l4_recovery.record_l3_guardrail_cases(dec.l3_result, incumbent_source, regime_spec, topology_axes=bundle.parent_axes)
+                        added_gr = self._l3_l4_recovery.record_l3_guardrail_cases(
+                            dec.l3_result, incumbent_source, regime_spec, topology_axes=bundle.parent_axes,
+                            guardrail_cases=self._guardrail_cases, scoreboard_anchors=self._scoreboard_anchors,
+                        )
+                        next_gr_cases = [*self._guardrail_cases, *added_gr]
                         l3_fcases = tuple(dec.new_guardrail_cases) or tuple(L3L4RecoveryCoordinator.extract_l3_failed_case_nums(dec.l3_result))
                 l3_sec = max(0.0, time.monotonic() - lt0)
+        self._advance_round_state(
+            regime_tag=regime_spec.regime_tag, new_inc=new_inc, new_best=new_best,
+            promoted=promoted, lrel_gain=lrel_gain, active_mask=bundle.active_mask,
+            collected_msprof=extra_msprof, p2_parent_sha=bundle.parent_sha, p2_diag=bundle.parent_p2_diag,
+            active_anchors=active_anchors, l2_timing_meta=outcome.l2_timing_meta,
+            guardrail_metrics_by_cid=gr_by_cid, updated_guardrail_cases=next_gr_cases,
+            pending_promotion=next_pending_p, active_promotion=next_active_p,
+            round_receipt=bundle.receipt, gate_receipt=outcome.receipt,
+        )
 
         pt0 = time.monotonic()
         beam_upd, r_adm, meas_cid = [], [], {}
@@ -946,15 +1010,15 @@ class PerfTargetCampaignRunner:
                 matched_any = any(base_res.for_regime(r.regime_tag).anchors for r in self._regime_specs)
                 for idx, rs in enumerate(self._regime_specs):
                     try:
-                        bsa = self._stage_gate_coordinator._run_l0(inc_src, rs)
+                        bsa = self._stage_gate_coordinator.run_l0(inc_src, rs, incumbent_source=inc_src, freedom_masks=dict(self._freedom_masks))
                     except (SyntaxError, RuntimeError, ValueError, TypeError, OSError):
                         bsa = None
                     try:
-                        bl1 = self._stage_gate_coordinator._l1_summary_for_first_round(inc_src, rs)
+                        bl1 = self._stage_gate_coordinator.l1_summary_for_round(inc_src, rs, scoreboard_anchors=self._scoreboard_anchors, guardrail_cases=self._guardrail_cases)
                     except (SyntaxError, RuntimeError, ValueError, TypeError, OSError):
                         bl1 = None
                     bl = bsa.ledger if bsa else None
-                    ba = self._stage_gate_coordinator._derive_topology_axes(bl, features=bsa.features if bsa else None, route=bsa.route if bsa else None)
+                    ba = self._stage_gate_coordinator.derive_topology_axes(bl, features=bsa.features if bsa else None, route=bsa.route if bsa else None)
                     rr = base_res.for_regime(rs.regime_tag)
                     if not rr.anchors and (len(self._regime_specs) == 1 or (not matched_any and idx == 0)):
                         rr = base_res
@@ -988,11 +1052,20 @@ class PerfTargetCampaignRunner:
         stop_reason, promo_blocked, l4_resolved = "", False, False
         if pending_p is not None:
             retried = pending_p
-            inc_src, best_res, stag_by_reg, pending_p, promo_blocked = self._l3_l4_recovery.resolve_pending_promotion(
+            p_out = self._l3_l4_recovery.resolve_pending_promotion_with_receipt(
                 retried, incumbent_source=inc_src, best_result=best_res, stagnation_by_regime=stag_by_reg,
                 rounds=rounds, promoted_rounds=prom_r, rolled_back_rounds=rb_r, active_anchors=act_ancs,
+                guardrail_cases=self._guardrail_cases, scoreboard_anchors=self._scoreboard_anchors,
+                guardrail_metrics_by_cid=self._last_guardrail_metrics_by_cid,
             )
-            self._pending_promotion = pending_p
+            inc_src, best_res = p_out.incumbent_source, p_out.best_result
+            stag_by_reg = dict(p_out.stagnation_by_regime)
+            rounds, prom_r, rb_r = list(p_out.rounds), list(p_out.promoted_rounds), list(p_out.rolled_back_rounds)
+            pending_p = self._pending_promotion = p_out.pending_promotion
+            self._active_promotion = p_out.active_promotion
+            self._guardrail_cases = p_out.guardrail_cases
+            self._last_recovery_receipt = p_out.receipt
+            promo_blocked = p_out.promotion_blocked
             stag_rounds = stag_by_reg.get(retried.regime_tag, 0)
             if promo_blocked:
                 stop_reason = "promotion_blocked"
@@ -1000,8 +1073,9 @@ class PerfTargetCampaignRunner:
                 creg, last_unprom = retried.regime_tag, None
         if pending_l4 is not None and not promo_blocked:
             prior_sr = pending_l4.prior_stop_reason
-            l4_res, pending_l4 = self._l3_l4_recovery.resolve_pending_l4(pending_l4, incumbent_source=inc_src)
-            self._pending_l4, l4_resolved = pending_l4, True
+            l4_out = self._l3_l4_recovery.resolve_pending_l4_with_receipt(pending_l4, incumbent_source=inc_src)
+            l4_res, pending_l4 = l4_out.l4_result, l4_out.pending_l4
+            self._pending_l4, self._last_recovery_receipt, l4_resolved = pending_l4, l4_out.receipt, True
             if not stop_reason:
                 stop_reason = prior_sr or "l4_pending"
             self._telemetry_writer.record_l4_observations(source=inc_src, l4_result=l4_res, active_anchors=act_ancs)
@@ -1088,8 +1162,9 @@ class PerfTargetCampaignRunner:
             await self._stage_gate_coordinator.cancel_pending_speculative()
         stop_reason = stop_reason or "budget_exhausted"
         if self._config.run_final_l4 and not promo_blocked and not l4_resolved:
-            l4_res = self._l3_l4_recovery.run_final_l4_tracked(incumbent_source=inc_src, prior_stop_reason=stop_reason)
-            pending_l4 = self._pending_l4 = self._l3_l4_recovery.pending_l4
+            l4_out = self._l3_l4_recovery.run_final_l4_with_receipt(incumbent_source=inc_src, prior_stop_reason=stop_reason)
+            l4_res, pending_l4 = l4_out.l4_result, l4_out.pending_l4
+            self._pending_l4, self._last_recovery_receipt = pending_l4, l4_out.receipt
             if pending_l4 is not None and not stop_reason:
                 stop_reason = "l4_pending"
             self._telemetry_writer.record_l4_observations(source=inc_src, l4_result=l4_res, active_anchors=act_ancs)
@@ -1250,6 +1325,11 @@ class ExtremeCampaignRunner(PerfTargetCampaignRunner):
         if rounds:
             last = rounds[-1]
             self._op_logger.info("ROUND_TELEMETRY op=%s round=%d regime=%s promoted=%s best_score=%.6f best_speedup=%.6f", self._config.operator_name, last.round_idx, last.regime_tag, last.promoted, best_result.surrogate_score, best_result.avg_speedup)
+
+
+def build_stage0_static_validator(*args: object, **kwargs: object) -> Callable[[str, str], tuple[bool, str]]:
+    """Build Stage-0 static validator binding campaign_runner gate entrypoints."""
+    return _stage0_build_static_validator(*args, run_stage_a_fn=run_stage_a_static, run_l1_fn=run_l1_compile_check, **kwargs)
 
 
 def build_resilient_l2_evaluator(

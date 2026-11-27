@@ -168,10 +168,22 @@ class TelemetryLedgerWriter:
         self._tracker, self._flywheel = tracker, flywheel
         self._flywheel_coordinator = flywheel_coordinator or FlywheelCoordinator(flywheel=flywheel)
         self.boundary_ledger = boundary_ledger or DeterministicSearchBoundaryLedger()
-        self.beams: dict[str, TwoLaneBeamSearch] = beams if beams is not None else {}
-        self.msprof_cache: dict[tuple[str, str], dict[str, float]] = msprof_cache if msprof_cache is not None else {}
-        self._case_dims_cache: dict[int, dict[str, object]] = case_dims_cache if case_dims_cache is not None else {}
-        self.regime_diag_stats: dict[str, dict[str, object]] = regime_diag_stats if regime_diag_stats is not None else {}
+        self.beams: dict[str, TwoLaneBeamSearch] = dict(beams) if beams is not None else {}
+        self.msprof_cache: dict[tuple[str, str], dict[str, float]] = (
+            {(str(k[0]), str(k[1])): dict(v) for k, v in msprof_cache.items()}
+            if msprof_cache is not None
+            else {}
+        )
+        self._case_dims_cache: dict[int, dict[str, object]] = (
+            {int(k): dict(v) for k, v in case_dims_cache.items()}
+            if case_dims_cache is not None
+            else {}
+        )
+        self.regime_diag_stats: dict[str, dict[str, object]] = (
+            {str(k): dict(v) for k, v in regime_diag_stats.items()}
+            if regime_diag_stats is not None
+            else {}
+        )
         self.scoreboard_anchors: tuple[AnchorCaseSpec, ...] = tuple(scoreboard_anchors)
         self.guardrail_cases: list[GuardrailCaseSpec] = list(guardrail_cases)
         self.calibrated_dispatch_floor_us: float = float(calibrated_dispatch_floor_us)
@@ -755,6 +767,8 @@ class TelemetryLedgerWriter:
         last_round_promoted_by_regime: Mapping[str, bool] | None = None,
         compile_wall_streak_by_regime: Mapping[str, int] | None = None,
         snapshot: CampaignStateSnapshot | None = None,
+        beams: Mapping[str, TwoLaneBeamSearch] | None = None,
+        msprof_cache: Mapping[tuple[str, str], Mapping[str, float]] | None = None,
     ) -> None:
         """Atomically persist full campaign checkpoint state to disk."""
         if self._checkpoint_path is None:
@@ -768,8 +782,10 @@ class TelemetryLedgerWriter:
         eff_pmap = last_round_promoted_by_regime if last_round_promoted_by_regime is not None else (dict(snapshot.last_round_promoted_by_regime) if snapshot else self.last_round_promoted_by_regime)
         eff_wmap = compile_wall_streak_by_regime if compile_wall_streak_by_regime is not None else (dict(snapshot.compile_wall_streak_by_regime) if snapshot else self.compile_wall_streak_by_regime)
         eff_stag_map = stagnation_by_regime if stagnation_by_regime is not None else (dict(snapshot.stagnation_by_regime) if snapshot else {})
+        eff_beams = beams if beams is not None else self.beams
+        eff_msprof = msprof_cache if msprof_cache is not None else self.msprof_cache
         beam_key = (snapshot.active_regime_tag if snapshot else None) or self.active_regime_tag
-        primary_beam = self.beams[beam_key] if (beam_key and beam_key in self.beams) else (next(iter(self.beams.values())) if self.beams else TwoLaneBeamSearch())
+        primary_beam = eff_beams[beam_key] if (beam_key and beam_key in eff_beams) else (next(iter(eff_beams.values())) if eff_beams else TwoLaneBeamSearch())
         payload = {
             "version": 1, "run_id": (snapshot.run_id if snapshot and snapshot.run_id else self.run_id),
             "operator_name": self._operator_name, "target_module_path": str(self._target_module_path) if self._target_module_path else "",
@@ -788,8 +804,8 @@ class TelemetryLedgerWriter:
             "promoted_rounds": list(promoted_rounds), "rolled_back_rounds": list(rolled_back_rounds),
             "escalated_rounds": list(escalated_rounds), "admitted_rule_ids": list(admitted_rule_ids),
             "tracker_state": self._tracker.to_dict() if self._tracker is not None else {},
-            "beam_state": primary_beam.to_dict(), "beam_states": {tag: b.to_dict() for tag, b in sorted(self.beams.items())},
-            "msprof_cache": {f"{sha}:{tag}": dict(m) for (sha, tag), m in sorted(self.msprof_cache.items())},
+            "beam_state": primary_beam.to_dict(), "beam_states": {tag: b.to_dict() for tag, b in sorted(eff_beams.items())},
+            "msprof_cache": {f"{sha}:{tag}": dict(m) for (sha, tag), m in sorted(eff_msprof.items())},
             "stagnation_diagnosis_stats": self.serialize_diag_stats(),
             "search_boundary_ledger": self.boundary_ledger.to_dict(), "stop_reason": stop_reason,
             "l4_result": l4_result.to_dict() if l4_result else None,

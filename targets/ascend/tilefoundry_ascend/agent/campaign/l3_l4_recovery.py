@@ -19,7 +19,7 @@ from tilefoundry_ascend.agent.campaign.helpers import (
     lookup_case_dims_safe, persist_runtime_state, source_sha256, write_source_and_verify,
 )
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import PendingPromotion
-from tilefoundry_ascend.agent.contracts import NpuExecutionPort
+from tilefoundry_ascend.agent.contracts import NpuExecutionPort, RecoveryReceipt
 from tilefoundry_ascend.agent.npu import (
     FAILURE_KIND_CANDIDATE, FAILURE_KIND_INFRASTRUCTURE, AnchorEvalMetrics,
     CandidateSurrogateResult, L3AcceptanceResult, L4CannbenchResult,
@@ -368,6 +368,32 @@ class _DevicePoolAdapter:
     retry_device_id: str
 
 
+@dataclass(frozen=True)
+class PendingPromotionOutcome:
+    """Immutable L5 outcome and RecoveryReceipt from pending L3 resolution."""
+
+    receipt: RecoveryReceipt
+    incumbent_source: str
+    best_result: CandidateSurrogateResult
+    stagnation_by_regime: tuple[tuple[str, int], ...]
+    pending_promotion: PendingPromotion | None
+    active_promotion: PendingPromotion | None
+    promotion_blocked: bool
+    rounds: tuple[object, ...]
+    promoted_rounds: tuple[int, ...]
+    rolled_back_rounds: tuple[int, ...]
+    guardrail_cases: tuple[GuardrailCaseSpec, ...]
+
+
+@dataclass(frozen=True)
+class PendingL4Outcome:
+    """Immutable L5 outcome and RecoveryReceipt from L4 CANNBench execution or recovery."""
+
+    receipt: RecoveryReceipt
+    l4_result: L4CannbenchResult
+    pending_l4: PendingL4 | None
+
+
 class L3L4RecoveryCoordinator:
     """Coordinate L3/L4 execution, pending recovery, card rotation, and guardrails."""
 
@@ -430,9 +456,17 @@ class L3L4RecoveryCoordinator:
             topology_axes if isinstance(topology_axes, TopologyAxes)
             else (TopologyAxes.from_dict(topology_axes) if isinstance(topology_axes, Mapping) else None)
         )
-        self.guardrail_cases: list[GuardrailCaseSpec] = guardrail_cases if guardrail_cases is not None else []
-        self.last_guardrail_metrics_by_cid: Mapping[str, Mapping[int, AnchorEvalMetrics]] = last_guardrail_metrics_by_cid if last_guardrail_metrics_by_cid is not None else {}
-        self.case_dims_cache: dict[int, dict[str, object]] = case_dims_cache if case_dims_cache is not None else {}
+        self.guardrail_cases: list[GuardrailCaseSpec] = list(guardrail_cases) if guardrail_cases is not None else []
+        self.last_guardrail_metrics_by_cid: dict[str, dict[int, AnchorEvalMetrics]] = (
+            {str(k): dict(v) for k, v in last_guardrail_metrics_by_cid.items()}
+            if last_guardrail_metrics_by_cid is not None
+            else {}
+        )
+        self.case_dims_cache: dict[int, dict[str, object]] = (
+            {int(k): dict(v) for k, v in case_dims_cache.items()}
+            if case_dims_cache is not None
+            else {}
+        )
         self.pending_promotion: PendingPromotion | None = None
         self.active_promotion: PendingPromotion | None = None
         self.pending_l4: PendingL4 | None = None
@@ -950,10 +984,14 @@ class L3L4RecoveryCoordinator:
     def record_l3_guardrail_cases(
         self, l3_res: L3AcceptanceResult, incumbent_source: str,
         regime_spec: RegimeTargetSpec, *, topology_axes: TopologyAxes | None = None,
+        guardrail_cases: Sequence[GuardrailCaseSpec] | None = None,
+        scoreboard_anchors: Sequence[AnchorCaseSpec] | None = None,
     ) -> list[GuardrailCaseSpec]:
         """Record all unseen non-scoreboard L3 failure probe cases monotonically."""
-        scoreboard_cases = {int(a.case_num) for a in self.scoreboard_anchors}
-        existing = {int(g.case_num) for g in self.guardrail_cases}
+        eff_sb = scoreboard_anchors if scoreboard_anchors is not None else self.scoreboard_anchors
+        eff_gr = guardrail_cases if guardrail_cases is not None else self.guardrail_cases
+        scoreboard_cases = {int(a.case_num) for a in eff_sb}
+        existing = {int(g.case_num) for g in eff_gr}
         targets = [c for c in extract_l3_failed_case_nums(l3_res) if c not in scoreboard_cases and c not in existing]
         if not targets:
             return []
@@ -1008,24 +1046,138 @@ class L3L4RecoveryCoordinator:
             seen_gr.add(cnum)
             inc_ref = inc_by_case.get(cnum, 0.0) or (ref_us if ref_us > 1.0 else 0.0)
             spec = GuardrailCaseSpec(task=task_name, case_num=cnum, regime_tag=rtag, incumbent_ref_us=inc_ref, t_hw_us=hw_us)
-            self.guardrail_cases.append(spec)
+            if guardrail_cases is None:
+                self.guardrail_cases.append(spec)
             added.append(spec)
         return added
 
-    def refresh_guardrail_incumbent_refs(self, winner_candidate_id: str) -> None:
-        """Update guardrail incumbent reference latencies from a newly promoted winner."""
-        metrics_by_case = self.last_guardrail_metrics_by_cid.get(winner_candidate_id) if self.guardrail_cases else None
-        if not metrics_by_case:
-            return
-        for idx, guardrail in enumerate(self.guardrail_cases):
+    def refresh_guardrail_incumbent_refs(
+        self,
+        winner_candidate_id: str,
+        *,
+        guardrail_cases: Sequence[GuardrailCaseSpec] | None = None,
+        guardrail_metrics: Mapping[int, AnchorEvalMetrics] | None = None,
+    ) -> list[GuardrailCaseSpec]:
+        """Return guardrail specs updated with newly promoted winner reference latencies."""
+        eff_gr = list(guardrail_cases) if guardrail_cases is not None else self.guardrail_cases
+        metrics_by_case = (
+            guardrail_metrics
+            if guardrail_metrics is not None
+            else (self.last_guardrail_metrics_by_cid.get(winner_candidate_id) if eff_gr else None)
+        )
+        if not metrics_by_case or not eff_gr:
+            return list(eff_gr)
+        updated: list[GuardrailCaseSpec] = []
+        for idx, guardrail in enumerate(eff_gr):
             m = metrics_by_case.get(int(guardrail.case_num))
-            if m is not None and m.accuracy_passed and m.cand_us > 0.0:
-                self.guardrail_cases[idx] = replace(guardrail, incumbent_ref_us=float(m.cand_us))
+            item = (
+                replace(guardrail, incumbent_ref_us=float(m.cand_us))
+                if (m is not None and m.accuracy_passed and m.cand_us > 0.0)
+                else guardrail
+            )
+            if guardrail_cases is None:
+                self.guardrail_cases[idx] = item
+            updated.append(item)
+        return updated
+
+    def resolve_pending_promotion_with_receipt(
+        self,
+        pending: PendingPromotion,
+        *,
+        incumbent_source: str,
+        best_result: CandidateSurrogateResult,
+        stagnation_by_regime: Mapping[str, int],
+        rounds: Sequence[object],
+        promoted_rounds: Sequence[int],
+        rolled_back_rounds: Sequence[int],
+        active_anchors: Sequence[AnchorCaseSpec],
+        guardrail_cases: Sequence[GuardrailCaseSpec] = (),
+        scoreboard_anchors: Sequence[AnchorCaseSpec] | None = None,
+        guardrail_metrics_by_cid: Mapping[str, Mapping[int, AnchorEvalMetrics]] | None = None,
+    ) -> PendingPromotionOutcome:
+        """Resolve pending L3 promotion purely on copied inputs and emit a RecoveryReceipt."""
+        saved_gr = list(self.guardrail_cases)
+        saved_gm = dict(self.last_guardrail_metrics_by_cid)
+        saved_sb = self.scoreboard_anchors
+        if scoreboard_anchors is not None:
+            self.scoreboard_anchors = tuple(scoreboard_anchors)
+        self.guardrail_cases = list(guardrail_cases)
+        if guardrail_metrics_by_cid is not None:
+            self.last_guardrail_metrics_by_cid = {str(k): dict(v) for k, v in guardrail_metrics_by_cid.items()}
+        stag_copy = {str(k): int(v) for k, v in stagnation_by_regime.items()}
+        rounds_copy = list(rounds)
+        prom_copy = list(promoted_rounds)
+        rb_copy = list(rolled_back_rounds)
+        try:
+            new_inc, new_best, new_stag, next_p, blocked = self.resolve_pending_promotion(
+                pending, incumbent_source=incumbent_source, best_result=best_result,
+                stagnation_by_regime=stag_copy, rounds=rounds_copy, promoted_rounds=prom_copy,
+                rolled_back_rounds=rb_copy, active_anchors=active_anchors,
+            )
+            new_gr = tuple(self.guardrail_cases)
+        finally:
+            self.guardrail_cases = saved_gr
+            self.last_guardrail_metrics_by_cid = saved_gm
+            self.scoreboard_anchors = saved_sb
+        ref_p = next_p or pending
+        receipt = RecoveryReceipt(
+            stage="l3_promotion", resolved=(next_p is None),
+            passed=(next_p is None and not blocked and new_inc == pending.candidate_source),
+            promotion_blocked=bool(blocked),
+            candidate_sha256=str(ref_p.candidate_sha256 or ""),
+            execution_id=str(ref_p.execution_id or ""), run_id=str(ref_p.run_id or ""),
+            receipt_path=str(ref_p.receipt_path or ""), device_id=str(ref_p.device_id or ""),
+            failure_kind=("" if (next_p is None and new_inc == pending.candidate_source) else "recovery"),
+            error_message=str(ref_p.error_message or ""),
+            execution_terminal=bool(ref_p.execution_terminal),
+        )
+        return PendingPromotionOutcome(
+            receipt=receipt, incumbent_source=new_inc, best_result=new_best,
+            stagnation_by_regime=tuple(sorted(new_stag.items())),
+            pending_promotion=next_p, active_promotion=self.active_promotion,
+            promotion_blocked=bool(blocked), rounds=tuple(rounds_copy),
+            promoted_rounds=tuple(prom_copy), rolled_back_rounds=tuple(rb_copy),
+            guardrail_cases=new_gr,
+        )
+
+    def resolve_pending_l4_with_receipt(
+        self, pending: PendingL4, *, incumbent_source: str
+    ) -> PendingL4Outcome:
+        """Resolve pending L4 execution and emit a frozen RecoveryReceipt."""
+        res, next_p = self.resolve_pending_l4(pending, incumbent_source=incumbent_source)
+        receipt = RecoveryReceipt(
+            stage="l4_cannbench", resolved=(next_p is None), passed=bool(res.passed),
+            promotion_blocked=False,
+            candidate_sha256=str(res.candidate_sha256 or pending.candidate_sha256 or ""),
+            execution_id=str(res.execution_id or ""), run_id=str(res.run_id or ""),
+            receipt_path=str(res.receipt_path or ""), device_id=str(res.device_id or ""),
+            failure_kind=str(res.failure_kind or ""), error_message=str(res.error_message or ""),
+            execution_terminal=bool(res.execution_terminal),
+        )
+        return PendingL4Outcome(receipt=receipt, l4_result=res, pending_l4=next_p)
+
+    def run_final_l4_with_receipt(
+        self, *, incumbent_source: str, prior_stop_reason: str
+    ) -> PendingL4Outcome:
+        """Submit tracked L4 CANNBench run and emit a frozen RecoveryReceipt."""
+        res = self.run_final_l4_tracked(incumbent_source=incumbent_source, prior_stop_reason=prior_stop_reason)
+        next_p = self.pending_l4
+        receipt = RecoveryReceipt(
+            stage="l4_cannbench", resolved=(next_p is None), passed=bool(res.passed),
+            promotion_blocked=False,
+            candidate_sha256=str(res.candidate_sha256 or source_sha256(incumbent_source)),
+            execution_id=str(res.execution_id or ""), run_id=str(res.run_id or ""),
+            receipt_path=str(res.receipt_path or ""), device_id=str(res.device_id or ""),
+            failure_kind=str(res.failure_kind or ""), error_message=str(res.error_message or ""),
+            execution_terminal=bool(res.execution_terminal),
+        )
+        return PendingL4Outcome(receipt=receipt, l4_result=res, pending_l4=next_p)
 
 
 __all__ = [
     "CAMPAIGN_DEVICE_IDS_ENV_KEY", "DevicePoolConfig", "L3L4RecoveryCoordinator",
-    "NON_TAIL_DIM_KEYS", "PendingL4", "ResolvedRegimeConfigLike", "RoundRecordLike",
+    "NON_TAIL_DIM_KEYS", "PendingL4", "PendingL4Outcome", "PendingPromotionOutcome",
+    "ResolvedRegimeConfigLike", "RoundRecordLike",
     "SHAPE_DIM_KEYS", "atomic_write_text", "canonical_device_id",
     "case_dim_alignment_flags", "ensure_candidate_bytes", "extract_knob_signature",
     "extract_l3_failed_case_nums", "is_blocked_env_l4", "is_occupancy_blocked_env",

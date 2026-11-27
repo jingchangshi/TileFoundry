@@ -18,7 +18,13 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     PerfTargetCampaignRunner,
     build_resilient_l2_evaluator,
 )
-from tilefoundry_ascend.agent.contracts import CampaignRoundRecord, CampaignStateSnapshot
+from tilefoundry_ascend.agent.contracts import (
+    CampaignRoundRecord,
+    CampaignStateSnapshot,
+    RecoveryReceipt,
+    RoundContextReceipt,
+    StageGateRoundReceipt,
+)
 from tilefoundry_ascend.agent.gates.gate_funnel import StageAResult, StageBResult
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, SymptomFamily
@@ -572,3 +578,133 @@ def test_extreme_runner_rotation_and_resilient_l2(tmp_path: Path) -> None:
     shared = eval_fn([("c1", target_path), ("c2", target_path)], anchors)
     assert set(shared) == {"c1", "c2"}
     assert shared.run_ids == {"c1": "batch-rid", "c2": "batch-rid"}
+
+
+@pytest.mark.parametrize(
+    ("frozen_obj", "field_name", "bad_value"),
+    [
+        (
+            CampaignStateSnapshot(
+                run_id="r0",
+                round_index=1,
+                incumbent_source=_BASE_SRC,
+                incumbent_sha256="sha0",
+                dispatch_floor_us=1.0,
+                active_regime_tag="main",
+                guardrail_case_ids=("14",),
+                stagnation_by_regime={"main": 0},
+            ),
+            "active_regime_tag",
+            "other",
+        ),
+        (
+            RoundContextReceipt(1, "main", "_build_main", "exploit", "sha0", "tilelang_dsl"),
+            "stagnation_rounds",
+            9,
+        ),
+        (
+            StageGateRoundReceipt(1, "main", 2, ("c1",), (), ("c1",)),
+            "infeasible_boundaries_added",
+            5,
+        ),
+        (
+            RecoveryReceipt("l4_cannbench", True, True),
+            "passed",
+            False,
+        ),
+    ],
+)
+def test_reject_snapshot_mutation_and_cross_object_private_writes(
+    frozen_obj: object, field_name: str, bad_value: object
+) -> None:
+    """Reject mutations on frozen snapshots/receipts and cross-object private writes in L4/L5."""
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(frozen_obj, field_name, bad_value)
+    agent_root = Path(campaign_runner.__file__).resolve().parents[1]
+    violations: list[str] = []
+    for subdir in ("npu", "probes", "campaign"):
+        for py_path in sorted((agent_root / subdir).rglob("*.py")):
+            tree = ast.parse(py_path.read_text(encoding="utf-8"), str(py_path))
+            for node in ast.walk(tree):
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else ([node.target] if isinstance(node, ast.AugAssign) else ())
+                )
+                for target in targets:
+                    if isinstance(target, ast.Attribute) and target.attr.startswith("_"):
+                        if isinstance(target.value, ast.Name) and target.value.id in ("self", "cls"):
+                            continue
+                        violations.append(f"{py_path.name}:{node.lineno}")
+    assert violations == []
+
+
+@pytest.mark.parametrize("l3_passes", [False, True])
+def test_accept_single_point_receipt_state_advancement(tmp_path: Path, l3_passes: bool) -> None:
+    """Accept single-point receipt advancement and conserve guardrails/incumbent."""
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_BASE_SRC, encoding="utf-8")
+    cand_snip = _SLICE_SRC.replace("tile_m=16", "tile_m=32")
+    expected_promoted_src = _BASE_SRC.replace("tile_m=16", "tile_m=32")
+    regime = _single_regime()
+    anchors = (AnchorCaseSpec("op/synthetic", 1, "main", 100.0, 10.0),)
+
+    class _LLM:
+        async def generate(self, req: GenerationRequest, *, effort_override: object = None) -> str:
+            _ = (req, effort_override)
+            return f"# target_bottleneck: aiv\n# structural_hypothesis: widen\n```python\n{cand_snip}```"
+
+    base_res = _make_surrogate("base", (_make_metric(1, "main", 50.0, ref_us=100.0, t_hw_us=10.0),))
+    cand_res = _make_surrogate("r1_creative", (_make_metric(1, "main", 25.0, ref_us=100.0, t_hw_us=10.0),))
+
+    def _l2_eval(cands: Sequence[tuple[str, Path]], eval_ancs: Sequence[AnchorCaseSpec]) -> L2BatchResults:
+        _ = eval_ancs
+        out: dict[str, CandidateSurrogateResult] = {}
+        for cid, _ in cands:
+            if cid in ("incumbent_baseline", "incumbent_slot"):
+                out[cid] = base_res
+            else:
+                out[cid] = cand_res
+        return L2BatchResults(out, {cid: "rid_1" for cid in out})
+
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="synthetic_op", max_rounds=1, k_rule_workers=0,
+            max_syntax_repairs=0, run_final_l4=True, disable_early_goal_stop=True,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("synthetic_op", 10.0, 10.0, 0.99),
+        anchors=anchors,
+        regime_specs=(regime,),
+        regime_blueprints={"main": _blueprint()},
+        llm_backend=_LLM(),
+        tracker=BayesianRuleTracker(rules={}),
+        l0_checker=lambda _s, _r: StageAResult(passed=True, prim_func=None, ledger=_make_ledger()),
+        l1_compiler=lambda _s, _r: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p, **_kw: L3AcceptanceResult(
+            passed=l3_passes,
+            failure_kind="" if l3_passes else "candidate",
+            failed_case_nums=() if l3_passes else (77,),
+            error_message="" if l3_passes else "case=77 fail",
+        ),
+        l4_cannbench_runner=lambda _p, **_kw: L4CannbenchResult(passed=True, execution_id="l4_ex"),
+        msprof_collector=lambda *_a: {},
+        p2_deep_dive_collector=lambda *_a: {},
+    )
+    report = asyncio.run(runner.run())
+    assert isinstance(runner.last_round_context_receipt, RoundContextReceipt)
+    assert runner.last_round_context_receipt.round_idx == 1
+    assert isinstance(runner.last_stage_gate_receipt, StageGateRoundReceipt)
+    assert runner.last_stage_gate_receipt.round_idx == 1
+    assert isinstance(runner.last_recovery_receipt, RecoveryReceipt)
+    assert runner.last_recovery_receipt.stage == "l4_cannbench"
+    assert runner.last_recovery_receipt.passed is True
+    if l3_passes:
+        assert report.promoted_rounds == (1,)
+        assert runner.guardrail_cases == ()
+        assert target_path.read_text(encoding="utf-8") == expected_promoted_src
+    else:
+        assert report.rolled_back_rounds == (1,)
+        assert [int(g.case_num) for g in runner.guardrail_cases] == [77]
+        assert target_path.read_text(encoding="utf-8") == _BASE_SRC

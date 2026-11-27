@@ -201,9 +201,13 @@ def build_stage0_static_validator(
     regime_specs: Sequence[RegimeTargetSpec], *, entrypoint: str, worktree: Path, env_file: Path | None,
     entrypoint_contract: GoldenEntrypointContract | None = None, semantics: PyTorchOpSemantics | None = None,
     op_proto: Mapping[str, object] | None = None,
+    run_stage_a_fn: Callable[..., object] | None = None,
+    run_l1_fn: Callable[..., object] | None = None,
 ) -> Callable[[str, str], tuple[bool, str]]:
     """Build the L0/L1 gate pair the bounded Stage-0 seed loop invokes per attempt."""
     assert regime_specs, "Stage-0 seed synthesis requires at least one regime specification"
+    eff_sa_fn = run_stage_a_fn or run_stage_a_static
+    eff_l1_fn = run_l1_fn or run_l1_compile_check
 
     def _run_ta(ms: str, rs: RegimeTargetSpec, *, enforce: bool) -> tuple[bool, str, ObjectivePhysicalLedger | None]:
         if (ce := _stage0_contract_err(ms, entrypoint, "tilelang_dsl", contract=entrypoint_contract)):
@@ -213,7 +217,7 @@ def build_stage0_static_validator(
             res = resolve_regime_config(ms, rs, dims=dims)
         except (SyntaxError, ImportError, KeyError, NameError, RuntimeError, TypeError, ValueError) as exc:
             return False, f"seed config resolution failed: {type(exc).__name__}: {exc}", None
-        sa = run_stage_a_static(
+        sa = eff_sa_fn(
             ms, factory_name=res.builder_name, factory_kwargs=res.builder_kwargs, pass_configs=res.pass_configs or None,
             compile_flags=res.compile_flags or None, dims=dims or None, case_ratios=rs.representative_case_ratios,
             require_hardware_dma=bool(enforce and semantics and not semantics.has_indirect_index),
@@ -222,7 +226,7 @@ def build_stage0_static_validator(
         )
         if not sa.passed:
             return False, f"L0 static/waterline rejection: {sa.error_message}", sa.ledger
-        sb = run_l1_compile_check(ms, builder_name=res.builder_name, builder_kwargs=res.builder_kwargs, config_selector_name=res.selector_name or None, pass_configs=res.pass_configs or None, compile_flags=res.compile_flags or None, source_root=worktree, env_file=env_file)
+        sb = eff_l1_fn(ms, builder_name=res.builder_name, builder_kwargs=res.builder_kwargs, config_selector_name=res.selector_name or None, pass_configs=res.pass_configs or None, compile_flags=res.compile_flags or None, source_root=worktree, env_file=env_file)
         return (True, "", sa.ledger) if sb.passed else (False, f"L1 device compilation rejection: {sb.error_message}", sa.ledger)
 
     def _run_tb(ms: str, rs: RegimeTargetSpec, *, track: str, enforce: bool) -> tuple[bool, str, ObjectivePhysicalLedger | None]:

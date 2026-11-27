@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast, asyncio, hashlib, json, logging, os, subprocess, tempfile, threading, time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol, TypeVar
 
@@ -26,7 +26,7 @@ from tilefoundry_ascend.agent.campaign.helpers import (
 )
 from tilefoundry_ascend.agent.campaign.promotion_coordinator import evaluate_promotion_gate
 from tilefoundry_ascend.agent.contracts import (
-    CampaignStateSnapshot, NpuExecutionPort, RegimeCompilePlan,
+    CampaignStateSnapshot, NpuExecutionPort, RegimeCompilePlan, StageGateRoundReceipt,
 )
 from tilefoundry_ascend.agent.cost_advisor import CostModelAdvisor, create_cost_advisor
 from tilefoundry_ascend.agent.gates.gate_funnel import (
@@ -55,7 +55,8 @@ from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
 from tilefoundry_ascend.agent.orchestrator.regime_slice_patcher import (
     _compact_trackb_snippet_source, _detect_trackb_dead_code_edit,
     _extract_p2_focus_lines_and_diag, _has_prim_func_builder, _render_trackb_tu_from_module,
-    _resolve_selector_compile_flags, patch_regime_into_module, resolve_regime_config,
+    _resolve_selector_compile_flags, extract_regime_snippet, patch_regime_into_module,
+    resolve_regime_config,
 )
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     rank_stage_a_candidates_with_cost_model,
@@ -93,7 +94,6 @@ def _pool_map(items: Sequence[_ItemT], fn: Callable[[_ItemT], _ResT]) -> list[_R
         return [fn(it) for it in items]
     with ThreadPoolExecutor(max_workers=min(_MAX_L1_COMPILE_WORKERS, len(items))) as pool:
         return list(pool.map(fn, items))
-
 
 def _repair_timeout_message(error_message: str, is_transport: bool) -> str:
     return f"[repair_timeout] {error_message}" if is_transport else error_message
@@ -405,6 +405,9 @@ class StageGateOutcome:
     ub_bytes_by_cid: dict[str, int]
     pred_by_cid: dict[str, float]
     cand_axes_by_cid: dict[str, TopologyAxes]
+    guardrail_metrics_by_cid: dict[str, dict[int, AnchorEvalMetrics]] = field(default_factory=dict)
+    l2_timing_meta: dict[str, object] = field(default_factory=dict)
+    receipt: StageGateRoundReceipt | None = None
 
 
 _ORIG_RUN_L0_L1_ROUND_FILTER = run_l0_l1_round_filter
@@ -418,33 +421,28 @@ class StageGateCoordinator:
         regime_specs: Sequence[RegimeTargetSpec] = (), initial_anchors: Sequence[AnchorCaseSpec] = (),
         scoreboard_anchors: Sequence[AnchorCaseSpec] = (), guardrail_cases: list[GuardrailCaseSpec] | None = None,
         backend: KernelLLMBackend | None = None, tracker: BayesianRuleTracker | None = None,
-        cost_advisor: CostModelAdvisor | None = None,
-        boundary_ledger: DeterministicSearchBoundaryLedger | None = None,
-        target: AscendTarget | None = None, source_root: Path | None = None,
-        env_file: Path | None = None, cannbench_repo: Path | None = None,
-        checkpoint_path: Path | None = None, experience_lake_dir: Path | None = None,
+        cost_advisor: CostModelAdvisor | None = None, boundary_ledger: DeterministicSearchBoundaryLedger | None = None,
+        target: AscendTarget | None = None, source_root: Path | None = None, env_file: Path | None = None,
+        cannbench_repo: Path | None = None, checkpoint_path: Path | None = None, experience_lake_dir: Path | None = None,
         run_id: str = "", device_id: str = "1", l4_device_pool: Sequence[str] = (),
-        warmup: int = 3, repeat: int = 5, max_syntax_repairs: int = 1,
-        cost_prescreen_top_k: int | None = None, pure_golden: bool = False,
-        enable_track_router: bool = False, sil_advisory: object | None = None,
+        warmup: int = 3, repeat: int = 5, max_syntax_repairs: int = 1, cost_prescreen_top_k: int | None = None,
+        pure_golden: bool = False, enable_track_router: bool = False, sil_advisory: object | None = None,
         topology_axes: TopologyAxes | None = None, semantic_topology_axes: TopologyAxes | None = None,
-        npu_port: NpuExecutionPort | None = None,
-        l0_checker: Callable[..., StageAResult] | None = None,
+        npu_port: NpuExecutionPort | None = None, l0_checker: Callable[..., StageAResult] | None = None,
         l1_compiler: Callable[[str, RegimeTargetSpec], StageBResult] | None = None,
         l2_batch_evaluator: Callable[[Sequence[tuple[str, Path]], Sequence[AnchorCaseSpec]], Mapping[str, CandidateSurrogateResult]] | None = None,
         static_width_dims_fn: Callable[[RegimeTargetSpec], Sequence[Mapping[str, object]]] | None = None,
         resolve_op_semantics_fn: Callable[[], PyTorchOpSemantics | None] | None = None,
         persist_artifact_fn: Callable[[L0L1CandidateCheck, int], None] | None = None,
-        record_kb_event_fn: Callable[..., None] | None = None,
-        config: StageGateConfig | None = None, active_incumbent_source: str = "",
-        incumbent_anchor_us_by_case: Mapping[int, float] | None = None,
+        record_kb_event_fn: Callable[..., None] | None = None, config: StageGateConfig | None = None,
+        active_incumbent_source: str = "", incumbent_anchor_us_by_case: Mapping[int, float] | None = None,
         freedom_masks: Mapping[str, ConstraintRelaxationMask] | None = None,
     ) -> None:
         self._config: StageGateConfig = config or _DefaultStageGateConfig(operator_name=operator_name, device_id=device_id, warmup=warmup, repeat=repeat, max_syntax_repairs=max_syntax_repairs, cost_prescreen_top_k=cost_prescreen_top_k, pure_golden=pure_golden)
         self._target_module_path = Path(target_module_path).resolve() if target_module_path else Path("module.py")
         self._regime_specs, self._initial_anchors = tuple(regime_specs), tuple(initial_anchors)
         self._scoreboard_anchors = tuple(scoreboard_anchors or initial_anchors)
-        self._guardrail_cases: list[GuardrailCaseSpec] = guardrail_cases if guardrail_cases is not None else []
+        self._guardrail_cases: list[GuardrailCaseSpec] = list(guardrail_cases) if guardrail_cases is not None else []
         self._backend, self._tracker = backend, (tracker or BayesianRuleTracker())
         self._target = target or AscendTarget("ascend.950pr")
         self._source_root = Path(source_root).resolve() if source_root else default_source_root()
@@ -479,17 +477,11 @@ class StageGateCoordinator:
         return self._backend
 
     def _lookup_case_dims_safe(self, case_num: int, regime_tag: str = "") -> dict[str, object]:
-        return lookup_case_dims_safe(
-            self._config.operator_name, case_num, regime_tag=regime_tag, regime_specs=self._regime_specs,
-            cache=self._case_dims_cache, cannbench_repo=self._cannbench_repo, env_file=self._env_file,
-        )
+        return lookup_case_dims_safe(self._config.operator_name, case_num, regime_tag=regime_tag, regime_specs=self._regime_specs, cache=self._case_dims_cache, cannbench_repo=self._cannbench_repo, env_file=self._env_file)
 
     def _resolve_cases_yaml_sha256(self) -> str:
         if self._cases_yaml_sha256_cache is None:
-            self._cases_yaml_sha256_cache = resolve_cases_yaml_sha256_for_operator(
-                self._config.operator_name, cannbench_repo=self._cannbench_repo,
-                env_file=self._env_file, source_root=self._source_root,
-            )
+            self._cases_yaml_sha256_cache = resolve_cases_yaml_sha256_for_operator(self._config.operator_name, cannbench_repo=self._cannbench_repo, env_file=self._env_file, source_root=self._source_root)
         return self._cases_yaml_sha256_cache
 
     def _lookup_case_static_spec_safe(self, case_num: int) -> dict[str, object] | None:
@@ -505,11 +497,13 @@ class StageGateCoordinator:
         self._case_static_spec_cache[cnum] = dict(spec)
         return spec
 
-    def _resolve_stage_b_anchor_case_specs(self) -> list[tuple[int, str, dict[str, object]]]:
+    def _resolve_stage_b_anchor_case_specs(self, *, scoreboard_anchors: Sequence[AnchorCaseSpec] | None = None, guardrail_cases: Sequence[GuardrailCaseSpec] | None = None) -> list[tuple[int, str, dict[str, object]]]:
         if not self._config.operator_name:
             return []
+        eff_sb = scoreboard_anchors if scoreboard_anchors is not None else self._scoreboard_anchors
+        eff_gr = guardrail_cases if guardrail_cases is not None else self._guardrail_cases
         specs, seen = [], set()
-        for item in (*self._scoreboard_anchors, *self._guardrail_cases):
+        for item in (*eff_sb, *eff_gr):
             cnum = int(item.case_num)
             if cnum not in seen:
                 seen.add(cnum)
@@ -525,14 +519,9 @@ class StageGateCoordinator:
         except (KeyError, ValueError, TypeError):
             return False
 
-    def _derive_topology_axes(
-        self, ledger: ObjectivePhysicalLedger | None, *, features: object | None = None, route: object | None = None
-    ) -> TopologyAxes:
-        return derive_topology_axes(
-            self._config.operator_name, ledger, topology_axes=self._topology_axes,
-            semantic_topology_axes=self._semantic_topology_axes, sil_advisory=self._sil_advisory,
-            features=features, route=route,
-        )
+    def derive_topology_axes(self, ledger: ObjectivePhysicalLedger | None, *, features: object | None = None, route: object | None = None) -> TopologyAxes:
+        """Derive 3D hardware TopologyAxes from a Stage-A ledger and features."""
+        return derive_topology_axes(self._config.operator_name, ledger, topology_axes=self._topology_axes, semantic_topology_axes=self._semantic_topology_axes, sil_advisory=self._sil_advisory, features=features, route=route)
 
     def _persist_round_candidate_artifact(self, check: L0L1CandidateCheck, *, round_idx: int) -> None:
         if self._persist_artifact_fn is not None:
@@ -540,42 +529,23 @@ class StageGateCoordinator:
         else:
             persist_round_candidate_artifact(self._checkpoint_path, check, round_idx=round_idx)
 
-    def _record_kb_event(
-        self, *, rule_id: str, postcondition_realized: bool, speed_gain: float = 0.0,
-        topology_axes: object | None = None, round_idx: int = 0,
-    ) -> None:
+    def _record_kb_event(self, *, rule_id: str, postcondition_realized: bool, speed_gain: float = 0.0, topology_axes: object | None = None, round_idx: int = 0) -> None:
         if self._record_kb_event_fn is not None:
             self._record_kb_event_fn(rule_id=rule_id, postcondition_realized=postcondition_realized, speed_gain=speed_gain, topology_axes=topology_axes, round_idx=round_idx)
             return
         if self._experience_lake_dir is None:
             return
         try:
-            append_kb_event_shard(
-                self._experience_lake_dir, run_id=self._run_id, rule_id=rule_id,
-                postcondition_realized=postcondition_realized, speed_gain=speed_gain,
-                topology_axes=topology_axes.to_dict() if hasattr(topology_axes, "to_dict") else (dict(topology_axes) if isinstance(topology_axes, Mapping) else {}),
-                round_idx=round_idx,
-            )
+            append_kb_event_shard(self._experience_lake_dir, run_id=self._run_id, rule_id=rule_id, postcondition_realized=postcondition_realized, speed_gain=speed_gain, topology_axes=topology_axes.to_dict() if hasattr(topology_axes, "to_dict") else (dict(topology_axes) if isinstance(topology_axes, Mapping) else {}), round_idx=round_idx)
         except (OSError, ValueError) as exc:
             logger.debug("KB event shard append skipped: %s", exc)
 
-    def _compile_trackb_stage_b(
-        self, cpp_source: str, selector_flags: Sequence[str] | str | None = None, *,
-        artifact_store: ArtifactStore | None = None, regime_tag: str = "",
-        verify_shared_link: bool = False, emit_shared_so_cache_dir: Path | None = None,
-    ) -> StageBResult:
-        return compile_trackb_stage_b(
-            cpp_source, selector_flags, env_file=self._env_file, source_root=self._source_root,
-            artifact_store=artifact_store, regime_tag=regime_tag,
-            verify_shared_link=verify_shared_link, emit_shared_so_cache_dir=emit_shared_so_cache_dir,
-        )
+    def _compile_trackb_stage_b(self, cpp_source: str, selector_flags: Sequence[str] | str | None = None, *, artifact_store: ArtifactStore | None = None, regime_tag: str = "", verify_shared_link: bool = False, emit_shared_so_cache_dir: Path | None = None) -> StageBResult:
+        return compile_trackb_stage_b(cpp_source, selector_flags, env_file=self._env_file, source_root=self._source_root, artifact_store=artifact_store, regime_tag=regime_tag, verify_shared_link=verify_shared_link, emit_shared_so_cache_dir=emit_shared_so_cache_dir)
 
-    def _resolve_operator_semantics_for_gates(self) -> PyTorchOpSemantics | None:
-        return resolve_operator_semantics_for_gates(
-            self._config.operator_name, source_root=self._source_root,
-            pure_golden=bool(self._config.pure_golden), cannbench_repo=self._cannbench_repo,
-            env_file=self._env_file, cache=self._semantics_cache, override_fn=self._resolve_op_semantics_fn,
-        )
+    def resolve_operator_semantics(self) -> PyTorchOpSemantics | None:
+        """Resolve and cache PyTorch operator semantic metadata for static gates."""
+        return resolve_operator_semantics_for_gates(self._config.operator_name, source_root=self._source_root, pure_golden=bool(self._config.pure_golden), cannbench_repo=self._cannbench_repo, env_file=self._env_file, cache=self._semantics_cache, override_fn=self._resolve_op_semantics_fn)
 
     def _resolve_trackb_baseline_tu(self, regime_spec: RegimeTargetSpec, *, incumbent_source: str = "") -> str | None:
         if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
@@ -590,13 +560,17 @@ class StageGateCoordinator:
         return _render_trackb_tu_from_module(bsrc, btb[1], regime_spec, require_renderer=False) if btb else None
 
     def _default_l0_checker(
-        self, module_source: str, regime_spec: RegimeTargetSpec, *, anchor_dims_override: Mapping[str, object] | None = None
+        self, module_source: str, regime_spec: RegimeTargetSpec, *,
+        anchor_dims_override: Mapping[str, object] | None = None,
+        incumbent_source: str = "", freedom_masks: Mapping[str, ConstraintRelaxationMask] | None = None,
     ) -> StageAResult:
-        op_sem = self._resolve_operator_semantics_for_gates()
-        btb_tu = self._resolve_trackb_baseline_tu(regime_spec)
+        eff_inc = incumbent_source or self._active_incumbent_source
+        eff_masks = freedom_masks if freedom_masks is not None else self._freedom_masks
+        op_sem = self.resolve_operator_semantics()
+        btb_tu = self._resolve_trackb_baseline_tu(regime_spec, incumbent_source=eff_inc)
         primary = run_l0_gate(
             module_source, regime_spec, target=self._target, enable_track_router=self._enable_track_router,
-            freedom_masks=self._freedom_masks, active_incumbent_source=self._active_incumbent_source,
+            freedom_masks=eff_masks, active_incumbent_source=eff_inc,
             target_module_path=self._target_module_path, anchor_dims_override=anchor_dims_override,
             op_semantics=op_sem, op_proto=self._semantics_cache.proto, baseline_tb_tu=btb_tu,
         )
@@ -616,7 +590,7 @@ class StageGateCoordinator:
                 cnode = None
             cdump = ast.dump(cnode, include_attributes=False) if cnode is not None else ""
             if cdump:
-                bsrc = self._active_incumbent_source or (self._target_module_path.read_text(encoding="utf-8") if self._target_module_path.is_file() else "")
+                bsrc = eff_inc or (self._target_module_path.read_text(encoding="utf-8") if self._target_module_path.is_file() else "")
                 bdump = ""
                 if bsrc:
                     try:
@@ -642,7 +616,7 @@ class StageGateCoordinator:
                         return StageAResult(passed=False, prim_func=primary.prim_func, ledger=primary.ledger, features=primary.features, route=primary.route, error_message=f"combine_kernel({combine_fn}): {cres.error_message}", elapsed_ms=primary.elapsed_ms + cres.elapsed_ms)
         tb_ext = extract_trackb_cpp_source(module_source, regime_spec.trackb_symbols) if regime_spec.runtime_backend == "hybrid_trackb" else None
         if regime_spec.runtime_backend == "hybrid_trackb" and tb_ext is not None:
-            mask = resolve_trackb_freedom_mask(regime_spec, freedom_masks=self._freedom_masks, baseline_source=self._active_incumbent_source, target_module_path=self._target_module_path)
+            mask = resolve_trackb_freedom_mask(regime_spec, freedom_masks=eff_masks, baseline_source=eff_inc, target_module_path=self._target_module_path)
             tu = _render_trackb_tu_from_module(module_source, tb_ext[1], regime_spec, require_renderer=False, anchor_dims_override=anchor_dims_override)
             tb_res = evaluate_ascendc_candidate(
                 tu, freedom_mask=mask, target=self._target, enable_track_router=self._enable_track_router,
@@ -660,17 +634,30 @@ class StageGateCoordinator:
             return replace(tb_res, elapsed_ms=tms)
         return primary
 
-    def _run_l0(
-        self, module_source: str, regime_spec: RegimeTargetSpec, *, anchor_dims_override: Mapping[str, object] | None = None
+    def run_l0(
+        self, module_source: str, regime_spec: RegimeTargetSpec, *,
+        anchor_dims_override: Mapping[str, object] | None = None,
+        incumbent_source: str = "", freedom_masks: Mapping[str, ConstraintRelaxationMask] | None = None,
     ) -> StageAResult:
+        """Run Stage-A L0 static/SIL checks for a candidate module and regime."""
+        def _df(ms: str, rs: RegimeTargetSpec, *, anchor_dims_override: Mapping[str, object] | None = None) -> StageAResult:
+            return self._default_l0_checker(
+                ms, rs, anchor_dims_override=anchor_dims_override,
+                incumbent_source=incumbent_source, freedom_masks=freedom_masks,
+            )
+
         return dispatch_l0_gate(
             module_source, regime_spec, l0_checker=self._l0_checker,
-            default_fn=self._default_l0_checker, anchor_dims_override=anchor_dims_override,
+            default_fn=_df, anchor_dims_override=anchor_dims_override,
         )
 
     def _collect_regime_cases_by_id(
-        self, regime_spec: RegimeTargetSpec, *, extra_dims: Sequence[Mapping[str, object]] = ()
+        self, regime_spec: RegimeTargetSpec, *, extra_dims: Sequence[Mapping[str, object]] = (),
+        scoreboard_anchors: Sequence[AnchorCaseSpec] | None = None,
+        guardrail_cases: Sequence[GuardrailCaseSpec] | None = None,
     ) -> dict[str, dict[str, object]]:
+        eff_sb = scoreboard_anchors if scoreboard_anchors is not None else self._scoreboard_anchors
+        eff_gr = guardrail_cases if guardrail_cases is not None else self._guardrail_cases
         cases_by_id: dict[str, dict[str, object]] = {}
         seen: set[int] = set()
         if (troot := resolve_cannbench_tasks_root(cannbench_repo=self._cannbench_repo, env_file=self._env_file, source_root=self._source_root)) and self._config.operator_name:
@@ -686,7 +673,7 @@ class StageGateCoordinator:
                                 seen.add(cn)
             except (FileNotFoundError, KeyError, OSError, ValueError, TypeError):
                 pass
-        for item in (*self._scoreboard_anchors, *self._guardrail_cases, *self._initial_anchors):
+        for item in (*eff_sb, *eff_gr, *self._initial_anchors):
             if len(self._regime_specs) > 1 and item.regime_tag and item.regime_tag != regime_spec.regime_tag:
                 continue
             cn = int(item.case_num)
@@ -704,12 +691,16 @@ class StageGateCoordinator:
             cases_by_id["__primary__"] = dict(adims)
         return cases_by_id
 
-    def _run_l1(
+    def run_l1(
         self, module_source: str, regime_spec: RegimeTargetSpec, *,
         static_width_dims_fn: Callable[[RegimeTargetSpec], Sequence[Mapping[str, object]]] | None = None,
+        scoreboard_anchors: Sequence[AnchorCaseSpec] | None = None,
+        guardrail_cases: Sequence[GuardrailCaseSpec] | None = None,
     ) -> StageBResult:
         """Run Stage-B L1 compilation over unique post-selector CompileTaskSpecs."""
         eff_wfn = static_width_dims_fn if static_width_dims_fn is not None else self._static_width_dims_fn
+        eff_sb = scoreboard_anchors if scoreboard_anchors is not None else self._scoreboard_anchors
+        eff_gr = guardrail_cases if guardrail_cases is not None else self._guardrail_cases
         adims = regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
         ewd = list(eff_wfn(regime_spec)) if eff_wfn is not None else []
         if self._l1_compiler is not None:
@@ -741,7 +732,7 @@ class StageGateCoordinator:
             if stage_b_has_vf_overflow(tb_res, compile_flags=efl, builder_name="_render_trackb_tu"):
                 return build_width_failure_result(tb_res, tb_res.elapsed_sec, compile_flags=efl, builder_name="_render_trackb_tu")
             seen_k, pend = {(tu, efl)}, []
-            for cd in self._collect_regime_cases_by_id(regime_spec, extra_dims=ewd).values():
+            for cd in self._collect_regime_cases_by_id(regime_spec, extra_dims=ewd, scoreboard_anchors=eff_sb, guardrail_cases=eff_gr).values():
                 if not cd:
                     continue
                 cspec = replace(regime_spec, representative_anchor_dims=dict(cd))
@@ -765,13 +756,14 @@ class StageGateCoordinator:
             tb_b, cached_tb_rec, tb_sec, fres = run_hybrid_trackb_stage_b(
                 module_source, tb_ext, regime_spec, resolved, utl_cache, store,
                 env_file=self._env_file, source_root=self._source_root,
-                scoreboard_anchors=self._scoreboard_anchors, guardrail_cases=self._guardrail_cases,
+                scoreboard_anchors=eff_sb, guardrail_cases=eff_gr,
                 lookup_dims_fn=lambda cn, rt: self._lookup_case_static_spec_safe(cn) or self._lookup_case_dims_safe(cn, rt),
             )
             if fres is not None:
                 return fres
-        anchor_case_specs, cases_sha = self._resolve_stage_b_anchor_case_specs(), self._resolve_cases_yaml_sha256()
-        cases_by_id = self._collect_regime_cases_by_id(regime_spec, extra_dims=ewd)
+        anchor_case_specs = self._resolve_stage_b_anchor_case_specs(scoreboard_anchors=eff_sb, guardrail_cases=eff_gr)
+        cases_sha = self._resolve_cases_yaml_sha256()
+        cases_by_id = self._collect_regime_cases_by_id(regime_spec, extra_dims=ewd, scoreboard_anchors=eff_sb, guardrail_cases=eff_gr)
         plan: RegimeCompilePlan | None = None
         if cases_by_id:
             try:
@@ -867,7 +859,12 @@ class StageGateCoordinator:
         sig = hashlib.sha256("|".join((str(res.builder_name), repr(tuple(res.compile_flags)), str(regime_spec.runtime_backend), tb_hash)).encode("utf-8")).hexdigest()
         return (src_sha, f"build:{sig}")
 
-    def _l1_summary_for_first_round(self, module_source: str, regime_spec: RegimeTargetSpec) -> BishengResourceSummary | None:
+    def l1_summary_for_round(
+        self, module_source: str, regime_spec: RegimeTargetSpec, *,
+        scoreboard_anchors: Sequence[AnchorCaseSpec] | None = None,
+        guardrail_cases: Sequence[GuardrailCaseSpec] | None = None,
+    ) -> BishengResourceSummary | None:
+        """Compute or retrieve cached Stage-B resource summary for a parent module."""
         ckey = (source_sha256(module_source), regime_spec.regime_tag)
         if ckey in self._l1_summary_cache:
             return self._l1_summary_cache[ckey]
@@ -875,7 +872,7 @@ class StageGateCoordinator:
         if rkey in self._l1_summary_cache:
             self._l1_summary_cache[ckey] = self._l1_summary_cache[rkey]
             return self._l1_summary_cache[rkey]
-        res = self._run_l1(module_source, regime_spec)
+        res = self.run_l1(module_source, regime_spec, scoreboard_anchors=scoreboard_anchors, guardrail_cases=guardrail_cases)
         if not res.passed:
             logger.warning("First-round parent L1 for regime %s failed: %s", regime_spec.regime_tag, res.error_message)
         summary = res.compiler_summary if res.passed else None
@@ -907,13 +904,18 @@ class StageGateCoordinator:
             out[cid] = aggregate_surrogate_result(cres.candidate_id, cres.operator_name, tuple(upd), error_message=cres.error_message) if changed else cres
         return out
 
-    def _run_l2_batch(
+    def run_l2_batch(
         self, candidates: Sequence[tuple[str, Path]], active_anchors: Sequence[AnchorCaseSpec], *,
         include_guardrails: bool = True, incumbent_source: str = "",
         incumbent_anchor_us_by_case: Mapping[int, float] | None = None,
+        guardrail_cases: Sequence[GuardrailCaseSpec] | None = None,
+        out_guardrail_metrics: dict[str, dict[int, AnchorEvalMetrics]] | None = None,
+        out_l2_meta: dict[str, object] | None = None,
     ) -> tuple[dict[str, CandidateSurrogateResult], dict[str, str]]:
+        """Run batched L2 surrogate evaluation with paired incumbent normalization."""
         self._last_l2_timing_meta = {}
         eff_inc = incumbent_source or self._active_incumbent_source
+        eff_gr = guardrail_cases if guardrail_cases is not None else self._guardrail_cases
         if not eff_inc and self._l2_batch_evaluator is None and self._npu_port is None and self._target_module_path.is_file():
             try:
                 eff_inc = self._target_module_path.read_text(encoding="utf-8")
@@ -923,8 +925,8 @@ class StageGateCoordinator:
         prepend_inc = bool(candidates and eff_inc.strip() and not ({"incumbent_slot", "__incumbent__", "incumbent_baseline"} & cids))
         sb_cnums = {int(a.case_num) for a in active_anchors}
         ex_gr, gr_cnums = [], set()
-        if include_guardrails and self._guardrail_cases and active_anchors:
-            for g in self._guardrail_cases:
+        if include_guardrails and eff_gr and active_anchors:
+            for g in eff_gr:
                 if (gn := int(g.case_num)) not in sb_cnums and gn not in gr_cnums:
                     ex_gr.append(g.to_anchor_spec())
                     gr_cnums.add(gn)
@@ -963,13 +965,18 @@ class StageGateCoordinator:
         else:
             results, run_ids = _dispatch(candidates)
         self._last_l2_timing_meta = l2_meta
+        if out_l2_meta is not None:
+            out_l2_meta.update(l2_meta)
         inc_slot = results.pop("incumbent_slot", None)
         run_ids.pop("incumbent_slot", None)
         norm = self._normalize_paired_l2_results(results, inc_slot, incumbent_anchor_us_by_case=incumbent_anchor_us_by_case)
         if gr_cnums:
             stripped: dict[str, CandidateSurrogateResult] = {}
             for cid, cr in norm.items():
-                self._last_guardrail_metrics_by_cid[cid] = {int(a.case_num): a for a in cr.anchors if int(a.case_num) in gr_cnums}
+                gmetrics = {int(a.case_num): a for a in cr.anchors if int(a.case_num) in gr_cnums}
+                self._last_guardrail_metrics_by_cid[cid] = gmetrics
+                if out_guardrail_metrics is not None:
+                    out_guardrail_metrics[cid] = dict(gmetrics)
                 kept = tuple(a for a in cr.anchors if int(a.case_num) not in gr_cnums)
                 stripped[cid] = aggregate_surrogate_result(cr.candidate_id, cr.operator_name, kept, error_message=cr.error_message) if kept else replace(cr, anchors=())
             final_map = stripped
@@ -983,7 +990,8 @@ class StageGateCoordinator:
         )
         return wrapped, run_ids
 
-    def _unchanged_sibling_regimes(self, incumbent_src: str, candidate_src: str, active_spec: RegimeTargetSpec) -> set[str]:
+    def unchanged_sibling_regimes(self, incumbent_src: str, candidate_src: str, active_spec: RegimeTargetSpec) -> set[str]:
+        """Identify sibling regimes whose extracted AST is structurally identical."""
         if not incumbent_src.strip() or not candidate_src.strip():
             return set()
         op_entry = resolve_operator_entrypoint_safe(self._config.operator_name)
@@ -1003,25 +1011,32 @@ class StageGateCoordinator:
                 continue
         return unchanged
 
-    def _retest_single_or_tail(
-        self, candidate_id: str, candidate_source: str, anchors_in: Sequence[AnchorCaseSpec]
+    def retest_single_or_tail(
+        self, candidate_id: str, candidate_source: str, anchors_in: Sequence[AnchorCaseSpec], *,
+        incumbent_source: str = "", incumbent_anchor_us_by_case: Mapping[int, float] | None = None,
     ) -> CandidateSurrogateResult | None:
+        """Re-evaluate a candidate on a subset of anchors without guardrail expansion."""
         if not anchors_in:
             return None
         with tempfile.TemporaryDirectory(prefix="tf_camp_retest_") as tdir:
             cf = Path(tdir) / f"{candidate_id}.py"
             cf.write_text(candidate_source, encoding="utf-8")
             try:
-                l2_res, _ = self._run_l2_batch([(candidate_id, cf)], list(anchors_in), include_guardrails=False)
+                l2_res, _ = self.run_l2_batch(
+                    [(candidate_id, cf)], list(anchors_in), include_guardrails=False,
+                    incumbent_source=incumbent_source, incumbent_anchor_us_by_case=incumbent_anchor_us_by_case,
+                )
             except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
                 logger.warning("Anchor recheck failed for %s: %s", candidate_id, exc)
                 return None
         return l2_res.get(candidate_id)
 
-    def _retest_noisy_tail_anchors(
+    def retest_noisy_tail_anchors(
         self, *, candidate_id: str, candidate_source: str, cur_res: CandidateSurrogateResult,
         regressed_anchors: Sequence[AnchorEvalMetrics], active_anchors: Sequence[AnchorCaseSpec],
+        incumbent_source: str = "", incumbent_anchor_us_by_case: Mapping[int, float] | None = None,
     ) -> CandidateSurrogateResult | None:
+        """Retest noisy regressed tail anchors and merge updated metrics."""
         by_c = {int(a.case_num): a for a in active_anchors}
         specs, seen = [], set()
         for anc in regressed_anchors:
@@ -1029,27 +1044,34 @@ class StageGateCoordinator:
                 continue
             seen.add(cn)
             specs.append(by_c.get(cn) or AnchorCaseSpec(task=f"operator/{cur_res.operator_name}", case_num=cn, regime_tag=anc.regime_tag, ref_perf_us=anc.ref_perf_us, t_hw_us=anc.t_hw_us))
-        ret = self._retest_single_or_tail(candidate_id, candidate_source, specs)
+        ret = self.retest_single_or_tail(
+            candidate_id, candidate_source, specs,
+            incumbent_source=incumbent_source, incumbent_anchor_us_by_case=incumbent_anchor_us_by_case,
+        )
         if ret is None or not ret.anchors:
             return None
         rb = {int(a.case_num): a for a in ret.anchors}
         return aggregate_surrogate_result(cur_res.candidate_id, cur_res.operator_name, tuple(rb.get(int(a.case_num), a) for a in cur_res.anchors), error_message=cur_res.error_message)
 
-    def _evaluate_dual_layer_tail_guard(
+    def evaluate_dual_layer_tail_guard(
         self, *, candidate_id: str, candidate_source: str, top_res: CandidateSurrogateResult,
         best_result: CandidateSurrogateResult, regime_spec: RegimeTargetSpec,
         active_anchors: Sequence[AnchorCaseSpec], incumbent_source: str = "",
         guardrail_cases: Sequence[GuardrailCaseSpec] | None = None,
+        cand_guardrail_metrics: Mapping[int, AnchorEvalMetrics] | None = None,
+        incumbent_anchor_us_by_case: Mapping[int, float] | None = None,
     ) -> tuple[bool, CandidateSurrogateResult]:
+        """Evaluate paired tail and guardrail non-regression before L3 promotion."""
         eff_inc = incumbent_source or self._active_incumbent_source
-        unchanged = self._unchanged_sibling_regimes(eff_inc, candidate_source, regime_spec) if (eff_inc and eff_inc != candidate_source) else set()
+        unchanged = self.unchanged_sibling_regimes(eff_inc, candidate_source, regime_spec) if (eff_inc and eff_inc != candidate_source) else set()
         eff_gr = list(guardrail_cases) if guardrail_cases is not None else self._guardrail_cases
+        eff_gm = cand_guardrail_metrics if cand_guardrail_metrics is not None else self._last_guardrail_metrics_by_cid.get(candidate_id, {})
         ok, updated, reason = evaluate_promotion_gate(
             candidate_id=candidate_id, cur_res=top_res, best_result=best_result, regime_spec=regime_spec,
-            guardrail_cases=eff_gr, cand_guardrail_metrics=self._last_guardrail_metrics_by_cid.get(candidate_id, {}),
+            guardrail_cases=eff_gr, cand_guardrail_metrics=eff_gm,
             unchanged_siblings=unchanged, active_anchors=active_anchors,
-            retest_noisy_fn=lambda reg, cur: self._retest_noisy_tail_anchors(candidate_id=candidate_id, candidate_source=candidate_source, cur_res=cur, regressed_anchors=reg, active_anchors=active_anchors),
-            recheck_single_sibling_fn=lambda sp: self._retest_single_or_tail(candidate_id, candidate_source, [sp]),
+            retest_noisy_fn=lambda reg, cur: self.retest_noisy_tail_anchors(candidate_id=candidate_id, candidate_source=candidate_source, cur_res=cur, regressed_anchors=reg, active_anchors=active_anchors, incumbent_source=eff_inc, incumbent_anchor_us_by_case=incumbent_anchor_us_by_case),
+            recheck_single_sibling_fn=lambda sp: self.retest_single_or_tail(candidate_id, candidate_source, [sp], incumbent_source=eff_inc, incumbent_anchor_us_by_case=incumbent_anchor_us_by_case),
         )
         self._last_tail_guard_reject_reason = reason
         return ok, updated
@@ -1120,14 +1142,20 @@ class StageGateCoordinator:
         backend: KernelLLMBackend | None = None, parent_sha: str = "",
         parent_workload: CostFeatures | Mapping[str, object] | None = None,
         snapshot: CampaignStateSnapshot | None = None,
+        guardrail_cases: Sequence[GuardrailCaseSpec] | None = None,
+        scoreboard_anchors: Sequence[AnchorCaseSpec] | None = None,
+        freedom_masks: Mapping[str, ConstraintRelaxationMask] | None = None,
     ) -> StageGateOutcome:
         """Execute LLM generation, speculative creative harvesting, and L0->L1->L2 gates."""
         eff_inc = snapshot.incumbent_source if snapshot is not None else self._active_incumbent_source
         inc_anchor_map = dict(snapshot.incumbent_anchor_us_by_case) if snapshot is not None else self._incumbent_anchor_us_by_case
+        eff_gr = tuple(guardrail_cases) if guardrail_cases is not None else tuple(self._guardrail_cases)
+        eff_sb = tuple(scoreboard_anchors) if scoreboard_anchors is not None else self._scoreboard_anchors
+        eff_masks = dict(freedom_masks) if freedom_masks is not None else self._freedom_masks
         eff_backend = backend or (self._get_backend() if (self._backend is None and batch.worker_specs) else self._backend)
         eff_psha = parent_sha or source_sha256(batch.parent_module_source)
-        eff_paxes = batch.parent_axes or self._derive_topology_axes(batch.parent_ledger)
-        eff_mask = batch.active_mask or resolve_trackb_freedom_mask(batch.regime_spec, freedom_masks=self._freedom_masks, baseline_source=eff_inc, target_module_path=self._target_module_path)
+        eff_paxes = batch.parent_axes or self.derive_topology_axes(batch.parent_ledger)
+        eff_mask = batch.active_mask or resolve_trackb_freedom_mask(batch.regime_spec, freedom_masks=eff_masks, baseline_source=eff_inc, target_module_path=self._target_module_path)
         raw_candidates: list[tuple[str, str]] = []
         failed_entries: list[tuple[str, str, str]] = []
         meta_by_id: dict[str, tuple[str, AscendCausalRule | None, str]] = {}
@@ -1194,7 +1222,7 @@ class StageGateCoordinator:
                 paus = pl0 if pl0 > 0.0 else None
 
                 def _score(_c: str, _s: str, sa: StageAResult) -> float:
-                    ca = self._derive_topology_axes(sa.ledger, features=sa.features, route=sa.route) if sa.ledger else eff_paxes
+                    ca = self.derive_topology_axes(sa.ledger, features=sa.features, route=sa.route) if sa.ledger else eff_paxes
                     ft = build_cost_features_from_ledger(sa.ledger, live_plan=batch.live_plan, axes=ca, blueprint=batch.blueprint, sil_advisory=self._sil_advisory, target=self._cost_advisor.target)
                     return extract_cost_pred_us(self._cost_advisor.predict_candidate_us(ft))
 
@@ -1206,7 +1234,7 @@ class StageGateCoordinator:
                     return StageAResult(passed=False, prim_func=None, ledger=None, error_message=ir, backend_kind=batch.regime_spec.runtime_backend)
                 if (de := _detect_trackb_dead_code_edit(batch.parent_module_source, mod_src, batch.regime_spec)) is not None:
                     return StageAResult(passed=False, prim_func=None, ledger=None, error_message=de, backend_kind="ascendc")
-                return self._run_l0(mod_src, batch.regime_spec, anchor_dims_override=batch.bn_dims or None)
+                return self.run_l0(mod_src, batch.regime_spec, anchor_dims_override=batch.bn_dims or None, incumbent_source=eff_inc, freedom_masks=eff_masks)
 
             ak = resolve_active_trackb_kernel(batch.parent_module_source, batch.regime_spec, cache=self._active_kernel_cache) or ""
             flines, dtext = _extract_p2_focus_lines_and_diag(batch.parent_p2_diag)
@@ -1232,7 +1260,7 @@ class StageGateCoordinator:
                 return await run_l0_l1_round_filter(
                     cands, patch_fn=lambda s: _pa(batch.parent_module_source, s),
                     repatch_from_current_fn=lambda cs, s: _pa(cs, s), l0_checker=_cand_l0,
-                    l1_compiler=l1_fn or (lambda ms: self._run_l1(ms, batch.regime_spec)),
+                    l1_compiler=l1_fn or (lambda ms: self.run_l1(ms, batch.regime_spec, scoreboard_anchors=eff_sb, guardrail_cases=eff_gr)),
                     repair_backend=trep if keep_repair else None,
                     max_syntax_repairs=self._config.max_syntax_repairs if keep_repair else 0,
                     slice_hint=shint, backend_kind=batch.regime_spec.runtime_backend, parent_source=repsrc,
@@ -1241,7 +1269,7 @@ class StageGateCoordinator:
                     sil_advisory=self._sil_advisory, freedom_mask=eff_mask, ub_256kb_unlock=ub_unlock,
                     creative_candidate_ids=cr_ids if cr_ids is not None else set(batch.creative_candidate_ids),
                     parent_analytical_us=paus, stage_a_analytical_scorer=scorer, parent_topology_axes=eff_paxes,
-                    candidate_topology_axes_fn=lambda _ms, sa: self._derive_topology_axes(sa.ledger, features=sa.features, route=sa.route) if sa.ledger else None,
+                    candidate_topology_axes_fn=lambda _ms, sa: self.derive_topology_axes(sa.ledger, features=sa.features, route=sa.route) if sa.ledger else None,
                     skip_repair_when_survivors_exist=True,
                 )
 
@@ -1284,7 +1312,7 @@ class StageGateCoordinator:
 
             async def _stream_one(wid: str, snip: str, *, is_cr: bool) -> L0L1CandidateCheck:
                 res = await run_filter(
-                    [(wid, snip)], l1_fn=lambda ms: _with_sem(sl1_sem, lambda: self._run_l1(ms, batch.regime_spec)),
+                    [(wid, snip)], l1_fn=lambda ms: _with_sem(sl1_sem, lambda: self.run_l1(ms, batch.regime_spec, scoreboard_anchors=eff_sb, guardrail_cases=eff_gr)),
                     cr_ids=({wid} if (is_cr or wid in batch.creative_candidate_ids) else ()),
                     keep_repair=False, keep_ranker=False,
                 )
@@ -1344,7 +1372,7 @@ class StageGateCoordinator:
             ub_wl = (getattr(chk.stage_a.ledger, "waterlines", {}) or {}).get("UB") if (chk.stage_a and chk.stage_a.ledger) else None
             ub_cid[chk.candidate_id] = int(getattr(ub_wl, "peak_allocated_bytes", 0) or 0) if ub_wl else 0
             if chk.stage_a is not None and (chk.stage_a.passed or chk.stage_a.ledger is not None):
-                ca = self._derive_topology_axes(chk.stage_a.ledger, features=chk.stage_a.features, route=chk.stage_a.route)
+                ca = self.derive_topology_axes(chk.stage_a.ledger, features=chk.stage_a.features, route=chk.stage_a.route)
                 axes_cid[chk.candidate_id] = ca
                 try:
                     cp = extract_cost_pred_us(self._cost_advisor.predict_candidate_us(build_cost_features_from_ledger(chk.stage_a.ledger, live_plan=batch.live_plan, axes=ca, blueprint=batch.blueprint, sil_advisory=self._sil_advisory, target=self._cost_advisor.target)))
@@ -1378,6 +1406,8 @@ class StageGateCoordinator:
         l2_infra_fault: TypedFault | None = None
         l2_pw_sec, l2_npu_sec = 0.0, 0.0
         pw_stats = {"total_tasks": 0, "cache_hits": 0, "compiled_tasks": 0, "failed_candidates": 0}
+        call_gr_metrics: dict[str, dict[int, AnchorEvalMetrics]] = {}
+        call_l2_meta: dict[str, object] = {}
         if passed_checks:
             with tempfile.TemporaryDirectory(prefix=f"tf_camp_r{batch.round_idx}_") as tdir:
                 cpaths = []
@@ -1386,10 +1416,13 @@ class StageGateCoordinator:
                     cf.write_text(chk.patched_module_source, encoding="utf-8")
                     cpaths.append((chk.candidate_id, cf))
                 lt0 = time.monotonic()
-                self._last_l2_timing_meta = {}
                 failed_l2 = False
                 try:
-                    l2_results, l2_run_ids = self._run_l2_batch(cpaths, working_anchors, include_guardrails=True, incumbent_source=eff_inc, incumbent_anchor_us_by_case=inc_anchor_map)
+                    l2_results, l2_run_ids = self.run_l2_batch(
+                        cpaths, working_anchors, include_guardrails=True, incumbent_source=eff_inc,
+                        incumbent_anchor_us_by_case=inc_anchor_map, guardrail_cases=eff_gr,
+                        out_guardrail_metrics=call_gr_metrics, out_l2_meta=call_l2_meta,
+                    )
                 except Exception as exc:
                     failed_l2 = True
                     l2_infra_fault = self._classify_l2_exception(exc)
@@ -1402,13 +1435,26 @@ class StageGateCoordinator:
                         failed_entries.append((chk.candidate_id, ftier, str(exc)[:1500]))
                 l2_wsec = max(0.0, time.monotonic() - lt0)
                 if not failed_l2:
-                    if isinstance(rpw := self._last_l2_timing_meta.get("prewarm_stats"), Mapping):
+                    if isinstance(rpw := call_l2_meta.get("prewarm_stats"), Mapping):
                         for pk_k in pw_stats:
                             if pk_k in rpw:
                                 pw_stats[pk_k] = int(rpw[pk_k])
-                    l2_pw_sec = float(self._last_l2_timing_meta.get("l2_prewarm_sec") or 0.0)
-                    rnpu = self._last_l2_timing_meta.get("l2_npu_sec")
+                    l2_pw_sec = float(call_l2_meta.get("l2_prewarm_sec") or 0.0)
+                    rnpu = call_l2_meta.get("l2_npu_sec")
                     l2_npu_sec = float(rnpu) if isinstance(rnpu, (int, float)) and not isinstance(rnpu, bool) else max(0.0, l2_wsec - l2_pw_sec)
+        receipt = StageGateRoundReceipt(
+            round_idx=int(batch.round_idx), regime_tag=batch.regime_spec.regime_tag,
+            raw_candidate_count=len(raw_candidates),
+            l0_l1_passed_ids=tuple(c.candidate_id for c in passed_checks),
+            l0_l1_failed=tuple(failed_entries),
+            l2_passed_ids=tuple(cid for cid, res in l2_results.items() if res.all_passed),
+            l2_run_ids=tuple(sorted((str(k), str(v)) for k, v in l2_run_ids.items())),
+            l2_infra_fault_plane=(l2_infra_fault.plane.value if l2_infra_fault else ""),
+            l2_infra_fault_code=(l2_infra_fault.code if l2_infra_fault else ""),
+            round_active_kernel=round_ak, infeasible_boundaries_added=inf_added,
+            prescreen_pruned_ids=tuple(pruned_list), llm_gen_sec=llm_sec, l0_l1_sec=l0_l1_sec,
+            syntax_repair_sec=repair_sec, l2_prewarm_sec=l2_pw_sec, l2_npu_sec=l2_npu_sec,
+        )
         return StageGateOutcome(
             raw_candidates=raw_candidates, meta_by_id=meta_by_id, failed_entries=failed_entries,
             l0_l1_checks=l0_l1_checks, passed_checks=passed_checks, l0_l1_faults_by_cid=faults_cid,
@@ -1418,6 +1464,7 @@ class StageGateCoordinator:
             round_active_kernel=round_ak, infeasible_boundaries_added=inf_added,
             prescreen_pruned_list=pruned_list, knob_sig_by_cid=ksig_cid, ub_bytes_by_cid=ub_cid,
             pred_by_cid=pred_cid, cand_axes_by_cid=axes_cid,
+            guardrail_metrics_by_cid=call_gr_metrics, l2_timing_meta=call_l2_meta, receipt=receipt,
         )
 
 
